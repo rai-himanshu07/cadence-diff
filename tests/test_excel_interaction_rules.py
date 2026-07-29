@@ -27,6 +27,7 @@ from qc_tool.io.model import (
     WorkbookSnapshot,
 )
 from qc_tool.io.ooxml_interaction import _differential_style
+from qc_tool.io.ooxml_worksheet import parse_ooxml_worksheet_metadata
 from qc_tool.report.excel_report import write_excel_report
 from qc_tool.report.html_report import render_html_report
 from qc_tool.triage.rules import triage
@@ -113,6 +114,9 @@ def test_ooxml_snapshot_captures_validation_and_conditional_rules(
     assert rule.priority == 1
     assert rule.style_supported
     assert rule.style_key is not None and "FF0000" in rule.style_key
+    raw = parse_ooxml_worksheet_metadata(path.read_bytes()).sheets[0].interactions
+    assert raw.data_validations == snapshot.data_validations
+    assert raw.conditional_formats == snapshot.conditional_formats
 
 
 def test_unresolved_theme_style_degrades_only_style_coverage(tmp_path: Path) -> None:

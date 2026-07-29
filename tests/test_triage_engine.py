@@ -4,9 +4,11 @@ from pathlib import Path
 
 import pytest
 
+import qc_tool.engine as engine_module
 from qc_tool.config.profile import DeliverableProfile
-from qc_tool.engine import QCRunResult, run_qc
-from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.coverage import CoverageItem, CoverageState
+from qc_tool.engine import QCRunResult, _apply_findings_budget, run_qc
+from qc_tool.findings import Finding, FindingClass, Severity, limit_findings
 from qc_tool.triage.rules import triage
 
 FIXTURE_PROFILE = DeliverableProfile.model_validate(
@@ -105,6 +107,52 @@ def test_profile_severity_override(result: QCRunResult) -> None:
     # Expected findings never escalate through class overrides.
     growth = next(f for f in retriaged if f.expected_growth)
     assert growth.severity is Severity.EXPECTED
+
+
+def test_findings_budget_discloses_omissions_and_degrades_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    findings = [
+        Finding(
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            sheet="Data",
+            location=f"A{index}",
+            message=f"changed {index}",
+        )
+        for index in range(1, 6)
+    ]
+    coverage = [
+        CoverageItem(
+            check_id="excel-values",
+            label="Excel values",
+            artifact="excel",
+            state=CoverageState.CHECKED,
+        )
+    ]
+    monkeypatch.setattr(
+        engine_module,
+        "limit_findings",
+        lambda items: limit_findings(
+            items,
+            max_per_class_scope=2,
+            max_total=10,
+        ),
+    )
+
+    bounded = _apply_findings_budget(findings, coverage)
+    finalized = triage(bounded)
+
+    assert len(bounded) == 3
+    summary = next(
+        item
+        for item in finalized
+        if item.finding_class is FindingClass.FINDINGS_CAPPED
+    )
+    assert summary.severity is Severity.WARNING
+    assert summary.current_value == "2 retained; 3 omitted"
+    assert coverage[0].state is CoverageState.DEGRADED
+    assert "omitted 3 findings" in coverage[0].detail
 
 
 def test_disclosure_for_xlsb_pair(fixture_dir: Path) -> None:

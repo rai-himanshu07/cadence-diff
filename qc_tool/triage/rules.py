@@ -76,6 +76,8 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.ROW_INSERTED: Severity.WARNING,
     FindingClass.COLUMN_INSERTED: Severity.WARNING,
     FindingClass.REGION_UNPAIRED: Severity.WARNING,
+    FindingClass.ALIGNMENT_LOW_CONFIDENCE: Severity.WARNING,
+    FindingClass.FINDINGS_CAPPED: Severity.WARNING,
     FindingClass.SLIDE_REMOVED: Severity.WARNING,
     FindingClass.SLIDE_TEXT_CHANGED: Severity.WARNING,
     FindingClass.TABLE_VALUE_CHANGED: Severity.WARNING,

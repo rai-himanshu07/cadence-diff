@@ -169,6 +169,8 @@ def excel_availability_issues(
     """Runtime resolution failures for Excel availability rules."""
     issues: list[str] = []
     for sheet_name, sheet_profile in profile.excel.sheets.items():
+        if sheet_name in profile.excel.ignore_sheets or sheet_profile.ignore:
+            continue
         if not sheet_profile.availability_rules:
             continue
         try:

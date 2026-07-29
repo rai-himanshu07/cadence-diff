@@ -40,6 +40,7 @@ from qc_tool.io.model import (
     WorkbookSnapshot,
     display_cell_value,
 )
+from qc_tool.progress import CancellationToken, check_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +467,8 @@ def diff_workbook_formulas(
     current: WorkbookSnapshot,
     alignment: WorkbookAlignment,
     profile: DeliverableProfile | None = None,
+    *,
+    cancellation_token: CancellationToken | None = None,
 ) -> list[Finding]:
     findings = _error_findings(current, profile)
     presence_pair = bool(
@@ -486,10 +489,14 @@ def diff_workbook_formulas(
             current.formula_source,
         )
     for sheet_name, regions in alignment.regions.items():
+        check_cancelled(cancellation_token)
         base_sheet = baseline.sheet(sheet_name)
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name) if profile is not None else None
         for region in regions:
+            check_cancelled(cancellation_token)
+            if region.low_confidence:
+                continue
             findings.extend(
                 _paired_cell_findings(
                     base_sheet,

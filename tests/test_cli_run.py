@@ -66,6 +66,31 @@ def test_preflight_mode_inferred(
     assert code == 2  # the fixture contains seeded error literals
 
 
+def test_progress_is_opt_in_and_stderr_only(
+    fixture_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = _run(
+        [
+            "--current-excel",
+            str(fixture_dir / "current.xlsx"),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--progress",
+            "--fail-on",
+            "never",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "progress: loading current excel" in captured.err
+    assert "progress: recording history (1/1)" in captured.err
+    assert "progress:" not in captured.out
+    assert "mode: current_file_preflight" in captured.out
+
+
 def test_package_mode_inferred(
     fixture_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

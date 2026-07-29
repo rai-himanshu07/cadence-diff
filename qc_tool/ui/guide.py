@@ -240,6 +240,12 @@ ppt:
                     "those limitations in the review or attestation.",
                     warning=True,
                 )
+                _callout(
+                    "Safeguards are visible",
+                    "Excel workload warnings, accepted large-workbook overrides, findings caps, "
+                    "and low-confidence alignment all degrade coverage and explain the affected "
+                    "scope. They never silently truncate or guess.",
+                )
                 _paragraph(
                     "Tables, structured references, combo charts, interaction rules, "
                     "dependencies, availability, and speaker notes have explicit coverage. "
@@ -324,23 +330,26 @@ ppt:
             with _guide_section("cli", "CLI and automation"):
                 _code(
                     """# Headless comparison; exit 2 when critical findings exist
-qc-tool run --baseline-excel last.xlsx --current-excel this.xlsx \\
-  --profile monthly --json findings.json
+cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
+    --profile monthly --json findings.json --progress
+
+# Deliberate local override after reviewing workload refusal
+cadence-diff run --current-excel unusually-large.xlsx --allow-large-workbooks
 
 # Structural-only evidence
-qc-tool fingerprint current.xlsx -o current.fingerprint.json
+cadence-diff fingerprint current.xlsx -o current.fingerprint.json
 
 # Strict verified package redaction
-qc-tool sanitize-package --excel current.xlsx --ppt current.pptx \\
+cadence-diff sanitize-package --excel current.xlsx --ppt current.pptx \\
   --profile monthly --output-dir sanitized --forbid "Client Name"
 
 # Signed audit evidence
-qc-tool run --current-excel current.xlsx --fail-on never \\
+cadence-diff run --current-excel current.xlsx --fail-on never \\
   --attestation run.qca
-qc-tool verify-attestation run.qca
+cadence-diff verify-attestation run.qca
 
 # Validate a profile against actual artifacts
-qc-tool lint monthly.yaml --against-excel current.xlsx --against-ppt current.pptx"""
+cadence-diff lint monthly.yaml --against-excel current.xlsx --against-ppt current.pptx"""
                 )
                 _list(
                     [
@@ -348,6 +357,8 @@ qc-tool lint monthly.yaml --against-excel current.xlsx --against-ppt current.ppt
                         "Exit <code>1</code>: usage, file, password, privacy, or runtime error.",
                         "Exit <code>2</code>: QC threshold reached, lint errors, unsafe verification, or invalid attestation.",
                         "Prefer <code>--password-env</code>, a mode-600 <code>--password-file</code>, or <code>--password-prompt</code>.",
+                        "Use <code>--progress</code> for stderr phase updates; the web UI shows the same phases and supports cooperative cancellation.",
+                        "<code>qc-tool</code> remains a compatibility alias for <code>cadence-diff</code>.",
                     ]
                 )
 
@@ -377,6 +388,15 @@ qc-tool network local --data-dir data"""
                     [
                         ["Password required / invalid", "Enter the open password for the exact file role"],
                         ["Formula cache missing", "Open and recalculate in Excel, save, then rerun"],
+                        [
+                            "Workbook workload refused",
+                            "Review the reported XML, shared-string, style, cell, and sheet-area metrics. "
+                            "Use the per-run override only when sufficient local memory is confirmed.",
+                        ],
+                        [
+                            "Run cancelled",
+                            "Wait for the next safe boundary. Partial reports are removed and no successful run is recorded.",
+                        ],
                         [
                             "XLSB formula checks degraded",
                             "Review coverage detail. Windows needs desktop Excel; Linux needs "

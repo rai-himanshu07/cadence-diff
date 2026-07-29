@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
+from xml.etree.ElementTree import Element
 
+from openpyxl.formatting.formatting import ConditionalFormatting
+from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.utils.cell import range_boundaries
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from qc_tool.io.model import ConditionalFormatDescriptor, DataValidationDescriptor
 
@@ -159,13 +163,9 @@ def _border_style(border: Any, details: list[str]) -> dict[str, object] | None:
         "outline": bool(getattr(border, "outline", False)),
     }
     has_side = any(
-        side["style"] is not None or side["color"] is not None
-        for side in sides.values()
+        side["style"] is not None or side["color"] is not None for side in sides.values()
     )
-    has_border_flag = any(
-        canonical[name]
-        for name in ("diagonal_up", "diagonal_down", "outline")
-    )
+    has_border_flag = any(canonical[name] for name in ("diagonal_up", "diagonal_down", "outline"))
     return canonical if has_side or has_border_flag else None
 
 
@@ -264,12 +264,8 @@ def _conditional_descriptor(
 ) -> ConditionalFormatDescriptor:
     rule_type = str(getattr(rule, "type", "unknown"))
     semantic_supported = rule_type in _SUPPORTED_RULE_TYPES
-    semantic_detail = (
-        "" if semantic_supported else f"{rule_type} rule details are unsupported"
-    )
-    style_key, style_supported, style_detail = _differential_style(
-        getattr(rule, "dxf", None)
-    )
+    semantic_detail = "" if semantic_supported else f"{rule_type} rule details are unsupported"
+    style_key, style_supported, style_detail = _differential_style(getattr(rule, "dxf", None))
     formulas = tuple(str(item) for item in (getattr(rule, "formula", None) or []))
     return ConditionalFormatDescriptor(
         sheet=sheet,
@@ -327,4 +323,78 @@ def extract_worksheet_interactions(worksheet: Any, sheet: str) -> InteractionExt
                 extraction.styles_supported = False
                 extraction.style_details.append(descriptor.style_detail)
             source_index += 1
+    return extraction
+
+
+def extract_data_validation_element(
+    element: Element,
+    *,
+    sheet: str,
+    source_index: int,
+) -> DataValidationDescriptor:
+    """Parse one raw OOXML data-validation element into the snapshot contract."""
+    validation = cast(
+        DataValidation | None,
+        DataValidation.from_tree(cast(Any, element)),
+    )
+    if validation is None:
+        raise ValueError("data-validation element could not be parsed")
+    return _validation_descriptor(
+        validation,
+        sheet=sheet,
+        source_index=source_index,
+    )
+
+
+def extract_conditional_formatting_element(
+    element: Element,
+    *,
+    sheet: str,
+    source_index: int,
+    differential_styles: list[DifferentialStyle],
+) -> InteractionExtraction:
+    """Parse one raw OOXML conditional-format group into canonical descriptors."""
+    extraction = InteractionExtraction()
+    group = cast(
+        ConditionalFormatting | None,
+        ConditionalFormatting.from_tree(cast(Any, element)),
+    )
+    if group is None:
+        raise ValueError("conditional-format element could not be parsed")
+    target_ranges = _target_ranges(group.sqref)
+    for offset, rule in enumerate(group.rules):
+        style_id = getattr(rule, "dxfId", None)
+        if style_id is not None:
+            if 0 <= style_id < len(differential_styles):
+                rule.dxf = differential_styles[style_id]
+            else:
+                descriptor = _conditional_descriptor(
+                    rule,
+                    sheet=sheet,
+                    source_index=source_index + offset,
+                    target_ranges=target_ranges,
+                )
+                descriptor.style_key = None
+                descriptor.style_supported = False
+                descriptor.style_detail = f"differential style {style_id} is unavailable"
+                extraction.conditional_formats.append(descriptor)
+                extraction.styles_supported = False
+                extraction.style_details.append(descriptor.style_detail)
+                if not descriptor.semantic_supported:
+                    extraction.rules_supported = False
+                    extraction.rule_details.append(descriptor.semantic_detail)
+                continue
+        descriptor = _conditional_descriptor(
+            rule,
+            sheet=sheet,
+            source_index=source_index + offset,
+            target_ranges=target_ranges,
+        )
+        extraction.conditional_formats.append(descriptor)
+        if not descriptor.semantic_supported:
+            extraction.rules_supported = False
+            extraction.rule_details.append(descriptor.semantic_detail)
+        if not descriptor.style_supported:
+            extraction.styles_supported = False
+            extraction.style_details.append(descriptor.style_detail)
     return extraction

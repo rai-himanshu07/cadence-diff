@@ -5,6 +5,8 @@ engine (severity module) classifies them. Reports must never re-derive
 diff logic from raw artifacts.
 """
 
+from collections import Counter
+from dataclasses import dataclass
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -46,6 +48,8 @@ class FindingClass(StrEnum):
     CHART_GEOMETRY_CHANGED = "chart_geometry_changed"
     PIVOT_SOURCE_CHANGED = "pivot_source_changed"
     REGION_UNPAIRED = "region_unpaired"
+    ALIGNMENT_LOW_CONFIDENCE = "alignment_low_confidence"
+    FINDINGS_CAPPED = "findings_capped"
     PERIOD_DUPLICATE = "period_duplicate"
     PERIOD_OUT_OF_ORDER = "period_out_of_order"
     PERIOD_GAP = "period_gap"
@@ -131,3 +135,86 @@ class Finding(BaseModel):
     root_cause_key: str = ""
     waiver_reason: str = ""
     waiver_expires: str = ""
+
+
+@dataclass(slots=True)
+class FindingsBudgetResult:
+    findings: list[Finding]
+    omitted_by_artifact: dict[str, int]
+    global_omitted: int = 0
+
+
+def limit_findings(
+    findings: list[Finding],
+    *,
+    max_per_class_scope: int = 500,
+    max_total: int = 10_000,
+) -> FindingsBudgetResult:
+    """Bound output volume and disclose every omitted finding."""
+    if max_per_class_scope < 1 or max_total < 2:
+        raise ValueError("findings budgets must retain at least one detail and summary")
+    retained: list[Finding] = []
+    kept: Counter[tuple[str, FindingClass, str]] = Counter()
+    omitted: Counter[tuple[str, FindingClass, str]] = Counter()
+    for finding in findings:
+        scope = finding.sheet or finding.slide or "workbook/package"
+        key = (finding.artifact, finding.finding_class, scope)
+        if kept[key] < max_per_class_scope:
+            retained.append(finding)
+            kept[key] += 1
+        else:
+            omitted[key] += 1
+
+    omitted_by_artifact: Counter[str] = Counter()
+    for (artifact, finding_class, scope), omitted_count in sorted(
+        omitted.items(),
+        key=lambda item: (
+            item[0][0],
+            item[0][2],
+            item[0][1].value,
+        ),
+    ):
+        omitted_by_artifact[artifact] += omitted_count
+        retained.append(
+            Finding(
+                artifact=artifact,
+                finding_class=FindingClass.FINDINGS_CAPPED,
+                sheet=scope if artifact == "excel" else None,
+                slide=scope if artifact == "ppt" else None,
+                element=finding_class.value,
+                current_value=(
+                    f"{max_per_class_scope} retained; {omitted_count} omitted"
+                ),
+                message=(
+                    f"{scope}: output budget retained the first "
+                    f"{max_per_class_scope} {finding_class.value} findings and "
+                    f"omitted {omitted_count}; affected coverage is degraded"
+                ),
+            )
+        )
+
+    global_omitted = 0
+    if len(retained) > max_total:
+        keep_count = max_total - 1
+        dropped = retained[keep_count:]
+        retained = retained[:keep_count]
+        global_omitted = len(dropped)
+        for finding in dropped:
+            omitted_by_artifact[finding.artifact] += 1
+        retained.append(
+            Finding(
+                artifact="run",
+                finding_class=FindingClass.FINDINGS_CAPPED,
+                element="global",
+                current_value=f"{keep_count} retained; {global_omitted} omitted",
+                message=(
+                    f"Run output budget retained {keep_count} findings and omitted "
+                    f"{global_omitted}; all affected coverage is degraded"
+                ),
+            )
+        )
+    return FindingsBudgetResult(
+        findings=retained,
+        omitted_by_artifact=dict(omitted_by_artifact),
+        global_omitted=global_omitted,
+    )

@@ -64,6 +64,13 @@ def _qualified_range(
     return _resolve_range(workbook, sheet_name.strip("'").replace("''", "'"), cell_range)
 
 
+def _reference_sheet(reference: str) -> str | None:
+    sheet_name, separator, _cell_range = reference.rpartition("!")
+    if not separator:
+        return None
+    return sheet_name.strip("'").replace("''", "'")
+
+
 def _numeric_values(
     resolved: tuple[SheetSnapshot, tuple[int, int, int, int]]
 ) -> list[float] | None:
@@ -80,17 +87,36 @@ def _numeric_values(
 
 
 def evaluate_controls(
-    workbook: WorkbookSnapshot, controls: ExcelControls
+    workbook: WorkbookSnapshot,
+    controls: ExcelControls,
+    *,
+    ignored_sheets: set[str] | None = None,
 ) -> ControlResult:
     result = ControlResult()
+    ignored = ignored_sheets or set()
+    required_ranges = [
+        control for control in controls.required_ranges if control.sheet not in ignored
+    ]
+    unique_ranges = [
+        control for control in controls.unique_ranges if control.sheet not in ignored
+    ]
+    numeric_bounds = [
+        control for control in controls.numeric_bounds if control.sheet not in ignored
+    ]
+    tie_outs = [
+        control
+        for control in controls.tie_outs
+        if _reference_sheet(control.target) not in ignored
+        and all(_reference_sheet(component) not in ignored for component in control.components)
+    ]
     configured = (
-        len(controls.required_ranges)
-        + len(controls.unique_ranges)
-        + len(controls.numeric_bounds)
-        + len(controls.tie_outs)
+        len(required_ranges)
+        + len(unique_ranges)
+        + len(numeric_bounds)
+        + len(tie_outs)
     )
 
-    for control in controls.required_ranges:
+    for control in required_ranges:
         resolved = _resolve_range(workbook, control.sheet, control.cell_range)
         if resolved is None:
             result.findings.append(
@@ -114,7 +140,7 @@ def evaluate_controls(
                     )
                 )
 
-    for control in controls.unique_ranges:
+    for control in unique_ranges:
         resolved = _resolve_range(workbook, control.sheet, control.cell_range)
         if resolved is None:
             result.findings.append(
@@ -152,7 +178,7 @@ def evaluate_controls(
                 )
             )
 
-    for control in controls.numeric_bounds:
+    for control in numeric_bounds:
         resolved = _resolve_range(workbook, control.sheet, control.cell_range)
         if resolved is None:
             result.findings.append(
@@ -186,7 +212,7 @@ def evaluate_controls(
                     )
                 )
 
-    for control in controls.tie_outs:
+    for control in tie_outs:
         target_range = _qualified_range(workbook, control.target)
         component_ranges = [
             _qualified_range(workbook, component) for component in control.components

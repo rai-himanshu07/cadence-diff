@@ -7,11 +7,13 @@ from pathlib import Path
 import pytest
 from nicegui.testing import User
 
+import qc_tool.ui.app as app_module
 from qc_tool.config.profile import DeliverableProfile, save_profile
 from qc_tool.coverage import QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.findings import Severity
 from qc_tool.history.store import RunHistory
+from qc_tool.progress import CancellationToken, ProgressEvent, RunCancelled, RunPhase
 from qc_tool.security import secure_managed_tree
 from qc_tool.server_config import NetworkMode
 from qc_tool.ui.app import (
@@ -156,6 +158,88 @@ def test_perform_run_produces_artifacts(fixture_dir: Path, tmp_path: Path) -> No
     assert set(record.file_hashes) == set(files)
 
 
+def test_perform_run_reports_ordered_progress(
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    events: list[ProgressEvent] = []
+
+    perform_run(
+        tmp_path / "work",
+        {"current_excel": fixture_dir / "current.xlsx"},
+        {},
+        DeliverableProfile(name="progress"),
+        mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+        on_progress=events.append,
+    )
+
+    completed_phases = [
+        event.phase
+        for event in events
+        if event.total and event.processed == event.total
+    ]
+    assert completed_phases == [
+        RunPhase.PREPARING,
+        RunPhase.LOADING_CURRENT_EXCEL,
+        RunPhase.ANALYZING_EXCEL,
+        RunPhase.WRITING_REPORTS,
+        RunPhase.RECORDING_HISTORY,
+        RunPhase.COMPLETE,
+    ]
+
+
+def test_cancelled_report_cleans_owned_directory_and_records_no_history(
+    fixture_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_dir = tmp_path / "work"
+    token = CancellationToken()
+
+    def cancel_after_partial_report(result, path: Path) -> None:
+        path.write_text("partial", encoding="utf-8")
+        token.cancel()
+
+    monkeypatch.setattr(app_module, "write_excel_report", cancel_after_partial_report)
+
+    with pytest.raises(RunCancelled):
+        perform_run(
+            work_dir,
+            {"current_excel": fixture_dir / "current.xlsx"},
+            {},
+            DeliverableProfile(name="cancelled"),
+            mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+            cancellation_token=token,
+        )
+
+    runs_dir = work_dir / "runs"
+    assert runs_dir.is_dir()
+    assert list(runs_dir.iterdir()) == []
+    assert not (work_dir / "history.sqlite3").exists()
+
+
+def test_pre_cancelled_run_creates_no_artifacts(
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    token = CancellationToken()
+    token.cancel()
+    work_dir = tmp_path / "work"
+
+    with pytest.raises(RunCancelled):
+        perform_run(
+            work_dir,
+            {"current_excel": fixture_dir / "current.xlsx"},
+            {},
+            DeliverableProfile(name="cancelled"),
+            mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+            cancellation_token=token,
+        )
+
+    assert not (work_dir / "runs").exists()
+    assert not (work_dir / "history.sqlite3").exists()
+
+
 def test_immediate_runs_get_distinct_private_report_paths(
     fixture_dir: Path, tmp_path: Path
 ) -> None:
@@ -206,6 +290,7 @@ async def test_main_page_renders(user: User, tmp_path: Path) -> None:
     await user.should_see("QC Tool")
     await user.should_see("Run QC")
     await user.should_see("Deliverable profile")
+    await user.should_see("Override large-workbook refusal")
     await user.should_see("Current-file preflight")
     await user.should_see("Cycle comparison")
     await user.should_see("Final-package QC")
@@ -224,6 +309,7 @@ async def test_guide_page_renders_packaged_operator_content(
     await user.should_see("Profiles, controls, and waivers")
     await user.should_see("Availability controls blankness only")
     await user.should_see("Coverage and severity")
+    await user.should_see("Safeguards are visible")
     await user.should_see("Excel to PowerPoint mappings")
     await user.should_see("Privacy, sharing, and attestations")
     await user.should_see("CLI and automation")

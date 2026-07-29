@@ -212,6 +212,19 @@ def _run_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top", type=int, default=10, help="findings to print")
     parser.add_argument(
+        "--allow-large-workbooks",
+        action="store_true",
+        help=(
+            "override OOXML workload refusal for this run; requires sufficient "
+            "local memory and degrades workload coverage"
+        ),
+    )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="write phase progress to stderr",
+    )
+    parser.add_argument(
         "--attestation",
         type=Path,
         default=None,
@@ -316,6 +329,7 @@ def _cmd_run(args: list[str]) -> int:
 
     from qc_tool.coverage import QCRunMode
     from qc_tool.findings import Severity
+    from qc_tool.progress import ProgressEvent
     from qc_tool.report.json_report import write_json_report
     from qc_tool.ui.app import perform_run
 
@@ -325,8 +339,27 @@ def _cmd_run(args: list[str]) -> int:
     profile = _resolve_profile(ns.profile, data_dir)
     passwords = _parse_password_sources(ns, files)
 
+    on_progress = None
+    if ns.progress:
+
+        def print_progress(event: ProgressEvent) -> None:
+            label = event.phase.value.replace("_", " ")
+            counts = (
+                f" ({event.processed}/{event.total})" if event.total else ""
+            )
+            detail = f" - {event.detail}" if event.detail else ""
+            print(f"progress: {label}{counts}{detail}", file=sys.stderr)
+
+        on_progress = print_progress
+
     artifacts = perform_run(
-        data_dir, files, passwords, profile, mode=QCRunMode(mode_value)
+        data_dir,
+        files,
+        passwords,
+        profile,
+        mode=QCRunMode(mode_value),
+        allow_large_workbooks=ns.allow_large_workbooks,
+        on_progress=on_progress,
     )
     result = artifacts.result
 

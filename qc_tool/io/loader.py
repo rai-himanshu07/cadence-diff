@@ -1,8 +1,9 @@
 """Read-only workbook loading into `WorkbookSnapshot` for xlsx/xlsm/xlsb.
 
-xlsx/xlsm: two openpyxl passes — ``data_only=False`` for formulas, styles,
-charts, names and hidden state; ``data_only=True`` for cached formula
-results. Pivot descriptors are parsed from the raw package parts
+xlsx/xlsm: one read-only openpyxl pass supplies formulas, constants, styles,
+and names. Raw package scans supply cached formula results, worksheet metadata,
+tables, charts, pivots, and interaction rules. Pivot descriptors are parsed
+from the raw package parts
 (``xl/pivotTables/*.xml`` + ``xl/pivotCache/pivotCacheDefinition*.xml``)
 because openpyxl's pivot object model is unreliable for arbitrary files.
 
@@ -17,12 +18,16 @@ import posixpath
 import re
 import sys
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from xml.etree import ElementTree
 
 from openpyxl import load_workbook
-from openpyxl.utils.cell import column_index_from_string
+from openpyxl.cell.read_only import ReadOnlyCell
+from openpyxl.styles.numbers import is_date_format, is_timedelta_format
+from openpyxl.utils.cell import column_index_from_string, coordinate_to_tuple
+from openpyxl.utils.datetime import from_excel, from_ISO8601
 from pyxlsb import open_workbook as open_xlsb
 
 from qc_tool.io.decrypt import open_decrypted
@@ -39,15 +44,23 @@ from qc_tool.io.model import (
     SheetSnapshot,
     TableDescriptor,
     WorkbookSnapshot,
+    WorkbookWorkload,
     is_cell_value,
 )
 from qc_tool.io.ooxml_chart import ChartParseError, parse_ooxml_charts
 from qc_tool.io.ooxml_interaction import extract_worksheet_interactions
+from qc_tool.io.ooxml_worksheet import (
+    OOXMLMetadataError,
+    WorkbookMetadata,
+    WorksheetMetadata,
+    parse_ooxml_worksheet_metadata,
+)
 from qc_tool.io.xlsb_formula import (
     XlsbFormulaScan,
     XlsbFormulaScanError,
     scan_xlsb_formulas,
 )
+from qc_tool.progress import CancellationToken, check_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +68,15 @@ SUPPORTED_SUFFIXES = {".xlsx", ".xlsm", ".xlsb"}
 
 _PIVOT_TABLE_RE = re.compile(r"^xl/pivotTables/pivotTable\d+\.xml$")
 _PIVOT_CACHE_RE = re.compile(r"^xl/pivotCache/pivotCacheDefinition\d+\.xml$")
+_MIB = 1024 * 1024
+_WORKLOAD_LIMITS = (
+    ("cell_count", 1_000_000, 5_000_000, "physical cells"),
+    ("worksheet_xml_bytes", 128 * _MIB, 512 * _MIB, "worksheet XML bytes"),
+    ("shared_string_bytes", 64 * _MIB, 256 * _MIB, "shared-string bytes"),
+    ("styles_bytes", 8 * _MIB, 32 * _MIB, "style XML bytes"),
+    ("style_count", 50_000, 250_000, "cell styles"),
+    ("largest_sheet_area", 10_000_000, 50_000_000, "largest sheet area"),
+)
 
 #: BIFF12 BOOLERR codes (pyxlsb yields them as hex strings) -> error literals.
 _XLSB_ERRORS = {
@@ -72,6 +94,14 @@ class UnsupportedFormatError(Exception):
     """The file extension is not a supported workbook format."""
 
 
+class OOXMLCellStreamError(ValueError):
+    """Formula and cached-value streams disagree on physical cell inventory."""
+
+
+class OOXMLWorkloadError(ValueError):
+    """An OOXML package exceeds safe local processing limits."""
+
+
 def _constant_cell_value(value: object) -> CellValue:
     if is_cell_value(value):
         return value
@@ -81,14 +111,10 @@ def _constant_cell_value(value: object) -> CellValue:
 def _without_chart_drawings(data: bytes) -> bytes:
     """Remove chart anchors from an in-memory OOXML copy before openpyxl reads it."""
     output = io.BytesIO()
-    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(
-        output, "w"
-    ) as target:
+    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(output, "w") as target:
         for member in source.infolist():
             content = source.read(member)
-            if member.filename.startswith("xl/drawings/") and member.filename.endswith(
-                ".xml"
-            ):
+            if member.filename.startswith("xl/drawings/") and member.filename.endswith(".xml"):
                 root = ElementTree.fromstring(content)
                 for child in list(root):
                     if any(_local_name(item.tag) == "chart" for item in child.iter()):
@@ -102,8 +128,16 @@ def _without_chart_drawings(data: bytes) -> bytes:
     return output.getvalue()
 
 
-def load_workbook_snapshot(path: Path, *, password: str | None = None) -> WorkbookSnapshot:
+def load_workbook_snapshot(
+    path: Path,
+    *,
+    password: str | None = None,
+    allow_large_workbook: bool = False,
+    _ooxml_loader: Literal["streaming", "oracle"] = "streaming",
+    cancellation_token: CancellationToken | None = None,
+) -> WorkbookSnapshot:
     """Load any supported workbook into a snapshot without touching the source."""
+    check_cancelled(cancellation_token)
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES:
         raise UnsupportedFormatError(
@@ -112,12 +146,66 @@ def load_workbook_snapshot(path: Path, *, password: str | None = None) -> Workbo
         )
     stream = open_decrypted(path, password)
     data = stream.getvalue()
+    check_cancelled(cancellation_token)
     if suffix == ".xlsb":
-        return _load_xlsb(data, source_name=path.name)
-    return _load_ooxml(data, source_name=path.name, file_format=suffix.lstrip("."))
+        return _load_xlsb(
+            data,
+            source_name=path.name,
+            cancellation_token=cancellation_token,
+        )
+    loader = (
+        _load_ooxml_streaming
+        if _ooxml_loader == "streaming"
+        else _load_ooxml_oracle
+    )
+    return loader(
+        data,
+        source_name=path.name,
+        file_format=suffix.lstrip("."),
+        allow_large_workbook=allow_large_workbook,
+        cancellation_token=cancellation_token,
+    )
 
 
 # --- xlsx / xlsm ---------------------------------------------------------
+
+
+def _assess_ooxml_workload(
+    metadata: WorkbookMetadata,
+    *,
+    source_name: str,
+    allow_large_workbook: bool,
+) -> WorkbookWorkload:
+    workload = WorkbookWorkload(
+        cell_count=sum(sheet.cell_count for sheet in metadata.sheets),
+        worksheet_xml_bytes=sum(sheet.xml_bytes for sheet in metadata.sheets),
+        shared_string_bytes=metadata.shared_string_bytes,
+        styles_bytes=metadata.styles_bytes,
+        style_count=metadata.style_count,
+        largest_sheet_area=max(
+            (sheet.max_row * sheet.max_column for sheet in metadata.sheets),
+            default=0,
+        ),
+    )
+    warnings: list[str] = []
+    refusals: list[str] = []
+    for field_name, warning_limit, refusal_limit, label in _WORKLOAD_LIMITS:
+        value = int(getattr(workload, field_name))
+        if value >= refusal_limit:
+            refusals.append(f"{label} {value:,} >= refusal limit {refusal_limit:,}")
+        elif value >= warning_limit:
+            warnings.append(f"{label} {value:,} >= warning limit {warning_limit:,}")
+    if refusals and not allow_large_workbook:
+        raise OOXMLWorkloadError(
+            f"{source_name}: workbook workload refused: {'; '.join(refusals)}. "
+            "Review the workbook and rerun with the explicit local "
+            "allow_large_workbook override only when sufficient memory is available."
+        )
+    if refusals:
+        warnings.extend(f"override accepted: {reason}" for reason in refusals)
+        workload.override_used = True
+    workload.warning_reasons = tuple(warnings)
+    return workload
 
 
 def _style_key(cell: Any) -> str:
@@ -139,10 +227,40 @@ def _style_key(cell: Any) -> str:
     return "|".join(str(p) for p in parts)
 
 
-def _load_ooxml(data: bytes, *, source_name: str, file_format: str) -> WorkbookSnapshot:
+def _openpyxl_hidden_columns(worksheet: Any) -> frozenset[int]:
+    hidden: set[int] = set()
+    for letter, dimension in worksheet.column_dimensions.items():
+        if not dimension.hidden:
+            continue
+        fallback = column_index_from_string(letter)
+        minimum = int(dimension.min or fallback)
+        maximum = int(dimension.max or fallback)
+        hidden.update(range(minimum, maximum + 1))
+    return frozenset(hidden)
+
+
+def _load_ooxml_oracle(
+    data: bytes,
+    *,
+    source_name: str,
+    file_format: str,
+    allow_large_workbook: bool = False,
+    cancellation_token: CancellationToken | None = None,
+) -> WorkbookSnapshot:
+    check_cancelled(cancellation_token)
+    workload = _assess_ooxml_workload(
+        parse_ooxml_worksheet_metadata(
+            data,
+            cancellation_token=cancellation_token,
+        ),
+        source_name=source_name,
+        allow_large_workbook=allow_large_workbook,
+    )
     workbook_data = _without_chart_drawings(data)
     wb_formulas = load_workbook(io.BytesIO(workbook_data), data_only=False)
+    check_cancelled(cancellation_token)
     wb_values = load_workbook(io.BytesIO(workbook_data), data_only=True)
+    check_cancelled(cancellation_token)
 
     snapshot = WorkbookSnapshot(
         source_name=source_name,
@@ -160,6 +278,7 @@ def _load_ooxml(data: bytes, *, source_name: str, file_format: str) -> WorkbookS
         calculation_mode=wb_formulas.calculation.calcMode,
         full_calc_on_load=wb_formulas.calculation.fullCalcOnLoad,
         external_links=_parse_external_links(data),
+        workload=workload,
     )
     interaction_details: list[str] = []
     conditional_style_details: list[str] = []
@@ -170,6 +289,7 @@ def _load_ooxml(data: bytes, *, source_name: str, file_format: str) -> WorkbookS
         snapshot.named_ranges.append(NamedRange(name=name, target=str(defined.attr_text)))
 
     for sheet_name in wb_formulas.sheetnames:
+        check_cancelled(cancellation_token)
         ws_f = wb_formulas[sheet_name]
         ws_v = wb_values[sheet_name]
 
@@ -197,14 +317,8 @@ def _load_ooxml(data: bytes, *, source_name: str, file_format: str) -> WorkbookS
                     style_key=_style_key(cell),
                 )
 
-        hidden_rows = frozenset(
-            index for index, dim in ws_f.row_dimensions.items() if dim.hidden
-        )
-        hidden_columns = frozenset(
-            column_index_from_string(letter)
-            for letter, dim in ws_f.column_dimensions.items()
-            if dim.hidden
-        )
+        hidden_rows = frozenset(index for index, dim in ws_f.row_dimensions.items() if dim.hidden)
+        hidden_columns = _openpyxl_hidden_columns(ws_f)
         snapshot.sheets.append(
             SheetSnapshot(
                 name=sheet_name,
@@ -227,9 +341,7 @@ def _load_ooxml(data: bytes, *, source_name: str, file_format: str) -> WorkbookS
                     cell_range=str(table.ref),
                     columns=[str(column.name) for column in table.tableColumns],
                     header_row_count=(
-                        int(table.headerRowCount)
-                        if table.headerRowCount is not None
-                        else 1
+                        int(table.headerRowCount) if table.headerRowCount is not None else 1
                     ),
                     totals_row_count=(
                         int(table.totalsRowCount)
@@ -256,26 +368,384 @@ def _load_ooxml(data: bytes, *, source_name: str, file_format: str) -> WorkbookS
             if not interaction.rules_supported:
                 snapshot.interaction_rules_supported = False
                 interaction_details.extend(
-                    f"{sheet_name}: {detail}"
-                    for detail in interaction.rule_details
+                    f"{sheet_name}: {detail}" for detail in interaction.rule_details
                 )
             if not interaction.styles_supported:
                 snapshot.conditional_format_styles_supported = False
                 conditional_style_details.extend(
-                    f"{sheet_name}: {detail}"
-                    for detail in interaction.style_details
+                    f"{sheet_name}: {detail}" for detail in interaction.style_details
                 )
 
     try:
-        snapshot.charts = parse_ooxml_charts(data)
+        snapshot.charts = parse_ooxml_charts(
+            data,
+            cancellation_token=cancellation_token,
+        )
         snapshot.chart_detail = "Charts parsed from raw OOXML package parts"
     except ChartParseError as exc:
         logger.warning("%s: complete chart extraction failed: %s", source_name, exc)
         snapshot.charts_available = False
         snapshot.chart_detail = f"Complete chart extraction unavailable: {exc}"
-    snapshot.interaction_rule_detail = "; ".join(
-        sorted(set(interaction_details))
+    snapshot.interaction_rule_detail = "; ".join(sorted(set(interaction_details)))
+    snapshot.conditional_format_style_detail = "; ".join(sorted(set(conditional_style_details)))
+    snapshot.pivots.extend(_parse_pivots(data))
+    return snapshot
+
+
+def _physical_cells(worksheet: Any) -> Iterator[ReadOnlyCell]:
+    for row in worksheet.iter_rows():
+        for cell in row:
+            if isinstance(cell, ReadOnlyCell):
+                yield cell
+
+
+def _cell_coordinate(cell: ReadOnlyCell) -> tuple[int, int]:
+    return int(cell.row), int(cell.column)
+
+
+def _stream_formula_cells(
+    formula_worksheet: Any,
+    *,
+    sheet_name: str,
+    style_cache: dict[int, tuple[str, str]],
+    cancellation_token: CancellationToken | None = None,
+) -> dict[tuple[int, int], CellRecord]:
+    cells: dict[tuple[int, int], CellRecord] = {}
+    for index, formula_cell in enumerate(_physical_cells(formula_worksheet), start=1):
+        if index % 10_000 == 0:
+            check_cancelled(cancellation_token)
+        if formula_cell.value is None:
+            continue
+        style_id = getattr(formula_cell, "_style_id", None)
+        if not isinstance(style_id, int):
+            raise OOXMLCellStreamError(
+                f"{sheet_name}!{formula_cell.coordinate}: read-only cell "
+                "does not expose a workbook-local style identifier"
+            )
+        style = style_cache.get(style_id)
+        if style is None:
+            style = (_style_key(formula_cell), str(formula_cell.number_format))
+            style_cache[style_id] = style
+        formula = (
+            str(formula_cell.value) if formula_cell.data_type == "f" else None
+        )
+        value = (
+            None
+            if formula is not None
+            else _constant_cell_value(formula_cell.value)
+        )
+        row, column = _cell_coordinate(formula_cell)
+        cells[(row, column)] = CellRecord(
+            row=row,
+            column=column,
+            value=value,
+            formula=formula,
+            is_formula=formula is not None,
+            number_format=style[1],
+            style_key=style[0],
+        )
+    return cells
+
+
+def _numeric_value(value: str) -> int | float:
+    return float(value) if "." in value or "E" in value.upper() else int(value)
+
+
+def _cached_formula_value(
+    raw_value: str | None,
+    data_type: str,
+    number_format: str | None,
+    epoch: Any,
+    shared_strings: list[str],
+) -> CellValue:
+    if raw_value is None:
+        return None
+    if data_type == "n":
+        numeric = _numeric_value(raw_value)
+        if number_format and is_date_format(number_format):
+            converted = from_excel(
+                numeric,
+                epoch,
+                timedelta=is_timedelta_format(number_format),
+            )
+            return converted if is_cell_value(converted) else None
+        return numeric
+    if data_type == "b":
+        return bool(int(raw_value))
+    if data_type in {"e", "str"}:
+        return raw_value
+    if data_type == "s":
+        try:
+            return shared_strings[int(raw_value)]
+        except (IndexError, ValueError) as exc:
+            raise OOXMLCellStreamError(
+                f"invalid shared-string cached formula result {raw_value!r}"
+            ) from exc
+    if data_type == "d":
+        converted = from_ISO8601(raw_value)
+        return converted if is_cell_value(converted) else None
+    raise OOXMLCellStreamError(
+        f"unsupported cached formula result type {data_type!r}"
     )
+
+
+def _shared_strings(
+    archive: zipfile.ZipFile,
+    cancellation_token: CancellationToken | None,
+) -> list[str]:
+    part = "xl/sharedStrings.xml"
+    if part not in archive.namelist():
+        return []
+    values: list[str] = []
+    retained_depth = 0
+    try:
+        with archive.open(part) as stream:
+            for event, element in ElementTree.iterparse(
+                stream,
+                events=("start", "end"),
+            ):
+                local_name = _local_name(element.tag)
+                if event == "start":
+                    if retained_depth:
+                        retained_depth += 1
+                    elif local_name == "si":
+                        retained_depth = 1
+                    continue
+                if retained_depth:
+                    retained_depth -= 1
+                    if retained_depth:
+                        continue
+                    values.append(
+                        "".join(
+                            child.text or ""
+                            for child in element.iter()
+                            if _local_name(child.tag) == "t"
+                        )
+                    )
+                    if len(values) % 10_000 == 0:
+                        check_cancelled(cancellation_token)
+                    element.clear()
+                    continue
+                element.clear()
+    except ElementTree.ParseError as exc:
+        raise OOXMLCellStreamError(
+            f"malformed shared-string cached-value stream: {exc}"
+        ) from exc
+    return values
+
+
+def _merge_cached_formula_values(
+    data: bytes,
+    metadata: list[WorksheetMetadata],
+    snapshot: WorkbookSnapshot,
+    *,
+    epoch: Any,
+    cancellation_token: CancellationToken | None = None,
+) -> None:
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        shared_strings = _shared_strings(archive, cancellation_token)
+        for sheet_metadata, sheet in zip(metadata, snapshot.sheets, strict=True):
+            check_cancelled(cancellation_token)
+            expected = {
+                coordinate
+                for coordinate, record in sheet.cells.items()
+                if record.formula is not None
+            }
+            seen: set[tuple[int, int]] = set()
+            retained_depth = 0
+            try:
+                with archive.open(sheet_metadata.part) as stream:
+                    for event, element in ElementTree.iterparse(
+                        stream,
+                        events=("start", "end"),
+                    ):
+                        local_name = _local_name(element.tag)
+                        if event == "start":
+                            if retained_depth:
+                                retained_depth += 1
+                            elif local_name == "c":
+                                retained_depth = 1
+                            continue
+                        if retained_depth:
+                            retained_depth -= 1
+                            if retained_depth:
+                                continue
+                            reference = element.get("r")
+                            formula = next(
+                                (
+                                    child
+                                    for child in element
+                                    if _local_name(child.tag) == "f"
+                                ),
+                                None,
+                            )
+                            if formula is not None and reference:
+                                row, column = coordinate_to_tuple(reference)
+                                coordinate = (row, column)
+                                record = sheet.cells.get(coordinate)
+                                if record is None or record.formula is None:
+                                    raise OOXMLCellStreamError(
+                                        f"{sheet.name}!{reference}: raw formula cell "
+                                        "is absent from the formula stream"
+                                    )
+                                raw_value = next(
+                                    (
+                                        child.text
+                                        for child in element
+                                        if _local_name(child.tag) == "v"
+                                    ),
+                                    None,
+                                )
+                                record.value = _cached_formula_value(
+                                    raw_value,
+                                    element.get("t", "n"),
+                                    record.number_format,
+                                    epoch,
+                                    shared_strings,
+                                )
+                                seen.add(coordinate)
+                                if len(seen) % 10_000 == 0:
+                                    check_cancelled(cancellation_token)
+                            element.clear()
+                            continue
+                        element.clear()
+            except ElementTree.ParseError as exc:
+                raise OOXMLCellStreamError(
+                    f"{sheet.name}: malformed worksheet cached-value stream: {exc}"
+                ) from exc
+            missing = expected.difference(seen)
+            if missing:
+                row, column = min(missing)
+                raise OOXMLCellStreamError(
+                    f"{sheet.name}!R{row}C{column}: formula stream cell is absent "
+                    "from raw worksheet XML"
+                )
+
+
+def _append_streaming_metadata(
+    snapshot: WorkbookSnapshot,
+    metadata: WorksheetMetadata,
+) -> None:
+    snapshot.tables.extend(metadata.tables)
+    snapshot.data_validations.extend(metadata.interactions.data_validations)
+    snapshot.conditional_formats.extend(metadata.interactions.conditional_formats)
+    if not metadata.interactions.rules_supported:
+        snapshot.interaction_rules_supported = False
+    if not metadata.interactions.styles_supported:
+        snapshot.conditional_format_styles_supported = False
+
+
+def _load_ooxml_streaming(
+    data: bytes,
+    *,
+    source_name: str,
+    file_format: str,
+    allow_large_workbook: bool = False,
+    cancellation_token: CancellationToken | None = None,
+) -> WorkbookSnapshot:
+    check_cancelled(cancellation_token)
+    metadata = parse_ooxml_worksheet_metadata(
+        data,
+        cancellation_token=cancellation_token,
+    )
+    workload = _assess_ooxml_workload(
+        metadata,
+        source_name=source_name,
+        allow_large_workbook=allow_large_workbook,
+    )
+    wb_formulas = load_workbook(
+        io.BytesIO(data),
+        data_only=False,
+        read_only=True,
+        keep_links=False,
+    )
+    try:
+        check_cancelled(cancellation_token)
+        expected_sheet_names = [sheet.name for sheet in metadata.sheets]
+        if wb_formulas.sheetnames != expected_sheet_names:
+            raise OOXMLMetadataError(
+                "formula workbook sheet inventory does not match raw package metadata"
+            )
+        snapshot = WorkbookSnapshot(
+            source_name=source_name,
+            file_format=file_format,
+            formulas_available=True,
+            styles_available=True,
+            formula_presence_available=True,
+            tables_available=True,
+            charts_available=True,
+            interaction_rules_available=True,
+            interaction_rules_supported=True,
+            conditional_format_styles_supported=True,
+            formula_source="openpyxl",
+            formula_detail="Formula text read directly from OOXML",
+            calculation_mode=wb_formulas.calculation.calcMode,
+            full_calc_on_load=wb_formulas.calculation.fullCalcOnLoad,
+            external_links=_parse_external_links(data),
+            workload=workload,
+        )
+        epoch = wb_formulas.epoch
+        for name, defined in wb_formulas.defined_names.items():
+            if name.startswith("_xlnm"):
+                continue
+            snapshot.named_ranges.append(NamedRange(name=name, target=str(defined.attr_text)))
+
+        interaction_details: list[str] = []
+        conditional_style_details: list[str] = []
+        style_cache: dict[int, tuple[str, str]] = {}
+        for sheet_metadata in metadata.sheets:
+            check_cancelled(cancellation_token)
+            formula_worksheet = wb_formulas[sheet_metadata.name]
+            formula_worksheet.reset_dimensions()
+            cells = _stream_formula_cells(
+                formula_worksheet,
+                sheet_name=sheet_metadata.name,
+                style_cache=style_cache,
+                cancellation_token=cancellation_token,
+            )
+            snapshot.sheets.append(
+                SheetSnapshot(
+                    name=sheet_metadata.name,
+                    visibility=sheet_metadata.visibility,
+                    max_row=sheet_metadata.max_row,
+                    max_column=sheet_metadata.max_column,
+                    cells=cells,
+                    hidden_rows=sheet_metadata.hidden_rows,
+                    hidden_columns=sheet_metadata.hidden_columns,
+                )
+            )
+            _append_streaming_metadata(snapshot, sheet_metadata)
+            interaction_details.extend(
+                f"{sheet_metadata.name}: {detail}"
+                for detail in sheet_metadata.interactions.rule_details
+            )
+            conditional_style_details.extend(
+                f"{sheet_metadata.name}: {detail}"
+                for detail in sheet_metadata.interactions.style_details
+            )
+    finally:
+        wb_formulas.close()
+
+    _merge_cached_formula_values(
+        data,
+        metadata.sheets,
+        snapshot,
+        epoch=epoch,
+        cancellation_token=cancellation_token,
+    )
+
+    try:
+        check_cancelled(cancellation_token)
+        snapshot.charts = parse_ooxml_charts(
+            data,
+            cancellation_token=cancellation_token,
+        )
+        snapshot.chart_detail = "Charts parsed from raw OOXML package parts"
+    except ChartParseError as exc:
+        logger.warning("%s: complete chart extraction failed: %s", source_name, exc)
+        snapshot.charts_available = False
+        snapshot.chart_detail = f"Complete chart extraction unavailable: {exc}"
+    snapshot.interaction_rule_detail = "; ".join(sorted(set(interaction_details)))
     snapshot.conditional_format_style_detail = "; ".join(
         sorted(set(conditional_style_details))
     )
@@ -314,9 +784,7 @@ def _parse_external_links(data: bytes) -> list[str]:
     targets: set[str] = set()
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         for part in zf.namelist():
-            if not (
-                part.startswith("xl/externalLinks/_rels/") and part.endswith(".rels")
-            ):
+            if not (part.startswith("xl/externalLinks/_rels/") and part.endswith(".rels")):
                 continue
             root = ElementTree.fromstring(zf.read(part))
             for relationship in root:
@@ -340,9 +808,7 @@ def _parse_pivots(data: bytes) -> list[PivotDescriptor]:
                     if _local_name(element.tag) == "location":
                         location_ref = element.get("ref")
                         break
-                tables.append(
-                    (part, root.get("name") or part, location_ref, root.get("cacheId"))
-                )
+                tables.append((part, root.get("name") or part, location_ref, root.get("cacheId")))
             elif _PIVOT_CACHE_RE.match(part):
                 root = ElementTree.fromstring(zf.read(part))
                 source_sheet = source_ref = None
@@ -378,13 +844,10 @@ def _parse_pivots(data: bytes) -> list[PivotDescriptor]:
             cache_part = cache_parts_by_id.get(cache_id or "")
             if cache_part not in caches:
                 relationship_part = (
-                    f"{posixpath.dirname(table_part)}/_rels/"
-                    f"{posixpath.basename(table_part)}.rels"
+                    f"{posixpath.dirname(table_part)}/_rels/{posixpath.basename(table_part)}.rels"
                 )
                 related_parts = _relationship_targets(zf, relationship_part, table_part)
-                cache_part = next(
-                    (part for part in related_parts.values() if part in caches), None
-                )
+                cache_part = next((part for part in related_parts.values() if part in caches), None)
             if cache_part not in caches and len(caches) == 1:
                 cache_part = next(iter(caches))
             source_sheet, source_ref = caches.get(cache_part or "", (None, None))
@@ -420,9 +883,7 @@ def _scan_xlsb(data: bytes, source_name: str) -> tuple[XlsbFormulaScan | None, s
         return None, f"Formula-presence scan failed: {exc}"
 
 
-def _extract_xlsb_formulas(
-    data: bytes, formula_scan: XlsbFormulaScan
-) -> FormulaExtraction:
+def _extract_xlsb_formulas(data: bytes, formula_scan: XlsbFormulaScan) -> FormulaExtraction:
     if sys.platform == "win32":
         from qc_tool.io.excel_formula import extract_formulas_with_excel
 
@@ -434,7 +895,13 @@ def _extract_xlsb_formulas(
     raise FormulaEnrichmentError(f"no XLSB formula adapter is configured for {sys.platform}")
 
 
-def _load_xlsb(data: bytes, *, source_name: str) -> WorkbookSnapshot:
+def _load_xlsb(
+    data: bytes,
+    *,
+    source_name: str,
+    cancellation_token: CancellationToken | None = None,
+) -> WorkbookSnapshot:
+    check_cancelled(cancellation_token)
     formula_scan, scan_detail = _scan_xlsb(data, source_name)
     snapshot = WorkbookSnapshot(
         source_name=source_name,
@@ -450,12 +917,11 @@ def _load_xlsb(data: bytes, *, source_name: str) -> WorkbookSnapshot:
         formula_detail=scan_detail or "Formula records identified; formula text unavailable",
         chart_detail="XLSB chart metadata is unavailable",
         interaction_rule_detail="XLSB interaction-rule metadata is unavailable",
-        conditional_format_style_detail=(
-            "XLSB conditional-format style metadata is unavailable"
-        ),
+        conditional_format_style_detail=("XLSB conditional-format style metadata is unavailable"),
     )
     with open_xlsb(io.BytesIO(data)) as wb:
         for sheet_name in wb.sheets:
+            check_cancelled(cancellation_token)
             cells: dict[tuple[int, int], CellRecord] = {}
             max_row = max_column = 0
             formula_cells = (
@@ -497,6 +963,7 @@ def _load_xlsb(data: bytes, *, source_name: str) -> WorkbookSnapshot:
                 )
             )
     if formula_scan is not None and formula_scan.formula_count:
+        check_cancelled(cancellation_token)
         try:
             extraction = _extract_xlsb_formulas(data, formula_scan)
             merge_formula_extraction(snapshot, formula_scan, extraction)

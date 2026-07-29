@@ -24,6 +24,7 @@ from qc_tool.io.model import (
     WorkbookSnapshot,
     display_cell_value,
 )
+from qc_tool.progress import CancellationToken, check_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -275,16 +276,36 @@ def diff_workbook_values(
     current: WorkbookSnapshot,
     alignment: WorkbookAlignment,
     profile: DeliverableProfile | None = None,
+    *,
+    cancellation_token: CancellationToken | None = None,
 ) -> list[Finding]:
     tolerance = profile.tolerance if profile else NumericTolerance()
     findings: list[Finding] = []
     for sheet_name, regions in alignment.regions.items():
+        check_cancelled(cancellation_token)
         base_sheet = baseline.sheet(sheet_name)
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name) if profile else None
         ignore = _RangeSet(sheet_profile.ignore_ranges if sheet_profile else [])
         refresh = _RangeSet(sheet_profile.refresh_ranges if sheet_profile else [])
         for region in regions:
+            check_cancelled(cancellation_token)
+            if region.low_confidence:
+                findings.append(
+                    Finding(
+                        artifact="excel",
+                        finding_class=FindingClass.ALIGNMENT_LOW_CONFIDENCE,
+                        sheet=sheet_name,
+                        location=region.current.cell_range,
+                        baseline_location=region.baseline.cell_range,
+                        message=(
+                            f"{sheet_name} ({region.current.region_id}): key matching "
+                            "fell below 50%; cell-level value, format, style, and "
+                            "formula comparison was skipped for this region"
+                        ),
+                    )
+                )
+                continue
             findings.extend(
                 diff_region_values(
                     base_sheet,

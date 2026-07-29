@@ -34,6 +34,7 @@ from qc_tool.excel.references import ReferenceStatus, resolve_reference
 from qc_tool.excel.regions import TableRegion, detect_regions
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot, display_cell_value
+from qc_tool.progress import CancellationToken, check_cancelled
 
 _FORMULA_RUN_MIN = 4
 _FORMULA_SHARE = 0.60
@@ -267,11 +268,18 @@ def _period_findings(
     return findings
 
 
-def _structure_findings(workbook: WorkbookSnapshot) -> tuple[list[Finding], int]:
+def _structure_findings(
+    workbook: WorkbookSnapshot,
+    ignored_sheets: set[str],
+) -> tuple[list[Finding], int]:
     findings: list[Finding] = []
     unsupported = 0
     for named in workbook.named_ranges:
         resolution = resolve_reference(workbook, named.target, host_sheet="")
+        if resolution.ranges and all(
+            resolved.sheet in ignored_sheets for resolved in resolution.ranges
+        ):
+            continue
         if resolution.status is ReferenceStatus.UNSUPPORTED:
             unsupported += 1
         elif resolution.status is ReferenceStatus.INVALID:
@@ -285,6 +293,8 @@ def _structure_findings(workbook: WorkbookSnapshot) -> tuple[list[Finding], int]
                 )
             )
     for chart in workbook.charts:
+        if chart.sheet in ignored_sheets:
+            continue
         for series in chart.series:
             sizes: dict[str, int] = {}
             for kind, target in (
@@ -354,9 +364,19 @@ def _structure_findings(workbook: WorkbookSnapshot) -> tuple[list[Finding], int]
 
 
 def preflight_workbook(
-    workbook: WorkbookSnapshot, profile: DeliverableProfile
+    workbook: WorkbookSnapshot,
+    profile: DeliverableProfile,
+    *,
+    cancellation_token: CancellationToken | None = None,
 ) -> ExcelPreflightResult:
+    check_cancelled(cancellation_token)
     result = ExcelPreflightResult()
+    ignored_sheets = set(profile.excel.ignore_sheets)
+    ignored_sheets.update(
+        sheet_name
+        for sheet_name, sheet_profile in profile.excel.sheets.items()
+        if sheet_profile.ignore
+    )
 
     if workbook.calculation_mode == "manual":
         result.findings.append(
@@ -390,13 +410,19 @@ def preflight_workbook(
 
     formula_start = len(result.findings)
     if workbook.formula_presence_available:
-        self_alignment = align_workbooks(workbook, workbook, profile)
+        self_alignment = align_workbooks(
+            workbook,
+            workbook,
+            profile,
+            cancellation_token=cancellation_token,
+        )
         result.findings.extend(
             diff_workbook_formulas(
                 workbook,
                 workbook,
                 self_alignment,
                 profile,
+                cancellation_token=cancellation_token,
             )
         )
         for sheet_name, regions in self_alignment.regions.items():
@@ -411,6 +437,9 @@ def preflight_workbook(
                     )
                 )
         for sheet in workbook.sheets:
+            check_cancelled(cancellation_token)
+            if sheet.name in ignored_sheets:
+                continue
             missing_cache = sum(
                 cell.has_formula and cell.value is None
                 for cell in sheet.cells.values()
@@ -447,7 +476,10 @@ def preflight_workbook(
     )
     dependency_graph: DependencyGraph | None = None
     if workbook.formulas_available:
-        dependency_graph = build_dependency_graph(workbook)
+        dependency_graph = build_dependency_graph(
+            workbook,
+            cancellation_token=cancellation_token,
+        )
         result.dependency_graph = dependency_graph
         annotate_impacts(result.findings, dependency_graph)
         dependency_state = dependency_graph.coverage_state
@@ -467,6 +499,9 @@ def preflight_workbook(
 
     period_start = len(result.findings)
     for sheet in workbook.sheets:
+        check_cancelled(cancellation_token)
+        if sheet.name in ignored_sheets:
+            continue
         sheet_profile = profile.sheet_profile(sheet.name)
         for region in detect_regions(sheet, sheet_profile):
             result.findings.extend(
@@ -487,7 +522,11 @@ def preflight_workbook(
     )
 
     structure_start = len(result.findings)
-    structure_findings, unsupported_references = _structure_findings(workbook)
+    check_cancelled(cancellation_token)
+    structure_findings, unsupported_references = _structure_findings(
+        workbook,
+        ignored_sheets,
+    )
     result.findings.extend(structure_findings)
     structure_details: list[str] = []
     if not workbook.tables_available:
@@ -499,6 +538,8 @@ def preflight_workbook(
             f"{unsupported_references} unsupported references were not validated"
         )
     for sheet in workbook.sheets:
+        if sheet.name in ignored_sheets:
+            continue
         if sheet.visibility != "visible" or sheet.hidden_rows or sheet.hidden_columns:
             detail = []
             if sheet.visibility != "visible":
@@ -555,12 +596,17 @@ def preflight_workbook(
             artifact="excel",
             rule_count=sum(
                 len(sheet.availability_rules)
-                for sheet in profile.excel.sheets.values()
+                for sheet_name, sheet in profile.excel.sheets.items()
+                if sheet_name not in ignored_sheets
             ),
             issues=excel_availability_issues(workbook, profile),
         )
     )
-    controls = evaluate_controls(workbook, profile.excel.controls)
+    controls = evaluate_controls(
+        workbook,
+        profile.excel.controls,
+        ignored_sheets=ignored_sheets,
+    )
     result.findings.extend(controls.findings)
     if controls.coverage is not None:
         result.coverage.append(controls.coverage)

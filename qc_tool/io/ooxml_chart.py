@@ -16,6 +16,7 @@ from qc_tool.io.model import (
     ChartPlot,
     ChartSeries,
 )
+from qc_tool.progress import CancellationToken, check_cancelled
 
 _PLOT_TYPES = frozenset(
     {
@@ -420,6 +421,7 @@ def _drawing_charts(
     *,
     sheet: str,
     start_index: int,
+    cancellation_token: CancellationToken | None = None,
 ) -> list[ChartDescriptor]:
     if drawing_part not in archive.namelist():
         raise ChartParseError(f"linked drawing part {drawing_part!r} is missing")
@@ -434,6 +436,7 @@ def _drawing_charts(
         chart_element = _descendant(anchor_element, "chart")
         if chart_element is None:
             continue
+        check_cancelled(cancellation_token)
         relationship_id = _relationship_id(chart_element)
         chart_part = relationships.get(relationship_id or "")
         if chart_part is None:
@@ -458,7 +461,26 @@ def _drawing_charts(
     return charts
 
 
-def parse_ooxml_charts(data: bytes) -> list[ChartDescriptor]:
+def _worksheet_drawing_ids(
+    archive: zipfile.ZipFile,
+    sheet_part: str,
+) -> list[str]:
+    relationship_ids: list[str] = []
+    with archive.open(sheet_part) as stream:
+        for _event, element in ElementTree.iterparse(stream, events=("end",)):
+            if _local_name(element.tag) == "drawing":
+                relationship_id = _relationship_id(element)
+                if relationship_id:
+                    relationship_ids.append(relationship_id)
+            element.clear()
+    return relationship_ids
+
+
+def parse_ooxml_charts(
+    data: bytes,
+    *,
+    cancellation_token: CancellationToken | None = None,
+) -> list[ChartDescriptor]:
     """Return every worksheet-linked chart using raw package relationships."""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -475,6 +497,7 @@ def parse_ooxml_charts(data: bytes) -> list[ChartDescriptor]:
             for sheet_element in workbook.iter():
                 if _local_name(sheet_element.tag) != "sheet":
                     continue
+                check_cancelled(cancellation_token)
                 sheet_name = sheet_element.get("name")
                 relationship_id = _relationship_id(sheet_element)
                 sheet_part = workbook_relationships.get(relationship_id or "")
@@ -485,13 +508,8 @@ def parse_ooxml_charts(data: bytes) -> list[ChartDescriptor]:
                     _rels_part(sheet_part),
                     sheet_part,
                 )
-                sheet_root = ElementTree.fromstring(archive.read(sheet_part))
-                for drawing in sheet_root.iter():
-                    if _local_name(drawing.tag) != "drawing":
-                        continue
-                    drawing_part = sheet_relationships.get(
-                        _relationship_id(drawing) or ""
-                    )
+                for drawing_id in _worksheet_drawing_ids(archive, sheet_part):
+                    drawing_part = sheet_relationships.get(drawing_id)
                     if drawing_part is None:
                         raise ChartParseError(
                             f"sheet {sheet_name!r} has an unresolved drawing relationship"
@@ -501,6 +519,7 @@ def parse_ooxml_charts(data: bytes) -> list[ChartDescriptor]:
                         drawing_part,
                         sheet=sheet_name,
                         start_index=sheet_counts.get(sheet_name, 0),
+                        cancellation_token=cancellation_token,
                     )
                     charts.extend(parsed)
                     sheet_counts[sheet_name] = sheet_counts.get(sheet_name, 0) + len(

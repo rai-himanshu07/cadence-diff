@@ -14,12 +14,17 @@ import resource
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import pytest
 from openpyxl import Workbook
 
+import qc_tool.engine as engine_module
+import qc_tool.io.loader as loader_module
 from qc_tool.config.profile import DeliverableProfile
 from qc_tool.engine import QCRunResult, run_qc
 from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.progress import CancellationToken
 from qc_tool.ui.app import perform_run
 from tests.conftest import fixture_profile
 from tests.fixtures.manifest_schema import FixtureManifest
@@ -128,6 +133,47 @@ def test_no_unexplained_findings(qc_result: QCRunResult) -> None:
     ]
     assert unexplained == [], f"findings without a seeded cause: {unexplained}"
     assert len(findings) == EXPECTED_NON_EXPECTED_COUNT
+
+
+def test_streaming_and_oracle_produce_equal_e2e_results(
+    fixture_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline_excel = fixture_dir / "baseline.xlsx"
+    current_excel = fixture_dir / "current.xlsx"
+    baseline_ppt = fixture_dir / "baseline.pptx"
+    current_ppt = fixture_dir / "current.pptx"
+    streaming = run_qc(
+        baseline_excel=baseline_excel,
+        current_excel=current_excel,
+        baseline_ppt=baseline_ppt,
+        current_ppt=current_ppt,
+    )
+
+    def load_oracle(
+        path: Path,
+        *,
+        password: str | None = None,
+        allow_large_workbook: bool = False,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Any:
+        return loader_module.load_workbook_snapshot(
+            path,
+            password=password,
+            allow_large_workbook=allow_large_workbook,
+            _ooxml_loader="oracle",
+            cancellation_token=cancellation_token,
+        )
+
+    monkeypatch.setattr(engine_module, "load_workbook_snapshot", load_oracle)
+    oracle = run_qc(
+        baseline_excel=baseline_excel,
+        current_excel=current_excel,
+        baseline_ppt=baseline_ppt,
+        current_ppt=current_ppt,
+    )
+
+    assert streaming == oracle
 
 
 def test_xlsb_defect_detected(fixture_dir: Path, manifest: FixtureManifest) -> None:

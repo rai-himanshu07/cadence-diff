@@ -19,6 +19,7 @@ from qc_tool.ppt.model import (
     SlideContent,
     TableContent,
 )
+from qc_tool.progress import CancellationToken, check_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +92,19 @@ def _notes(slide: Any) -> list[str]:
     ]
 
 
-def load_deck_snapshot(path: Path, *, password: str | None = None) -> DeckSnapshot:
+def load_deck_snapshot(
+    path: Path,
+    *,
+    password: str | None = None,
+    cancellation_token: CancellationToken | None = None,
+) -> DeckSnapshot:
+    check_cancelled(cancellation_token)
     stream = open_decrypted(path, password)
     presentation = Presentation(stream)
     snapshot = DeckSnapshot(source_name=path.name)
     chart_errors: list[str] = []
     for index, slide in enumerate(presentation.slides):
+        check_cancelled(cancellation_token)
         title_shape = slide.shapes.title
         title = title_shape.text if title_shape is not None else None
         try:
@@ -167,6 +175,7 @@ def load_deck_snapshot(path: Path, *, password: str | None = None) -> DeckSnapsh
                 )
                 table_index += 1
             if base_shape.has_chart:
+                check_cancelled(cancellation_token)
                 chart_part = cast(Any, shape.chart.part)
                 try:
                     content.charts.append(

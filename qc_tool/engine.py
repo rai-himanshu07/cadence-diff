@@ -41,16 +41,122 @@ from qc_tool.excel.interaction import (
     interaction_rule_coverage,
 )
 from qc_tool.excel.preflight import preflight_workbook
-from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.findings import Finding, FindingClass, Severity, limit_findings
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.model import WorkbookSnapshot
 from qc_tool.ppt.diff import diff_decks
 from qc_tool.ppt.extract import load_deck_snapshot
 from qc_tool.ppt.match import match_slides
 from qc_tool.ppt.preflight import preflight_deck
+from qc_tool.progress import (
+    CancellationToken,
+    ProgressCallback,
+    RunPhase,
+    check_cancelled,
+    report_progress,
+)
 from qc_tool.triage.rules import triage
 
 logger = logging.getLogger(__name__)
+
+
+def _load_excel_file(
+    path: Path,
+    *,
+    password: str | None,
+    phase: RunPhase,
+    allow_large_workbooks: bool,
+    cancellation_token: CancellationToken | None,
+    on_progress: ProgressCallback | None,
+) -> WorkbookSnapshot:
+    check_cancelled(cancellation_token)
+    report_progress(on_progress, phase, total=1, detail=path.name)
+    workbook = load_workbook_snapshot(
+        path,
+        password=password,
+        allow_large_workbook=allow_large_workbooks,
+        cancellation_token=cancellation_token,
+    )
+    check_cancelled(cancellation_token)
+    report_progress(on_progress, phase, processed=1, total=1, detail=path.name)
+    return workbook
+
+
+def _load_powerpoint_file(
+    path: Path,
+    *,
+    password: str | None,
+    phase: RunPhase,
+    cancellation_token: CancellationToken | None,
+    on_progress: ProgressCallback | None,
+):
+    check_cancelled(cancellation_token)
+    report_progress(on_progress, phase, total=1, detail=path.name)
+    deck = load_deck_snapshot(
+        path,
+        password=password,
+        cancellation_token=cancellation_token,
+    )
+    check_cancelled(cancellation_token)
+    report_progress(on_progress, phase, processed=1, total=1, detail=path.name)
+    return deck
+
+
+def _workload_coverage(*workbooks: WorkbookSnapshot) -> CoverageItem:
+    ooxml = [
+        workbook
+        for workbook in workbooks
+        if workbook.file_format in {"xlsx", "xlsm"}
+    ]
+    if not ooxml:
+        return CoverageItem(
+            check_id="excel-workload",
+            label="Excel workload safeguards",
+            artifact="excel",
+            state=CoverageState.UNAVAILABLE,
+            detail="OOXML workload metrics are unavailable for XLSB",
+        )
+    incomplete = len(ooxml) != len(workbooks)
+    degraded = incomplete or any(workbook.workload.degraded for workbook in ooxml)
+    details = [
+        f"{workbook.source_name}: {workbook.workload.detail}"
+        for workbook in ooxml
+    ]
+    if incomplete:
+        details.append("XLSB workload metrics unavailable for one workbook")
+    return CoverageItem(
+        check_id="excel-workload",
+        label="Excel workload safeguards",
+        artifact="excel",
+        state=CoverageState.DEGRADED if degraded else CoverageState.CHECKED,
+        detail="; ".join(details),
+    )
+
+
+def _apply_findings_budget(
+    findings: list[Finding],
+    coverage: list[CoverageItem],
+) -> list[Finding]:
+    budget = limit_findings(findings)
+    if not budget.omitted_by_artifact:
+        return budget.findings
+    affected_artifacts = set(budget.omitted_by_artifact)
+    if "crosscheck" in affected_artifacts:
+        affected_artifacts.add("package")
+    if budget.global_omitted:
+        affected_artifacts.update(item.artifact for item in coverage)
+    omitted_total = sum(budget.omitted_by_artifact.values())
+    detail = (
+        f"Output budget omitted {omitted_total} findings; summary finding(s) "
+        "identify affected classes and scopes"
+    )
+    for item in coverage:
+        if item.artifact not in affected_artifacts:
+            continue
+        if item.state is CoverageState.CHECKED:
+            item.state = CoverageState.DEGRADED
+        item.detail = f"{item.detail}; {detail}" if item.detail else detail
+    return budget.findings
 
 
 def _pair_coverage_state(
@@ -130,9 +236,20 @@ def run_qc(
     profile: DeliverableProfile | None = None,
     passwords: dict[str, str] | None = None,
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON,
+    allow_large_workbooks: bool = False,
+    cancellation_token: CancellationToken | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> QCRunResult:
     """Run a full QC comparison. ``passwords`` is keyed by file name."""
+    check_cancelled(cancellation_token)
     mode = QCRunMode(mode)
+    report_progress(
+        on_progress,
+        RunPhase.PREPARING,
+        processed=1,
+        total=1,
+        detail=mode.value,
+    )
     if mode is QCRunMode.CURRENT_FILE_PREFLIGHT:
         if baseline_excel is not None or baseline_ppt is not None:
             raise ValueError("current-file preflight does not accept baseline files")
@@ -143,14 +260,32 @@ def run_qc(
         result = QCRunResult(profile_name=profile.name, mode=mode)
         findings: list[Finding] = []
         if current_excel is not None:
-            workbook = load_workbook_snapshot(
-                current_excel, password=passwords.get(current_excel.name)
+            workbook = _load_excel_file(
+                current_excel,
+                password=passwords.get(current_excel.name),
+                phase=RunPhase.LOADING_CURRENT_EXCEL,
+                allow_large_workbooks=allow_large_workbooks,
+                cancellation_token=cancellation_token,
+                on_progress=on_progress,
             )
             result.files["current_excel"] = current_excel.name
-            excel_preflight = preflight_workbook(workbook, profile)
+            report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)
+            excel_preflight = preflight_workbook(
+                workbook,
+                profile,
+                cancellation_token=cancellation_token,
+            )
+            check_cancelled(cancellation_token)
+            report_progress(
+                on_progress,
+                RunPhase.ANALYZING_EXCEL,
+                processed=1,
+                total=1,
+            )
             attach_current_excerpts(excel_preflight.findings, workbook)
             findings.extend(excel_preflight.findings)
             result.coverage.extend(excel_preflight.coverage)
+            result.coverage.append(_workload_coverage(workbook))
             if disclosure := _single_formula_disclosure(workbook):
                 result.disclosures.append(disclosure)
         else:
@@ -164,9 +299,23 @@ def run_qc(
                 )
             )
         if current_ppt is not None:
-            deck = load_deck_snapshot(current_ppt, password=passwords.get(current_ppt.name))
+            deck = _load_powerpoint_file(
+                current_ppt,
+                password=passwords.get(current_ppt.name),
+                phase=RunPhase.LOADING_CURRENT_POWERPOINT,
+                cancellation_token=cancellation_token,
+                on_progress=on_progress,
+            )
             result.files["current_ppt"] = current_ppt.name
+            report_progress(on_progress, RunPhase.ANALYZING_POWERPOINT, total=1)
             ppt_preflight = preflight_deck(deck, profile.ppt)
+            check_cancelled(cancellation_token)
+            report_progress(
+                on_progress,
+                RunPhase.ANALYZING_POWERPOINT,
+                processed=1,
+                total=1,
+            )
             findings.extend(ppt_preflight.findings)
             result.coverage.extend(ppt_preflight.coverage)
         else:
@@ -179,7 +328,6 @@ def run_qc(
                     detail="No current deck supplied",
                 )
             )
-        result.findings = triage(findings, profile)
         result.coverage.extend(
             [
             CoverageItem(
@@ -205,6 +353,8 @@ def run_qc(
             ),
             ]
         )
+        findings = _apply_findings_budget(findings, result.coverage)
+        result.findings = triage(findings, profile)
         return result
     if mode is QCRunMode.FINAL_PACKAGE:
         if baseline_excel is not None or baseline_ppt is not None:
@@ -213,19 +363,58 @@ def run_qc(
             raise ValueError("final-package QC needs current Excel and PowerPoint files")
         profile = profile or default_profile()
         passwords = passwords or {}
-        workbook = load_workbook_snapshot(
-            current_excel, password=passwords.get(current_excel.name)
+        workbook = _load_excel_file(
+            current_excel,
+            password=passwords.get(current_excel.name),
+            phase=RunPhase.LOADING_CURRENT_EXCEL,
+            allow_large_workbooks=allow_large_workbooks,
+            cancellation_token=cancellation_token,
+            on_progress=on_progress,
         )
-        deck = load_deck_snapshot(current_ppt, password=passwords.get(current_ppt.name))
+        deck = _load_powerpoint_file(
+            current_ppt,
+            password=passwords.get(current_ppt.name),
+            phase=RunPhase.LOADING_CURRENT_POWERPOINT,
+            cancellation_token=cancellation_token,
+            on_progress=on_progress,
+        )
         result = QCRunResult(profile_name=profile.name, mode=mode)
         result.files = {
             "current_excel": current_excel.name,
             "current_ppt": current_ppt.name,
         }
         findings: list[Finding] = []
-        excel_preflight = preflight_workbook(workbook, profile)
+        report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)
+        excel_preflight = preflight_workbook(
+            workbook,
+            profile,
+            cancellation_token=cancellation_token,
+        )
+        check_cancelled(cancellation_token)
+        report_progress(
+            on_progress,
+            RunPhase.ANALYZING_EXCEL,
+            processed=1,
+            total=1,
+        )
+        report_progress(on_progress, RunPhase.ANALYZING_POWERPOINT, total=1)
         ppt_preflight = preflight_deck(deck, profile.ppt)
+        check_cancelled(cancellation_token)
+        report_progress(
+            on_progress,
+            RunPhase.ANALYZING_POWERPOINT,
+            processed=1,
+            total=1,
+        )
+        report_progress(on_progress, RunPhase.CROSSCHECKING, total=1)
         package = reconcile_package(workbook, deck, profile.crosscheck)
+        check_cancelled(cancellation_token)
+        report_progress(
+            on_progress,
+            RunPhase.CROSSCHECKING,
+            processed=1,
+            total=1,
+        )
         attach_current_excerpts(excel_preflight.findings, workbook)
         findings.extend(excel_preflight.findings)
         findings.extend(ppt_preflight.findings)
@@ -238,9 +427,9 @@ def run_qc(
                 excel_preflight.dependency_graph,
             )
             limit_impacts(findings)
-        result.findings = triage(findings, profile)
         result.coverage = [
             *excel_preflight.coverage,
+            _workload_coverage(workbook),
             *ppt_preflight.coverage,
             *package.coverage,
             CoverageItem(
@@ -256,6 +445,8 @@ def run_qc(
         result.verified_crosschecks = package.mapping_coverage.verified
         if disclosure := _single_formula_disclosure(workbook):
             result.disclosures.append(disclosure)
+        findings = _apply_findings_budget(findings, result.coverage)
+        result.findings = triage(findings, profile)
         return result
     if mode is not QCRunMode.CYCLE_COMPARISON:
         raise NotImplementedError(f"{mode.value} is not enabled yet")
@@ -274,27 +465,63 @@ def run_qc(
     dependency_graph: DependencyGraph | None = None
 
     if baseline_excel is not None and current_excel is not None:
-        base_wb = load_workbook_snapshot(
-            baseline_excel, password=passwords.get(baseline_excel.name)
+        base_wb = _load_excel_file(
+            baseline_excel,
+            password=passwords.get(baseline_excel.name),
+            phase=RunPhase.LOADING_BASELINE_EXCEL,
+            allow_large_workbooks=allow_large_workbooks,
+            cancellation_token=cancellation_token,
+            on_progress=on_progress,
         )
-        curr_wb = load_workbook_snapshot(
-            current_excel, password=passwords.get(current_excel.name)
+        curr_wb = _load_excel_file(
+            current_excel,
+            password=passwords.get(current_excel.name),
+            phase=RunPhase.LOADING_CURRENT_EXCEL,
+            allow_large_workbooks=allow_large_workbooks,
+            cancellation_token=cancellation_token,
+            on_progress=on_progress,
         )
         current_workbook = curr_wb
         result.files["baseline_excel"] = baseline_excel.name
         result.files["current_excel"] = current_excel.name
+        result.coverage.append(_workload_coverage(base_wb, curr_wb))
         if disclosure := _pair_formula_disclosure(base_wb, curr_wb):
             result.disclosures.append(disclosure)
-        alignment = align_workbooks(base_wb, curr_wb, profile)
+        report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)
+        alignment = align_workbooks(
+            base_wb,
+            curr_wb,
+            profile,
+            cancellation_token=cancellation_token,
+        )
+        check_cancelled(cancellation_token)
+        alignment_detail = (
+            "Low-confidence key alignment skipped cell-level comparison for: "
+            + ", ".join(alignment.low_confidence_regions)
+            if alignment.low_confidence_regions
+            else ""
+        )
         value_start = len(findings)
-        findings += diff_workbook_values(base_wb, curr_wb, alignment, profile)
+        findings += diff_workbook_values(
+            base_wb,
+            curr_wb,
+            alignment,
+            profile,
+            cancellation_token=cancellation_token,
+        )
+        check_cancelled(cancellation_token)
         result.coverage.append(
             CoverageItem(
                 check_id="excel-values",
                 label="Excel values and presentation",
                 artifact="excel",
-                state=CoverageState.CHECKED,
+                state=(
+                    CoverageState.DEGRADED
+                    if alignment.low_confidence_regions
+                    else CoverageState.CHECKED
+                ),
                 findings=len(findings) - value_start,
+                detail=alignment_detail,
             )
         )
         structure_start = len(findings)
@@ -304,6 +531,7 @@ def run_qc(
             alignment,
             profile,
         )
+        check_cancelled(cancellation_token)
         findings += structure_findings
         base_chart_state, base_chart_detail = chart_reference_coverage(base_wb)
         curr_chart_state, curr_chart_detail = chart_reference_coverage(curr_wb)
@@ -414,7 +642,9 @@ def run_qc(
                 artifact="excel",
                 rule_count=sum(
                     len(sheet.availability_rules)
-                    for sheet in profile.excel.sheets.values()
+                    for sheet_name, sheet in profile.excel.sheets.items()
+                    if sheet_name not in profile.excel.ignore_sheets
+                    and not sheet.ignore
                 ),
                 issues=excel_availability_issues(curr_wb, profile),
             )
@@ -425,8 +655,13 @@ def run_qc(
             curr_wb,
             alignment,
             profile,
+            cancellation_token=cancellation_token,
         )
+        check_cancelled(cancellation_token)
         formula_text_checked = formula_text_compatible(base_wb, curr_wb)
+        formula_complete = (
+            formula_text_checked and not alignment.low_confidence_regions
+        )
         result.coverage.append(
             CoverageItem(
                 check_id="excel-formulas",
@@ -434,22 +669,29 @@ def run_qc(
                 artifact="excel",
                 state=(
                     CoverageState.CHECKED
-                    if formula_text_checked
+                    if formula_complete
                     else CoverageState.DEGRADED
                 ),
                 findings=len(findings) - formula_start,
                 detail=(
                     f"Compatible formula text source: {base_wb.formula_source}"
-                    if formula_text_checked
+                    if formula_complete
                     else (
-                        "Formula presence checks completed; semantic formula text "
-                        "checks unavailable"
+                        alignment_detail
+                        if alignment.low_confidence_regions
+                        else (
+                            "Formula presence checks completed; semantic formula text "
+                            "checks unavailable"
+                        )
                     )
                 ),
             )
         )
         if curr_wb.formulas_available:
-            dependency_graph = build_dependency_graph(curr_wb)
+            dependency_graph = build_dependency_graph(
+                curr_wb,
+                cancellation_token=cancellation_token,
+            )
             annotate_impacts(findings, dependency_graph)
             dependency_state = dependency_graph.coverage_state
             dependency_detail = dependency_graph.coverage_detail
@@ -465,27 +707,55 @@ def run_qc(
                 detail=dependency_detail,
             )
         )
-        controls = evaluate_controls(curr_wb, profile.excel.controls)
+        ignored_sheets = set(profile.excel.ignore_sheets)
+        ignored_sheets.update(
+            sheet_name
+            for sheet_name, sheet_profile in profile.excel.sheets.items()
+            if sheet_profile.ignore
+        )
+        controls = evaluate_controls(
+            curr_wb,
+            profile.excel.controls,
+            ignored_sheets=ignored_sheets,
+        )
         findings += controls.findings
         if controls.coverage is not None:
             result.coverage.append(controls.coverage)
         annotate_chart_impacts(findings, curr_wb, dependency_graph)
         limit_impacts(findings)
         attach_excerpts(findings, base_wb, curr_wb)
+        check_cancelled(cancellation_token)
+        report_progress(
+            on_progress,
+            RunPhase.ANALYZING_EXCEL,
+            processed=1,
+            total=1,
+        )
 
     current_deck = None
     if baseline_ppt is not None and current_ppt is not None:
-        base_deck = load_deck_snapshot(
-            baseline_ppt, password=passwords.get(baseline_ppt.name)
+        base_deck = _load_powerpoint_file(
+            baseline_ppt,
+            password=passwords.get(baseline_ppt.name),
+            phase=RunPhase.LOADING_BASELINE_POWERPOINT,
+            cancellation_token=cancellation_token,
+            on_progress=on_progress,
         )
-        current_deck = load_deck_snapshot(
-            current_ppt, password=passwords.get(current_ppt.name)
+        current_deck = _load_powerpoint_file(
+            current_ppt,
+            password=passwords.get(current_ppt.name),
+            phase=RunPhase.LOADING_CURRENT_POWERPOINT,
+            cancellation_token=cancellation_token,
+            on_progress=on_progress,
         )
         result.files["baseline_ppt"] = baseline_ppt.name
         result.files["current_ppt"] = current_ppt.name
+        report_progress(on_progress, RunPhase.ANALYZING_POWERPOINT, total=1)
         matching = match_slides(base_deck, current_deck, profile.ppt)
+        check_cancelled(cancellation_token)
         ppt_start = len(findings)
         findings += diff_decks(matching, profile.ppt)
+        check_cancelled(cancellation_token)
         result.coverage.append(
             CoverageItem(
                 check_id="ppt-comparison",
@@ -504,6 +774,12 @@ def run_qc(
                     else "Complete semantic slide-element comparison"
                 ),
             )
+        )
+        report_progress(
+            on_progress,
+            RunPhase.ANALYZING_POWERPOINT,
+            processed=1,
+            total=1,
         )
         result.coverage.append(
             availability_coverage(
@@ -529,6 +805,13 @@ def run_qc(
     if baseline_excel is None:
         result.coverage.extend(
             [
+                CoverageItem(
+                    check_id="excel-workload",
+                    label="Excel workload safeguards",
+                    artifact="excel",
+                    state=CoverageState.UNAVAILABLE,
+                    detail="Excel pair not supplied",
+                ),
                 CoverageItem(
                     check_id="excel-values",
                     label="Excel values and presentation",
@@ -601,8 +884,10 @@ def run_qc(
         )
 
     if current_deck is not None and current_workbook is not None and profile.crosscheck.mappings:
+        report_progress(on_progress, RunPhase.CROSSCHECKING, total=1)
         crosscheck_start = len(findings)
         crosscheck = verify_mappings(current_deck, current_workbook, profile.crosscheck)
+        check_cancelled(cancellation_token)
         findings += crosscheck.findings
         result.verified_crosschecks = len(crosscheck.verified)
         result.coverage.append(
@@ -626,6 +911,12 @@ def run_qc(
                 ),
             )
         )
+        report_progress(
+            on_progress,
+            RunPhase.CROSSCHECKING,
+            processed=1,
+            total=1,
+        )
     else:
         reason = (
             "Both current Excel and PowerPoint are required"
@@ -642,6 +933,7 @@ def run_qc(
             )
         )
 
+    findings = _apply_findings_budget(findings, result.coverage)
     result.findings = triage(findings, profile)
     logger.info(
         "QC run complete: %s findings (%s)",

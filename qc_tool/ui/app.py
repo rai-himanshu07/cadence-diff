@@ -12,7 +12,9 @@ import datetime as dt
 import logging
 import re
 import secrets
+import shutil
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,6 +34,15 @@ from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings, run_qc
 from qc_tool.findings import Severity
 from qc_tool.history.store import RunHistory, sha256_file
 from qc_tool.io.decrypt import InvalidPasswordError, PasswordRequiredError
+from qc_tool.progress import (
+    CancellationToken,
+    ProgressCallback,
+    ProgressEvent,
+    RunCancelled,
+    RunPhase,
+    check_cancelled,
+    report_progress,
+)
 from qc_tool.report.excel_report import write_excel_report
 from qc_tool.report.html_report import write_html_report
 from qc_tool.security import private_directory, private_file, secure_managed_tree
@@ -67,6 +78,19 @@ MODE_LABELS = {
     QCRunMode.CYCLE_COMPARISON: "Cycle comparison",
     QCRunMode.FINAL_PACKAGE: "Final-package QC",
 }
+PHASE_LABELS = {
+    RunPhase.PREPARING: "Preparing run",
+    RunPhase.LOADING_BASELINE_EXCEL: "Loading baseline Excel",
+    RunPhase.LOADING_CURRENT_EXCEL: "Loading current Excel",
+    RunPhase.LOADING_BASELINE_POWERPOINT: "Loading baseline PowerPoint",
+    RunPhase.LOADING_CURRENT_POWERPOINT: "Loading current PowerPoint",
+    RunPhase.ANALYZING_EXCEL: "Analyzing Excel",
+    RunPhase.ANALYZING_POWERPOINT: "Analyzing PowerPoint",
+    RunPhase.CROSSCHECKING: "Cross-checking package",
+    RunPhase.WRITING_REPORTS: "Writing reports",
+    RunPhase.RECORDING_HISTORY: "Recording history",
+    RunPhase.COMPLETE: "Complete",
+}
 
 
 def _download_handler(path: str | Path):
@@ -93,6 +117,7 @@ class SessionState:
     passwords: dict[str, str] = field(default_factory=dict)  # role -> password
     profile_name: str = "default"
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON
+    allow_large_workbooks: bool = False
     rerun_of: int | None = None
     rerun_required: frozenset[str] = frozenset()  # roles the previous run used
 
@@ -216,6 +241,9 @@ def perform_run(
     *,
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON,
     rerun_of: int | None = None,
+    allow_large_workbooks: bool = False,
+    cancellation_token: CancellationToken | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> RunArtifacts:
     """Run QC, write both reports, and record the run in history."""
     password_by_file = {
@@ -231,7 +259,11 @@ def perform_run(
         profile=profile,
         passwords=password_by_file,
         mode=mode,
+        allow_large_workbooks=allow_large_workbooks,
+        cancellation_token=cancellation_token,
+        on_progress=on_progress,
     )
+    check_cancelled(cancellation_token)
     runs_dir = private_directory(work_dir / "runs")
     stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S.%fZ-")
     run_dir = Path(tempfile.mkdtemp(prefix=stamp, dir=runs_dir))
@@ -240,24 +272,60 @@ def perform_run(
         "excel": run_dir / "qc_report.xlsx",
         "html": run_dir / "qc_report.html",
     }
-    write_excel_report(result, report_paths["excel"])
-    write_html_report(result, report_paths["html"])
-    history = RunHistory(work_dir / "history.sqlite3")
-    delta: FindingsDelta | None = None
-    if rerun_of is not None:
-        try:
-            previous = history.get_run(rerun_of)
-            delta = compare_findings(previous.findings, result.findings)
-        except KeyError:
-            logger.warning("re-QC referenced missing run %s", rerun_of)
-            rerun_of = None
-    run_id = history.record_run(
-        result,
-        file_hashes={role: sha256_file(path) for role, path in files.items()},
-        report_paths={kind: str(path) for kind, path in report_paths.items()},
-        file_paths={role: str(path) for role, path in files.items()},
-        rerun_of=rerun_of,
-    )
+    recorded = False
+    try:
+        report_progress(on_progress, RunPhase.WRITING_REPORTS, total=2)
+        write_excel_report(result, report_paths["excel"])
+        check_cancelled(cancellation_token)
+        report_progress(
+            on_progress,
+            RunPhase.WRITING_REPORTS,
+            processed=1,
+            total=2,
+        )
+        write_html_report(result, report_paths["html"])
+        check_cancelled(cancellation_token)
+        report_progress(
+            on_progress,
+            RunPhase.WRITING_REPORTS,
+            processed=2,
+            total=2,
+        )
+
+        report_progress(on_progress, RunPhase.RECORDING_HISTORY, total=1)
+        history = RunHistory(work_dir / "history.sqlite3")
+        delta: FindingsDelta | None = None
+        if rerun_of is not None:
+            try:
+                previous = history.get_run(rerun_of)
+                delta = compare_findings(previous.findings, result.findings)
+            except KeyError:
+                logger.warning("re-QC referenced missing run %s", rerun_of)
+                rerun_of = None
+        file_hashes: dict[str, str] = {}
+        for role, path in files.items():
+            check_cancelled(cancellation_token)
+            file_hashes[role] = sha256_file(path)
+        check_cancelled(cancellation_token)
+        run_id = history.record_run(
+            result,
+            file_hashes=file_hashes,
+            report_paths={kind: str(path) for kind, path in report_paths.items()},
+            file_paths={role: str(path) for role, path in files.items()},
+            rerun_of=rerun_of,
+        )
+        recorded = True
+        report_progress(
+            on_progress,
+            RunPhase.RECORDING_HISTORY,
+            processed=1,
+            total=1,
+        )
+        report_progress(on_progress, RunPhase.COMPLETE, processed=1, total=1)
+    except BaseException:
+        if not recorded:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        raise
     return RunArtifacts(
         run_id=run_id,
         result=result,
@@ -894,6 +962,55 @@ def create_pages(
                 spinner = ui.spinner(size="1.6rem").classes("ml-auto")
                 spinner.visible = False
 
+                ui.checkbox(
+                    "Override large-workbook refusal",
+                    value=False,
+                    on_change=lambda e: setattr(
+                        state,
+                        "allow_large_workbooks",
+                        bool(e.value),
+                    ),
+                ).tooltip(
+                    "Process workbooks above local safety limits; workload coverage is degraded"
+                )
+
+                progress_label = ui.label("").classes("text-sm min-w-52")
+                progress_label.visible = False
+                progress_lock = threading.Lock()
+                latest_progress: dict[str, ProgressEvent | None] = {"event": None}
+                active_token: dict[str, CancellationToken | None] = {"token": None}
+
+                def cancel_active_run() -> None:
+                    token = active_token["token"]
+                    if token is None:
+                        return
+                    token.cancel()
+                    cancel_button.disable()
+                    progress_label.set_text("Cancelling at the next safe boundary")
+
+                cancel_button = ui.button(
+                    "Cancel",
+                    icon="stop_circle",
+                    on_click=cancel_active_run,
+                ).classes("ghostbtn").props("flat no-caps")
+                cancel_button.visible = False
+
+                def refresh_progress() -> None:
+                    with progress_lock:
+                        event = latest_progress["event"]
+                    if event is None or active_token["token"] is None:
+                        return
+                    label = PHASE_LABELS[event.phase]
+                    counts = (
+                        f" ({event.processed}/{event.total})"
+                        if event.total
+                        else ""
+                    )
+                    detail = f" · {event.detail}" if event.detail else ""
+                    progress_label.set_text(f"{label}{counts}{detail}")
+
+                ui.timer(0.25, refresh_progress)
+
                 async def start_run() -> None:
                     if state.rerun_of is not None:
                         missing = state.rerun_required - state.files.keys()
@@ -919,6 +1036,19 @@ def create_pages(
                         return
                     spinner.visible = True
                     run_button.disable()
+                    cancellation_token = CancellationToken()
+                    active_token["token"] = cancellation_token
+                    with progress_lock:
+                        latest_progress["event"] = None
+                    progress_label.set_text("Preparing run")
+                    progress_label.visible = True
+                    cancel_button.enable()
+                    cancel_button.visible = True
+
+                    def receive_progress(event: ProgressEvent) -> None:
+                        with progress_lock:
+                            latest_progress["event"] = event
+
                     try:
                         artifacts = await run.io_bound(
                             perform_run,
@@ -928,7 +1058,16 @@ def create_pages(
                             profile,
                             mode=state.mode,
                             rerun_of=state.rerun_of,
+                            allow_large_workbooks=state.allow_large_workbooks,
+                            cancellation_token=cancellation_token,
+                            on_progress=receive_progress,
                         )
+                    except RunCancelled:
+                        ui.notify(
+                            "Run cancelled; no successful run was recorded",
+                            type="warning",
+                        )
+                        return
                     except PasswordRequiredError as exc:
                         ui.notify(f"{exc} — set it under Passwords", type="negative")
                         return
@@ -940,8 +1079,11 @@ def create_pages(
                         ui.notify(f"QC run failed: {exc}", type="negative")
                         return
                     finally:
+                        active_token["token"] = None
                         spinner.visible = False
                         run_button.enable()
+                        progress_label.visible = False
+                        cancel_button.visible = False
                     if artifacts is None:  # run.io_bound is typed Optional
                         ui.notify("QC run returned no result", type="negative")
                         return

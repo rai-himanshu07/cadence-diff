@@ -26,10 +26,12 @@ from qc_tool.config.profile import DeliverableProfile
 from qc_tool.excel.periods import Period, is_period_after, is_period_label, parse_period
 from qc_tool.excel.regions import TableRegion, detect_regions
 from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot
+from qc_tool.progress import CancellationToken, check_cancelled
 
 logger = logging.getLogger(__name__)
 
 _MIN_KEY_MATCH_RATIO = 0.5
+_MIN_CONFIDENCE_AXIS_SIZE = 4
 
 AxisKey = tuple[object, ...]
 
@@ -48,6 +50,7 @@ class AxisAlignment:
     inserted: list[int] = field(default_factory=list)  # current indices, unexpected
     growth: list[int] = field(default_factory=list)  # current indices, expected
     method: str = "keys"  # "keys" | "positional"
+    low_confidence_fallback: bool = False
 
 
 @dataclass(slots=True)
@@ -71,6 +74,13 @@ class RegionAlignment:
     def column_growth_count(self) -> int:
         return len(self.columns.growth)
 
+    @property
+    def low_confidence(self) -> bool:
+        return (
+            self.rows.low_confidence_fallback
+            or self.columns.low_confidence_fallback
+        )
+
 
 @dataclass(slots=True)
 class WorkbookAlignment:
@@ -80,6 +90,7 @@ class WorkbookAlignment:
     regions: dict[str, list[RegionAlignment]] = field(default_factory=dict)
     unpaired_baseline_regions: list[TableRegion] = field(default_factory=list)
     unpaired_current_regions: list[TableRegion] = field(default_factory=list)
+    low_confidence_regions: list[str] = field(default_factory=list)
 
 
 # --- axis key extraction --------------------------------------------------
@@ -208,14 +219,27 @@ def _align_axis(
             alignment.inserted.append(curr_entry.index)
 
     if baseline and len(alignment.pairs) / len(baseline) < _MIN_KEY_MATCH_RATIO:
-        return _align_positionally(baseline, current)
+        return _align_positionally(
+            baseline,
+            current,
+            low_confidence=(
+                len(baseline) >= _MIN_CONFIDENCE_AXIS_SIZE
+                and len(current) >= _MIN_CONFIDENCE_AXIS_SIZE
+            ),
+        )
     return alignment
 
 
 def _align_positionally(
-    baseline: list[AxisEntry], current: list[AxisEntry]
+    baseline: list[AxisEntry],
+    current: list[AxisEntry],
+    *,
+    low_confidence: bool = False,
 ) -> AxisAlignment:
-    alignment = AxisAlignment(method="positional")
+    alignment = AxisAlignment(
+        method="positional",
+        low_confidence_fallback=low_confidence,
+    )
     shared = min(len(baseline), len(current))
     alignment.pairs = [
         (baseline[i].index, current[i].index) for i in range(shared)
@@ -388,6 +412,8 @@ def align_workbooks(
     baseline: WorkbookSnapshot,
     current: WorkbookSnapshot,
     profile: DeliverableProfile | None = None,
+    *,
+    cancellation_token: CancellationToken | None = None,
 ) -> WorkbookAlignment:
     ignore = set(profile.excel.ignore_sheets) if profile else set()
     base_names = [n for n in baseline.sheet_names if n not in ignore]
@@ -400,6 +426,7 @@ def align_workbooks(
     )
 
     for sheet_name in result.common_sheets:
+        check_cancelled(cancellation_token)
         sheet_profile = profile.sheet_profile(sheet_name) if profile else None
         if sheet_profile is not None and sheet_profile.ignore:
             continue
@@ -412,8 +439,14 @@ def align_workbooks(
         )
         result.unpaired_baseline_regions.extend(unpaired_base)
         result.unpaired_current_regions.extend(unpaired_curr)
-        result.regions[sheet_name] = [
+        region_alignments = [
             align_regions(base_sheet, curr_sheet, base_region, curr_region)
             for base_region, curr_region in pairs
         ]
+        result.regions[sheet_name] = region_alignments
+        result.low_confidence_regions.extend(
+            f"{sheet_name}!{region.current.cell_range}"
+            for region in region_alignments
+            if region.low_confidence
+        )
     return result

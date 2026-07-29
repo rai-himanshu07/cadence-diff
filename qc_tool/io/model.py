@@ -69,6 +69,34 @@ class CellRecord:
 
 
 @dataclass(slots=True)
+class WorkbookWorkload:
+    cell_count: int = 0
+    worksheet_xml_bytes: int = 0
+    shared_string_bytes: int = 0
+    styles_bytes: int = 0
+    style_count: int = 0
+    largest_sheet_area: int = 0
+    warning_reasons: tuple[str, ...] = ()
+    override_used: bool = False
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.warning_reasons) or self.override_used
+
+    @property
+    def detail(self) -> str:
+        metrics = (
+            f"{self.cell_count:,} physical cells; "
+            f"{self.worksheet_xml_bytes / (1024 * 1024):.1f} MiB worksheet XML; "
+            f"{self.shared_string_bytes / (1024 * 1024):.1f} MiB shared strings; "
+            f"{self.style_count:,} cell styles"
+        )
+        if self.warning_reasons:
+            return f"{metrics}; " + "; ".join(self.warning_reasons)
+        return metrics
+
+
+@dataclass(slots=True)
 class NamedRange:
     name: str
     target: str
@@ -312,6 +340,10 @@ class WorkbookSnapshot:
     calculation_mode: str | None = None
     full_calc_on_load: bool | None = None
     external_links: list[str] = field(default_factory=list)
+    workload: WorkbookWorkload = field(
+        default_factory=WorkbookWorkload,
+        compare=False,
+    )
 
     @property
     def sheet_names(self) -> list[str]:

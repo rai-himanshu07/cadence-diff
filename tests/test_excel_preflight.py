@@ -2,7 +2,12 @@
 
 from pathlib import Path
 
-from qc_tool.config.profile import CadenceBand, SheetProfile, default_profile
+from qc_tool.config.profile import (
+    CadenceBand,
+    DeliverableProfile,
+    SheetProfile,
+    default_profile,
+)
 from qc_tool.coverage import CoverageState, QCRunMode
 from qc_tool.engine import run_qc
 from qc_tool.excel.preflight import preflight_workbook
@@ -168,3 +173,61 @@ def test_preflight_duplicate_labels_are_scoped_to_configured_bands() -> None:
         finding.finding_class is FindingClass.PERIOD_DUPLICATE
         for finding in result.findings
     )
+
+
+def test_preflight_honors_existing_ignored_sheet_scope() -> None:
+    ignored = SheetSnapshot(
+        name="Ignored",
+        visibility="hidden",
+        max_row=2,
+        max_column=2,
+        cells={
+            (1, 1): CellRecord(1, 1, "Jan-26"),
+            (1, 2): CellRecord(1, 2, "Jan-26"),
+            (2, 1): CellRecord(2, 1, None, formula="=1+1", is_formula=True),
+        },
+    )
+    workbook = WorkbookSnapshot(
+        source_name="ignored.xlsx",
+        file_format="xlsx",
+        formulas_available=True,
+        styles_available=True,
+        formula_presence_available=True,
+        sheets=[ignored],
+        charts=[
+            ChartDescriptor(
+                sheet="Ignored",
+                title="Broken",
+                chart_type="lineChart",
+                series=[
+                    ChartSeries(
+                        index=0,
+                        values_ref="Ignored!A1:B1",
+                        categories_ref="Ignored!A1:A1",
+                    )
+                ],
+            )
+        ],
+    )
+    profile = DeliverableProfile.model_validate(
+        {
+            "name": "ignored",
+            "excel": {
+                "ignore_sheets": ["Ignored"],
+                "sheets": {"Ignored": {"ignore": True}},
+                "controls": {
+                    "required_ranges": [
+                        {"name": "ignored required", "sheet": "Ignored", "range": "A1:A2"}
+                    ]
+                },
+            },
+        }
+    )
+
+    result = preflight_workbook(workbook, profile)
+
+    assert result.findings == []
+    controls = next(
+        item for item in result.coverage if item.check_id == "excel-profile-controls"
+    )
+    assert controls.detail == "0 controls configured"

@@ -3,8 +3,11 @@
 from pathlib import Path
 
 import pytest
+from openpyxl import Workbook
 
 from qc_tool.config.profile import DeliverableProfile
+from qc_tool.coverage import CoverageState
+from qc_tool.engine import run_qc
 from qc_tool.excel.align import (
     AxisEntry,
     RegionAlignment,
@@ -15,6 +18,7 @@ from qc_tool.excel.align import (
 )
 from qc_tool.excel.periods import parse_period
 from qc_tool.excel.regions import detect_regions
+from qc_tool.findings import FindingClass
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.model import CellRecord, SheetSnapshot, WorkbookSnapshot
 
@@ -95,6 +99,62 @@ def test_yearless_week_rollover_is_growth() -> None:
 
     assert aligned.growth == [3]
     assert aligned.inserted == []
+
+
+def test_key_alignment_marks_low_confidence_positional_fallback() -> None:
+    baseline = [
+        AxisEntry(index=index, key=(label,), periods=(None,))
+        for index, label in enumerate(("A", "B", "C", "D"), start=1)
+    ]
+    current = [
+        AxisEntry(index=index, key=(label,), periods=(None,))
+        for index, label in enumerate(("W", "X", "Y", "Z"), start=1)
+    ]
+
+    aligned = _align_axis(baseline, current)
+
+    assert aligned.method == "positional"
+    assert aligned.low_confidence_fallback
+
+
+def test_low_confidence_alignment_degrades_and_skips_cell_comparison(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+
+    def write(path: Path, labels: list[str], offset: int) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Data"
+        sheet.append(["Key", "Value"])
+        for index, label in enumerate(labels, start=1):
+            sheet.append([label, index + offset])
+        workbook.save(path)
+
+    write(baseline, ["A", "B", "C", "D"], 0)
+    write(current, ["W", "X", "Y", "Z"], 100)
+
+    result = run_qc(baseline_excel=baseline, current_excel=current)
+
+    value_coverage = next(
+        item for item in result.coverage if item.check_id == "excel-values"
+    )
+    formula_coverage = next(
+        item for item in result.coverage if item.check_id == "excel-formulas"
+    )
+    assert value_coverage.state is CoverageState.DEGRADED
+    assert formula_coverage.state is CoverageState.DEGRADED
+    assert "Low-confidence" in value_coverage.detail
+    assert sum(
+        finding.finding_class is FindingClass.ALIGNMENT_LOW_CONFIDENCE
+        for finding in result.findings
+    ) == 1
+    assert not any(
+        finding.finding_class is FindingClass.VALUE_CHANGED
+        for finding in result.findings
+    )
 
 
 def test_dashboard_blocks_align(alignment: WorkbookAlignment) -> None:

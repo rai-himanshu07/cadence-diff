@@ -20,6 +20,7 @@ from qc_tool.coverage import CoverageState
 from qc_tool.excel.references import ReferenceStatus, ResolvedRange, resolve_reference
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import WorkbookSnapshot
+from qc_tool.progress import CancellationToken, check_cancelled
 
 logger = logging.getLogger(__name__)
 
@@ -122,10 +123,14 @@ def build_dependency_graph(
     workbook: WorkbookSnapshot,
     *,
     max_range_cells: int = _MAX_RANGE_CELLS,
+    cancellation_token: CancellationToken | None = None,
 ) -> DependencyGraph:
     graph = DependencyGraph()
     for sheet in workbook.sheets:
-        for (row, col), cell in sheet.cells.items():
+        check_cancelled(cancellation_token)
+        for index, ((row, col), cell) in enumerate(sheet.cells.items(), start=1):
+            if index % 10_000 == 0:
+                check_cancelled(cancellation_token)
             if cell.formula is None:
                 continue
             dependent: Node = (sheet.name, row, col)

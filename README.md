@@ -28,6 +28,14 @@ separate speaker notes, and visible chart-label anchors for Excel reconciliation
 Unsupported representations degrade the relevant check instead of becoming a
 false pass.
 
+OOXML loading streams worksheet content, verifies physical cells independently
+of declared dimensions, and reports workload evidence from uncompressed XML,
+shared strings, styles, cell counts, and sheet bounds. Pathological packages
+are refused before expensive parsing unless the operator deliberately enables
+the per-run override. Findings budgets and low-confidence alignment are always
+disclosed through summary findings and degraded coverage rather than silently
+truncating or guessing.
+
 ## Install & run
 
 ```bash
@@ -48,37 +56,45 @@ jump directly to the relevant guide section.
 
 ```bash
 # CI-style QC: exit 0 clean, 2 when findings at/above --fail-on exist
-qc-tool run --baseline-excel last.xlsx --current-excel this.xlsx \
-            --profile monthly --json findings.json
-qc-tool run --current-excel this.xlsx            # preflight (inferred)
-qc-tool run --current-excel x.xlsx --current-ppt d.pptx   # package QC
+cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \
+                 --profile monthly --json findings.json --progress
+cadence-diff run --current-excel this.xlsx            # preflight (inferred)
+cadence-diff run --current-excel x.xlsx --current-ppt d.pptx   # package QC
+
+# Only after reviewing workload refusal and confirming sufficient local memory
+cadence-diff run --current-excel unusually-large.xlsx \
+  --allow-large-workbooks
 
 # Local numeric scrambling only — NOT privacy-safe or shareable
-qc-tool sanitize client_pack.xlsx --seed 7
+cadence-diff sanitize client_pack.xlsx --seed 7
 
 # Strict, fail-closed redaction + recursive OOXML privacy verification
-qc-tool sanitize client_pack.xlsx --seed 7 --redact-text \
+cadence-diff sanitize client_pack.xlsx --seed 7 --redact-text \
   --output client_pack.sanitized.xlsx
-qc-tool verify-sanitized client_pack.sanitized.xlsx \
+cadence-diff verify-sanitized client_pack.sanitized.xlsx \
   --forbid "Client Name" --json privacy-report.json
 
 # Structural-only evidence: no values, text, formulas, paths, or identifiers
-qc-tool fingerprint client_pack.xlsx --output client_pack.fingerprint.json
+cadence-diff fingerprint client_pack.xlsx --output client_pack.fingerprint.json
 
 # Sanitize an Excel/PPT package together and reverify confirmed mappings
-qc-tool sanitize-package --excel current.xlsx --ppt current.pptx \
+cadence-diff sanitize-package --excel current.xlsx --ppt current.pptx \
   --profile monthly --output-dir sanitized-package --forbid "Client Name"
 
 # Signed evidence bundle; verify every member and manifest signature
-qc-tool run --current-excel this.xlsx --fail-on never \
+cadence-diff run --current-excel this.xlsx --fail-on never \
   --attestation run.qca
-qc-tool verify-attestation run.qca
+cadence-diff verify-attestation run.qca
 
 # Validate a profile — optionally against the real files it targets
-qc-tool lint monthly.yaml --against-excel this.xlsx --against-ppt d.pptx
+cadence-diff lint monthly.yaml --against-excel this.xlsx --against-ppt d.pptx
 ```
 
-Headless runs record into the same history the web UI shows.
+`qc-tool` remains a compatibility alias. Headless runs record into the same
+history the web UI shows. `--progress` writes phase updates to stderr, leaving
+normal stdout and JSON files unchanged. The web UI shows the same phases and a
+Cancel control; cancellation stops at the next safe boundary, removes partial
+reports, and does not record a successful run.
 
 JSON exports omit raw cell neighborhoods and mapping-candidate values by
 default. `--json-context` includes them for private diagnostics and must not be
@@ -146,7 +162,7 @@ The development environment is Conda/Miniforge:
 ```bash
 conda env create -f environment.yml
 conda run -n cadence-diff-dev python main.py        # dev server, repo-local ./data
-conda run -n cadence-diff-dev pytest -x -q          # 380+ tests, fixture-driven
+conda run -n cadence-diff-dev pytest -x -q          # 400+ tests, fixture-driven
 conda run -n cadence-diff-dev ruff check .
 conda run -n cadence-diff-dev pyright
 ```
@@ -170,11 +186,11 @@ qc_tool/
   privacy.py   fail-closed OOXML privacy verification
   fingerprint.py structural-only evidence export
   attestation.py signed QC evidence bundles
+  progress.py  progress events and cooperative cancellation
   server_config.py fail-safe local/temporary-LAN configuration
   ui/          NiceGUI app (loopback only) + theme
                packaged operator guide at /guide
   engine.py    run orchestration
-docs/QC_MODES.md   operator guide
 ```
 
 ## Publishing (maintainers)
