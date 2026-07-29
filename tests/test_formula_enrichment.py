@@ -1,6 +1,7 @@
 """Formula enrichment parity, merging, and sandbox-adapter behavior."""
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from qc_tool.io.formula_enrichment import (
 )
 from qc_tool.io.libreoffice_formula import (
     _convert_with_libreoffice,
-    extract_formulas_with_libreoffice,
+    _extract_formulas_with_converter,
 )
 from qc_tool.io.model import CellRecord, SheetSnapshot, WorkbookSnapshot
 from qc_tool.io.xlsb_formula import XlsbFormulaScan
@@ -84,7 +85,8 @@ def test_coordinate_mismatch_fails_before_mutation() -> None:
 def test_libreoffice_adapter_reads_formula_only_and_checks_parity() -> None:
     def fake_converter(work_dir: Path, timeout: float) -> tuple[str, str]:
         assert timeout == 12.0
-        assert (work_dir / "input.xlsb").stat().st_mode & 0o777 == 0o600
+        if os.name == "posix":
+            assert (work_dir / "input.xlsb").stat().st_mode & 0o777 == 0o600
         workbook = Workbook()
         sheet = workbook.active
         assert sheet is not None
@@ -93,7 +95,7 @@ def test_libreoffice_adapter_reads_formula_only_and_checks_parity() -> None:
         workbook.save(work_dir / "output" / "input.xlsx")
         return "fake-libreoffice", "sandbox test"
 
-    extraction = extract_formulas_with_libreoffice(
+    extraction = _extract_formulas_with_converter(
         b"decrypted xlsb bytes",
         _scan(),
         timeout=12.0,
@@ -113,9 +115,10 @@ def test_libreoffice_adapter_rejects_risky_content_before_conversion() -> None:
         return "unused", "unused"
 
     with pytest.raises(FormulaEnrichmentError, match="VBA project"):
-        extract_formulas_with_libreoffice(
+        _extract_formulas_with_converter(
             b"xlsb",
             _scan(risky=("VBA project",)),
+            timeout=300.0,
             converter=fake_converter,
         )
 
@@ -133,11 +136,15 @@ def test_libreoffice_adapter_rejects_formula_coordinate_mismatch() -> None:
         return "fake-libreoffice", "mismatch test"
 
     with pytest.raises(FormulaEnrichmentError, match="coordinate mismatch"):
-        extract_formulas_with_libreoffice(
-            b"xlsb", _scan(), converter=fake_converter
+        _extract_formulas_with_converter(
+            b"xlsb",
+            _scan(),
+            timeout=300.0,
+            converter=fake_converter,
         )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group cleanup")
 def test_libreoffice_timeout_race_still_returns_enrichment_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

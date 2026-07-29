@@ -52,7 +52,8 @@ def test_storage_secret_is_private_and_stable(tmp_path: Path) -> None:
 
     assert first == second
     assert len(first) >= 32
-    assert (tmp_path / ".nicegui-storage-secret").stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":
+        assert (tmp_path / ".nicegui-storage-secret").stat().st_mode & 0o777 == 0o600
 
 
 def test_existing_managed_tree_is_migrated_private(tmp_path: Path) -> None:

@@ -173,16 +173,13 @@ def _read_ooxml_formulas(path: Path) -> FormulaMap:
     return formulas
 
 
-def extract_formulas_with_libreoffice(
+def _extract_formulas_with_converter(
     data: bytes,
     scan: XlsbFormulaScan,
     *,
-    timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
-    converter: _Converter | None = None,
+    timeout: float,
+    converter: _Converter,
 ) -> FormulaExtraction:
-    """Extract XLSB formula text in an isolated, networkless LibreOffice process."""
-    if os.name != "posix":
-        raise FormulaEnrichmentError("LibreOffice XLSB enrichment is enabled on POSIX only")
     if not scan.safe_for_external_engine:
         raise FormulaEnrichmentError(
             "XLSB contains active or external content: " + ", ".join(scan.risky_features)
@@ -196,7 +193,7 @@ def extract_formulas_with_libreoffice(
         input_path.write_bytes(data)
         private_file(input_path)
 
-        engine, detail = (converter or _convert_with_libreoffice)(work_dir, timeout)
+        engine, detail = converter(work_dir, timeout)
         output_path = work_dir / "output" / "input.xlsx"
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise FormulaEnrichmentError("LibreOffice did not produce the expected XLSX output")
@@ -208,3 +205,21 @@ def extract_formulas_with_libreoffice(
         )
         validate_formula_extraction(scan, extraction)
         return extraction
+
+
+def extract_formulas_with_libreoffice(
+    data: bytes,
+    scan: XlsbFormulaScan,
+    *,
+    timeout: float = DEFAULT_CONVERSION_TIMEOUT_SECONDS,
+    converter: _Converter | None = None,
+) -> FormulaExtraction:
+    """Extract XLSB formula text in an isolated, networkless LibreOffice process."""
+    if os.name != "posix":
+        raise FormulaEnrichmentError("LibreOffice XLSB enrichment is enabled on POSIX only")
+    return _extract_formulas_with_converter(
+        data,
+        scan,
+        timeout=timeout,
+        converter=converter or _convert_with_libreoffice,
+    )
