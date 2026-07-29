@@ -39,7 +39,7 @@ truncating or guessing.
 ## Install & run
 
 ```bash
-pip install cadence-diff        # not yet published — see Development
+pip install cadence-diff
 cadence-diff                    # web UI → http://127.0.0.1:8080
 cadence-diff --port 9000 --data-dir ~/qc-data
 qc-tool                         # compatibility alias
@@ -195,10 +195,11 @@ qc_tool/
 
 ## Publishing (maintainers)
 
-The package carries the `Private :: Do Not Upload` classifier while under
-development — PyPI rejects it, so accidental uploads fail. To release:
-remove that classifier, bump `qc_tool.__version__`, then
-`python -m build && twine check dist/*` and upload deliberately.
+Releases are built and validated by GitHub Actions, then published through PyPI
+Trusted Publishing. Create an annotated version tag matching
+`qc_tool.__version__`, publish the corresponding GitHub Release, and promote the
+exact workflow-built artifacts. Do not upload manually or rebuild between
+validation and publication.
 
 ## License
 

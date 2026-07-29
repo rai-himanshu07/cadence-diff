@@ -12,9 +12,6 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 keywords = ["qc", "excel", "powerpoint", "diff", "reporting", "openpyxl"]
 classifiers = [
-  # Publication interlock: PyPI rejects this classifier, so accidental
-  # uploads fail. Remove it deliberately when the tool is declared ready.
-  "Private :: Do Not Upload",
   "Development Status :: 4 - Beta",
   "Environment :: Web Environment",
   "Intended Audience :: Financial and Insurance Industry",
@@ -44,6 +41,12 @@ dev = ["pytest>=8.0", "pytest-asyncio>=1.0", "ruff", "pyright", "psutil>=6.0"]
 [project.scripts]
 cadence-diff = "qc_tool.cli:main"
 qc-tool = "qc_tool.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/rai-himanshu07/cadence-diff"
+Repository = "https://github.com/rai-himanshu07/cadence-diff"
+Issues = "https://github.com/rai-himanshu07/cadence-diff/issues"
+Releases = "https://github.com/rai-himanshu07/cadence-diff/releases"
 
 [tool.hatch.version]
 path = "qc_tool/__init__.py"
