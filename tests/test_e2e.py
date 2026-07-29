@@ -10,12 +10,12 @@ Plus: whole-pipeline read-only guarantee and a large-workbook run.
 """
 
 import hashlib
-import resource
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
 from openpyxl import Workbook
 
@@ -257,11 +257,12 @@ def _write_large_pair(dest: Path) -> tuple[Path, Path]:
 
 def test_large_workbook_run(tmp_path: Path) -> None:
     base, curr = _write_large_pair(tmp_path)
-    rss_before_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    process = psutil.Process()
+    rss_before = process.memory_info().rss
     started = time.monotonic()
     result = run_qc(baseline_excel=base, current_excel=curr)
     duration = time.monotonic() - started
-    rss_after_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_after = process.memory_info().rss
 
     value_changes = [
         f
@@ -273,4 +274,4 @@ def test_large_workbook_run(tmp_path: Path) -> None:
     assert len(growth) == 10  # the appended 2026-12 rows
 
     assert duration < 90, f"large run took {duration:.1f}s"
-    assert (rss_after_kb - rss_before_kb) < 4 * 1024 * 1024, "memory growth exceeded 4GB"
+    assert (rss_after - rss_before) < 4 * 1024**3, "memory growth exceeded 4GB"
