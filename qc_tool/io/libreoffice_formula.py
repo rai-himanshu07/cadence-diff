@@ -90,6 +90,13 @@ def _sandbox_command(work_dir: Path) -> tuple[list[str], str]:
     return command, libreoffice
 
 
+def _kill_process_group(pid: int) -> None:
+    killpg = getattr(os, "killpg", None)
+    if not callable(killpg):
+        raise OSError("POSIX process-group termination is unavailable")
+    killpg(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
 def _convert_with_libreoffice(work_dir: Path, timeout: float) -> tuple[str, str]:
     command, libreoffice = _sandbox_command(work_dir)
     try:
@@ -123,7 +130,7 @@ def _convert_with_libreoffice(work_dir: Path, timeout: float) -> tuple[str, str]
         _, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         with suppress(OSError):
-            os.killpg(process.pid, signal.SIGKILL)
+            _kill_process_group(process.pid)
         process.communicate()
         raise FormulaEnrichmentError(
             f"LibreOffice formula extraction exceeded {timeout:g} seconds"
