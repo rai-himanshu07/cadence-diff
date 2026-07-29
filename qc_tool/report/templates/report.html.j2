@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>QC Report — {{ result.profile_name }}</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; margin: 2rem; color: #1a1a1a; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+  .meta { color: #555; font-size: 0.85rem; margin-bottom: 1rem; }
+  .note { background: #fff4f4; border-left: 4px solid #c00000; padding: 0.5rem 0.75rem;
+          margin: 0.5rem 0; font-size: 0.9rem; }
+  .cards { display: flex; gap: 0.75rem; margin: 1rem 0; flex-wrap: wrap; }
+  .card { border-radius: 8px; padding: 0.6rem 1.1rem; color: #fff; min-width: 7rem; }
+  .card .n { font-size: 1.4rem; font-weight: 700; display: block; }
+  .critical { background: #c00000; } .warning { background: #ed7d31; }
+  .info { background: #2e75b6; } .expected { background: #548235; }
+  .filters { margin: 0.5rem 0 1rem; font-size: 0.9rem; }
+  .filters label { margin-right: 1rem; user-select: none; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+  th, td { border: 1px solid #ddd; padding: 0.35rem 0.5rem; text-align: left;
+           vertical-align: top; }
+  th { background: #262626; color: #fff; position: sticky; top: 0; }
+  td.sev { font-weight: 700; color: #fff; text-align: center; white-space: nowrap; }
+  tr.critical td.sev { background: #c00000; } tr.warning td.sev { background: #ed7d31; }
+  tr.info td.sev { background: #2e75b6; } tr.expected td.sev { background: #548235; }
+  td.mono { font-family: ui-monospace, monospace; }
+  .impacts { color: #555; font-size: 0.78rem; }
+  .coverage { margin: 1rem 0 1.25rem; }
+</style>
+</head>
+<body>
+<h1>QC Report — {{ result.profile_name }}</h1>
+<div class="meta">
+  Generated {{ generated_at }} (UTC)
+  | mode: <strong>{{ result.mode.value }}</strong>
+  {% for role, name in result.files.items() %} | {{ role }}: <strong>{{ name }}</strong>{% endfor %}
+  | verified cross-checks: {{ result.verified_crosschecks }}
+</div>
+{% if result.mapping_coverage %}
+<h2>Mapping coverage</h2>
+<div class="meta">
+  {{ result.mapping_coverage.eligible }} eligible |
+  {{ result.mapping_coverage.mapped }} mapped |
+  {{ result.mapping_coverage.verified }} verified |
+  {{ result.mapping_coverage.mismatched }} mismatched |
+  {{ result.mapping_coverage.unresolved }} unresolved |
+  {{ result.mapping_coverage.unmapped }} unmapped
+</div>
+{% endif %}
+<h2>Check coverage</h2>
+<table class="coverage">
+  <thead><tr><th>Artifact</th><th>Check</th><th>Status</th><th>Findings</th><th>Detail</th></tr></thead>
+  <tbody>
+  {% for item in result.coverage %}
+  <tr><td>{{ item.artifact }}</td><td>{{ item.label }}</td><td>{{ item.state.value }}</td>
+    <td>{{ item.findings }}</td><td>{{ item.detail }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% for disclosure in result.disclosures %}
+<div class="note">{{ disclosure }}</div>
+{% endfor %}
+<div class="cards">
+  {% for severity, count in counts.items() %}
+  <div class="card {{ severity.value }}"><span class="n">{{ count }}</span>{{ severity.value }}</div>
+  {% endfor %}
+</div>
+<div class="filters">
+  Show:
+  {% for severity in counts %}
+  <label><input type="checkbox" data-sev="{{ severity.value }}"
+    {% if severity.value != 'expected' %}checked{% endif %}> {{ severity.value }}</label>
+  {% endfor %}
+</div>
+<table id="findings">
+  <thead><tr>
+    <th>ID</th><th>Severity</th><th>Artifact</th><th>Class</th><th>Sheet / Slide</th>
+    <th>Location</th><th>Element</th><th>Baseline</th><th>Current</th><th>Message</th>
+    <th>Analyst comment</th><th>Root cause</th><th>Waiver</th>
+  </tr></thead>
+  <tbody>
+  {% for finding in result.findings %}
+  <tr class="{{ finding.severity.value }}">
+    <td class="mono">{{ finding.finding_id }}</td>
+    <td class="sev">{{ finding.severity.value }}{% if finding.severity_overridden %} *{% endif %}</td>
+    <td>{{ finding.artifact }}</td>
+    <td class="mono">{{ finding.finding_class.value }}</td>
+    <td>{{ finding.sheet or finding.slide or "" }}</td>
+    <td class="mono">{{ finding.location or finding.baseline_location or "" }}</td>
+    <td>{{ finding.element or "" }}</td>
+    <td class="mono">{{ finding.baseline_value or "" }}</td>
+    <td class="mono">{{ finding.current_value or "" }}</td>
+    <td>{{ finding.message }}
+      {% if finding.impacts %}<div class="impacts">impacts: {{ finding.impacts | join("; ") }}</div>{% endif %}
+    </td>
+    <td>{{ finding.analyst_comment }}</td>
+    <td class="mono">{{ finding.root_cause_key }}</td>
+    <td>{% if finding.waiver_reason %}{{ finding.waiver_reason }}
+      (expires {{ finding.waiver_expires }}){% endif %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<script>
+  const boxes = document.querySelectorAll('.filters input');
+  function apply() {
+    const visible = new Set([...boxes].filter(b => b.checked).map(b => b.dataset.sev));
+    document.querySelectorAll('#findings tbody tr').forEach(row => {
+      row.style.display = visible.has(row.className) ? '' : 'none';
+    });
+  }
+  boxes.forEach(box => box.addEventListener('change', apply));
+  apply();
+</script>
+</body>
+</html>

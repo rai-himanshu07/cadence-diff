@@ -1,0 +1,28 @@
+# generated artifacts and local runtime state
+artifacts/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.pyright/
+*.egg-info/
+
+# virtual environments
+.venv/
+venv/
+
+# generated artifacts — never commit deliverables, fixtures, reports, or run data
+tests/fixtures/generated/
+runs/
+reports/
+data/
+*.sqlite3
+dist/
+build/
+*.qca
+*.log

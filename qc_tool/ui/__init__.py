@@ -1,0 +1,1 @@
+"""NiceGUI local web application."""

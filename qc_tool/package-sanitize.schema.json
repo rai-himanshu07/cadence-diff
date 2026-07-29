@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cadence-diff.local/schema/package-sanitize-v1.json",
+  "title": "cadence-diff package redaction manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "seed",
+    "privacy_safe",
+    "mappings_verified",
+    "mappings_unverifiable",
+    "inputs",
+    "outputs",
+    "privacy"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string"},
+    "seed": {"type": "integer"},
+    "privacy_safe": {"type": "boolean"},
+    "mappings_verified": {"type": "integer"},
+    "mappings_unverifiable": {"type": "integer"},
+    "inputs": {"type": "object"},
+    "outputs": {"type": "object"},
+    "mapping_results": {"type": "array"},
+    "sanitizer_stats": {"type": "object"},
+    "privacy": {"type": "object"}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cadence-diff.local/schema/fingerprint-v1.json",
+  "title": "cadence-diff structural fingerprint v1",
+  "type": "object",
+  "required": ["schema_version", "schema", "artifact", "format", "fingerprint_id"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "schema": {"type": "string"},
+    "artifact": {"enum": ["excel", "powerpoint"]},
+    "format": {"type": "string"},
+    "fingerprint_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": true
+}

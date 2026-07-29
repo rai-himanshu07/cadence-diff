@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cadence-diff.local/schema/findings-v1.json",
+  "title": "cadence-diff findings export v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "profile",
+    "files",
+    "counts",
+    "coverage",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "schema": {"type": "string"},
+    "generated_at": {"type": "string"},
+    "context_included": {"type": "boolean"},
+    "mode": {"type": "string"},
+    "profile": {"type": "string"},
+    "files": {"type": "object", "additionalProperties": {"type": "string"}},
+    "counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+    "disclosures": {"type": "array", "items": {"type": "string"}},
+    "coverage": {"type": "array", "items": {"type": "object"}},
+    "mapping_coverage": {"type": ["object", "null"]},
+    "mapping_suggestions": {"type": "array", "items": {"type": "object"}},
+    "verified_crosschecks": {"type": "integer"},
+    "findings": {"type": "array", "items": {"type": "object"}}
+  },
+  "additionalProperties": false
+}

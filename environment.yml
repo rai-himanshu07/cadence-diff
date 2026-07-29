@@ -1,0 +1,32 @@
+# cadence-diff public development environment.
+# Local contributors may substitute another environment name.
+name: cadence-diff-dev
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  # runtime
+  - openpyxl>=3.1
+  - pyxlsb>=1.0
+  - msoffcrypto-tool>=5.4
+  - python-pptx>=1.0
+  - rapidfuzz>=3.9
+  - networkx>=3.2
+  - pydantic>=2.7
+  - pyyaml>=6.0
+  - jinja2>=3.1
+  - nicegui>=2.0
+  - platformdirs>=4.0
+  # dev / checks
+  - pytest>=8.0
+  - pytest-asyncio>=1.0
+  - ruff
+  - pyright
+  - psutil>=6.0
+  # packaging
+  - hatchling
+  - python-build
+  - twine
+  - pip
+  - pip:
+      - "pywin32>=306; sys_platform == 'win32'"

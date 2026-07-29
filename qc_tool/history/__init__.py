@@ -1,0 +1,1 @@
+"""Persistent run history (SQLite)."""
