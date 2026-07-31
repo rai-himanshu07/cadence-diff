@@ -212,6 +212,11 @@ def _run_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--top", type=int, default=10, help="findings to print")
     parser.add_argument(
+        "--individual-findings",
+        action="store_true",
+        help="print atomic findings instead of grouped review items",
+    )
+    parser.add_argument(
         "--allow-large-workbooks",
         action="store_true",
         help=(
@@ -331,6 +336,7 @@ def _cmd_run(args: list[str]) -> int:
     from qc_tool.findings import Severity
     from qc_tool.progress import ProgressEvent
     from qc_tool.report.json_report import write_json_report
+    from qc_tool.review import build_review_groups, review_counts
     from qc_tool.ui.app import perform_run
 
     data_dir = ns.data_dir or default_data_dir()
@@ -365,9 +371,21 @@ def _cmd_run(args: list[str]) -> int:
 
     print(f"mode: {result.mode.value}   profile: {result.profile_name}")
     print("files:", "  ".join(f"{r}={n}" for r, n in result.files.items()))
+    groups = build_review_groups(result.findings)
+    grouped_counts = review_counts(groups)
     print(
-        "counts:",
-        "  ".join(f"{sev.value}={count}" for sev, count in result.counts.items()),
+        "review items:",
+        "  ".join(
+            f"{severity.value}={count}"
+            for severity, count in grouped_counts.review_items.items()
+        ),
+    )
+    print(
+        "affected findings:",
+        "  ".join(
+            f"{severity.value}={count}"
+            for severity, count in grouped_counts.atomic_findings.items()
+        ),
     )
     if result.coverage:
         states: dict[str, int] = {}
@@ -383,18 +401,40 @@ def _cmd_run(args: list[str]) -> int:
         )
     for disclosure in result.disclosures:
         print(f"note: {disclosure}")
-    ranked = [
-        f
-        for f in result.findings
-        if f.severity in (Severity.CRITICAL, Severity.WARNING)
-    ]
-    for finding in ranked[: ns.top]:
-        severity = finding.severity.value if finding.severity else "?"
-        where = finding.sheet or finding.slide or ""
-        print(
-            f"  {finding.finding_id} {severity:8s} {finding.finding_class.value:24s} "
-            f"{where}!{finding.location or finding.element or ''}  {finding.message}"
-        )
+    if ns.individual_findings:
+        ranked = [
+            finding
+            for finding in result.findings
+            if finding.severity in (Severity.CRITICAL, Severity.WARNING)
+        ]
+        lines = [
+            (
+                f"  {finding.finding_id} "
+                f"{finding.severity.value if finding.severity else '?':8s} "
+                f"{finding.finding_class.value:24s} "
+                f"{finding.sheet or finding.slide or ''}!"
+                f"{finding.location or finding.element or ''}  {finding.message}"
+            )
+            for finding in ranked[: ns.top]
+        ]
+    else:
+        ranked = [
+            group
+            for group in groups
+            if group.severity in (Severity.CRITICAL, Severity.WARNING)
+        ]
+        lines = [
+            (
+                f"  {group.group_id} {group.severity.value:8s} "
+                f"{group.finding_class.value:24s} "
+                f"{group.sheet or group.slide or ''}!{group.bounding_range}  "
+                f"{group.member_count:,} affected finding"
+                f"{'s' if group.member_count != 1 else ''}"
+            )
+            for group in ranked[: ns.top]
+        ]
+    for line in lines:
+        print(line)
     if len(ranked) > ns.top:
         print(f"  ... {len(ranked) - ns.top} more (see reports)")
     print("reports:", "  ".join(str(p) for p in artifacts.report_paths.values()))

@@ -17,6 +17,8 @@ from qc_tool.coverage import CoverageItem, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import Finding, Severity
+from qc_tool.review import build_review_groups
+from qc_tool.review import review_counts as count_review_groups
 from qc_tool.security import private_directory, private_file
 
 logger = logging.getLogger(__name__)
@@ -38,7 +40,8 @@ CREATE TABLE IF NOT EXISTS runs (
     mode TEXT NOT NULL DEFAULT 'cycle_comparison',
     coverage TEXT NOT NULL DEFAULT '[]',
     mapping_coverage TEXT NOT NULL DEFAULT 'null',
-    mapping_suggestions TEXT NOT NULL DEFAULT '[]'
+    mapping_suggestions TEXT NOT NULL DEFAULT '[]',
+    review_counts TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS annotations (
     run_id INTEGER NOT NULL,
@@ -64,6 +67,9 @@ _MIGRATIONS = {
     "mapping_suggestions": (
         "ALTER TABLE runs ADD COLUMN mapping_suggestions TEXT NOT NULL DEFAULT '[]'"
     ),
+    "review_counts": (
+        "ALTER TABLE runs ADD COLUMN review_counts TEXT NOT NULL DEFAULT '{}'"
+    ),
 }
 
 
@@ -76,6 +82,7 @@ class RunRecord:
     files: dict[str, str]
     file_hashes: dict[str, str]
     counts: dict[str, int]
+    review_counts: dict[str, int]
     disclosures: list[str]
     verified_crosschecks: int
     report_paths: dict[str, str]
@@ -123,6 +130,11 @@ class RunHistory:
     ) -> int:
         started_at = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         counts = {sev.value: count for sev, count in result.counts.items()}
+        grouped = count_review_groups(build_review_groups(result.findings))
+        grouped_counts = {
+            severity.value: count
+            for severity, count in grouped.review_items.items()
+        }
         findings_payload = json.dumps(
             [finding.model_dump(mode="json") for finding in result.findings]
         )
@@ -133,8 +145,8 @@ class RunHistory:
                     started_at, profile, files, file_hashes, counts,
                     disclosures, verified_crosschecks, findings, report_paths,
                     file_paths, rerun_of, mode, coverage, mapping_coverage,
-                    mapping_suggestions
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mapping_suggestions, review_counts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     started_at,
@@ -158,6 +170,7 @@ class RunHistory:
                     json.dumps(
                         [item.model_dump(mode="json") for item in result.mapping_suggestions]
                     ),
+                    json.dumps(grouped_counts),
                 ),
             )
             run_id = cursor.lastrowid
@@ -180,6 +193,7 @@ class RunHistory:
             files=json.loads(row["files"]),
             file_hashes=json.loads(row["file_hashes"]),
             counts=json.loads(row["counts"]),
+            review_counts=json.loads(row["review_counts"]),
             disclosures=json.loads(row["disclosures"]),
             verified_crosschecks=row["verified_crosschecks"],
             report_paths=json.loads(row["report_paths"]),
@@ -227,8 +241,22 @@ class RunHistory:
         self, run_id: int, finding_id: str, *, severity: str | None, comment: str
     ) -> None:
         """Upsert an analyst annotation (severity=None keeps the engine severity)."""
+        self.set_annotations_bulk(
+            run_id,
+            [(finding_id, severity, comment)],
+        )
+
+    def set_annotations_bulk(
+        self,
+        run_id: int,
+        updates: list[tuple[str, str | None, str]],
+    ) -> None:
+        """Upsert one group decision atomically across its finding members."""
+        if not updates:
+            return
+        updated_at = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         with self._connect() as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT INTO annotations (run_id, finding_id, severity, comment, updated_at)
                 VALUES (?, ?, ?, ?, ?)
@@ -237,13 +265,10 @@ class RunHistory:
                     comment = excluded.comment,
                     updated_at = excluded.updated_at
                 """,
-                (
-                    run_id,
-                    finding_id,
-                    severity,
-                    comment,
-                    dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
-                ),
+                [
+                    (run_id, finding_id, severity, comment, updated_at)
+                    for finding_id, severity, comment in updates
+                ],
             )
 
     def get_annotations(self, run_id: int) -> dict[str, tuple[str | None, str]]:

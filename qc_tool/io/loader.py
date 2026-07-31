@@ -108,6 +108,11 @@ def _constant_cell_value(value: object) -> CellValue:
     return str(value)
 
 
+def _formula_text(value: object) -> str:
+    text = getattr(value, "text", None)
+    return text if isinstance(text, str) else str(value)
+
+
 def _without_chart_drawings(data: bytes) -> bytes:
     """Remove chart anchors from an in-memory OOXML copy before openpyxl reads it."""
     output = io.BytesIO()
@@ -248,11 +253,12 @@ def _load_ooxml_oracle(
     cancellation_token: CancellationToken | None = None,
 ) -> WorkbookSnapshot:
     check_cancelled(cancellation_token)
+    metadata = parse_ooxml_worksheet_metadata(
+        data,
+        cancellation_token=cancellation_token,
+    )
     workload = _assess_ooxml_workload(
-        parse_ooxml_worksheet_metadata(
-            data,
-            cancellation_token=cancellation_token,
-        ),
+        metadata,
         source_name=source_name,
         allow_large_workbook=allow_large_workbook,
     )
@@ -280,6 +286,11 @@ def _load_ooxml_oracle(
         external_links=_parse_external_links(data),
         workload=workload,
     )
+    snapshot.formula_ranges.extend(
+        descriptor
+        for sheet_metadata in metadata.sheets
+        for descriptor in sheet_metadata.formula_ranges
+    )
     interaction_details: list[str] = []
     conditional_style_details: list[str] = []
 
@@ -302,7 +313,7 @@ def _load_ooxml_oracle(
                 formula: str | None = None
                 value: CellValue
                 if cell.data_type == "f":
-                    formula = str(cell.value)
+                    formula = _formula_text(cell.value)
                     cached = ws_v.cell(row=cell.row, column=cell.column).value
                     value = cached if is_cell_value(cached) else None
                 else:
@@ -427,7 +438,9 @@ def _stream_formula_cells(
             style = (_style_key(formula_cell), str(formula_cell.number_format))
             style_cache[style_id] = style
         formula = (
-            str(formula_cell.value) if formula_cell.data_type == "f" else None
+            _formula_text(formula_cell.value)
+            if formula_cell.data_type == "f"
+            else None
         )
         value = (
             None
@@ -627,6 +640,7 @@ def _append_streaming_metadata(
     metadata: WorksheetMetadata,
 ) -> None:
     snapshot.tables.extend(metadata.tables)
+    snapshot.formula_ranges.extend(metadata.formula_ranges)
     snapshot.data_validations.extend(metadata.interactions.data_validations)
     snapshot.conditional_formats.extend(metadata.interactions.conditional_formats)
     if not metadata.interactions.rules_supported:

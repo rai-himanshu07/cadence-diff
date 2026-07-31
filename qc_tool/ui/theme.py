@@ -209,6 +209,8 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
   font-variant-numeric: tabular-nums; }
 .stat .l { font-size: 0.7rem; letter-spacing: 0.1em; text-transform: uppercase;
   color: var(--ink-soft); }
+.stat .a { font-family: var(--font-mono); font-size: 0.66rem;
+  color: var(--ink-soft); margin-top: 0.15rem; }
 .stat-critical { border-top-color: var(--critical); }
 .stat-warning { border-top-color: var(--warning); }
 .stat-info { border-top-color: var(--info); }
@@ -224,6 +226,11 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 .findings-table td { border-color: var(--line-soft) !important;
   font-size: 0.8rem; vertical-align: top; }
 .findings-table .mono { font-family: var(--font-mono); font-size: 0.75rem; }
+.review-toggle { border: 1px solid var(--line); border-radius: 4px; }
+.review-groups-table .groupcount { font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums; text-align: right; }
+.capbadge { color: var(--warning); font-size: 0.65rem; display: block;
+  margin-top: 0.15rem; }
 .coverage-table { width: 100%; border: 1px solid var(--line); border-radius: 6px;
   background: var(--panel); }
 .coverage-table thead th { background: var(--surface2); color: var(--ink);
@@ -343,6 +350,111 @@ SEVERITY_CELL_SLOT = """
 <q-td :props="props">
   <span :class="'sevdot sev-' + props.value"></span><span class="sevtext">{{ props.value }}</span>
 </q-td>
+"""
+
+REVIEW_GROUPS_BODY_SLOT = """
+<q-tr :props="props">
+  <q-td auto-width>
+    <q-btn size="sm" color="grey-7" flat dense round icon="list_alt"
+      aria-label="View affected findings"
+      @click="$parent.$emit('members', {id: props.row.id})" />
+    <q-btn size="sm" color="grey-7" flat dense round icon="fact_check"
+      aria-label="Review affected findings"
+      @click="$parent.$emit('groupreview', {id: props.row.id})" />
+  </q-td>
+  <q-td key="id" :props="props" class="mono">{{ props.row.id }}</q-td>
+  <q-td key="severity" :props="props">
+    <span :class="'sevdot sev-' + props.row.severity"></span
+    ><span class="sevtext">{{ props.row.severity }}</span>
+  </q-td>
+  <q-td key="class" :props="props" class="mono">{{ props.row.class }}</q-td>
+  <q-td key="where" :props="props">{{ props.row.where }}</q-td>
+  <q-td key="location" :props="props" class="mono">{{ props.row.location }}</q-td>
+  <q-td key="members" :props="props" class="groupcount">{{ props.row.members }}</q-td>
+  <q-td key="message" :props="props">{{ props.row.message }}
+    <span v-if="props.row.cap_degraded" class="capbadge">
+      retained details; coverage degraded
+    </span>
+  </q-td>
+</q-tr>
+"""
+
+REVIEW_MEMBERS_BODY_SLOT = """
+<q-tr :props="props">
+  <q-td auto-width>
+    <q-btn size="sm" color="grey-7" flat dense round
+      :icon="props.expand ? 'expand_less' : 'expand_more'"
+      @click="props.expand = !props.expand" />
+  </q-td>
+  <q-td key="id" :props="props" class="mono">{{ props.row.id }}</q-td>
+  <q-td key="severity" :props="props">
+    <span :class="'sevdot sev-' + props.row.severity"></span
+    ><span class="sevtext">{{ props.row.severity }}</span
+    ><span v-if="props.row.overridden" class="overridden">analyst</span>
+  </q-td>
+  <q-td key="class" :props="props" class="mono">{{ props.row.class }}</q-td>
+  <q-td key="where" :props="props">{{ props.row.where }}</q-td>
+  <q-td key="location" :props="props" class="mono">{{ props.row.location }}</q-td>
+  <q-td key="message" :props="props">{{ props.row.message }}</q-td>
+</q-tr>
+<q-tr v-show="props.expand" :props="props" class="detailrow">
+  <q-td colspan="100%">
+    <div class="detailgrid">
+      <template v-if="props.row.baseline">
+        <div class="dk">baseline</div><div class="dv mono">{{ props.row.baseline }}</div>
+      </template>
+      <template v-if="props.row.current">
+        <div class="dk">current</div><div class="dv mono">{{ props.row.current }}</div>
+      </template>
+      <template v-if="props.row.element">
+        <div class="dk">element</div><div class="dv">{{ props.row.element }}</div>
+      </template>
+      <template v-if="props.row.impacts">
+        <div class="dk">impacts</div><div class="dv mono">{{ props.row.impacts }}</div>
+      </template>
+      <template v-if="props.row.root">
+        <div class="dk">root cause</div><div class="dv mono">{{ props.row.root }}</div>
+      </template>
+      <template v-if="props.row.waiver">
+        <div class="dk">waiver</div><div class="dv">{{ props.row.waiver }}</div>
+      </template>
+      <template v-if="props.row.comment">
+        <div class="dk">analyst comment</div><div class="dv">{{ props.row.comment }}</div>
+      </template>
+      <template v-if="props.row.bx || props.row.cx">
+        <div class="dk">context</div>
+        <div class="dv">
+          <div class="ctxpair">
+            <div v-if="props.row.bx">
+              <div class="ctxlabel">baseline</div>
+              <table class="ctxgrid"><tbody>
+                <tr><th></th><th v-for="c in props.row.bx.cols" :key="c">{{ c }}</th></tr>
+                <tr v-for="(r, ri) in props.row.bx.cells" :key="ri">
+                  <th>{{ props.row.bx.rows[ri] }}</th>
+                  <td v-for="(v, ci) in r" :key="ci"
+                    :class="{hit: ri===props.row.bx.hit_row && ci===props.row.bx.hit_col}"
+                  >{{ v }}</td>
+                </tr>
+              </tbody></table>
+            </div>
+            <div v-if="props.row.cx">
+              <div class="ctxlabel">current</div>
+              <table class="ctxgrid"><tbody>
+                <tr><th></th><th v-for="c in props.row.cx.cols" :key="c">{{ c }}</th></tr>
+                <tr v-for="(r, ri) in props.row.cx.cells" :key="ri">
+                  <th>{{ props.row.cx.rows[ri] }}</th>
+                  <td v-for="(v, ci) in r" :key="ci"
+                    :class="{hit: ri===props.row.cx.hit_row && ci===props.row.cx.hit_col}"
+                  >{{ v }}</td>
+                </tr>
+              </tbody></table>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+  </q-td>
+</q-tr>
 """
 
 #: Full body slot: main row + expandable detail row (baseline/current/impacts).

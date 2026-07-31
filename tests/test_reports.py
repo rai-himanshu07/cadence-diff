@@ -16,7 +16,7 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
     write_excel_report(qc_result, path)
 
     workbook = load_workbook(path)
-    assert workbook.sheetnames == ["Summary", "Coverage", "Findings"]
+    assert workbook.sheetnames == ["Summary", "Coverage", "Review Groups", "Findings"]
 
     findings_sheet = workbook["Findings"]
     assert findings_sheet.max_row == len(qc_result.findings) + 1
@@ -32,11 +32,21 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
     assert "fixture" in summary_text  # profile name
     assert "cycle_comparison" in summary_text
     assert "current.xlsx" in summary_text
-    assert "Critical findings" in summary_text
+    assert "Critical review items" in summary_text
+    assert "Critical affected findings" in summary_text
 
     coverage = workbook["Coverage"]
     assert coverage["A1"].value == "Artifact"
     assert coverage.max_row == len(qc_result.coverage) + 1
+
+    review_groups = workbook["Review Groups"]
+    assert review_groups["A1"].value == "Group"
+    assert review_groups.max_row <= len(qc_result.findings) + 1
+    assert review_groups["J2"].hyperlink is not None
+    assert review_groups["J2"].hyperlink.location.startswith("'Findings'!A")
+    assert "Clear any Findings sheet filter" in review_groups["J2"].hyperlink.tooltip
+    assert summary["D3"].hyperlink is not None
+    assert summary["D3"].hyperlink.location == "'Review Groups'!A1"
 
 
 def test_excel_report_discloses_xlsb_degradation(fixture_dir: Path, tmp_path: Path) -> None:
@@ -90,8 +100,12 @@ def test_html_report_contents(qc_result: QCRunResult, tmp_path: Path) -> None:
         assert f'class="card {severity.value}"' in html
     # Self-contained: no external asset references.
     assert "http://" not in html and "https://" not in html
-    # Every finding row rendered.
-    assert html.count("<tr class=") == len(qc_result.findings)
+    assert "review items" in html
+    assert "affected findings" in html
+    # Every atomic finding remains available in safely escaped inline JSON.
+    assert all(finding.finding_id in html for finding in qc_result.findings)
+    assert "data-member-body" in html
+    assert "const pageSize = 50" in html
 
 
 def test_html_report_escapes_client_content() -> None:
@@ -111,7 +125,8 @@ def test_html_report_escapes_client_content() -> None:
     html = render_html_report(hostile)
     assert "<script>alert" not in html
     assert "<img src=x" not in html
-    assert "&lt;script&gt;" in html
+    assert r"\u003cscript\u003e" in html
+    assert r"\u003cimg src=x onerror=alert(1)\u003e" in html
     assert "&lt;b&gt;markup&lt;/b&gt;" in html
 
 

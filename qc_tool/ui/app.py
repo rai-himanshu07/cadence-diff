@@ -31,7 +31,7 @@ from qc_tool.config.profile import (
 from qc_tool.coverage import QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings, run_qc
-from qc_tool.findings import Severity
+from qc_tool.findings import Finding, FindingClass, Severity
 from qc_tool.history.store import RunHistory, sha256_file
 from qc_tool.io.decrypt import InvalidPasswordError, PasswordRequiredError
 from qc_tool.progress import (
@@ -45,6 +45,13 @@ from qc_tool.progress import (
 )
 from qc_tool.report.excel_report import write_excel_report
 from qc_tool.report.html_report import write_html_report
+from qc_tool.review import (
+    ReviewGroup,
+    apply_group_review,
+    build_review_groups,
+    format_group_ranges,
+    review_counts,
+)
 from qc_tool.security import private_directory, private_file, secure_managed_tree
 from qc_tool.server_config import (
     NetworkMode,
@@ -53,7 +60,13 @@ from qc_tool.server_config import (
     save_server_config,
 )
 from qc_tool.ui.guide import render_guide
-from qc_tool.ui.theme import FINDINGS_BODY_SLOT, page_frame, section
+from qc_tool.ui.theme import (
+    FINDINGS_BODY_SLOT,
+    REVIEW_GROUPS_BODY_SLOT,
+    REVIEW_MEMBERS_BODY_SLOT,
+    page_frame,
+    section,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -338,32 +351,62 @@ def perform_run(
 # --- pages -------------------------------------------------------------------
 
 
+def _finding_row(finding: Finding) -> dict[str, object]:
+    return {
+        "id": finding.finding_id,
+        "severity": (finding.severity or Severity.WARNING).value,
+        "class": finding.finding_class.value,
+        "where": finding.sheet or finding.slide or "",
+        "location": finding.location or finding.baseline_location or "",
+        "message": finding.message,
+        "baseline": finding.baseline_value or "",
+        "current": finding.current_value or "",
+        "element": finding.element or "",
+        "impacts": "; ".join(finding.impacts),
+        "artifact": finding.artifact,
+        "comment": finding.analyst_comment,
+        "overridden": finding.severity_overridden,
+        "root": finding.root_cause_key,
+        "waiver": (
+            f"{finding.waiver_reason} (expires {finding.waiver_expires})"
+            if finding.waiver_reason
+            else ""
+        ),
+        "bx": finding.baseline_excerpt.model_dump() if finding.baseline_excerpt else None,
+        "cx": finding.current_excerpt.model_dump() if finding.current_excerpt else None,
+    }
+
+
 def _findings_rows(result: QCRunResult) -> list[dict[str, object]]:
+    return [_finding_row(finding) for finding in result.findings]
+
+
+def _review_group_rows(groups: list[ReviewGroup]) -> list[dict[str, object]]:
     return [
         {
-            "id": f.finding_id,
-            "severity": (f.severity or Severity.WARNING).value,
-            "class": f.finding_class.value,
-            "where": f.sheet or f.slide or "",
-            "location": f.location or f.baseline_location or "",
-            "message": f.message,
-            "baseline": f.baseline_value or "",
-            "current": f.current_value or "",
-            "element": f.element or "",
-            "impacts": "; ".join(f.impacts),
-            "artifact": f.artifact,
-            "comment": f.analyst_comment,
-            "overridden": f.severity_overridden,
-            "root": f.root_cause_key,
-            "waiver": (
-                f"{f.waiver_reason} (expires {f.waiver_expires})"
-                if f.waiver_reason
-                else ""
+            "id": group.group_id,
+            "severity": group.severity.value,
+            "class": group.finding_class.value,
+            "where": group.sheet or group.slide or "",
+            "location": format_group_ranges(group),
+            "bounds": group.bounding_range,
+            "baseline": "; ".join(group.baseline_ranges),
+            "members": group.member_count,
+            "message": (
+                group.members[0].message
+                if group.member_count == 1
+                else (
+                    f"{group.member_count:,} contiguous "
+                    f"{group.finding_class.value.replace('_', ' ')} findings"
+                )
             ),
-            "bx": f.baseline_excerpt.model_dump() if f.baseline_excerpt else None,
-            "cx": f.current_excerpt.model_dump() if f.current_excerpt else None,
+            "element": group.element,
+            "cap_degraded": any(
+                member.finding_class is FindingClass.FINDINGS_CAPPED
+                for member in group.members
+            ),
         }
-        for f in result.findings
+        for group in groups
     ]
 
 
@@ -375,6 +418,17 @@ _FINDINGS_COLUMNS = [
     {"name": "where", "label": "Sheet / Slide", "field": "where", "sortable": True},
     {"name": "location", "label": "Location", "field": "location", "classes": "mono"},
     {"name": "message", "label": "Message", "field": "message", "align": "left"},
+]
+
+_REVIEW_GROUP_COLUMNS = [
+    {"name": "members_action", "label": "", "field": "members_action"},
+    {"name": "id", "label": "Group", "field": "id", "classes": "mono"},
+    {"name": "severity", "label": "Severity", "field": "severity", "sortable": True},
+    {"name": "class", "label": "Class", "field": "class", "sortable": True},
+    {"name": "where", "label": "Sheet / Slide", "field": "where", "sortable": True},
+    {"name": "location", "label": "Affected range", "field": "location"},
+    {"name": "members", "label": "Findings", "field": "members", "sortable": True},
+    {"name": "message", "label": "Review item", "field": "message", "align": "left"},
 ]
 
 
@@ -392,16 +446,21 @@ def _render_result_view(
     """Shared results renderer: stat strip, disclosures, exports, table."""
     all_rows = _findings_rows(result)
     findings_by_id = {f.finding_id: f for f in result.findings}
+    review_groups = build_review_groups(result.findings)
     section(heading)
     stats_box = ui.element("div").classes("statstrip")
 
     def render_stats() -> None:
         stats_box.clear()
+        counts = review_counts(review_groups)
         with stats_box:
-            for severity, count in result.counts.items():
+            for severity, count in counts.review_items.items():
                 with ui.column().classes(f"stat stat-{severity.value}"):
                     ui.label(str(count)).classes("n")
-                    ui.label(severity.value).classes("l")
+                    ui.label(f"{severity.value} review items").classes("l")
+                    ui.label(
+                        f"{counts.atomic_findings[severity]:,} affected findings"
+                    ).classes("a")
             with ui.column().classes("stat"):
                 ui.label(str(result.verified_crosschecks)).classes("n")
                 ui.label("cross-checks ok").classes("l")
@@ -614,6 +673,14 @@ def _render_result_view(
         ui.label("exports are for sharing — findings are fully viewable below").classes(
             "text-xs text-gray-500"
         )
+        view_toggle = (
+            ui.toggle(
+                {"groups": "Review groups", "findings": "Individual findings"},
+                value="groups",
+            )
+            .classes("review-toggle")
+            .props("no-caps")
+        )
         severity_filter = (
             ui.select(
                 [s.value for s in Severity],
@@ -626,7 +693,23 @@ def _render_result_view(
         )
 
     visible = set(severity_filter.value or [])
-    table = (
+    group_table = (
+        ui.table(
+            columns=_REVIEW_GROUP_COLUMNS,
+            rows=[
+                row
+                for row in _review_group_rows(review_groups)
+                if row["severity"] in visible
+            ],
+            row_key="id",
+            pagination=25,
+        )
+        .classes("findings-table review-groups-table")
+        .props("flat dense")
+    )
+    group_table.add_slot("body", REVIEW_GROUPS_BODY_SLOT)
+
+    findings_table = (
         ui.table(
             columns=_FINDINGS_COLUMNS,
             rows=[r for r in all_rows if r["severity"] in visible],
@@ -636,11 +719,165 @@ def _render_result_view(
         .classes("findings-table")
         .props("flat dense")
     )
-    table.add_slot("body", FINDINGS_BODY_SLOT)
+    findings_table.add_slot("body", FINDINGS_BODY_SLOT)
+    findings_table.visible = False
+
+    def open_members(e: events.GenericEventArguments) -> None:
+        group_id = str(e.args.get("id", ""))
+        group = next(
+            (candidate for candidate in review_groups if candidate.group_id == group_id),
+            None,
+        )
+        if group is None:
+            return
+        page_size = 50
+        page = {"index": 0}
+        with ui.dialog() as dialog, ui.card().style(
+            "width: min(72rem, 95vw); max-width: 95vw"
+        ):
+            ui.label(
+                f"{group.group_id} - {group.member_count:,} affected findings"
+            ).classes("runhead")
+            ui.label(
+                f"{group.sheet or group.slide or ''} · {format_group_ranges(group)}"
+            ).classes("runmeta")
+            member_table = ui.table(
+                columns=_FINDINGS_COLUMNS,
+                rows=[],
+                row_key="id",
+                pagination=page_size,
+            ).classes("findings-table").props("flat dense")
+            member_table.add_slot("body", REVIEW_MEMBERS_BODY_SLOT)
+            page_label = ui.label().classes("text-xs text-gray-500")
+
+            def refresh_page() -> None:
+                start = page["index"] * page_size
+                end = min(start + page_size, group.member_count)
+                member_table.rows = [
+                    _finding_row(member) for member in group.members[start:end]
+                ]
+                page_label.set_text(
+                    f"Showing {start + 1:,}-{end:,} of {group.member_count:,}"
+                )
+                previous_button.set_enabled(page["index"] > 0)
+                next_button.set_enabled(end < group.member_count)
+
+            def previous_page() -> None:
+                page["index"] = max(0, page["index"] - 1)
+                refresh_page()
+
+            def next_page() -> None:
+                page["index"] += 1
+                refresh_page()
+
+            with ui.row().classes("items-center gap-2"):
+                previous_button = ui.button(
+                    icon="chevron_left", on_click=previous_page
+                ).props("flat round dense aria-label='Previous member page'")
+                next_button = ui.button(
+                    icon="chevron_right", on_click=next_page
+                ).props("flat round dense aria-label='Next member page'")
+                ui.button("Close", on_click=dialog.close).props("flat no-caps")
+            refresh_page()
+        dialog.open()
+
+    group_table.on("members", open_members)
+
+    def refresh_review_groups() -> None:
+        nonlocal review_groups
+        review_groups = build_review_groups(result.findings)
+        selected = set(severity_filter.value or [])
+        group_table.rows = [
+            row
+            for row in _review_group_rows(review_groups)
+            if row["severity"] in selected
+        ]
+
+    def switch_view() -> None:
+        grouped = view_toggle.value == "groups"
+        group_table.visible = grouped
+        findings_table.visible = not grouped
+
+    view_toggle.on_value_change(switch_view)
 
     def refilter() -> None:
         selected = set(severity_filter.value or [])
-        table.rows = [r for r in all_rows if r["severity"] in selected]
+        group_table.rows = [
+            row
+            for row in _review_group_rows(review_groups)
+            if row["severity"] in selected
+        ]
+        findings_table.rows = [
+            row for row in all_rows if row["severity"] in selected
+        ]
+
+    def open_group_review(e: events.GenericEventArguments) -> None:
+        group_id = str(e.args.get("id", ""))
+        group = next(
+            (candidate for candidate in review_groups if candidate.group_id == group_id),
+            None,
+        )
+        if group is None:
+            return
+        with ui.dialog() as dialog, ui.card().classes("w-[34rem] max-w-full"):
+            ui.label(
+                f"Review {group.group_id} · {group.member_count:,} findings"
+            ).classes("runhead")
+            ui.label(
+                "Choose unreviewed only to preserve existing individual decisions, "
+                "or replace all explicitly."
+            ).classes("lede")
+            severity_select = ui.select(
+                ["keep", *[severity.value for severity in Severity]],
+                value="keep",
+                label="Group severity",
+            ).classes("w-full").props("outlined dense")
+            comment_input = ui.input("Group comment (blank keeps comments)").classes(
+                "w-full"
+            ).props("outlined dense")
+            apply_mode = ui.toggle(
+                {
+                    "blank": "Unreviewed only",
+                    "replace": "Replace all",
+                },
+                value="blank",
+            ).classes("review-toggle").props("no-caps")
+
+            def apply_review() -> None:
+                selected = str(severity_select.value or "keep")
+                severity = None if selected == "keep" else Severity(selected)
+                updates = apply_group_review(
+                    group,
+                    severity=severity,
+                    comment=str(comment_input.value or ""),
+                    replace_existing=apply_mode.value == "replace",
+                )
+                if not updates:
+                    ui.notify("No group review changes to apply", type="warning")
+                    return
+                if history is not None and run_id is not None:
+                    history.set_annotations_bulk(
+                        run_id,
+                        [
+                            (update.finding_id, update.severity, update.comment)
+                            for update in updates
+                        ],
+                    )
+                all_rows[:] = _findings_rows(result)
+                refresh_review_groups()
+                refilter()
+                render_stats()
+                dialog.close()
+                ui.notify(f"Updated {len(updates):,} affected findings")
+
+            with ui.row().classes("items-center gap-2"):
+                ui.button("Apply review", on_click=apply_review).classes(
+                    "runbtn"
+                ).props("no-caps")
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+        dialog.open()
+
+    group_table.on("groupreview", open_group_review)
 
     severity_filter.on_value_change(refilter)
 
@@ -659,6 +896,7 @@ def _render_result_view(
             history.set_annotation(
                 run_id, finding_id, severity=value, comment=finding.analyst_comment
             )
+        refresh_review_groups()
         render_stats()
         ui.notify(f"{finding_id}: severity set to {value} (analyst override)")
 
@@ -682,8 +920,8 @@ def _render_result_view(
             )
         ui.notify(f"{finding_id}: comment saved")
 
-    table.on("sev", on_severity)
-    table.on("note", on_note)
+    findings_table.on("sev", on_severity)
+    findings_table.on("note", on_note)
 
 
 def _render_results(container: ui.element, artifacts: RunArtifacts, work_dir: Path) -> None:
@@ -1135,10 +1373,17 @@ def create_pages(
                         "  |  ".join(f"{r}: {n}" for r, n in record.files.items())
                     ).classes("runmeta")
                     with ui.element("div").classes("runcounts"):
-                        for kind, count in record.counts.items():
+                        primary_counts = record.review_counts or record.counts
+                        for kind, count in primary_counts.items():
                             with ui.row().classes("items-center gap-1 no-wrap"):
                                 ui.element("span").classes(f"sevdot sev-{kind}")
-                                ui.label(f"{kind} {count}")
+                                atomic = record.counts.get(kind, 0)
+                                label = (
+                                    f"{kind} {count} review items · {atomic} affected"
+                                    if record.review_counts
+                                    else f"{kind} {count} affected (legacy run)"
+                                )
+                                ui.label(label)
                     with ui.row().classes("gap-2 mt-1"):
                         run_id = record.run_id
                         ui.button(

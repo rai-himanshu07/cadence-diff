@@ -170,6 +170,57 @@ def test_valid_tie_out_range_passes_lint(workbook) -> None:
     assert errors == []
 
 
+def test_signed_tie_out_terms_pass_lint_and_mixed_forms_fail(workbook) -> None:
+    signed = DeliverableProfile.model_validate(
+        {
+            "name": "signed",
+            "excel": {
+                "controls": {
+                    "tie_outs": [
+                        {
+                            "name": "Signed ranges",
+                            "target": "Dashboard!B2",
+                            "terms": [
+                                {
+                                    "reference": "Long_Monthly!C2:C5",
+                                    "operation": "add",
+                                },
+                                {
+                                    "reference": "Long_Monthly!D2:D5",
+                                    "operation": "subtract",
+                                },
+                            ],
+                        }
+                    ]
+                }
+            },
+        }
+    )
+    assert [
+        issue for issue in lint_profile(signed, workbook=workbook) if issue.level == "error"
+    ] == []
+
+    mixed = DeliverableProfile.model_validate(
+        {
+            "name": "mixed",
+            "excel": {
+                "controls": {
+                    "tie_outs": [
+                        {
+                            "name": "Mixed",
+                            "target": "Dashboard!B2",
+                            "components": ["Long_Monthly!C2:C5"],
+                            "terms": [{"reference": "Long_Monthly!D2:D5"}],
+                        }
+                    ]
+                }
+            },
+        }
+    )
+    issues = lint_profile(mixed, workbook=workbook)
+    assert any("exactly one" in issue.message for issue in issues)
+
+
 def test_inverted_numeric_bounds_are_rejected() -> None:
     profile = DeliverableProfile.model_validate(
         {

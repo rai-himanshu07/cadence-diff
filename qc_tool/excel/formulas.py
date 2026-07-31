@@ -26,12 +26,12 @@ import logging
 import re
 from collections import Counter
 
-from openpyxl.formula import Tokenizer
 from openpyxl.utils import get_column_letter
 
 from qc_tool.availability import cell_in_ranges, excel_blank_allowed
 from qc_tool.config.profile import DeliverableProfile, SheetProfile
 from qc_tool.excel.align import RegionAlignment, WorkbookAlignment
+from qc_tool.excel.formula_tokens import tokenize_formula
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import (
     ERROR_LITERALS,
@@ -86,7 +86,7 @@ def _range_token_to_r1c1(token: str, host_row: int, host_col: int) -> str:
 def to_r1c1(formula: str, host_row: int, host_col: int) -> str:
     """Normalize an A1-style formula to R1C1 relative to its host cell."""
     try:
-        tokens = Tokenizer(formula).items
+        tokens = tokenize_formula(formula)
     except Exception:  # malformed formulas must not kill a run
         logger.warning("unparseable formula at %s: %r", _ref(host_row, host_col), formula)
         return formula
@@ -136,8 +136,8 @@ def _is_range_extension(base_token: str, curr_token: str) -> bool:
 
 def _differs_only_by_extension(base_formula: str, curr_formula: str) -> bool:
     try:
-        base_tokens = Tokenizer(base_formula).items
-        curr_tokens = Tokenizer(curr_formula).items
+        base_tokens = tokenize_formula(base_formula)
+        curr_tokens = tokenize_formula(curr_formula)
     except Exception:  # malformed formulas cannot be extension-classified
         return False
     if len(base_tokens) != len(curr_tokens):

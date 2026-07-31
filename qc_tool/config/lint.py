@@ -16,10 +16,12 @@ from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 from qc_tool.config.profile import DeliverableProfile
 from qc_tool.crosscheck.trace import extract_deck_figures
 from qc_tool.excel.periods import parse_period
+from qc_tool.excel.references import ReferenceStatus, resolve_reference
 from qc_tool.io.model import WorkbookSnapshot
 from qc_tool.ppt.extract import DeckSnapshot
 
 _SHEET_REF_RE = re.compile(r"^(?:'(?P<quoted>[^']+)'|(?P<plain>[^'!]+))!(?P<ref>.+)$")
+_NAME_RE = re.compile(r"^[A-Za-z_\\][A-Za-z0-9_.\\]*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +160,79 @@ def _check_sheet_range(
                     "uncached cells",
                 )
             )
+
+
+def _check_tie_reference(
+    where: str,
+    reference: str,
+    workbook: WorkbookSnapshot | None,
+    issues: list[LintIssue],
+    *,
+    scalar: bool,
+) -> None:
+    parts = _split_sheet_ref(reference)
+    if workbook is None:
+        if parts is not None:
+            if scalar:
+                _check_sheet_cell(where, reference, None, issues, numeric=True)
+            else:
+                _check_sheet_range(where, reference, None, issues, numeric=True)
+            return
+        if not reference.strip() or (
+            "[" not in reference and _NAME_RE.fullmatch(reference) is None
+        ):
+            kind = "Sheet!Cell" if scalar else "Sheet!Range"
+            issues.append(
+                LintIssue(
+                    "error",
+                    where,
+                    f"{reference!r} is not a {kind}, named range, or structured reference",
+                )
+            )
+        return
+
+    host_sheet = (
+        parts[0]
+        if parts is not None
+        else (workbook.sheets[0].name if workbook.sheets else "")
+    )
+    resolution = resolve_reference(
+        workbook,
+        reference,
+        host_sheet=host_sheet,
+        require_within_sheet=True,
+    )
+    if resolution.status is not ReferenceStatus.RESOLVED:
+        issues.append(
+            LintIssue(
+                "error",
+                where,
+                f"reference {reference!r} is {resolution.status.value}: {resolution.detail}",
+            )
+        )
+        return
+    if scalar and resolution.size != 1:
+        issues.append(
+            LintIssue("error", where, f"target {reference!r} must resolve to one cell")
+        )
+        return
+    non_numeric = 0
+    for resolved in resolution.ranges:
+        sheet = workbook.sheet(resolved.sheet)
+        for row in range(resolved.min_row, resolved.max_row + 1):
+            for column in range(resolved.min_col, resolved.max_col + 1):
+                cell = sheet.cells.get((row, column))
+                value = None if cell is None else cell.value
+                if isinstance(value, bool) or not isinstance(value, int | float):
+                    non_numeric += 1
+    if non_numeric:
+        issues.append(
+            LintIssue(
+                "warning",
+                where,
+                f"{reference!r} contains {non_numeric} non-numeric or uncached cells",
+            )
+        )
 
 
 def lint_profile(
@@ -327,11 +402,31 @@ def lint_profile(
                     )
     for tie_out in controls.tie_outs:
         where = f"excel.controls.tie_outs[{tie_out.name}]"
-        _check_sheet_cell(where, tie_out.target, workbook, issues, numeric=True)
-        if not tie_out.components:
-            issues.append(LintIssue("error", where, "tie-out has no components"))
-        for component in tie_out.components:
-            _check_sheet_range(where, component, workbook, issues, numeric=True)
+        uses_components = bool(tie_out.components)
+        uses_terms = bool(tie_out.terms)
+        if uses_components == uses_terms:
+            detail = (
+                "tie-out has no components or terms; define exactly one"
+                if not uses_components
+                else "tie-out must define exactly one of components or terms"
+            )
+            issues.append(LintIssue("error", where, detail))
+        _check_tie_reference(
+            where,
+            tie_out.target,
+            workbook,
+            issues,
+            scalar=True,
+        )
+        references = tie_out.components or [term.reference for term in tie_out.terms]
+        for reference in references:
+            _check_tie_reference(
+                where,
+                reference,
+                workbook,
+                issues,
+                scalar=False,
+            )
         if tie_out.absolute_tolerance < 0 or tie_out.relative_tolerance < 0:
             issues.append(LintIssue("error", where, "tie-out tolerances cannot be negative"))
 

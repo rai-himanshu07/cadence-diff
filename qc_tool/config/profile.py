@@ -92,10 +92,16 @@ class NumericBoundsControl(RangeControl):
     maximum: float | None = None
 
 
+class TieOutTerm(BaseModel):
+    reference: str
+    operation: Literal["add", "subtract"] = "add"
+
+
 class TieOutControl(BaseModel):
     name: str
     target: str
-    components: list[str]
+    components: list[str] = Field(default_factory=list)
+    terms: list[TieOutTerm] = Field(default_factory=list)
     absolute_tolerance: float = 0.0
     relative_tolerance: float = 0.0
 

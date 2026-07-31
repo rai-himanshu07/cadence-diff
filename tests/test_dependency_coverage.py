@@ -18,7 +18,11 @@ from qc_tool.config.profile import (
 from qc_tool.coverage import CoverageState
 from qc_tool.crosscheck.trace import annotate_ppt_chart_impacts
 from qc_tool.engine import run_qc
-from qc_tool.excel.charts import annotate_chart_impacts, diff_charts
+from qc_tool.excel.charts import (
+    annotate_chart_impacts,
+    chart_reference_coverage,
+    diff_charts,
+)
 from qc_tool.excel.dependency import (
     annotate_impacts,
     build_dependency_graph,
@@ -33,6 +37,7 @@ from qc_tool.io.model import (
     ChartDescriptor,
     ChartPlot,
     ChartSeries,
+    FormulaRangeDescriptor,
     SheetSnapshot,
     WorkbookSnapshot,
 )
@@ -228,6 +233,121 @@ def test_parse_error_degrades_dependency_coverage() -> None:
     assert graph.coverage_state is CoverageState.DEGRADED
     assert graph.parse_errors
     assert "unparseable" in graph.coverage_detail
+
+
+def test_spill_and_anchorarray_resolve_only_with_declared_extent() -> None:
+    workbook = _sheet(max_row=10, max_column=5)
+    workbook.formula_ranges.append(
+        FormulaRangeDescriptor(
+            sheet="Data",
+            anchor_row=2,
+            anchor_column=2,
+            cell_range="B2:B5",
+            formula_type="array",
+            always_calculate=True,
+        )
+    )
+
+    spill = resolve_reference(workbook, "B2#", host_sheet="Data")
+    wrapper = resolve_reference(
+        workbook,
+        "_xlfn.ANCHORARRAY(B2)",
+        host_sheet="Data",
+    )
+
+    assert spill.status is wrapper.status is ReferenceStatus.RESOLVED
+    assert spill.ranges == wrapper.ranges
+    assert spill.ranges[0].min_row == 2 and spill.ranges[0].max_row == 5
+
+    workbook.formula_ranges.clear()
+    unsupported = resolve_reference(workbook, "B2#", host_sheet="Data")
+    assert unsupported.status is ReferenceStatus.UNSUPPORTED
+    assert "spill extent" in unsupported.detail
+
+
+def test_implicit_intersection_is_bounded_by_host_context() -> None:
+    workbook = _sheet(max_row=10, max_column=5)
+
+    direct = resolve_reference(workbook, "@A1", host_sheet="Data", host_cell=(5, 5))
+    vertical = resolve_reference(
+        workbook,
+        "@A1:A5",
+        host_sheet="Data",
+        host_cell=(3, 4),
+    )
+    ambiguous = resolve_reference(
+        workbook,
+        "@A1:B5",
+        host_sheet="Data",
+        host_cell=(3, 1),
+    )
+
+    assert direct.status is ReferenceStatus.RESOLVED and direct.size == 1
+    assert vertical.status is ReferenceStatus.RESOLVED
+    assert (vertical.ranges[0].min_row, vertical.ranges[0].min_col) == (3, 1)
+    assert ambiguous.status is ReferenceStatus.UNSUPPORTED
+
+
+def test_spill_dependency_expands_declared_range_without_parse_degradation() -> None:
+    workbook = _sheet(
+        max_row=10,
+        max_column=5,
+        cells={(1, 4): CellRecord(1, 4, None, formula="=SUM(B2#)")},
+    )
+    workbook.formula_ranges.append(
+        FormulaRangeDescriptor(
+            sheet="Data",
+            anchor_row=2,
+            anchor_column=2,
+            cell_range="B2:B5",
+            formula_type="array",
+        )
+    )
+
+    graph = build_dependency_graph(workbook)
+
+    assert dependents_of(graph, "Data", "B4") == ["Data!D1"]
+    assert graph.coverage_state is CoverageState.CHECKED
+    assert graph.parse_errors == []
+
+
+def test_unproven_spill_dependency_is_unsupported_not_unparseable() -> None:
+    workbook = _sheet(
+        cells={(1, 4): CellRecord(1, 4, None, formula="=SUM(B2#)")},
+    )
+
+    graph = build_dependency_graph(workbook)
+
+    assert graph.coverage_state is CoverageState.DEGRADED
+    assert len(graph.unsupported_references) == 1
+    assert graph.parse_errors == []
+
+    result = preflight_workbook(workbook, default_profile())
+    coverage = next(
+        item for item in result.coverage if item.check_id == "excel-dependencies"
+    )
+    assert coverage.state is CoverageState.DEGRADED
+    assert "unsupported" in coverage.detail
+
+
+def test_chart_spill_source_uses_the_shared_declared_extent() -> None:
+    workbook = _chart_workbook()
+    workbook.charts[0].series[0].values_ref = "Data!$B$2#"
+    workbook.sheets[0].max_row = 10
+    workbook.formula_ranges.append(
+        FormulaRangeDescriptor(
+            sheet="Data",
+            anchor_row=2,
+            anchor_column=2,
+            cell_range="B2:B5",
+            formula_type="array",
+        )
+    )
+
+    state, detail = chart_reference_coverage(workbook)
+
+    assert state is CoverageState.CHECKED
+    assert "validated" in detail
 
 
 def _chart_workbook() -> WorkbookSnapshot:

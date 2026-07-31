@@ -34,6 +34,8 @@ def test_record_and_list_runs(
     assert newest.files["current_excel"] == "current.xlsx"
     assert newest.file_hashes == hashes
     assert newest.counts["critical"] > 0
+    assert newest.review_counts["critical"] > 0
+    assert newest.review_counts["critical"] <= newest.counts["critical"]
     assert newest.started_at.tzinfo is not None  # timezone-aware UTC
     assert newest.findings == []  # listing stays lightweight
 
@@ -117,6 +119,7 @@ def test_legacy_run_rehydrates_after_optional_contract_expansion(tmp_path: Path)
 
     assert record.mode.value == "cycle_comparison"
     assert record.coverage == []
+    assert record.review_counts == {}
     assert len(record.findings) == 1
     finding = record.findings[0]
     assert finding.message == "legacy finding"
@@ -152,6 +155,27 @@ def test_annotations_persist_and_apply(qc_result: QCRunResult, tmp_path: Path) -
     assert noted.analyst_comment == "checked, fine"
 
 
+def test_bulk_annotations_commit_as_one_group_decision(
+    qc_result: QCRunResult, tmp_path: Path
+) -> None:
+    history = RunHistory(tmp_path / "history.sqlite3")
+    run_id = history.record_run(qc_result, file_hashes={}, report_paths={})
+    targets = [finding.finding_id for finding in qc_result.findings[:3]]
+
+    history.set_annotations_bulk(
+        run_id,
+        [(target, "expected", "reviewed as one range") for target in targets],
+    )
+
+    record = history.get_run(run_id)
+    reviewed = [finding for finding in record.findings if finding.finding_id in targets]
+    assert len(reviewed) == 3
+    assert all(finding.severity is not None for finding in reviewed)
+    assert all(finding.severity.value == "expected" for finding in reviewed if finding.severity)
+    assert all(finding.severity_overridden for finding in reviewed)
+    assert all(finding.analyst_comment == "reviewed as one range" for finding in reviewed)
+
+
 def test_annotations_flow_into_reports(qc_result: QCRunResult, tmp_path: Path) -> None:
     from openpyxl import load_workbook
 
@@ -173,5 +197,6 @@ def test_annotations_flow_into_reports(qc_result: QCRunResult, tmp_path: Path) -
     assert sheet["L2"].value == "reviewed & accepted"
 
     html = render_html_report(result)
-    assert "reviewed &amp; accepted" in html
-    assert "info *" in html
+    assert r'"comment": "reviewed \u0026 accepted"' in html
+    assert '"overridden": true' in html
+    assert "member.severity + (member.overridden ? ' *' : '')" in html

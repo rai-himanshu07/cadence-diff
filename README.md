@@ -19,6 +19,13 @@ Findings support analyst severity overrides and comments; exports
 (annotated Excel workbook, self-contained HTML) regenerate from the
 reviewed state.
 
+Analyst-facing views collapse compatible, edge-adjacent Excel cell findings
+into deterministic **review groups**. Review-item counts answer how many
+decisions remain; affected-finding counts preserve the complete cell-level
+evidence. Open a group for paged atomic detail or switch to Individual findings.
+JSON, attestations, Re-QC identity, coverage counts, and CI failure thresholds
+remain atomic and backward-compatible.
+
 The structural engine models Excel tables and structured references, mixed
 cadence bands, every plot and named series in combo charts, chart axes/legends/
 labels/geometry, data validation, conditional formatting, bounded and symbolic
@@ -27,6 +34,12 @@ uses collision-safe shape identities, semantic table/chart/plot/series matching,
 separate speaker notes, and visible chart-label anchors for Excel reconciliation.
 Unsupported representations degrade the relevant check instead of becoming a
 false pass.
+
+Modern Excel spill references (`B2#` / `ANCHORARRAY`) use only declared
+array-formula extents from the OOXML anchor. Implicit intersection (`@`) is
+resolved only when the host cell makes one result unambiguous. Missing or
+unprovable spill metadata degrades the affected reference coverage rather than
+guessing; XLSB spill extents remain degraded even when formula text is enriched.
 
 OOXML loading streams worksheet content, verifies physical cells independently
 of declared dimensions, and reports workload evidence from uncompressed XML,
@@ -60,6 +73,7 @@ cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \
                  --profile monthly --json findings.json --progress
 cadence-diff run --current-excel this.xlsx            # preflight (inferred)
 cadence-diff run --current-excel x.xlsx --current-ppt d.pptx   # package QC
+cadence-diff run --current-excel this.xlsx --individual-findings # raw CLI rows
 
 # Only after reviewing workload refusal and confirming sufficient local memory
 cadence-diff run --current-excel unusually-large.xlsx \
@@ -95,6 +109,11 @@ history the web UI shows. `--progress` writes phase updates to stderr, leaving
 normal stdout and JSON files unchanged. The web UI shows the same phases and a
 Cancel control; cancellation stops at the next safe boundary, removes partial
 reports, and does not record a successful run.
+
+Profiles can define legacy additive tie-outs with `components`, or mutually
+exclusive signed `terms` using `operation: add|subtract`. Targets and terms may
+use bounded A1, workbook named, or supported structured references. Profile
+text is never executed as Python or a free-form expression language.
 
 JSON exports omit raw cell neighborhoods and mapping-candidate values by
 default. `--json-context` includes them for private diagnostics and must not be

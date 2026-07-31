@@ -23,6 +23,39 @@ GUIDE_SECTIONS = (
     ("signoff", "Before sign-off"),
 )
 
+PROFILE_CONTROLS_EXAMPLE = "\n".join(
+    (
+        "name: monthly-pack",
+        "excel:",
+        "  controls:",
+        "    required_ranges:",
+        "      - name: Current KPIs",
+        "        sheet: Dashboard",
+        "        range: B2:B8",
+        "    numeric_bounds:",
+        "      - name: Margin bounds",
+        "        sheet: Dashboard",
+        "        range: B4",
+        "        minimum: 0",
+        "        maximum: 1",
+        "    tie_outs:",
+        "      - name: Regional revenue total",
+        "        target: Dashboard!B2",
+        "        components: [Data!C2:C5]",
+        "        absolute_tolerance: 1",
+        "      - name: Net contribution",
+        "        target: NetContribution",
+        "        terms:",
+        "          - reference: RevenueData[Revenue]",
+        "            operation: add",
+        "          - reference: RevenueData[Cost]",
+        "            operation: subtract",
+        "ppt:",
+        "  required_slides: [Executive Summary, Revenue Trend]",
+        "",
+    )
+)
+
 
 @contextmanager
 def _guide_section(anchor: str, title: str) -> Iterator[None]:
@@ -172,34 +205,12 @@ def render_guide() -> None:
                         ["Required ranges", "Require current cells to be populated"],
                         ["Unique ranges", "Detect duplicate business-key tuples"],
                         ["Numeric bounds", "Enforce valid ranges such as 0 to 1 for margins"],
-                        ["Tie-outs", "Compare one target cell to sums of component ranges"],
+                        ["Tie-outs", "Compare one target to additive components or signed named/table terms"],
                         ["Required slides / draft tokens", "Enforce final-deck completeness"],
                         ["Waivers", "Retain approved evidence as Expected until an expiry date"],
                     ],
                 )
-                _code(
-                    """name: monthly-pack
-excel:
-  controls:
-    required_ranges:
-      - name: Current KPIs
-        sheet: Dashboard
-        range: B2:B8
-    numeric_bounds:
-      - name: Margin bounds
-        sheet: Dashboard
-        range: B4
-        minimum: 0
-        maximum: 1
-    tie_outs:
-      - name: Regional revenue total
-        target: Dashboard!B2
-        components: [Data!C2:C5]
-        absolute_tolerance: 1
-ppt:
-  required_slides: [Executive Summary, Revenue Trend]
-"""
-                )
+                _code(PROFILE_CONTROLS_EXAMPLE)
                 _callout(
                     "Availability controls blankness only",
                     "Ignore ranges win first. Availability decides whether a blank is "
@@ -253,7 +264,9 @@ ppt:
                     "Tables, structured references, combo charts, interaction rules, "
                     "dependencies, availability, and speaker notes have explicit coverage. "
                     "Symbolic aggregate dependencies remain checked when membership and "
-                    "transitive impacts are complete; unsupported formulas, chart parts, "
+                    "transitive impacts are complete. Proven XLSX/XLSM spill references and "
+                    "unambiguous implicit intersections are resolved; missing spill extents, "
+                    "including XLSB extents, degrade reference coverage. Unsupported formulas, chart parts, "
                     "rule families, or theme styles are disclosed separately."
                 )
 
@@ -261,11 +274,15 @@ ppt:
                 _list(
                     [
                         "Filter by severity, but inspect the coverage table first.",
-                        "Expand a finding to see baseline/current values, element details, impacts, and nearby cells.",
+                        "Review-item counts are analyst decisions; affected-finding counts are the underlying atomic evidence.",
+                        "Review groups are the default. Open a group for paged atomic members, or switch to Individual findings.",
+                        "Use Unreviewed only to preserve prior member decisions; Replace all is an explicit bulk override.",
+                        "Expand an individual finding to see baseline/current values, element details, impacts, and nearby cells.",
                         "A shared <strong>root cause</strong> key groups multiple truthful symptoms at one location.",
                         "Use the severity selector only for an analyst disposition; it does not rewrite engine logic.",
                         "Add a comment explaining evidence, approval, source, or required follow-up.",
                         "Exports are regenerated from the reviewed state so comments and overrides are included.",
+                        "Excel and HTML exports lead with review groups while retaining every atomic finding; Excel links stay inside the report workbook.",
                     ]
                 )
                 _callout(
@@ -424,7 +441,7 @@ qc-tool network local --data-dir data"""
                         ],
                         [
                             "Dependency coverage degraded",
-                            "Review unsupported, invalid, or unparseable reference counts. Symbolic "
+                            "Review unsupported, invalid, or unparseable reference counts. A dynamic spill with no declared extent is unsupported, not guessed. Symbolic "
                             "aggregate references remain queryable and are disclosed separately.",
                         ],
                         ["Re-QC file not found", "Select the renamed or replacement artifact again"],

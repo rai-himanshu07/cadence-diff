@@ -102,6 +102,18 @@ class NamedRange:
     target: str
 
 
+@dataclass(frozen=True, slots=True)
+class FormulaRangeDescriptor:
+    """Authoritative range declared by one anchor formula element."""
+
+    sheet: str
+    anchor_row: int
+    anchor_column: int
+    cell_range: str
+    formula_type: str
+    always_calculate: bool | None = None
+
+
 @dataclass(slots=True)
 class ChartSeries:
     index: int
@@ -332,6 +344,7 @@ class WorkbookSnapshot:
     conditional_format_style_detail: str = ""
     sheets: list[SheetSnapshot] = field(default_factory=list)
     named_ranges: list[NamedRange] = field(default_factory=list)
+    formula_ranges: list[FormulaRangeDescriptor] = field(default_factory=list)
     charts: list[ChartDescriptor] = field(default_factory=list)
     pivots: list[PivotDescriptor] = field(default_factory=list)
     tables: list[TableDescriptor] = field(default_factory=list)

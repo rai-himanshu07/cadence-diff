@@ -25,6 +25,15 @@ from tests.fixtures.manifest_schema import FixtureManifest
         ("=SUM(Long_Monthly!C2:C25)", 2, 2, "=SUM(Long_Monthly!RC[1]:R[23]C[1])"),
         ("=B4/B2", 6, 2, "=R[-2]C/R[-4]C"),
         ("=SUM(RevenueData)", 3, 3, "=SUM(RevenueData)"),  # named range untouched
+        ("=B2#", 5, 5, "=_xlfn.ANCHORARRAY(R[-3]C[-3])"),
+        (
+            "=_xlfn.ANCHORARRAY(B2)",
+            5,
+            5,
+            "=_xlfn.ANCHORARRAY(R[-3]C[-3])",
+        ),
+        ("=@A1", 5, 5, "=_xlfn.SINGLE(R[-4]C[-4])"),
+        ('="B2# and @A1"', 5, 5, '="B2# and @A1"'),
     ],
 )
 def test_to_r1c1(formula: str, row: int, col: int, expected: str) -> None:

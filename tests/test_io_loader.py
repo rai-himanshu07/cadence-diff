@@ -463,6 +463,76 @@ def test_xlsx_snapshot_preserves_shared_formulas_and_cached_values(
     ]
 
 
+def test_xlsx_snapshot_preserves_array_formula_text_and_declared_range(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "array-formula.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet["A1"] = 1
+    sheet["A2"] = 2
+    sheet["B1"] = "=SUM(A1:A2)"
+    workbook.save(path)
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    formula = next(element for element in root.iter() if element.tag.endswith("}f"))
+    formula.set("t", "array")
+    formula.set("ref", "B1:B2")
+    formula.set("aca", "1")
+    _rewrite_package(
+        path,
+        {
+            "xl/worksheets/sheet1.xml": ElementTree.tostring(
+                root,
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+        },
+    )
+
+    oracle = _oracle_snapshot(path)
+    streaming = _streaming_snapshot(path)
+
+    assert streaming == oracle
+    anchor = streaming.sheets[0].cell("B1")
+    assert anchor is not None and anchor.formula == "=SUM(A1:A2)"
+    assert len(streaming.formula_ranges) == 1
+    descriptor = streaming.formula_ranges[0]
+    assert descriptor.sheet == "Sheet"
+    assert (descriptor.anchor_row, descriptor.anchor_column) == (1, 2)
+    assert descriptor.cell_range == "B1:B2"
+    assert descriptor.formula_type == "array"
+    assert descriptor.always_calculate is True
+
+
+def test_xlsx_snapshot_rejects_formula_range_with_wrong_anchor(tmp_path: Path) -> None:
+    path = tmp_path / "bad-array-anchor.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet["B2"] = "=SUM(A1:A2)"
+    workbook.save(path)
+    with zipfile.ZipFile(path) as archive:
+        root = ElementTree.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    formula = next(element for element in root.iter() if element.tag.endswith("}f"))
+    formula.set("t", "array")
+    formula.set("ref", "A1:B2")
+    _rewrite_package(
+        path,
+        {
+            "xl/worksheets/sheet1.xml": ElementTree.tostring(
+                root,
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+        },
+    )
+
+    with pytest.raises(OOXMLMetadataError, match="not the top-left"):
+        load_workbook_snapshot(path)
+
+
 def test_xlsx_snapshot_preserves_typed_formula_cached_values(tmp_path: Path) -> None:
     path = tmp_path / "typed-formula-cache.xlsx"
     workbook = Workbook()

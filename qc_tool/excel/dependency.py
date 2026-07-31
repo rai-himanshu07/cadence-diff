@@ -13,10 +13,10 @@ import re
 from dataclasses import dataclass
 
 import networkx as nx
-from openpyxl.formula import Tokenizer
 from openpyxl.utils import get_column_letter
 
 from qc_tool.coverage import CoverageState
+from qc_tool.excel.formula_tokens import formula_reference_operands
 from qc_tool.excel.references import ReferenceStatus, ResolvedRange, resolve_reference
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import WorkbookSnapshot
@@ -135,7 +135,7 @@ def build_dependency_graph(
                 continue
             dependent: Node = (sheet.name, row, col)
             try:
-                tokens = Tokenizer(cell.formula).items
+                references = formula_reference_operands(cell.formula)
             except Exception:  # malformed formulas must not kill a run
                 detail = f"{_display(dependent)}: {cell.formula}"
                 if detail not in graph.parse_errors:
@@ -144,10 +144,8 @@ def build_dependency_graph(
                     "unparseable formula at %s: %r", _display(dependent), cell.formula
                 )
                 continue
-            for token in tokens:
-                if token.type != "OPERAND" or token.subtype != "RANGE":
-                    continue
-                value = token.value
+            for reference in references:
+                value = reference.value
                 resolution = resolve_reference(
                     workbook,
                     value,

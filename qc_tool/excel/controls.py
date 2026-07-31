@@ -7,6 +7,7 @@ from openpyxl.utils.cell import range_boundaries
 
 from qc_tool.config.profile import ExcelControls
 from qc_tool.coverage import CoverageItem, CoverageState
+from qc_tool.excel.references import ReferenceResolution, ReferenceStatus, resolve_reference
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import (
     CellRecord,
@@ -55,35 +56,39 @@ def _is_blank(cell: CellRecord | None) -> bool:
     )
 
 
-def _qualified_range(
-    workbook: WorkbookSnapshot, reference: str
-) -> tuple[SheetSnapshot, tuple[int, int, int, int]] | None:
-    sheet_name, separator, cell_range = reference.rpartition("!")
-    if not separator:
-        return None
-    return _resolve_range(workbook, sheet_name.strip("'").replace("''", "'"), cell_range)
-
-
-def _reference_sheet(reference: str) -> str | None:
-    sheet_name, separator, _cell_range = reference.rpartition("!")
-    if not separator:
-        return None
-    return sheet_name.strip("'").replace("''", "'")
-
-
 def _numeric_values(
-    resolved: tuple[SheetSnapshot, tuple[int, int, int, int]]
+    workbook: WorkbookSnapshot,
+    resolution: ReferenceResolution,
 ) -> list[float] | None:
-    sheet, (min_col, min_row, max_col, max_row) = resolved
     values: list[float] = []
-    for row in range(min_row, max_row + 1):
-        for col in range(min_col, max_col + 1):
-            cell = sheet.cells.get((row, col))
-            value = None if cell is None else cell.value
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                return None
-            values.append(float(value))
+    for resolved in resolution.ranges:
+        sheet = workbook.sheet(resolved.sheet)
+        for row in range(resolved.min_row, resolved.max_row + 1):
+            for col in range(resolved.min_col, resolved.max_col + 1):
+                cell = sheet.cells.get((row, col))
+                value = None if cell is None else cell.value
+                if isinstance(value, bool) or not isinstance(value, int | float):
+                    return None
+                values.append(float(value))
     return values
+
+
+def _resolve_control_reference(
+    workbook: WorkbookSnapshot,
+    reference: str,
+) -> ReferenceResolution:
+    sheet_name, separator, _target = reference.rpartition("!")
+    host_sheet = (
+        sheet_name.strip("'").replace("''", "'")
+        if separator
+        else (workbook.sheets[0].name if workbook.sheets else "")
+    )
+    return resolve_reference(
+        workbook,
+        reference,
+        host_sheet=host_sheet,
+        require_within_sheet=True,
+    )
 
 
 def evaluate_controls(
@@ -103,17 +108,10 @@ def evaluate_controls(
     numeric_bounds = [
         control for control in controls.numeric_bounds if control.sheet not in ignored
     ]
-    tie_outs = [
-        control
-        for control in controls.tie_outs
-        if _reference_sheet(control.target) not in ignored
-        and all(_reference_sheet(component) not in ignored for component in control.components)
-    ]
     configured = (
         len(required_ranges)
         + len(unique_ranges)
         + len(numeric_bounds)
-        + len(tie_outs)
     )
 
     for control in required_ranges:
@@ -212,25 +210,55 @@ def evaluate_controls(
                     )
                 )
 
-    for control in tie_outs:
-        target_range = _qualified_range(workbook, control.target)
-        component_ranges = [
-            _qualified_range(workbook, component) for component in control.components
-        ]
-        if target_range is None or any(item is None for item in component_ranges):
+    for control in controls.tie_outs:
+        uses_components = bool(control.components)
+        uses_terms = bool(control.terms)
+        if uses_components == uses_terms:
+            configured += 1
             result.findings.append(_control_invalid(control.name, control.target))
             continue
-        target_values = _numeric_values(target_range)
-        component_values = [
-            _numeric_values(item) for item in component_ranges if item is not None
+        terms = (
+            [(component, 1.0) for component in control.components]
+            if uses_components
+            else [
+                (term.reference, 1.0 if term.operation == "add" else -1.0)
+                for term in control.terms
+            ]
+        )
+        target_resolution = _resolve_control_reference(workbook, control.target)
+        term_resolutions = [
+            (_resolve_control_reference(workbook, reference), sign)
+            for reference, sign in terms
+        ]
+        resolutions = [target_resolution, *[item for item, _sign in term_resolutions]]
+        if any(item.status is not ReferenceStatus.RESOLVED for item in resolutions):
+            configured += 1
+            result.findings.append(_control_invalid(control.name, control.target))
+            continue
+        if any(
+            resolved.sheet in ignored
+            for resolution in resolutions
+            for resolved in resolution.ranges
+        ):
+            continue
+        configured += 1
+        target_values = _numeric_values(workbook, target_resolution)
+        term_values = [
+            (_numeric_values(workbook, resolution), sign)
+            for resolution, sign in term_resolutions
         ]
         if target_values is None or len(target_values) != 1 or any(
-            values is None for values in component_values
+            values is None for values, _sign in term_values
         ):
             result.findings.append(_control_invalid(control.name, control.target))
             continue
         target = target_values[0]
-        expected = sum(value for values in component_values if values for value in values)
+        expected = sum(
+            sign * value
+            for values, sign in term_values
+            if values is not None
+            for value in values
+        )
         delta = abs(target - expected)
         within_absolute = delta <= control.absolute_tolerance
         within_relative = (
@@ -238,13 +266,14 @@ def evaluate_controls(
         )
         if within_absolute or within_relative:
             continue
-        sheet_name, _, location = control.target.rpartition("!")
+        target_cell = target_resolution.ranges[0]
+        location = _cell_ref(target_cell.min_row, target_cell.min_col)
         result.findings.append(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.TIE_OUT_MISMATCH,
-                sheet=sheet_name.strip("'"),
-                location=location.replace("$", ""),
+                sheet=target_cell.sheet,
+                location=location,
                 element=control.name,
                 baseline_value=str(expected),
                 current_value=str(target),

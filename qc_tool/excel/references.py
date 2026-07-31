@@ -8,6 +8,7 @@ from enum import StrEnum
 
 from openpyxl.utils.cell import range_boundaries
 
+from qc_tool.excel.formula_tokens import parse_dynamic_reference
 from qc_tool.io.model import TableDescriptor, WorkbookSnapshot
 
 
@@ -326,6 +327,117 @@ def _resolve_reference(
     normalized_target = target.strip()
     if not normalized_target or "#REF!" in normalized_target.upper():
         return _failure(ReferenceStatus.INVALID, "empty or broken reference")
+    dynamic = parse_dynamic_reference(normalized_target)
+    if dynamic is not None:
+        kind, inner = dynamic
+        resolved = _resolve_reference(
+            workbook,
+            inner,
+            host_sheet=host_sheet,
+            host_cell=host_cell,
+            require_within_sheet=require_within_sheet,
+            seen_names=seen_names,
+        )
+        if resolved.status is not ReferenceStatus.RESOLVED:
+            return resolved
+        if len(resolved.ranges) != 1:
+            return _failure(
+                ReferenceStatus.UNSUPPORTED,
+                f"{kind} reference resolves to multiple ranges",
+            )
+        source = resolved.ranges[0]
+        if kind == "spill":
+            if source.size != 1:
+                return _failure(
+                    ReferenceStatus.UNSUPPORTED,
+                    "spill anchor must resolve to one cell",
+                )
+            matches = [
+                descriptor
+                for descriptor in workbook.formula_ranges
+                if descriptor.sheet == source.sheet
+                and descriptor.anchor_row == source.min_row
+                and descriptor.anchor_column == source.min_col
+                and descriptor.formula_type.casefold() == "array"
+            ]
+            if len(matches) != 1:
+                return _failure(
+                    ReferenceStatus.UNSUPPORTED,
+                    "dynamic-array spill extent is unavailable",
+                )
+            descriptor = matches[0]
+            try:
+                min_col, min_row, max_col, max_row = range_boundaries(
+                    descriptor.cell_range
+                )
+            except ValueError:
+                return _failure(
+                    ReferenceStatus.INVALID,
+                    "declared spill extent is malformed",
+                )
+            if (
+                min_col is None
+                or min_row is None
+                or max_col is None
+                or max_row is None
+            ):
+                return _failure(
+                    ReferenceStatus.INVALID,
+                    "declared spill extent is unbounded",
+                )
+            return ReferenceResolution(
+                status=ReferenceStatus.RESOLVED,
+                ranges=(
+                    ResolvedRange(
+                        sheet=descriptor.sheet,
+                        min_row=min_row,
+                        min_col=min_col,
+                        max_row=max_row,
+                        max_col=max_col,
+                    ),
+                ),
+                detail="dynamic-array spill extent declared by the anchor formula",
+            )
+        if source.size == 1:
+            return resolved
+        if host_cell is None:
+            return _failure(
+                ReferenceStatus.UNSUPPORTED,
+                "implicit intersection requires a host cell",
+            )
+        host_row, host_column = host_cell
+        if source.min_col == source.max_col and source.min_row <= host_row <= source.max_row:
+            return ReferenceResolution(
+                status=ReferenceStatus.RESOLVED,
+                ranges=(
+                    ResolvedRange(
+                        source.sheet,
+                        host_row,
+                        source.min_col,
+                        host_row,
+                        source.max_col,
+                    ),
+                ),
+                detail="implicit intersection projected by host row",
+            )
+        if source.min_row == source.max_row and source.min_col <= host_column <= source.max_col:
+            return ReferenceResolution(
+                status=ReferenceStatus.RESOLVED,
+                ranges=(
+                    ResolvedRange(
+                        source.sheet,
+                        source.min_row,
+                        host_column,
+                        source.max_row,
+                        host_column,
+                    ),
+                ),
+                detail="implicit intersection projected by host column",
+            )
+        return _failure(
+            ReferenceStatus.UNSUPPORTED,
+            "implicit intersection is ambiguous for this range and host cell",
+        )
     if normalized_target.startswith("[") and "!" in normalized_target:
         return _failure(
             ReferenceStatus.UNSUPPORTED,

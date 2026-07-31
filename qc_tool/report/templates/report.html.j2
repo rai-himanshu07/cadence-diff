@@ -13,6 +13,7 @@
   .cards { display: flex; gap: 0.75rem; margin: 1rem 0; flex-wrap: wrap; }
   .card { border-radius: 8px; padding: 0.6rem 1.1rem; color: #fff; min-width: 7rem; }
   .card .n { font-size: 1.4rem; font-weight: 700; display: block; }
+  .card .affected { display: block; font-size: 0.7rem; margin-top: 0.15rem; }
   .critical { background: #c00000; } .warning { background: #ed7d31; }
   .info { background: #2e75b6; } .expected { background: #548235; }
   .filters { margin: 0.5rem 0 1rem; font-size: 0.9rem; }
@@ -27,6 +28,13 @@
   td.mono { font-family: ui-monospace, monospace; }
   .impacts { color: #555; font-size: 0.78rem; }
   .coverage { margin: 1rem 0 1.25rem; }
+  details > summary { cursor: pointer; color: #2e5f96; }
+  .member-table { margin-top: 0.5rem; }
+  .range-list { white-space: pre-wrap; }
+  .member-pages { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.45rem; }
+  .member-pages button { border: 1px solid #bbb; background: #fff; padding: 0.2rem 0.55rem;
+    border-radius: 3px; cursor: pointer; }
+  .member-pages button:disabled { color: #999; cursor: default; }
 </style>
 </head>
 <body>
@@ -62,55 +70,116 @@
 <div class="note">{{ disclosure }}</div>
 {% endfor %}
 <div class="cards">
-  {% for severity, count in counts.items() %}
-  <div class="card {{ severity.value }}"><span class="n">{{ count }}</span>{{ severity.value }}</div>
+  {% for severity, count in counts.review_items.items() %}
+  <div class="card {{ severity.value }}"><span class="n">{{ count }}</span>
+    {{ severity.value }} review items
+    <span class="affected">{{ counts.atomic_findings[severity] }} affected findings</span>
+  </div>
   {% endfor %}
 </div>
 <div class="filters">
   Show:
-  {% for severity in counts %}
+  {% for severity in counts.review_items %}
   <label><input type="checkbox" data-sev="{{ severity.value }}"
     {% if severity.value != 'expected' %}checked{% endif %}> {{ severity.value }}</label>
   {% endfor %}
 </div>
 <table id="findings">
   <thead><tr>
-    <th>ID</th><th>Severity</th><th>Artifact</th><th>Class</th><th>Sheet / Slide</th>
-    <th>Location</th><th>Element</th><th>Baseline</th><th>Current</th><th>Message</th>
-    <th>Analyst comment</th><th>Root cause</th><th>Waiver</th>
+    <th>Group</th><th>Severity</th><th>Class</th><th>Sheet / Slide</th>
+    <th>Affected range</th><th>Findings</th><th>Review item</th>
   </tr></thead>
-  <tbody>
-  {% for finding in result.findings %}
-  <tr class="{{ finding.severity.value }}">
-    <td class="mono">{{ finding.finding_id }}</td>
-    <td class="sev">{{ finding.severity.value }}{% if finding.severity_overridden %} *{% endif %}</td>
-    <td>{{ finding.artifact }}</td>
-    <td class="mono">{{ finding.finding_class.value }}</td>
-    <td>{{ finding.sheet or finding.slide or "" }}</td>
-    <td class="mono">{{ finding.location or finding.baseline_location or "" }}</td>
-    <td>{{ finding.element or "" }}</td>
-    <td class="mono">{{ finding.baseline_value or "" }}</td>
-    <td class="mono">{{ finding.current_value or "" }}</td>
-    <td>{{ finding.message }}
-      {% if finding.impacts %}<div class="impacts">impacts: {{ finding.impacts | join("; ") }}</div>{% endif %}
-    </td>
-    <td>{{ finding.analyst_comment }}</td>
-    <td class="mono">{{ finding.root_cause_key }}</td>
-    <td>{% if finding.waiver_reason %}{{ finding.waiver_reason }}
-      (expires {{ finding.waiver_expires }}){% endif %}</td>
-  </tr>
-  {% endfor %}
+  {% for group in groups %}
+  <tbody class="review-item" data-sev="{{ group.severity.value }}">
+    <tr class="{{ group.severity.value }} review-group">
+      <td class="mono">{{ group.group_id }}</td>
+      <td class="sev">{{ group.severity.value }}</td>
+      <td class="mono">{{ group.finding_class.value }}</td>
+      <td>{{ group.sheet or group.slide or "" }}</td>
+      <td class="mono range-list">{{ group.ranges | join("; ") or group.bounding_range }}</td>
+      <td>{{ group.member_count }}</td>
+      <td>{% if group.member_count == 1 %}{{ group.members[0].message }}{% else %}
+        {{ group.member_count }} contiguous {{ group.finding_class.value | replace("_", " ") }} findings
+        {% endif %}</td>
+    </tr>
+    <tr><td colspan="7">
+      <details><summary>View {{ group.member_count }} atomic finding{% if group.member_count != 1 %}s{% endif %}</summary>
+        <table class="member-table">
+          <thead><tr><th>ID</th><th>Severity</th><th>Location</th><th>Element</th>
+            <th>Baseline</th><th>Current</th><th>Message</th><th>Analyst comment</th>
+            <th>Root cause</th><th>Waiver</th></tr></thead>
+          <tbody data-member-body="{{ group.group_id }}"></tbody>
+        </table>
+        <div class="member-pages" data-member-controls="{{ group.group_id }}">
+          <button type="button" data-member-previous>Previous</button>
+          <span data-member-label></span>
+          <button type="button" data-member-next>Next</button>
+        </div>
+        <script type="application/json" data-members="{{ group.group_id }}">{{ member_payload[group.group_id] | tojson }}</script>
+      </details>
+    </td></tr>
   </tbody>
+  {% endfor %}
 </table>
 <script>
   const boxes = document.querySelectorAll('.filters input');
   function apply() {
     const visible = new Set([...boxes].filter(b => b.checked).map(b => b.dataset.sev));
-    document.querySelectorAll('#findings tbody tr').forEach(row => {
-      row.style.display = visible.has(row.className) ? '' : 'none';
+    document.querySelectorAll('#findings tbody.review-item').forEach(group => {
+      group.style.display = visible.has(group.dataset.sev) ? '' : 'none';
     });
   }
   boxes.forEach(box => box.addEventListener('change', apply));
+  const pageSize = 50;
+  function textCell(row, value, className = '') {
+    const cell = document.createElement('td');
+    cell.textContent = value || '';
+    if (className) cell.className = className;
+    row.appendChild(cell);
+    return cell;
+  }
+  document.querySelectorAll('details').forEach(details => {
+    let pageIndex = 0;
+    let members = null;
+    const groupId = details.querySelector('[data-member-body]').dataset.memberBody;
+    const body = details.querySelector('[data-member-body]');
+    const controls = details.querySelector(`[data-member-controls="${groupId}"]`);
+    const previous = controls.querySelector('[data-member-previous]');
+    const next = controls.querySelector('[data-member-next]');
+    const label = controls.querySelector('[data-member-label]');
+    function renderPage() {
+      if (!members) members = JSON.parse(details.querySelector('[data-members]').textContent);
+      const start = pageIndex * pageSize;
+      const end = Math.min(start + pageSize, members.length);
+      body.replaceChildren();
+      members.slice(start, end).forEach(member => {
+        const row = document.createElement('tr');
+        textCell(row, member.finding_id, 'mono');
+        textCell(row, member.severity + (member.overridden ? ' *' : ''));
+        textCell(row, member.location, 'mono');
+        textCell(row, member.element);
+        textCell(row, member.baseline, 'mono');
+        textCell(row, member.current, 'mono');
+        const message = textCell(row, member.message);
+        if (member.impacts) {
+          const impacts = document.createElement('div');
+          impacts.className = 'impacts';
+          impacts.textContent = `impacts: ${member.impacts}`;
+          message.appendChild(impacts);
+        }
+        textCell(row, member.comment);
+        textCell(row, member.root, 'mono');
+        textCell(row, member.waiver);
+        body.appendChild(row);
+      });
+      label.textContent = `${start + 1}-${end} of ${members.length}`;
+      previous.disabled = pageIndex === 0;
+      next.disabled = end >= members.length;
+    }
+    details.addEventListener('toggle', () => { if (details.open) renderPage(); });
+    previous.addEventListener('click', () => { pageIndex -= 1; renderPage(); });
+    next.addEventListener('click', () => { pageIndex += 1; renderPage(); });
+  });
   apply();
 </script>
 </body>

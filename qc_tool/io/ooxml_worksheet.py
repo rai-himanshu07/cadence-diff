@@ -12,7 +12,7 @@ from xml.etree import ElementTree
 from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
-from qc_tool.io.model import TableDescriptor
+from qc_tool.io.model import FormulaRangeDescriptor, TableDescriptor
 from qc_tool.io.ooxml_interaction import (
     InteractionExtraction,
     extract_conditional_formatting_element,
@@ -39,6 +39,7 @@ class WorksheetMetadata:
     hidden_rows: frozenset[int] = frozenset()
     hidden_columns: frozenset[int] = frozenset()
     tables: list[TableDescriptor] = field(default_factory=list)
+    formula_ranges: list[FormulaRangeDescriptor] = field(default_factory=list)
     interactions: InteractionExtraction = field(default_factory=InteractionExtraction)
 
 
@@ -234,14 +235,19 @@ def _parse_worksheet(
     hidden_rows: set[int] = set()
     hidden_columns: set[int] = set()
     table_relationship_ids: list[str] = []
+    formula_ranges: list[FormulaRangeDescriptor] = []
+    formula_anchors: set[tuple[int, int]] = set()
     interactions = InteractionExtraction()
     validation_index = conditional_index = 0
     retained_depth = 0
+    current_cell_reference: str | None = None
     try:
         with archive.open(part) as stream:
             for event, element in ElementTree.iterparse(stream, events=("start", "end")):
                 local_name = _local_name(element.tag)
                 if event == "start":
+                    if local_name == "c":
+                        current_cell_reference = element.get("r")
                     if retained_depth:
                         retained_depth += 1
                     elif local_name in {"dataValidation", "conditionalFormatting"}:
@@ -273,7 +279,61 @@ def _parse_worksheet(
                     element.clear()
                     continue
 
-                if local_name == "dimension":
+                if local_name == "f" and current_cell_reference:
+                    declared_range = element.get("ref")
+                    if declared_range:
+                        try:
+                            anchor_row, anchor_column = coordinate_to_tuple(
+                                current_cell_reference
+                            )
+                            (
+                                min_column,
+                                min_row,
+                                range_max_column,
+                                range_max_row,
+                            ) = (
+                                range_boundaries(declared_range.replace("$", ""))
+                            )
+                        except ValueError as exc:
+                            raise OOXMLMetadataError(
+                                f"{name}!{current_cell_reference}: invalid formula "
+                                f"range {declared_range!r}"
+                            ) from exc
+                        if (
+                            min_column is None
+                            or min_row is None
+                            or range_max_column is None
+                            or range_max_row is None
+                        ):
+                            raise OOXMLMetadataError(
+                                f"{name}!{current_cell_reference}: formula range must "
+                                "be a bounded cell range"
+                            )
+                        if (anchor_row, anchor_column) != (min_row, min_column):
+                            raise OOXMLMetadataError(
+                                f"{name}!{current_cell_reference}: formula anchor is "
+                                f"not the top-left cell of {declared_range}"
+                            )
+                        anchor = (anchor_row, anchor_column)
+                        if anchor in formula_anchors:
+                            raise OOXMLMetadataError(
+                                f"{name}!{current_cell_reference}: duplicate formula "
+                                "range declaration"
+                            )
+                        formula_anchors.add(anchor)
+                        formula_ranges.append(
+                            FormulaRangeDescriptor(
+                                sheet=name,
+                                anchor_row=anchor_row,
+                                anchor_column=anchor_column,
+                                cell_range=declared_range.replace("$", ""),
+                                formula_type=element.get("t", "normal"),
+                                always_calculate=_xml_bool(element.get("aca")),
+                            )
+                        )
+                        max_row = max(max_row, range_max_row)
+                        max_column = max(max_column, range_max_column)
+                elif local_name == "dimension":
                     declared_max_row, declared_max_column = _parse_dimension(element.get("ref"))
                 elif local_name == "c":
                     reference = element.get("r")
@@ -321,6 +381,8 @@ def _parse_worksheet(
                     relationship_id = _relationship_id(element)
                     if relationship_id:
                         table_relationship_ids.append(relationship_id)
+                if local_name == "c":
+                    current_cell_reference = None
                 element.clear()
     except ElementTree.ParseError as exc:
         raise OOXMLMetadataError(f"{name}: malformed worksheet part {part}: {exc}") from exc
@@ -348,6 +410,7 @@ def _parse_worksheet(
         hidden_rows=frozenset(hidden_rows),
         hidden_columns=frozenset(hidden_columns),
         tables=tables,
+        formula_ranges=formula_ranges,
         interactions=interactions,
     )
 

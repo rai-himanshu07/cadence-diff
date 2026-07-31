@@ -28,6 +28,8 @@ def test_cycle_run_exit_codes_and_json(
 
     out = capsys.readouterr().out
     assert "mode: cycle_comparison" in out
+    assert "review items:" in out
+    assert "affected findings:" in out
     assert "critical=" in out and "reports:" in out
 
     payload = json.loads(json_path.read_text(encoding="utf-8"))

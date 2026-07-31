@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import pytest
+import yaml
 from nicegui.testing import User
 
 import qc_tool.ui.app as app_module
@@ -14,11 +15,13 @@ from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.findings import Severity
 from qc_tool.history.store import RunHistory
 from qc_tool.progress import CancellationToken, ProgressEvent, RunCancelled, RunPhase
+from qc_tool.review import build_review_groups
 from qc_tool.security import secure_managed_tree
 from qc_tool.server_config import NetworkMode
 from qc_tool.ui.app import (
     _files_for_mode,
     _profile_path,
+    _review_group_rows,
     _safe_upload_name,
     _storage_secret,
     create_pages,
@@ -27,6 +30,7 @@ from qc_tool.ui.app import (
     perform_run,
     persist_confirmed_mapping,
 )
+from qc_tool.ui.guide import PROFILE_CONTROLS_EXAMPLE
 from qc_tool.ui.theme import CSS
 from tests.conftest import fixture_profile
 
@@ -36,6 +40,30 @@ pytest_plugins = ["nicegui.testing.user_plugin"]
 def test_mode_toggle_pins_content_color_against_quasar() -> None:
     assert '.mode-select .q-btn .q-btn__content' in CSS
     assert '.mode-select .q-btn[aria-pressed="true"] .q-btn__content' in CSS
+    member_slot = app_module.REVIEW_MEMBERS_BODY_SLOT
+    assert "root cause" in member_slot
+    assert "props.row.bx || props.row.cx" in member_slot
+
+
+def test_profile_controls_guide_example_is_valid_yaml() -> None:
+    payload = yaml.safe_load(PROFILE_CONTROLS_EXAMPLE)
+    tie_outs = payload["excel"]["controls"]["tie_outs"]
+
+    assert tie_outs[0]["components"] == ["Data!C2:C5"]
+    assert [term["operation"] for term in tie_outs[1]["terms"]] == [
+        "add",
+        "subtract",
+    ]
+
+
+def test_review_group_rows_do_not_embed_atomic_member_payloads(qc_result) -> None:
+    groups = build_review_groups(qc_result.findings)
+
+    rows = _review_group_rows(groups)
+
+    assert rows
+    assert sum(group.member_count for group in groups) == len(qc_result.findings)
+    assert all("member_ids" not in row and "excerpts" not in row for row in rows)
 
 
 def test_managed_names_cannot_escape_storage(tmp_path: Path) -> None:
@@ -309,6 +337,8 @@ async def test_guide_page_renders_packaged_operator_content(
     await user.should_see("Choose the right QC mode")
     await user.should_see("they do not block read-only QC")
     await user.should_see("Profiles, controls, and waivers")
+    await user.should_see("Review-item counts are analyst decisions")
+    await user.should_see("operation: subtract")
     await user.should_see("Availability controls blankness only")
     await user.should_see("Coverage and severity")
     await user.should_see("Safeguards are visible")
@@ -372,6 +402,8 @@ async def test_run_detail_page(user: User, fixture_dir: Path, tmp_path: Path) ->
     await user.should_see(f"Run #{artifacts.run_id}")
     await user.should_see("profile 'fixture'")
     await user.should_see("cross-checks ok")
+    await user.should_see("Review groups")
+    await user.should_see("affected findings")
 
 
 @pytest.mark.asyncio
