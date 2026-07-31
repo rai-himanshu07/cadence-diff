@@ -137,6 +137,9 @@ def render_guide() -> None:
                         "Excel: <code>.xlsx</code>, <code>.xlsm</code>, and <code>.xlsb</code> for QC input.",
                         "PowerPoint: <code>.pptx</code>. Legacy <code>.xls</code>/<code>.ppt</code> are unsupported.",
                         "For encrypted files, expand <strong>Passwords</strong> and enter the open password for that file role.",
+                        "Baseline and current files may use different open passwords. Use distinct filenames when encrypted inputs require different passwords.",
+                        "Excel sheet/workbook protection and locked, unlocked, or formula-hidden cells control editing; they do not block read-only QC, and protection settings are not themselves audited.",
+                        "IRM, sensitivity-label encryption, or missing filesystem read permission can still prevent automated access.",
                         "A comparison requires both sides of an artifact pair; incomplete pairs are rejected.",
                         "Re-QC reuses a stored upload only after its hash still matches the recorded run.",
                     ]

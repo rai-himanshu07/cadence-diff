@@ -101,7 +101,14 @@ default. `--json-context` includes them for private diagnostics and must not be
 treated as a shareable artifact. For encrypted files, prefer
 `--password-env`, a mode-600 `--password-file`, or `--password-prompt`; inline
 `--password ROLE=PW` is retained for compatibility but exposes secrets in shell
-history and process listings.
+history and process listings. File-open passwords are supplied per input role,
+so baseline and current files may use different passwords. Standard Excel
+worksheet/workbook protection and locked, unlocked, or formula-hidden cell
+flags control editing and do not prevent read-only QC; those protection settings
+are not themselves audited. IRM, sensitivity-label encryption, and filesystem
+read restrictions may still prevent access. Use distinct filenames when two
+encrypted inputs require different passwords because runtime password lookup is
+currently keyed by filename.
 
 ### Network exposure
 

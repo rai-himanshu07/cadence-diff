@@ -307,6 +307,7 @@ async def test_guide_page_renders_packaged_operator_content(
     await user.open("/guide")
     await user.should_see("QC Tool guide")
     await user.should_see("Choose the right QC mode")
+    await user.should_see("they do not block read-only QC")
     await user.should_see("Profiles, controls, and waivers")
     await user.should_see("Availability controls blankness only")
     await user.should_see("Coverage and severity")
