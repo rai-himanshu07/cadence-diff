@@ -80,11 +80,11 @@ def test_step6_checkpoint_reconciles_with_the_delta_ledger() -> None:
 
 def test_only_the_parity_tests_import_the_test_only_oracle() -> None:
     offenders = sorted(
-        str(path.relative_to(_ROOT))
+        path.relative_to(_ROOT).as_posix()
         for path in _ROOT.rglob("*.py")
         if "__pycache__" not in path.parts
         and _ORACLE_IMPORT in path.read_text(encoding="utf-8")
-        and str(path.relative_to(_ROOT)) not in _ALLOWED_ORACLE_IMPORTERS
+        and path.relative_to(_ROOT).as_posix() not in _ALLOWED_ORACLE_IMPORTERS
         and path.name != "dependency_oracle.py"
     )
 

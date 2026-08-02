@@ -2,6 +2,7 @@
 
 import datetime as dt
 import json
+import os
 import sqlite3
 import zipfile
 from pathlib import Path
@@ -138,7 +139,8 @@ def test_export_archive_bundles_reports_and_a_path_free_manifest(
     assert {entry["run_id"] for entry in manifest["runs"]} == {inside, outside}
     # A manifest is evidence, not a path leak.
     assert str(work_dir) not in json.dumps(manifest)
-    assert bundle.stat().st_mode & 0o077 == 0
+    if os.name == "posix":
+        assert bundle.stat().st_mode & 0o077 == 0
 
 
 def test_get_run_roundtrips_findings(qc_result: QCRunResult, tmp_path: Path) -> None:
