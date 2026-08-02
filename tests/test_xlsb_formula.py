@@ -1,5 +1,6 @@
 """Structural XLSB formula scanning and safety classification."""
 
+import hashlib
 import struct
 import zipfile
 from pathlib import Path
@@ -90,6 +91,83 @@ def test_relationship_target_cannot_escape_package(tmp_path: Path) -> None:
 
     with pytest.raises(XlsbFormulaScanError, match="unsafe workbook relationship"):
         scan_xlsb_formulas(path.read_bytes())
+
+
+def test_customxml_relationship_is_scanned_without_mutating_the_source(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "customxml.xlsb"
+    write_xlsb(path, {"Data": [[1.0]]})
+    relationships = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1"
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+        Target="worksheets/sheet1.bin"/>
+      <Relationship Id="rIdCustom"
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml"
+        Target="../customXml/item1.xml"/>
+    </Relationships>"""
+    _replace_part(path, "xl/_rels/workbook.bin.rels", relationships)
+    before = path.read_bytes()
+
+    scan = scan_xlsb_formulas(before)
+
+    assert "Data" in scan.formula_cells
+    assert hashlib.sha256(path.read_bytes()).digest() == hashlib.sha256(before).digest()
+
+
+def test_non_customxml_targets_outside_xl_still_fail_closed(tmp_path: Path) -> None:
+    path = tmp_path / "outside.xlsb"
+    write_xlsb(path, {"Data": [[1.0]]})
+    relationships = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1"
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+        Target="worksheets/sheet1.bin"/>
+      <Relationship Id="rIdOther"
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+        Target="../media/image1.png"/>
+    </Relationships>"""
+    _replace_part(path, "xl/_rels/workbook.bin.rels", relationships)
+
+    with pytest.raises(XlsbFormulaScanError, match="unsafe workbook relationship"):
+        scan_xlsb_formulas(path.read_bytes())
+
+
+def test_customxml_relationship_cannot_escape_its_allowed_prefix(tmp_path: Path) -> None:
+    path = tmp_path / "traversal.xlsb"
+    write_xlsb(path, {"Data": [[1.0]]})
+    relationships = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1"
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+        Target="worksheets/sheet1.bin"/>
+      <Relationship Id="rIdCustom"
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml"
+        Target="../../customXml/item1.xml"/>
+    </Relationships>"""
+    _replace_part(path, "xl/_rels/workbook.bin.rels", relationships)
+
+    with pytest.raises(XlsbFormulaScanError, match="unsafe workbook relationship"):
+        scan_xlsb_formulas(path.read_bytes())
+
+
+def test_a_customxml_relationship_is_never_treated_as_a_worksheet(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sheet-customxml.xlsb"
+    write_xlsb(path, {"Data": [[1.0]]})
+    relationships = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rId1"
+        Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXml"
+        Target="../customXml/item1.xml"/>
+    </Relationships>"""
+    _replace_part(path, "xl/_rels/workbook.bin.rels", relationships)
+
+    scan = scan_xlsb_formulas(path.read_bytes())
+
+    assert scan.formula_cells == {"Data": frozenset()}
 
 
 def test_external_non_hyperlink_relationship_blocks_external_engine(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 from openpyxl import Workbook
 from pptx import Presentation
 from pptx.chart.data import ChartData
@@ -38,6 +39,7 @@ from qc_tool.io.model import (
     ChartPlot,
     ChartSeries,
     FormulaRangeDescriptor,
+    NamedRange,
     SheetSnapshot,
     WorkbookSnapshot,
 )
@@ -167,6 +169,147 @@ def test_unsupported_and_invalid_references_degrade_dependency_coverage() -> Non
     assert len(graph.invalid_references) == 1
     assert "unsupported" in graph.coverage_detail
     assert "invalid" in graph.coverage_detail
+
+
+def test_invalid_reference_telemetry_is_occurrence_accurate_and_bounded() -> None:
+    occurrence_count = 250
+    workbook = _sheet(
+        max_row=occurrence_count,
+        cells={
+            (row, 2): CellRecord(row, 2, None, formula="=MissingReference")
+            for row in range(1, occurrence_count + 1)
+        },
+    )
+
+    graph = build_dependency_graph(workbook)
+
+    assert graph.reference_status_counts[ReferenceStatus.INVALID] == occurrence_count
+    assert graph.invalid_reason_counts == {"invalid_a1_reference": occurrence_count}
+    assert 0 < len(graph.invalid_references) <= 8
+    assert set(graph.invalid_references) == {"invalid_a1_reference"}
+    assert f"{occurrence_count} invalid references" in graph.coverage_detail
+
+
+def test_repeated_formula_template_is_extracted_once_but_projected_per_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import qc_tool.excel.dependency as dependency
+
+    workbook = _sheet(
+        max_row=3,
+        cells={
+            (1, 2): CellRecord(1, 2, None, formula="=@A1:A3"),
+            (3, 2): CellRecord(3, 2, None, formula="=@a1:a3"),
+        },
+    )
+    calls = 0
+    original = dependency.extract_formula_precedents
+
+    def counted(formula: str):
+        nonlocal calls
+        calls += 1
+        return original(formula)
+
+    monkeypatch.setattr(dependency, "extract_formula_precedents", counted)
+
+    graph = build_dependency_graph(workbook)
+
+    assert calls == 1
+    assert dependents_of(graph, "Data", "A1") == ["Data!B1"]
+    assert dependents_of(graph, "Data", "A3") == ["Data!B3"]
+
+
+def test_dependency_metadata_index_resolves_sheet_names_case_insensitively() -> None:
+    workbook = _sheet(
+        cells={
+            (1, 1): CellRecord(1, 1, 10),
+            (1, 2): CellRecord(1, 2, None, formula="=data!a1"),
+        },
+    )
+
+    graph = build_dependency_graph(workbook)
+
+    assert dependents_of(graph, "Data", "A1") == ["Data!B1"]
+    assert graph.coverage_state is CoverageState.CHECKED
+
+
+def test_lexical_symbol_shadows_same_named_workbook_range() -> None:
+    workbook = _sheet(
+        cells={
+            (1, 1): CellRecord(1, 1, 10),
+            (1, 2): CellRecord(1, 2, 20),
+            (1, 3): CellRecord(1, 3, 30),
+            (1, 4): CellRecord(1, 4, None, formula="=LET(rate,B1,rate+C1)"),
+        },
+    )
+    workbook.named_ranges.append(NamedRange("rate", "Data!A1"))
+
+    graph = build_dependency_graph(workbook)
+
+    assert dependents_of(graph, "Data", "A1") == []
+    assert dependents_of(graph, "Data", "B1") == ["Data!D1"]
+    assert dependents_of(graph, "Data", "C1") == ["Data!D1"]
+    assert graph.coverage_state is CoverageState.CHECKED
+
+
+def test_let_value_can_resolve_same_named_workbook_range_before_binding() -> None:
+    workbook = _sheet(
+        cells={
+            (1, 1): CellRecord(1, 1, 10),
+            (1, 2): CellRecord(1, 2, 20),
+            (1, 3): CellRecord(1, 3, 30),
+            (1, 4): CellRecord(
+                1,
+                4,
+                None,
+                formula="=LET(rate,rate+B1,rate+C1)",
+            ),
+        },
+    )
+    workbook.named_ranges.append(NamedRange("rate", "Data!A1"))
+
+    graph = build_dependency_graph(workbook)
+
+    assert dependents_of(graph, "Data", "A1") == ["Data!D1"]
+    assert dependents_of(graph, "Data", "B1") == ["Data!D1"]
+    assert dependents_of(graph, "Data", "C1") == ["Data!D1"]
+    assert graph.coverage_state is CoverageState.CHECKED
+
+
+def test_malformed_lexical_formula_degrades_without_false_invalid_reference() -> None:
+    workbook = _sheet(
+        cells={(1, 2): CellRecord(1, 2, None, formula="=LET(item,A1)")},
+    )
+
+    graph = build_dependency_graph(workbook)
+
+    assert graph.invalid_reason_counts == {}
+    assert graph.unsupported_reason_counts == {"malformed_let": 1}
+    assert graph.coverage_state is CoverageState.DEGRADED
+
+
+def test_lexical_formula_dependency_checkpoint_after_step3() -> None:
+    workbook = _sheet(
+        cells={
+            (1, 4): CellRecord(
+                1,
+                4,
+                None,
+                formula="=LET(rate,A1,scaled,rate*B1,LAMBDA(item,item+scaled)(C1))",
+            ),
+        }
+    )
+
+    graph = build_dependency_graph(workbook)
+
+    assert dependents_of(graph, "Data", "A1") == ["Data!D1"]
+    assert dependents_of(graph, "Data", "B1") == ["Data!D1"]
+    assert dependents_of(graph, "Data", "C1") == ["Data!D1"]
+    assert graph.invalid_references == []
+    assert graph.invalid_reason_counts == {}
+    assert graph.reference_status_counts[ReferenceStatus.INVALID] == 0
+    assert graph.local_symbol_count == 6
+    assert graph.coverage_state is CoverageState.CHECKED
 
 
 def test_final_impact_limit_has_one_accurate_trailing_marker() -> None:

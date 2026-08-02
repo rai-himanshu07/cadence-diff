@@ -76,13 +76,14 @@ def _build_long_monthly(ws: Worksheet, *, current: bool) -> None:
         ws.cell(row=1, column=col, value=header)
     months = domain.CURRENT_MONTHS if current else domain.BASELINE_MONTHS
     revenue_fn = domain.current_monthly_revenue if current else domain.monthly_revenue
+    cost_fn = domain.current_monthly_cost if current else domain.monthly_cost
     row = 2
     for month in range(months):
         for region in range(len(domain.REGION_LABELS)):
             ws.cell(row=row, column=1, value=domain.MONTH_LABELS[month])
             ws.cell(row=row, column=2, value=domain.REGION_LABELS[region])
             ws.cell(row=row, column=3, value=revenue_fn(month, region))
-            ws.cell(row=row, column=4, value=domain.monthly_cost(month, region))
+            ws.cell(row=row, column=4, value=cost_fn(month, region))
             ws.cell(row=row, column=5, value=f"=C{row}-D{row}")
             row += 1
     if current:
@@ -254,6 +255,26 @@ def build_workbooks(dest: Path) -> tuple[list[SeededDefect], list[ExpectedChange
             current=str(domain.monthly_revenue(1, 1) + domain.E01_DELTA),
             impacts=["Summary!B2", "Summary!B4", "Summary!B6"],
             note="historical revenue edited (Feb-26 / South)",
+        ),
+        defect(
+            "E19",
+            [DefectClass.VALUE_CHANGED],
+            sheet="Long_Monthly",
+            cell="D4",
+            baseline=str(domain.monthly_cost(0, 2)),
+            current=str(domain.current_monthly_cost(0, 2)),
+            impacts=["Summary!B3", "Summary!B4", "Summary!B6"],
+            note="old-history constant re-exported one ULP off: representation noise",
+        ),
+        defect(
+            "E20",
+            [DefectClass.VALUE_CHANGED],
+            sheet="Long_Monthly",
+            cell="C21",
+            baseline=str(domain.monthly_revenue(4, 3)),
+            current=str(domain.monthly_revenue(4, 3) + domain.E20_DELTA),
+            impacts=["Summary!B2", "Summary!B4", "Summary!B6"],
+            note="May-26 restated inside the trailing 2-month window",
         ),
         defect(
             "E02",

@@ -4,13 +4,18 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from openpyxl import Workbook
 
 import qc_tool.io.libreoffice_formula as libreoffice_formula_module
 from qc_tool.io.excel_formula import _load_worker_result, extract_formulas_with_excel
-from qc_tool.io.excel_formula_worker import _grid, _rectangles
+from qc_tool.io.excel_formula_worker import (
+    _grid,
+    _rectangles,
+    _set_manual_calculation,
+)
 from qc_tool.io.formula_enrichment import (
     FormulaEnrichmentError,
     FormulaExtraction,
@@ -214,6 +219,89 @@ def test_excel_formula_rectangles_and_shapes() -> None:
     assert _grid("=A1", 1, 1) == [["=A1"]]
     assert _grid(("=A1", "=B1"), 1, 2) == [["=A1", "=B1"]]
     assert _grid((("=A1",), ("=A2",)), 2, 1) == [["=A1"], ["=A2"]]
+
+
+def test_excel_manual_calculation_retries_with_a_guard_workbook() -> None:
+    class FakeComError(Exception):
+        pass
+
+    class Guard:
+        closed = False
+
+        def Close(self, *, SaveChanges: bool) -> None:
+            assert SaveChanges is False
+            self.closed = True
+
+    class Workbooks:
+        def __init__(self, app: Any) -> None:
+            self.app = app
+            self.guard = Guard()
+
+        def Add(self) -> Guard:
+            self.app.workbook_exists = True
+            return self.guard
+
+    class App:
+        def __init__(self) -> None:
+            self.workbook_exists = False
+            self.calculation = 0
+            self.Workbooks = Workbooks(self)
+
+        @property
+        def Calculation(self) -> int:
+            return self.calculation
+
+        @Calculation.setter
+        def Calculation(self, value: int) -> None:
+            if not self.workbook_exists:
+                raise FakeComError
+            self.calculation = value
+
+    app = App()
+
+    guard = _set_manual_calculation(app, FakeComError)
+
+    assert guard is app.Workbooks.guard
+    assert app.Calculation == -4135
+    assert not app.Workbooks.guard.closed
+
+
+def test_excel_manual_calculation_retry_stays_fail_closed() -> None:
+    class FakeComError(Exception):
+        pass
+
+    class Guard:
+        closed = False
+
+        def Close(self, *, SaveChanges: bool) -> None:
+            assert SaveChanges is False
+            self.closed = True
+
+    class Workbooks:
+        def __init__(self) -> None:
+            self.guard = Guard()
+
+        def Add(self) -> Guard:
+            return self.guard
+
+    class App:
+        def __init__(self) -> None:
+            self.Workbooks = Workbooks()
+
+        @property
+        def Calculation(self) -> int:
+            return 0
+
+        @Calculation.setter
+        def Calculation(self, value: int) -> None:
+            raise FakeComError
+
+    app = App()
+
+    with pytest.raises(FakeComError):
+        _set_manual_calculation(app, FakeComError)
+
+    assert app.Workbooks.guard.closed
 
 
 @pytest.mark.parametrize(

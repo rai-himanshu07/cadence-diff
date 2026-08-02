@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 
 from openpyxl.utils.cell import range_boundaries
 
 from qc_tool.excel.formula_tokens import parse_dynamic_reference
-from qc_tool.io.model import TableDescriptor, WorkbookSnapshot
+from qc_tool.io.model import (
+    NamedRange,
+    SheetSnapshot,
+    TableDescriptor,
+    WorkbookSnapshot,
+)
 
 
 class ReferenceStatus(StrEnum):
@@ -43,6 +51,46 @@ class ReferenceResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkbookReferenceIndex:
+    """Immutable case-normalized workbook metadata used during reference scans."""
+
+    sheets: Mapping[str, tuple[SheetSnapshot, ...]]
+    named_ranges: Mapping[str, tuple[NamedRange, ...]]
+    tables: Mapping[str, tuple[TableDescriptor, ...]]
+    tables_by_sheet: Mapping[str, tuple[TableDescriptor, ...]]
+
+
+def build_reference_index(workbook: WorkbookSnapshot) -> WorkbookReferenceIndex:
+    sheets: dict[str, list[SheetSnapshot]] = defaultdict(list)
+    named_ranges: dict[str, list[NamedRange]] = defaultdict(list)
+    tables: dict[str, list[TableDescriptor]] = defaultdict(list)
+    tables_by_sheet: dict[str, list[TableDescriptor]] = defaultdict(list)
+    for sheet in workbook.sheets:
+        sheets[sheet.name.casefold()].append(sheet)
+    for named_range in workbook.named_ranges:
+        named_ranges[named_range.name.casefold()].append(named_range)
+    for table in workbook.tables:
+        aliases = {table.name.casefold(), table.display_name.casefold()}
+        for alias in aliases:
+            tables[alias].append(table)
+        tables_by_sheet[table.sheet.casefold()].append(table)
+    return WorkbookReferenceIndex(
+        sheets=MappingProxyType(
+            {key: tuple(values) for key, values in sheets.items()}
+        ),
+        named_ranges=MappingProxyType(
+            {key: tuple(values) for key, values in named_ranges.items()}
+        ),
+        tables=MappingProxyType(
+            {key: tuple(values) for key, values in tables.items()}
+        ),
+        tables_by_sheet=MappingProxyType(
+            {key: tuple(values) for key, values in tables_by_sheet.items()}
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _StructuredSpec:
     table_name: str
     row_selectors: tuple[str, ...]
@@ -65,6 +113,31 @@ _RANGE_EXTENSION_RE = re.compile(
 
 def _failure(status: ReferenceStatus, detail: str) -> ReferenceResolution:
     return ReferenceResolution(status=status, detail=detail)
+
+
+def reference_reason_code(status: ReferenceStatus, detail: str) -> str:
+    """Map resolver detail to a fixed, privacy-safe telemetry reason."""
+    normalized = detail.casefold()
+    markers = (
+        ("invalid a1 reference", "invalid_a1_reference"),
+        ("external workbook", "external_workbook_reference"),
+        ("multi-area", "multi_area_reference"),
+        ("spill", "dynamic_spill_reference"),
+        ("implicit intersection", "implicit_intersection"),
+        ("structured", "structured_reference"),
+        ("selector", "structured_reference"),
+        ("table", "structured_reference"),
+        ("current-row", "structured_reference"),
+        ("host cell", "structured_reference"),
+        ("cyclic named range", "cyclic_named_range"),
+        ("empty or broken", "broken_reference"),
+        ("worksheet bounds", "worksheet_bounds"),
+        ("worksheet context", "worksheet_context"),
+    )
+    return next(
+        (reason for marker, reason in markers if marker in normalized),
+        f"{status.value}_reference",
+    )
 
 
 def _unescape_name(value: str) -> str:
@@ -184,6 +257,7 @@ def _containing_table(
     workbook: WorkbookSnapshot,
     host_sheet: str,
     host_cell: tuple[int, int] | None,
+    index: WorkbookReferenceIndex | None,
 ) -> TableDescriptor | ReferenceResolution:
     if host_cell is None:
         return _failure(
@@ -192,9 +266,14 @@ def _containing_table(
         )
     host_row, host_col = host_cell
     matches: list[TableDescriptor] = []
-    for table in workbook.tables:
+    candidates = (
+        index.tables_by_sheet.get(host_sheet.casefold(), ())
+        if index is not None
+        else workbook.tables
+    )
+    for table in candidates:
         bounds = _table_bounds(table)
-        if bounds is None or table.sheet != host_sheet:
+        if bounds is None or table.sheet.casefold() != host_sheet.casefold():
             continue
         min_col, min_row, max_col, max_row = bounds
         if min_row <= host_row <= max_row and min_col <= host_col <= max_col:
@@ -212,11 +291,12 @@ def _find_table(
     table_name: str,
     host_sheet: str,
     host_cell: tuple[int, int] | None,
+    index: WorkbookReferenceIndex | None,
 ) -> TableDescriptor | ReferenceResolution:
     if not table_name:
-        return _containing_table(workbook, host_sheet, host_cell)
+        return _containing_table(workbook, host_sheet, host_cell, index)
     normalized = table_name.casefold()
-    matches = [
+    matches = list(index.tables.get(normalized, ())) if index is not None else [
         table
         for table in workbook.tables
         if normalized in {table.name.casefold(), table.display_name.casefold()}
@@ -234,8 +314,9 @@ def _structured_ranges(
     spec: _StructuredSpec,
     host_sheet: str,
     host_cell: tuple[int, int] | None,
+    index: WorkbookReferenceIndex | None,
 ) -> ReferenceResolution:
-    table = _find_table(workbook, spec.table_name, host_sheet, host_cell)
+    table = _find_table(workbook, spec.table_name, host_sheet, host_cell, index)
     if isinstance(table, ReferenceResolution):
         return table
     bounds = _table_bounds(table)
@@ -252,13 +333,13 @@ def _structured_ranges(
     if spec.columns:
         indexes: list[int] = []
         for name in spec.columns:
-            index = column_lookup.get(name.casefold())
-            if index is None:
+            column_index = column_lookup.get(name.casefold())
+            if column_index is None:
                 return _failure(
                     ReferenceStatus.INVALID,
                     f"table column {name!r} was not found",
                 )
-            indexes.append(index)
+            indexes.append(column_index)
         if spec.column_span and indexes[0] > indexes[1]:
             return _failure(ReferenceStatus.INVALID, "reversed table column span")
         selected_min_col = min_col + indexes[0]
@@ -323,6 +404,7 @@ def _resolve_reference(
     host_cell: tuple[int, int] | None,
     require_within_sheet: bool,
     seen_names: frozenset[str],
+    index: WorkbookReferenceIndex | None,
 ) -> ReferenceResolution:
     normalized_target = target.strip()
     if not normalized_target or "#REF!" in normalized_target.upper():
@@ -337,6 +419,7 @@ def _resolve_reference(
             host_cell=host_cell,
             require_within_sheet=require_within_sheet,
             seen_names=seen_names,
+            index=index,
         )
         if resolved.status is not ReferenceStatus.RESOLVED:
             return resolved
@@ -449,13 +532,21 @@ def _resolve_reference(
         parsed = _parse_structured_reference(normalized_target)
         if isinstance(parsed, ReferenceResolution):
             return parsed
-        return _structured_ranges(workbook, parsed, host_sheet, host_cell)
+        return _structured_ranges(workbook, parsed, host_sheet, host_cell, index)
 
     normalized_name = normalized_target.casefold()
-    named = next(
-        (item for item in workbook.named_ranges if item.name.casefold() == normalized_name),
-        None,
-    )
+    if index is not None:
+        indexed_names = index.named_ranges.get(normalized_name, ())
+        named = indexed_names[0] if indexed_names else None
+    else:
+        named = next(
+            (
+                item
+                for item in workbook.named_ranges
+                if item.name.casefold() == normalized_name
+            ),
+            None,
+        )
     if named is not None:
         if normalized_name in seen_names:
             return _failure(ReferenceStatus.INVALID, "cyclic named range")
@@ -466,6 +557,7 @@ def _resolve_reference(
             host_cell=host_cell,
             require_within_sheet=require_within_sheet,
             seen_names=seen_names | {normalized_name},
+            index=index,
         )
 
     sheet_part, separator, cell_range = normalized_target.rpartition("!")
@@ -473,7 +565,13 @@ def _resolve_reference(
     if not sheet_name:
         return _failure(ReferenceStatus.INVALID, "reference has no worksheet context")
     try:
-        sheet = workbook.sheet(sheet_name)
+        if index is None:
+            sheet = workbook.sheet(sheet_name)
+        else:
+            matching_sheets = index.sheets.get(sheet_name.casefold(), ())
+            if len(matching_sheets) != 1:
+                raise KeyError(sheet_name)
+            sheet = matching_sheets[0]
         min_col, min_row, max_col, max_row = range_boundaries(
             cell_range.replace("$", "") if separator else normalized_target.replace("$", "")
         )
@@ -497,7 +595,7 @@ def _resolve_reference(
         status=ReferenceStatus.RESOLVED,
         ranges=(
             ResolvedRange(
-                sheet=sheet_name,
+                sheet=sheet.name,
                 min_row=resolved_min_row,
                 min_col=resolved_min_col,
                 max_row=resolved_max_row,
@@ -517,6 +615,7 @@ def resolve_reference(
     host_sheet: str,
     host_cell: tuple[int, int] | None = None,
     require_within_sheet: bool = True,
+    index: WorkbookReferenceIndex | None = None,
 ) -> ReferenceResolution:
     """Resolve one A1, named, or supported structured reference."""
     return _resolve_reference(
@@ -526,6 +625,7 @@ def resolve_reference(
         host_cell=host_cell,
         require_within_sheet=require_within_sheet,
         seen_names=frozenset(),
+        index=index,
     )
 
 

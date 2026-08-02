@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TypeGuard
 
 CellValue = str | float | int | bool | dt.date | dt.datetime | None
@@ -94,6 +95,31 @@ class WorkbookWorkload:
         if self.warning_reasons:
             return f"{metrics}; " + "; ".join(self.warning_reasons)
         return metrics
+
+
+class WorkbookRiskKind(StrEnum):
+    EXTERNAL_WORKBOOK_LINK = "external_workbook_link"
+    EXTERNAL_RELATIONSHIP = "external_relationship"
+    EXTERNAL_DATA_CONNECTION = "external_data_connection"
+    QUERY_TABLE = "query_table"
+    VBA_PROJECT = "vba_project"
+    EXCEL4_MACRO_SHEET = "excel4_macro_sheet"
+    ACTIVEX_CONTROL = "activex_control"
+    EMBEDDED_OLE = "embedded_ole"
+    CONTROL_CONTENT = "control_content"
+    DIALOG_SHEET = "dialog_sheet"
+    CUSTOM_OFFICE_UI = "custom_office_ui"
+    UNREADABLE_RELATIONSHIP_METADATA = "unreadable_relationship_metadata"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkbookRisk:
+    kind: WorkbookRiskKind
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.count < 1:
+            raise ValueError("workbook risk count must be positive")
 
 
 @dataclass(slots=True)
@@ -352,7 +378,7 @@ class WorkbookSnapshot:
     conditional_formats: list[ConditionalFormatDescriptor] = field(default_factory=list)
     calculation_mode: str | None = None
     full_calc_on_load: bool | None = None
-    external_links: list[str] = field(default_factory=list)
+    intrinsic_risks: list[WorkbookRisk] = field(default_factory=list)
     workload: WorkbookWorkload = field(
         default_factory=WorkbookWorkload,
         compare=False,

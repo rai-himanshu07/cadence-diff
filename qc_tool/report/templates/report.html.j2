@@ -44,7 +44,12 @@
   | mode: <strong>{{ result.mode.value }}</strong>
   {% for role, name in result.files.items() %} | {{ role }}: <strong>{{ name }}</strong>{% endfor %}
   | verified cross-checks: {{ result.verified_crosschecks }}
+  {% if capability_limited %} | <strong class="capability-limited">capability-limited</strong>{% endif %}
 </div>
+{% if capability_limited %}
+<div class="note">One or more required checks were unavailable, so a low finding
+count is not a clean result. Review the check coverage table below.</div>
+{% endif %}
 {% if result.mapping_coverage %}
 <h2>Mapping coverage</h2>
 <div class="meta">
@@ -69,11 +74,34 @@
 {% for disclosure in result.disclosures %}
 <div class="note">{{ disclosure }}</div>
 {% endfor %}
+{% if stories %}
+<h2>Change stories</h2>
+<div class="meta">Cross-class narrative synthesis; severities and counts are
+unchanged — stories are a lens over the same findings.</div>
+<table class="coverage">
+  <thead><tr><th>Story</th><th>Kind</th><th>Narrative</th><th>Findings</th><th>Severity mix</th></tr></thead>
+  <tbody>
+  {% for story in stories %}
+  <tr>
+    <td class="mono">{{ story.story_id }}</td>
+    <td class="mono">{{ story.kind.value }}</td>
+    <td>
+      <strong>{{ story.title }}</strong>
+      <div>{{ story.description }}</div>
+      {% for line in story.evidence %}<div class="mono">{{ line }}</div>{% endfor %}
+    </td>
+    <td>{{ story.member_count }}</td>
+    <td>{% for name, count in story.severity_counts.items() if count %}{{ name }}: {{ count }}{% if not loop.last %} | {% endif %}{% endfor %}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
 <div class="cards">
   {% for severity, count in counts.review_items.items() %}
   <div class="card {{ severity.value }}"><span class="n">{{ count }}</span>
-    {{ severity.value }} review items
-    <span class="affected">{{ counts.atomic_findings[severity] }} affected findings</span>
+    {{ severity.value }} pattern review items
+    <span class="affected">{{ counts.atomic_findings[severity] }} atomic findings</span>
   </div>
   {% endfor %}
 </div>
@@ -107,7 +135,9 @@
         <table class="member-table">
           <thead><tr><th>ID</th><th>Severity</th><th>Location</th><th>Element</th>
             <th>Baseline</th><th>Current</th><th>Message</th><th>Analyst comment</th>
-            <th>Root cause</th><th>Waiver</th></tr></thead>
+            <th>Root cause</th><th>Waiver</th><th>Provenance</th><th>Subtype</th>
+            <th>Materiality</th><th>Temporal context</th><th>Expected reason</th>
+            <th>Evidence tags</th></tr></thead>
           <tbody data-member-body="{{ group.group_id }}"></tbody>
         </table>
         <div class="member-pages" data-member-controls="{{ group.group_id }}">
@@ -170,6 +200,12 @@
         textCell(row, member.comment);
         textCell(row, member.root, 'mono');
         textCell(row, member.waiver);
+        textCell(row, member.provenance, 'mono');
+        textCell(row, member.subtype, 'mono');
+        textCell(row, member.materiality, 'mono');
+        textCell(row, member.temporal_context, 'mono');
+        textCell(row, member.expected_reason, 'mono');
+        textCell(row, member.evidence_tags, 'mono');
         body.appendChild(row);
       });
       label.textContent = `${start + 1}-${end} of ${members.length}`;

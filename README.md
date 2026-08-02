@@ -19,12 +19,32 @@ Findings support analyst severity overrides and comments; exports
 (annotated Excel workbook, self-contained HTML) regenerate from the
 reviewed state.
 
-Analyst-facing views collapse compatible, edge-adjacent Excel cell findings
-into deterministic **review groups**. Review-item counts answer how many
-decisions remain; affected-finding counts preserve the complete cell-level
-evidence. Open a group for paged atomic detail or switch to Individual findings.
+Analyst-facing views partition findings into deterministic **semantic pattern
+groups**, the primary analyst decisions. Spatial groups remain a separate
+backward-compatible layout metric. Pattern review-item counts answer how many
+decisions remain; atomic-finding counts preserve the complete cell-level
+evidence. Results open on the review queue with a selected-decision evidence
+panel; stories, coverage, and every atomic finding are one click away.
 JSON, attestations, Re-QC identity, coverage counts, and CI failure thresholds
 remain atomic and backward-compatible.
+
+Severity carries analyst judgment, not just class labels. Numeric value
+changes carry independent **magnitude** and **temporal context** axes.
+Display-identical ULP-scale noise reports as Info; declared acceptance bands
+remain visible as within-tolerance Info. Current/recent material changes are
+Warning only after hard guards: sign flips, zero-boundary changes, and a
+10x-or-greater magnitude ratio remain Critical. Historical material changes
+stay Critical. Implicit numeric block refreshes are Warning; only explicit
+profile refresh ranges may be Expected. Inherited explicit `NA()` formulas can
+be Info, formula-backed systematic data-state errors can be Warning, and
+structural, new, changed, or unsupported inherited errors remain Critical.
+Systematic formula rollouts are
+recognized when the old logic survives as a subtree inside a new wrapper, and
+in-place key changes distinguish formula-derived labels from genuine history
+rewrites. **Change stories** are a dedicated results view, linking structural
+drivers to the formula changes that reference them and isolating noise,
+refresh, and inherited populations — everything unexplained lands in an explicit
+residual review queue. Stories never alter severities or counts.
 
 The structural engine models Excel tables and structured references, mixed
 cadence bands, every plot and named series in combo charts, chart axes/legends/
@@ -52,12 +72,20 @@ truncating or guessing.
 ## Install & run
 
 ```bash
+# Current 0.2 alpha (pre-releases require an explicit version)
+pip install --pre 'cadence-diff==0.2.0a1'
+
+# Latest stable release
 pip install cadence-diff
 cadence-diff                    # web UI → http://127.0.0.1:8080
 cadence-diff --port 9000 --data-dir ~/qc-data
 qc-tool                         # compatibility alias
 python -m qc_tool               # equivalent
 ```
+
+The `0.2` line is published as an Alpha for representative analyst testing.
+PyPI does not select pre-releases by default, so an unqualified install remains
+on the latest stable `0.1.x` release.
 
 The web UI includes a packaged **Guide** page at `/guide`. It covers mode
 selection, files, profiles and controls, coverage/severity, finding review,
@@ -78,6 +106,14 @@ cadence-diff run --current-excel this.xlsx --individual-findings # raw CLI rows
 # Only after reviewing workload refusal and confirming sufficient local memory
 cadence-diff run --current-excel unusually-large.xlsx \
   --allow-large-workbooks
+
+# Optional analyst acceptance threshold: visible Info, never hidden
+cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \
+  --accept-absolute 1 --accept-percent 0.1
+
+# Optional validated scope: files load fully; selected/total counts are reported
+cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \
+  --sheets "Dashboard,Data" --slides 1,3-5
 
 # Local numeric scrambling only — NOT privacy-safe or shareable
 cadence-diff sanitize client_pack.xlsx --seed 7

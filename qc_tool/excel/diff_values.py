@@ -14,10 +14,29 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
 
 from qc_tool.availability import excel_blank_allowed
-from qc_tool.config.profile import DeliverableProfile, NumericTolerance, SheetProfile
+from qc_tool.config.profile import (
+    AcceptanceBand,
+    DeliverableProfile,
+    NumericTolerance,
+    RestatementWindows,
+    SheetProfile,
+)
 from qc_tool.excel.align import AxisAlignment, RegionAlignment, WorkbookAlignment
+from qc_tool.excel.materiality import (
+    classify_numeric_pair,
+    is_anomalous_magnitude,
+    numeric_evidence_tags,
+    temporal_contexts,
+)
 from qc_tool.excel.periods import is_period_after, parse_period
-from qc_tool.findings import Finding, FindingClass
+from qc_tool.excel.regions import TableRegion, period_positions
+from qc_tool.findings import (
+    Finding,
+    FindingClass,
+    FindingExpectedReason,
+    FindingSubtype,
+    FindingTemporalContext,
+)
 from qc_tool.io.model import (
     CellRecord,
     SheetSnapshot,
@@ -55,6 +74,47 @@ def _numbers_match(base: float, curr: float, tolerance: NumericTolerance) -> boo
     return within_abs or within_rel
 
 
+class _AcceptanceBands:
+    """Declared per-range tolerance bands plus the run-level analyst band."""
+
+    def __init__(
+        self,
+        bands: Iterable[AcceptanceBand],
+        run_acceptance: NumericTolerance | None = None,
+    ) -> None:
+        self._bands = [(_RangeSet([band.cell_range]), band) for band in bands]
+        self._run_acceptance = run_acceptance
+
+    @staticmethod
+    def _within(absolute: float, relative: float, base: float, curr: float) -> bool:
+        delta = abs(curr - base)
+        within_abs = absolute > 0 and delta <= absolute
+        within_rel = relative > 0 and base != 0 and delta / abs(base) <= relative
+        return within_abs or within_rel
+
+    def accepts(self, cell: tuple[int, int], base: object, curr: object) -> bool:
+        if not self._bands and self._run_acceptance is None:
+            return False
+        if isinstance(base, bool) or isinstance(curr, bool):
+            return False
+        if not isinstance(base, int | float) or not isinstance(curr, int | float):
+            return False
+        base_float, curr_float = float(base), float(curr)
+        if self._run_acceptance is not None and self._within(
+            self._run_acceptance.absolute,
+            self._run_acceptance.relative,
+            base_float,
+            curr_float,
+        ):
+            return True
+        for range_set, band in self._bands:
+            if cell not in range_set:
+                continue
+            if self._within(band.absolute, band.relative, base_float, curr_float):
+                return True
+        return False
+
+
 def _values_differ(
     base: CellRecord | None, curr: CellRecord | None, tolerance: NumericTolerance
 ) -> bool:
@@ -76,6 +136,15 @@ def _display(value: object) -> str:
 def _is_blank(cell: CellRecord | None) -> bool:
     return cell is None or cell.value is None or (
         isinstance(cell.value, str) and not cell.value.strip()
+    )
+
+
+def _both_numeric(base_value: object, curr_value: object) -> bool:
+    return (
+        isinstance(base_value, int | float)
+        and isinstance(curr_value, int | float)
+        and not isinstance(base_value, bool)
+        and not isinstance(curr_value, bool)
     )
 
 
@@ -118,10 +187,32 @@ def diff_region_values(
     ignore: _RangeSet,
     refresh: _RangeSet,
     sheet_profile: SheetProfile | None,
+    windows: RestatementWindows | None = None,
+    run_acceptance: NumericTolerance | None = None,
 ) -> list[Finding]:
     findings: list[Finding] = []
     sheet_name = curr_sheet.name
     refresh_block = _is_refresh_block(base_sheet, curr_sheet, region)
+    recency_windows = windows if windows is not None else RestatementWindows()
+    acceptance = _AcceptanceBands(
+        sheet_profile.acceptance_bands if sheet_profile is not None else [],
+        run_acceptance,
+    )
+    temporal_by_position: dict[int, FindingTemporalContext] = {}
+    period_axis = region.current.period_axis
+    if period_axis in ("rows", "columns"):
+        is_rows_axis = period_axis == "rows"
+        populated = _data_positions(
+            curr_sheet, region.current, is_rows=is_rows_axis
+        )
+        positions = {
+            position: period
+            for position, period in period_positions(
+                curr_sheet, region.current
+            ).items()
+            if position in populated
+        }
+        temporal_by_position = temporal_contexts(positions, recency_windows)
     for (base_row, base_col), (curr_row, curr_col) in region.cell_pairs():
         base_cell = base_sheet.cells.get((base_row, base_col))
         curr_cell = curr_sheet.cells.get((curr_row, curr_col))
@@ -153,32 +244,73 @@ def diff_region_values(
         ):
             base_value = base_cell.value if base_cell else None
             curr_value = curr_cell.value if curr_cell else None
-            if _is_blank(curr_cell):
-                expected = False
+            base_blank = _is_blank(base_cell)
+            curr_blank = _is_blank(curr_cell)
+            if curr_blank and not base_blank:
+                subtype = FindingSubtype.VALUE_CLEARED_POPULATION
+                wording = "historical value cleared"
+            elif base_blank and not curr_blank:
+                subtype = FindingSubtype.VALUE_ADDED_POPULATION
+                wording = "value added to a previously blank cell"
+            else:
+                subtype = FindingSubtype.VALUE_REPLACEMENT
+                wording = "historical value changed"
+            materiality = None
+            temporal_context = None
+            evidence_tags = set()
+            if subtype is FindingSubtype.VALUE_REPLACEMENT:
+                display_format = (
+                    curr_cell.number_format if curr_cell else None
+                ) or (base_cell.number_format if base_cell else None)
+                position = curr_row if period_axis == "rows" else curr_col
+                temporal_context = temporal_by_position.get(position)
+                materiality = classify_numeric_pair(
+                    base_value,
+                    curr_value,
+                    display_format,
+                    within_acceptance=acceptance.accepts(
+                        (curr_row, curr_col), base_value, curr_value
+                    ),
+                )
+                evidence_tags = numeric_evidence_tags(
+                    base_value,
+                    curr_value,
+                    display_format,
+                )
+            if curr_blank:
+                expected_reason = None
                 reason = " (required value is blank)"
             elif _period_advanced(base_value, curr_value):
-                expected = True
+                expected_reason = FindingExpectedReason.PERIOD_PROGRESSION
                 reason = " (period label advanced with the new cycle)"
-            elif refresh_block:
-                expected = True
-                reason = " (cycle-snapshot block refresh)"
             elif (curr_row, curr_col) in refresh:
-                expected = True
+                expected_reason = FindingExpectedReason.PROFILE_REFRESH
                 reason = " (profile refresh range)"
+            elif refresh_block and _both_numeric(base_value, curr_value):
+                expected_reason = None
+                if is_anomalous_magnitude(base_value, curr_value):
+                    reason = " (anomalous change in cycle-snapshot block)"
+                else:
+                    temporal_context = FindingTemporalContext.CURRENT_PERIOD
+                    reason = " (implicit cycle-snapshot block refresh)"
             else:
-                expected = False
+                expected_reason = None
                 reason = ""
             findings.append(
                 Finding(
                     artifact="excel",
                     finding_class=FindingClass.VALUE_CHANGED,
-                    expected_growth=expected,
+                    expected_reason=expected_reason,
+                    subtype=subtype,
+                    materiality=materiality,
+                    temporal_context=temporal_context,
+                    evidence_tags=evidence_tags,
                     sheet=sheet_name,
                     location=location,
                     baseline_location=baseline_location,
                     baseline_value=_display(base_value),
                     current_value=_display(curr_value),
-                    message=f"{sheet_name}!{location}: historical value changed{reason}",
+                    message=f"{sheet_name}!{location}: {wording}{reason}",
                 )
             )
 
@@ -220,39 +352,204 @@ def diff_region_values(
     return findings
 
 
+_AXIS_WORDING = {
+    FindingSubtype.AXIS_ROLLING_TURNOVER: "oldest {span} left the rolling window",
+    FindingSubtype.AXIS_PHYSICAL_DELETION: "historical {span} deleted",
+    FindingSubtype.AXIS_PHYSICAL_INSERTION: (
+        "unexpected {span} inserted outside the cadence growth pattern"
+    ),
+    FindingSubtype.AXIS_EXTENT_GROWTH: "new-cycle {span} appended",
+}
+
+
+def _axis_events(axis: AxisAlignment) -> tuple[
+    dict[int, FindingSubtype],
+    dict[int, FindingSubtype],
+    FindingSubtype,
+    list[int],
+]:
+    """Per-index deleted/inserted events, the shared growth event, and the
+    in-place key changes.
+
+    A position that is both deleted and inserted changed its key in place; it
+    is one key-change event, never a physical row or column edit pair.
+    """
+    deleted = set(axis.deleted)
+    inserted = set(axis.inserted)
+    reused = deleted & inserted
+    sliding = bool(axis.growth) and not inserted
+    deleted_events = {
+        index: (
+            FindingSubtype.AXIS_ROLLING_TURNOVER
+            if sliding
+            else FindingSubtype.AXIS_PHYSICAL_DELETION
+        )
+        for index in axis.deleted
+        if index not in reused
+    }
+    inserted_events = {
+        index: FindingSubtype.AXIS_PHYSICAL_INSERTION
+        for index in axis.inserted
+        if index not in reused
+    }
+    growth_event = (
+        FindingSubtype.AXIS_ROLLING_TURNOVER
+        if sliding and deleted
+        else FindingSubtype.AXIS_EXTENT_GROWTH
+    )
+    return deleted_events, inserted_events, growth_event, sorted(reused)
+
+
+def _key_cell(
+    sheet: SheetSnapshot, region_table: TableRegion, index: int, *, is_rows: bool
+) -> CellRecord | None:
+    if is_rows:
+        key_col = region_table.key_col
+        return sheet.cells.get((index, key_col)) if key_col is not None else None
+    header_row = region_table.header_row
+    return sheet.cells.get((header_row, index)) if header_row is not None else None
+
+
+def _data_positions(
+    sheet: SheetSnapshot, region_table: TableRegion, *, is_rows: bool
+) -> set[int]:
+    """Axis positions holding at least one populated non-label cell.
+
+    Trackers often pre-fill their period calendar years ahead; the
+    restatement window must trail the last period WITH data, not the last
+    printed label, so empty future positions never define the edge.
+    """
+    positions: set[int] = set()
+    for (row, col), cell in sheet.cells.items():
+        if cell.value is None:
+            continue
+        if not (
+            region_table.min_row <= row <= region_table.max_row
+            and region_table.min_col <= col <= region_table.max_col
+        ):
+            continue
+        if is_rows:
+            if col == region_table.key_col:
+                continue
+            positions.add(row)
+        else:
+            if row == region_table.header_row:
+                continue
+            positions.add(col)
+    return positions
+
+
 def _axis_findings(
-    sheet_name: str, axis: AxisAlignment, *, is_rows: bool, region_id: str
+    base_sheet: SheetSnapshot,
+    curr_sheet: SheetSnapshot,
+    region: RegionAlignment,
+    axis: AxisAlignment,
+    *,
+    is_rows: bool,
+    region_id: str,
 ) -> list[Finding]:
     findings: list[Finding] = []
+    sheet_name = curr_sheet.name
+    if not (axis.deleted or axis.inserted or axis.growth):
+        return findings
+    deleted_events, inserted_events, growth_event, key_changes = _axis_events(axis)
+    event_key = f"excel:{region_id}:{'rows' if is_rows else 'columns'}"
 
     def span(index: int) -> str:
         return f"row {index}" if is_rows else f"column {get_column_letter(index)}"
 
+    def message(subtype: FindingSubtype, index: int) -> str:
+        return (
+            f"{sheet_name} ({region_id}): "
+            + _AXIS_WORDING[subtype].format(span=span(index))
+        )
+
+    for index in key_changes:
+        base_key = _key_cell(base_sheet, region.baseline, index, is_rows=is_rows)
+        curr_key = _key_cell(curr_sheet, region.current, index, is_rows=is_rows)
+        derived = (
+            base_key is not None
+            and curr_key is not None
+            and base_key.has_formula
+            and curr_key.has_formula
+        )
+        advanced = (
+            base_key is not None
+            and curr_key is not None
+            and _period_advanced(base_key.value, curr_key.value)
+        )
+        subtype = (
+            FindingSubtype.AXIS_KEY_DERIVED_LABEL
+            if derived
+            else FindingSubtype.AXIS_KEY_REPLACEMENT
+        )
+        base_label = display_cell_value(base_key.value) if base_key else ""
+        curr_label = display_cell_value(curr_key.value) if curr_key else ""
+        note = ""
+        if advanced:
+            note = " (tracking period advanced with the new cycle)"
+        elif derived and curr_key is not None and curr_key.formula:
+            note = (
+                " [label is formula-derived ("
+                + (curr_key.formula[:80])
+                + "); the upstream driver changed, not this position]"
+            )
+        findings.append(
+            Finding(
+                artifact="excel",
+                finding_class=(
+                    FindingClass.ROW_KEY_CHANGED
+                    if is_rows
+                    else FindingClass.COLUMN_KEY_CHANGED
+                ),
+                expected_reason=(
+                    FindingExpectedReason.PERIOD_PROGRESSION if advanced else None
+                ),
+                subtype=subtype,
+                event_key=event_key,
+                sheet=sheet_name,
+                location=span(index),
+                baseline_location=span(index),
+                baseline_value=base_label,
+                current_value=curr_label,
+                message=(
+                    f"{sheet_name} ({region_id}): historical key at {span(index)} "
+                    f"replaced in place: {base_label!r} -> {curr_label!r}" + note
+                ),
+            )
+        )
     for index in axis.deleted:
+        if index not in deleted_events:
+            continue
+        subtype = deleted_events[index]
         findings.append(
             Finding(
                 artifact="excel",
                 finding_class=(
                     FindingClass.ROW_DELETED if is_rows else FindingClass.COLUMN_DELETED
                 ),
+                subtype=subtype,
+                event_key=event_key,
                 sheet=sheet_name,
                 baseline_location=span(index),
-                message=f"{sheet_name} ({region_id}): historical {span(index)} deleted",
+                message=message(subtype, index),
             )
         )
     for index in axis.inserted:
+        if index not in inserted_events:
+            continue
+        subtype = inserted_events[index]
         findings.append(
             Finding(
                 artifact="excel",
                 finding_class=(
                     FindingClass.ROW_INSERTED if is_rows else FindingClass.COLUMN_INSERTED
                 ),
+                subtype=subtype,
+                event_key=event_key,
                 sheet=sheet_name,
                 location=span(index),
-                message=(
-                    f"{sheet_name} ({region_id}): unexpected {span(index)} inserted "
-                    "outside the cadence growth pattern"
-                ),
+                message=message(subtype, index),
             )
         )
     for index in axis.growth:
@@ -262,10 +559,23 @@ def _axis_findings(
                 finding_class=(
                     FindingClass.ROW_GROWTH if is_rows else FindingClass.COLUMN_GROWTH
                 ),
-                expected_growth=True,
+                expected_reason=(
+                    FindingExpectedReason.ROLLING_WINDOW
+                    if growth_event is FindingSubtype.AXIS_ROLLING_TURNOVER
+                    else FindingExpectedReason.CADENCE_EXTENSION
+                ),
+                subtype=growth_event,
+                event_key=event_key,
                 sheet=sheet_name,
                 location=span(index),
-                message=f"{sheet_name} ({region_id}): new-cycle {span(index)} appended",
+                message=(
+                    f"{sheet_name} ({region_id}): new-cycle {span(index)} "
+                    + (
+                        "entered the rolling window"
+                        if growth_event is FindingSubtype.AXIS_ROLLING_TURNOVER
+                        else "appended"
+                    )
+                ),
             )
         )
     return findings
@@ -277,9 +587,11 @@ def diff_workbook_values(
     alignment: WorkbookAlignment,
     profile: DeliverableProfile | None = None,
     *,
+    run_acceptance: NumericTolerance | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> list[Finding]:
     tolerance = profile.tolerance if profile else NumericTolerance()
+    windows = profile.restatement_windows if profile else RestatementWindows()
     findings: list[Finding] = []
     for sheet_name, regions in alignment.regions.items():
         check_cancelled(cancellation_token)
@@ -315,13 +627,29 @@ def diff_workbook_values(
                     ignore=ignore,
                     refresh=refresh,
                     sheet_profile=sheet_profile,
+                    windows=windows,
+                    run_acceptance=run_acceptance,
                 )
             )
             region_id = region.current.region_id
             findings.extend(
-                _axis_findings(sheet_name, region.rows, is_rows=True, region_id=region_id)
+                _axis_findings(
+                    base_sheet,
+                    curr_sheet,
+                    region,
+                    region.rows,
+                    is_rows=True,
+                    region_id=region_id,
+                )
             )
             findings.extend(
-                _axis_findings(sheet_name, region.columns, is_rows=False, region_id=region_id)
+                _axis_findings(
+                    base_sheet,
+                    curr_sheet,
+                    region,
+                    region.columns,
+                    is_rows=False,
+                    region_id=region_id,
+                )
             )
     return findings

@@ -13,7 +13,7 @@ from qc_tool.engine import run_qc
 from qc_tool.excel.align import align_workbooks
 from qc_tool.excel.formulas import diff_workbook_formulas
 from qc_tool.excel.preflight import preflight_workbook
-from qc_tool.findings import FindingClass
+from qc_tool.findings import FindingClass, FindingExpectedReason
 from qc_tool.io.model import CellRecord, SheetSnapshot, WorkbookSnapshot
 from qc_tool.ppt.diff import diff_decks
 from qc_tool.ppt.match import SlideMatching
@@ -267,6 +267,7 @@ def test_availability_controls_blankness_not_nonblank_refresh(
     )
     assert not changed_finding.expected_growth
     assert refreshed_finding.expected_growth
+    assert refreshed_finding.expected_reason is FindingExpectedReason.PROFILE_REFRESH
 
 
 def test_refresh_range_never_excuses_a_required_blank(tmp_path: Path) -> None:

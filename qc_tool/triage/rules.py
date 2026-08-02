@@ -18,7 +18,17 @@ import datetime as dt
 from collections import Counter
 
 from qc_tool.config.profile import DeliverableProfile
-from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.findings import (
+    Finding,
+    FindingClass,
+    FindingEvidenceTag,
+    FindingExpectedReason,
+    FindingProvenance,
+    FindingSubtype,
+    FindingTemporalContext,
+    Materiality,
+    Severity,
+)
 
 DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     # Historical data integrity: critical.
@@ -28,6 +38,7 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.FORMULA_REMOVED: Severity.CRITICAL,
     FindingClass.FORMULA_MISSING: Severity.CRITICAL,
     FindingClass.EXTERNAL_LINK: Severity.CRITICAL,
+    FindingClass.ACTIVE_CONTENT: Severity.CRITICAL,
     FindingClass.NAMED_RANGE_INVALID: Severity.CRITICAL,
     FindingClass.CHART_REFERENCE_INVALID: Severity.CRITICAL,
     FindingClass.PIVOT_SOURCE_INVALID: Severity.CRITICAL,
@@ -40,6 +51,9 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.ROW_DELETED: Severity.CRITICAL,
     FindingClass.COLUMN_DELETED: Severity.CRITICAL,
     FindingClass.SHEET_REMOVED: Severity.CRITICAL,
+    #: An in-place key change on a constant key rewrites history identity.
+    FindingClass.ROW_KEY_CHANGED: Severity.CRITICAL,
+    FindingClass.COLUMN_KEY_CHANGED: Severity.CRITICAL,
     FindingClass.CROSSCHECK_MISMATCH: Severity.CRITICAL,
     FindingClass.PACKAGE_PERIOD_MISMATCH: Severity.CRITICAL,
     # Formula and structure drift: warning.
@@ -98,9 +112,9 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.SLIDE_REORDERED: Severity.INFO,
     FindingClass.CROSSCHECK_UNRESOLVED: Severity.INFO,
     FindingClass.HIDDEN_CONTENT: Severity.INFO,
-    # Growth classes only ever occur with expected_growth=True.
-    FindingClass.ROW_GROWTH: Severity.EXPECTED,
-    FindingClass.COLUMN_GROWTH: Severity.EXPECTED,
+    # Geometry alone does not prove cadence growth.
+    FindingClass.ROW_GROWTH: Severity.WARNING,
+    FindingClass.COLUMN_GROWTH: Severity.WARNING,
 }
 
 _SEVERITY_RANK = {
@@ -110,15 +124,114 @@ _SEVERITY_RANK = {
     Severity.EXPECTED: 3,
 }
 
+#: Default severity for non-material numeric tiers. Material tiers fall
+#: through to the per-class path so history integrity keeps its default.
+MATERIALITY_SEVERITIES: dict[Materiality, Severity] = {
+    Materiality.NOISE: Severity.INFO,
+    Materiality.WITHIN_TOLERANCE: Severity.INFO,
+    # Legacy history only; new findings carry temporal_context separately.
+    Materiality.RECENT_RESTATEMENT: Severity.WARNING,
+}
+
+_RECENT_CONTEXTS = frozenset(
+    {
+        FindingTemporalContext.CURRENT_PERIOD,
+        FindingTemporalContext.RECENT_WINDOW,
+    }
+)
+
+#: Pre-existing conditions proven identical in the baseline are not this
+#: cycle's regressions; they inform rather than alarm.
+_INHERITED_DEMOTED_CLASSES = frozenset({FindingClass.FORMULA_INCONSISTENT})
+
+#: Subtype-specific defaults: a formula-derived label re-resolving is driver
+#: churn, not a historical-row deletion; the oldest row leaving a detected
+#: rolling window is that window's design, not a historical deletion.
+_SUBTYPE_SEVERITIES: dict[tuple[FindingClass, FindingSubtype], Severity] = {
+    (
+        FindingClass.ROW_KEY_CHANGED,
+        FindingSubtype.AXIS_KEY_DERIVED_LABEL,
+    ): Severity.WARNING,
+    (
+        FindingClass.COLUMN_KEY_CHANGED,
+        FindingSubtype.AXIS_KEY_DERIVED_LABEL,
+    ): Severity.WARNING,
+    (
+        FindingClass.ROW_DELETED,
+        FindingSubtype.AXIS_ROLLING_TURNOVER,
+    ): Severity.WARNING,
+    (
+        FindingClass.COLUMN_DELETED,
+        FindingSubtype.AXIS_ROLLING_TURNOVER,
+    ): Severity.WARNING,
+}
+
+_REGRESSION_ERROR_PROVENANCE = frozenset(
+    {FindingProvenance.NEW, FindingProvenance.CHANGED}
+)
+_SYSTEMATIC_ERROR_EVIDENCE = frozenset(
+    {
+        FindingEvidenceTag.CONCENTRATED_POPULATION,
+        FindingEvidenceTag.CONTIGUOUS_POPULATION,
+    }
+)
+
+
+def _formula_error_severity(finding: Finding) -> Severity | None:
+    if finding.finding_class is not FindingClass.FORMULA_ERROR:
+        return None
+    evidence = finding.evidence_tags
+    if FindingEvidenceTag.STRUCTURAL_ERROR in evidence:
+        return Severity.CRITICAL
+    if finding.provenance in _REGRESSION_ERROR_PROVENANCE:
+        return Severity.CRITICAL
+    if (
+        finding.provenance is FindingProvenance.INHERITED
+        and FindingEvidenceTag.EXPLICIT_NA in evidence
+        and FindingEvidenceTag.FORMULA_TEXT in evidence
+    ):
+        return Severity.INFO
+    if (
+        FindingEvidenceTag.FORMULA_PRESENCE in evidence
+        and not _SYSTEMATIC_ERROR_EVIDENCE.isdisjoint(evidence)
+    ):
+        return Severity.WARNING
+    return Severity.CRITICAL
+
 
 def assign_severity(finding: Finding, profile: DeliverableProfile | None = None) -> Severity:
-    if finding.expected_growth:
+    if finding.expected_reason is not None:
         return Severity.EXPECTED
+    if finding.expected_growth:  # legacy evidence without a typed reason
+        return Severity.EXPECTED
+    error_severity = _formula_error_severity(finding)
+    if error_severity is not None:
+        return error_severity
+    tier = finding.materiality
+    if tier is not None:
+        tier_overrides = profile.materiality_severity if profile is not None else {}
+        mapped = tier_overrides.get(tier, MATERIALITY_SEVERITIES.get(tier))
+        if mapped is not None:
+            return mapped
+    if finding.materiality is Materiality.MATERIAL and (
+        finding.temporal_context in _RECENT_CONTEXTS
+    ):
+        return Severity.WARNING
+    if (
+        finding.provenance is FindingProvenance.INHERITED
+        and finding.finding_class in _INHERITED_DEMOTED_CLASSES
+    ):
+        return Severity.INFO
     overrides = profile.severity if profile is not None else {}
-    return overrides.get(
-        finding.finding_class,
-        DEFAULT_SEVERITIES.get(finding.finding_class, Severity.WARNING),
-    )
+    if finding.finding_class in overrides:
+        return overrides[finding.finding_class]
+    if finding.subtype is not None:
+        subtype_default = _SUBTYPE_SEVERITIES.get(
+            (finding.finding_class, finding.subtype)
+        )
+        if subtype_default is not None:
+            return subtype_default
+    return DEFAULT_SEVERITIES.get(finding.finding_class, Severity.WARNING)
 
 
 def triage(
@@ -165,6 +278,7 @@ def triage(
             None,
         )
         if active is not None:
+            finding.mark_expected(FindingExpectedReason.WAIVER)
             finding.severity = Severity.EXPECTED
             finding.waiver_reason = active.reason
             finding.waiver_expires = active.expires.isoformat()

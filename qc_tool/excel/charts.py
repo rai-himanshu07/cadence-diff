@@ -15,7 +15,7 @@ from qc_tool.excel.references import (
     is_pure_range_extension,
     resolve_reference,
 )
-from qc_tool.findings import Finding, FindingClass
+from qc_tool.findings import Finding, FindingClass, FindingExpectedReason
 from qc_tool.io.model import (
     ChartAnchor,
     ChartAxis,
@@ -312,14 +312,18 @@ def _expected_source_change(
     current: str | None,
     *,
     window_override: str | None,
-) -> bool:
+) -> FindingExpectedReason | None:
     if baseline is None or current is None:
-        return False
+        return None
     if is_pure_range_extension(baseline, current):
-        return True
+        return FindingExpectedReason.CADENCE_EXTENSION
     if window_override == "full":
-        return False
-    return _is_rolling_shift(baseline, current)
+        return None
+    return (
+        FindingExpectedReason.ROLLING_WINDOW
+        if _is_rolling_shift(baseline, current)
+        else None
+    )
 
 
 def _data_labels_signature(value: ChartDataLabels | None) -> tuple[object, ...] | None:
@@ -432,12 +436,12 @@ def _finding(
     *,
     baseline_value: str | None = None,
     current_value: str | None = None,
-    expected_growth: bool = False,
+    expected_reason: FindingExpectedReason | None = None,
 ) -> Finding:
     return Finding(
         artifact="excel",
         finding_class=finding_class,
-        expected_growth=expected_growth,
+        expected_reason=expected_reason,
         sheet=chart.sheet,
         element=_chart_label(chart),
         baseline_value=baseline_value,
@@ -476,7 +480,7 @@ def _series_findings(
         current_ref = getattr(current, attribute)
         if baseline_ref == current_ref:
             continue
-        expected = _expected_source_change(
+        expected_reason = _expected_source_change(
             baseline_ref,
             current_ref,
             window_override=window_override,
@@ -488,11 +492,15 @@ def _series_findings(
                 (
                     f"chart {_chart_label(chart)!r} plot {plot.index} "
                     f"series {_series_label(current)!r} {label} "
-                    + ("advanced with expected cadence data" if expected else "changed")
+                    + (
+                        "advanced with expected cadence data"
+                        if expected_reason is not None
+                        else "changed"
+                    )
                 ),
                 baseline_value=baseline_ref,
                 current_value=current_ref,
-                expected_growth=expected,
+                expected_reason=expected_reason,
             )
         )
     if _data_labels_signature(baseline.data_labels) != _data_labels_signature(

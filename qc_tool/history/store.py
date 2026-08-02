@@ -10,6 +10,8 @@ import hashlib
 import json
 import logging
 import sqlite3
+import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,9 +19,12 @@ from qc_tool.coverage import CoverageItem, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import Finding, Severity
-from qc_tool.review import build_review_groups
+from qc_tool.review import build_pattern_groups, build_review_groups
+from qc_tool.review import count_pattern_groups as count_pattern_review_groups
 from qc_tool.review import review_counts as count_review_groups
+from qc_tool.scope import ComparisonScope
 from qc_tool.security import private_directory, private_file
+from qc_tool.story import build_stories
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +46,10 @@ CREATE TABLE IF NOT EXISTS runs (
     coverage TEXT NOT NULL DEFAULT '[]',
     mapping_coverage TEXT NOT NULL DEFAULT 'null',
     mapping_suggestions TEXT NOT NULL DEFAULT '[]',
-    review_counts TEXT NOT NULL DEFAULT '{}'
+    review_counts TEXT NOT NULL DEFAULT '{}',
+    pattern_review_counts TEXT NOT NULL DEFAULT '{}',
+    story_counts TEXT NOT NULL DEFAULT '{}',
+    comparison_scope TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS annotations (
     run_id INTEGER NOT NULL,
@@ -70,6 +78,16 @@ _MIGRATIONS = {
     "review_counts": (
         "ALTER TABLE runs ADD COLUMN review_counts TEXT NOT NULL DEFAULT '{}'"
     ),
+    "pattern_review_counts": (
+        "ALTER TABLE runs ADD COLUMN pattern_review_counts TEXT NOT NULL DEFAULT '{}'"
+    ),
+    "story_counts": (
+        "ALTER TABLE runs ADD COLUMN story_counts TEXT NOT NULL DEFAULT '{}'"
+    ),
+    "comparison_scope": (
+        "ALTER TABLE runs ADD COLUMN comparison_scope TEXT NOT NULL DEFAULT '{}'"
+    ),
+    "archived": "ALTER TABLE runs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -86,8 +104,15 @@ class RunRecord:
     disclosures: list[str]
     verified_crosschecks: int
     report_paths: dict[str, str]
+    #: Semantic pattern review counts; ``{}`` for runs recorded before Step 8.
+    pattern_review_counts: dict[str, int] = field(default_factory=dict)
+    #: Change-story member counts by kind; ``{}`` for earlier runs.
+    story_counts: dict[str, dict[str, int]] = field(default_factory=dict)
+    comparison_scope: ComparisonScope = field(default_factory=ComparisonScope)
     file_paths: dict[str, str] = field(default_factory=dict)  # role -> stored path
     rerun_of: int | None = None
+    #: Retired from the default history view; the record itself is retained.
+    archived: bool = False
     coverage: list[CoverageItem] = field(default_factory=list)
     mapping_coverage: MappingCoverage | None = None
     mapping_suggestions: list[MappingSuggestion] = field(default_factory=list)
@@ -100,6 +125,23 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _remove_managed_report(path: Path, root: Path) -> None:
+    """Delete one report file, and its now-empty run directory, inside ``root``."""
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        logger.warning("refusing to delete a report outside the managed data directory")
+        return
+    try:
+        resolved.unlink(missing_ok=True)
+        parent = resolved.parent
+        if parent != root and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError:
+        logger.warning("could not remove a stored report file")
 
 
 class RunHistory:
@@ -115,7 +157,9 @@ class RunHistory:
             private_file(db_path)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
+        # The worker process, the queue manager, and the UI share this file.
+        conn = sqlite3.connect(self._db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -135,6 +179,18 @@ class RunHistory:
             severity.value: count
             for severity, count in grouped.review_items.items()
         }
+        patterned = count_pattern_review_groups(build_pattern_groups(result.findings))
+        pattern_counts = {
+            severity.value: count
+            for severity, count in patterned.review_items.items()
+        }
+        story_counts: dict[str, dict[str, int]] = {}
+        for story in build_stories(result.findings):
+            bucket = story_counts.setdefault(
+                story.kind.value, {"stories": 0, "members": 0}
+            )
+            bucket["stories"] += 1
+            bucket["members"] += story.member_count
         findings_payload = json.dumps(
             [finding.model_dump(mode="json") for finding in result.findings]
         )
@@ -145,8 +201,9 @@ class RunHistory:
                     started_at, profile, files, file_hashes, counts,
                     disclosures, verified_crosschecks, findings, report_paths,
                     file_paths, rerun_of, mode, coverage, mapping_coverage,
-                    mapping_suggestions, review_counts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mapping_suggestions, review_counts, pattern_review_counts,
+                    story_counts, comparison_scope
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     started_at,
@@ -171,6 +228,9 @@ class RunHistory:
                         [item.model_dump(mode="json") for item in result.mapping_suggestions]
                     ),
                     json.dumps(grouped_counts),
+                    json.dumps(pattern_counts),
+                    json.dumps(story_counts),
+                    json.dumps(result.comparison_scope.model_dump(mode="json")),
                 ),
             )
             run_id = cursor.lastrowid
@@ -194,11 +254,17 @@ class RunHistory:
             file_hashes=json.loads(row["file_hashes"]),
             counts=json.loads(row["counts"]),
             review_counts=json.loads(row["review_counts"]),
+            pattern_review_counts=json.loads(row["pattern_review_counts"]),
+            story_counts=json.loads(row["story_counts"]),
+            comparison_scope=ComparisonScope.model_validate(
+                json.loads(row["comparison_scope"])
+            ),
             disclosures=json.loads(row["disclosures"]),
             verified_crosschecks=row["verified_crosschecks"],
             report_paths=json.loads(row["report_paths"]),
             file_paths=json.loads(row["file_paths"]),
             rerun_of=row["rerun_of"],
+            archived=bool(row["archived"]),
             coverage=[CoverageItem.model_validate(item) for item in json.loads(row["coverage"])],
             mapping_coverage=(
                 MappingCoverage.model_validate(json.loads(row["mapping_coverage"]))
@@ -212,12 +278,54 @@ class RunHistory:
             findings=findings,
         )
 
-    def list_runs(self, limit: int = 50) -> list[RunRecord]:
+    def list_runs(self, limit: int = 50, *, include_archived: bool = True) -> list[RunRecord]:
+        clause = "" if include_archived else " WHERE archived = 0"
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT * FROM runs{clause} ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         return [self._record_from_row(row, with_findings=False) for row in rows]
+
+    def set_archived(self, run_ids: Iterable[int], archived: bool) -> int:
+        """Retire or restore runs without touching their recorded evidence."""
+        ids = sorted({int(run_id) for run_id in run_ids})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE runs SET archived = ? WHERE id IN ({placeholders})",
+                (1 if archived else 0, *ids),
+            )
+            return cursor.rowcount
+
+    def delete_runs(self, run_ids: Iterable[int], *, managed_root: Path) -> int:
+        """Delete runs, their annotations, and their report files.
+
+        Report files are removed only when they resolve inside ``managed_root``,
+        so a tampered or legacy path can never delete anything outside the
+        managed data directory.
+        """
+        ids = sorted({int(run_id) for run_id in run_ids})
+        if not ids:
+            return 0
+        root = managed_root.resolve()
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT report_paths FROM runs WHERE id IN ({placeholders})", ids
+            ).fetchall()
+            cursor = conn.execute(
+                f"DELETE FROM runs WHERE id IN ({placeholders})", ids
+            )
+            conn.execute(
+                f"DELETE FROM annotations WHERE run_id IN ({placeholders})", ids
+            )
+            deleted = cursor.rowcount
+        for row in rows:
+            for raw in json.loads(row["report_paths"]).values():
+                _remove_managed_report(Path(raw), root)
+        return deleted
 
     def get_run(self, run_id: int) -> RunRecord:
         with self._connect() as conn:
@@ -310,3 +418,59 @@ class RunHistory:
             )
         if cursor.rowcount == 0:
             raise KeyError(f"no QC run with id {run_id}")
+
+
+def export_runs_archive(
+    records: list[RunRecord], destination: Path, *, managed_root: Path
+) -> Path:
+    """Bundle the stored reports for several runs into one private zip.
+
+    Entry names are generated here, never taken from stored paths, and a source
+    file is included only when it resolves inside ``managed_root``.
+    """
+    root = managed_root.resolve()
+    manifest: list[dict[str, object]] = []
+    private_directory(destination.parent)
+    with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for record in records:
+            included: list[str] = []
+            for kind, raw in sorted(record.report_paths.items()):
+                source = Path(raw)
+                try:
+                    resolved = source.resolve()
+                    resolved.relative_to(root)
+                except (OSError, ValueError):
+                    logger.warning("skipping a report outside the managed directory")
+                    continue
+                if not resolved.is_file():
+                    continue
+                entry = f"run-{record.run_id}/{kind}{resolved.suffix}"
+                bundle.write(resolved, entry)
+                included.append(entry)
+            manifest.append(
+                {
+                    "run_id": record.run_id,
+                    "started_at": record.started_at.isoformat(timespec="seconds"),
+                    "mode": record.mode.value,
+                    "profile": record.profile,
+                    "files": record.files,  # display names only, never paths
+                    "counts": record.counts,
+                    "pattern_review_counts": record.pattern_review_counts,
+                    "archived": record.archived,
+                    "reports": included,
+                }
+            )
+        bundle.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "exported_at": dt.datetime.now(dt.UTC).isoformat(
+                        timespec="seconds"
+                    ),
+                    "runs": manifest,
+                },
+                indent=2,
+            ),
+        )
+    private_file(destination)
+    return destination

@@ -23,7 +23,13 @@ import qc_tool.engine as engine_module
 import qc_tool.io.loader as loader_module
 from qc_tool.config.profile import DeliverableProfile
 from qc_tool.engine import QCRunResult, run_qc
-from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.findings import (
+    Finding,
+    FindingClass,
+    FindingTemporalContext,
+    Materiality,
+    Severity,
+)
 from qc_tool.progress import CancellationToken
 from qc_tool.ui.app import perform_run
 from tests.conftest import fixture_profile
@@ -62,6 +68,8 @@ class Expectation:
 #: One expectation per manifest defect in the xlsx/pptx/crosscheck run.
 EXPECTATIONS = [
     Expectation("E01", FindingClass.VALUE_CHANGED, "Long_Monthly", "C7"),
+    Expectation("E19", FindingClass.VALUE_CHANGED, "Long_Monthly", "D4"),
+    Expectation("E20", FindingClass.VALUE_CHANGED, "Long_Monthly", "C21"),
     Expectation("E02", FindingClass.FORMULA_HARDCODED, "Long_Monthly", "E10"),
     Expectation("E03", FindingClass.FORMULA_LOGIC_CHANGED, "Long_Monthly", "E14"),
     Expectation("E04", FindingClass.FORMULA_NOT_EXTENDED, "Long_Monthly", "E25"),
@@ -99,7 +107,9 @@ CONSEQUENCES = [
 
 #: Total non-expected findings on the fixture pair — pinned deliberately:
 #: a change here must be a conscious engine-behavior decision.
-EXPECTED_NON_EXPECTED_COUNT = 27
+#: 27 -> 29 (2026-08-01): E19 noise-tier and E20 restatement-tier value
+#: defects were seeded; both stay visible (INFO / WARNING), never hidden.
+EXPECTED_NON_EXPECTED_COUNT = 29
 
 
 def _non_expected(result: QCRunResult) -> list[Finding]:
@@ -133,6 +143,23 @@ def test_no_unexplained_findings(qc_result: QCRunResult) -> None:
     ]
     assert unexplained == [], f"findings without a seeded cause: {unexplained}"
     assert len(findings) == EXPECTED_NON_EXPECTED_COUNT
+
+
+def test_materiality_tiers_reach_severity_end_to_end(qc_result: QCRunResult) -> None:
+    """E01 old-history stays critical; E19 is noise/INFO; E20 restates/WARNING."""
+    values = {
+        f.location: f
+        for f in qc_result.findings
+        if f.finding_class is FindingClass.VALUE_CHANGED and f.sheet == "Long_Monthly"
+    }
+
+    assert values["C7"].materiality is Materiality.MATERIAL
+    assert values["C7"].severity is Severity.CRITICAL
+    assert values["D4"].materiality is Materiality.NOISE
+    assert values["D4"].severity is Severity.INFO
+    assert values["C21"].materiality is Materiality.MATERIAL
+    assert values["C21"].temporal_context is FindingTemporalContext.RECENT_WINDOW
+    assert values["C21"].severity is Severity.WARNING
 
 
 def test_streaming_and_oracle_produce_equal_e2e_results(

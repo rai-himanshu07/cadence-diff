@@ -8,7 +8,7 @@ from qc_tool.availability import ppt_blank_allowed
 from qc_tool.config.profile import PptProfile
 from qc_tool.excel.periods import Period, is_period_after, parse_period
 from qc_tool.excel.references import is_pure_range_extension
-from qc_tool.findings import Finding, FindingClass
+from qc_tool.findings import Finding, FindingClass, FindingExpectedReason
 from qc_tool.io.model import ChartAxis, ChartDataLabels, ChartLegend
 from qc_tool.ppt.element_match import match_plots, match_series, match_slide_elements
 from qc_tool.ppt.model import (
@@ -159,7 +159,9 @@ def _table_findings(
             Finding(
                 artifact="ppt",
                 finding_class=FindingClass.TABLE_VALUE_CHANGED,
-                expected_growth=expected,
+                expected_reason=(
+                    FindingExpectedReason.CADENCE_EXTENSION if expected else None
+                ),
                 slide=display,
                 element=header,
                 message=(
@@ -385,7 +387,7 @@ def _series_data_findings(
             Finding(
                 artifact="ppt",
                 finding_class=FindingClass.CHART_VALUE_CHANGED,
-                expected_growth=True,
+                expected_reason=FindingExpectedReason.ROLLING_WINDOW,
                 slide=display,
                 element="window",
                 baseline_value=(
@@ -429,7 +431,15 @@ def _series_data_findings(
             Finding(
                 artifact="ppt",
                 finding_class=FindingClass.CHART_VALUE_CHANGED,
-                expected_growth=expected or window == "rolling",
+                expected_reason=(
+                    FindingExpectedReason.ROLLING_WINDOW
+                    if window == "rolling"
+                    else (
+                        FindingExpectedReason.CADENCE_EXTENSION
+                        if expected
+                        else None
+                    )
+                ),
                 slide=display,
                 element=category,
                 current_value=category,
@@ -875,4 +885,6 @@ def diff_slide_elements(
                 message=f"{display}: chart {_chart_label(current_chart)!r} reordered",
             )
         )
+    for finding in findings:
+        finding.slide_index = current.index + 1
     return findings

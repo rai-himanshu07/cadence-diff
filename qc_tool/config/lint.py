@@ -260,6 +260,17 @@ def lint_profile(
             _check_range(f"{where}.ignore_ranges", cell_range, issues)
         for cell_range in sheet_profile.refresh_ranges:
             _check_range(f"{where}.refresh_ranges", cell_range, issues)
+        for index, band in enumerate(sheet_profile.acceptance_bands):
+            band_where = f"{where}.acceptance_bands[{index}]"
+            _check_range(band_where, band.cell_range, issues)
+            if band.absolute <= 0 and band.relative <= 0:
+                issues.append(
+                    LintIssue(
+                        "error",
+                        band_where,
+                        "acceptance band accepts nothing; set absolute or relative > 0",
+                    )
+                )
         for region in sheet_profile.regions:
             _check_range(f"{where}.regions", region.cell_range, issues)
         for band in sheet_profile.cadence_bands:

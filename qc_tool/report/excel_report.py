@@ -15,10 +15,12 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.worksheet.worksheet import Worksheet
 
+from qc_tool.coverage import capability_limited
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import Severity
-from qc_tool.review import build_review_groups, format_group_ranges, review_counts
+from qc_tool.review import build_pattern_groups, count_pattern_groups, format_group_ranges
 from qc_tool.security import private_directory, private_file
+from qc_tool.story import build_stories
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,12 @@ _COLUMNS = [
     ("Sheet / Slide", 20),
     ("Location", 14),
     ("Element", 22),
+    ("Provenance", 18),
+    ("Subtype", 20),
+    ("Materiality", 18),
+    ("Temporal context", 20),
+    ("Expected reason", 22),
+    ("Evidence tags", 50),
     ("Baseline", 32),
     ("Current", 32),
     ("Message", 60),
@@ -80,8 +88,9 @@ def _internal_link(
 
 
 def write_excel_report(result: QCRunResult, path: Path) -> None:
-    review_groups = build_review_groups(result.findings)
-    counts = review_counts(review_groups)
+    review_groups = build_pattern_groups(result.findings)
+    counts = count_pattern_groups(review_groups)
+    stories = build_stories(result.findings)
     workbook = Workbook()
     summary = workbook.active
     if summary is None:  # pragma: no cover - openpyxl always provides one
@@ -95,13 +104,20 @@ def write_excel_report(result: QCRunResult, path: Path) -> None:
         ("Profile", result.profile_name),
         ("Mode", result.mode.value),
         *((f"File: {role}", name) for role, name in result.files.items()),
+        (
+            "Result status",
+            "capability-limited"
+            if capability_limited(result.coverage)
+            else "all required checks ran",
+        ),
         ("Verified cross-checks", str(result.verified_crosschecks)),
+        ("Change stories", str(len(stories))),
         *(
-            (f"{severity.value.title()} review items", str(count))
+            (f"{severity.value.title()} pattern review items", str(count))
             for severity, count in counts.review_items.items()
         ),
         *(
-            (f"{severity.value.title()} affected findings", str(count))
+            (f"{severity.value.title()} atomic findings", str(count))
             for severity, count in counts.atomic_findings.items()
         ),
     ]
@@ -133,10 +149,47 @@ def write_excel_report(result: QCRunResult, path: Path) -> None:
         cell.font = Font(italic=True, color="FFC00000")
     summary.column_dimensions["A"].width = 28
     summary.column_dimensions["B"].width = 60
-    _internal_link(summary["D3"], location="'Review Groups'!A1", label="Review groups")
-    _internal_link(summary["D4"], location="'Findings'!A1", label="Atomic findings")
-    _internal_link(summary["D5"], location="'Coverage'!A1", label="Coverage")
+    _internal_link(summary["D3"], location="'Stories'!A1", label="Change stories")
+    _internal_link(summary["D4"], location="'Review Groups'!A1", label="Review groups")
+    _internal_link(summary["D5"], location="'Findings'!A1", label="Atomic findings")
+    _internal_link(summary["D6"], location="'Coverage'!A1", label="Coverage")
     summary.column_dimensions["D"].width = 20
+
+    stories_sheet = workbook.create_sheet("Stories")
+    story_headers = (
+        "Story",
+        "Kind",
+        "Title",
+        "Narrative and evidence",
+        "Findings",
+        "Severity mix",
+    )
+    for col, header in enumerate(story_headers, start=1):
+        cell = stories_sheet.cell(row=1, column=col, value=header)
+        cell.font = _WHITE_BOLD
+        cell.fill = _HEADER_FILL
+    for row, story in enumerate(stories, start=2):
+        narrative = story.description
+        if story.evidence:
+            narrative += "\n" + "\n".join(story.evidence)
+        mix = " | ".join(
+            f"{name}: {count}"
+            for name, count in story.severity_counts.items()
+            if count
+        )
+        values = (
+            story.story_id,
+            story.kind.value,
+            story.title,
+            narrative,
+            story.member_count,
+            mix,
+        )
+        for col, value in enumerate(values, start=1):
+            _dynamic_cell(stories_sheet, row=row, column=col, value=value)
+    stories_sheet.freeze_panes = "A2"
+    stories_sheet.column_dimensions["C"].width = 44
+    stories_sheet.column_dimensions["D"].width = 80
 
     coverage = workbook.create_sheet("Coverage")
     coverage_headers = ("Artifact", "Check", "Status", "Findings", "Detail")
@@ -230,6 +283,20 @@ def write_excel_report(result: QCRunResult, path: Path) -> None:
             finding.sheet or finding.slide or "",
             finding.location or finding.baseline_location or "",
             finding.element or "",
+            finding.provenance.value if finding.provenance is not None else "",
+            finding.subtype.value if finding.subtype is not None else "",
+            finding.materiality.value if finding.materiality is not None else "",
+            (
+                finding.temporal_context.value
+                if finding.temporal_context is not None
+                else ""
+            ),
+            (
+                finding.expected_reason.value
+                if finding.expected_reason is not None
+                else ""
+            ),
+            "; ".join(sorted(tag.value for tag in finding.evidence_tags)),
             finding.baseline_value or "",
             finding.current_value or "",
             finding.message,

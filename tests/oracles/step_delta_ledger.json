@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "steps": {
+    "1": {
+      "checkpoint": "before_state",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0
+    },
+    "10": {
+      "checkpoint": "safeguards_and_phase_telemetry",
+      "expected_atomic_delta": 0,
+      "expected_checked_coverage_delta": 1,
+      "expected_coverage_transitions": [
+        "excel-dependency-workload added as checked"
+      ],
+      "expected_impact_delta": 0,
+      "expected_pattern_review_delta": 0,
+      "expected_phases": [
+        "preparing",
+        "loading_baseline_excel",
+        "loading_current_excel",
+        "diffing_excel",
+        "comparing_formulas",
+        "indexing_dependencies",
+        "querying_impacts",
+        "building_review"
+      ],
+      "expected_reclassification": "no finding change; a dependency-cost estimate gains its own coverage item and Excel analysis subdivides into diff, formula, dependency-index, impact, and review phases",
+      "expected_review_count_delta": 0
+    },
+    "11": {
+      "checkpoint": "persistent_run_queue",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0,
+      "expected_pattern_review_delta": 0,
+      "expected_reclassification": "execution plumbing only; heavy QC moves into one owned spawn worker and queue lifecycle state persists in run_state, so no finding, severity, coverage, or review value changes",
+      "expected_review_count_delta": 0,
+      "expected_run_state_statuses": [
+        "queued",
+        "starting",
+        "running",
+        "cancelling",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "orphaned"
+      ]
+    },
+    "12": {
+      "checkpoint": "xlsb_scanner_repair",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0,
+      "expected_pattern_review_delta": 0,
+      "expected_reclassification": "XLSB-only repair; the cycle pair contains no XLSB input, so its aggregates are unchanged and the customXml allowlist affects XLSB workloads only",
+      "expected_review_count_delta": 0
+    },
+    "13": {
+      "checkpoint": "integrated_gates",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_equal_to_checkpoint": "real_workload_step10.json",
+      "expected_impact_delta": 0,
+      "expected_pattern_review_delta": 0,
+      "expected_reclassification": "validation only; the Step 13 checkpoint must equal the Step 10 checkpoint on every finding, severity, coverage, and review aggregate",
+      "expected_review_count_delta": 0
+    },
+    "2": {
+      "checkpoint": "bounded_telemetry",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0,
+      "expected_reference_status_delta": {
+        "invalid": 0,
+        "resolved": 0,
+        "unsupported": 0
+      }
+    },
+    "3": {
+      "anonymous_reference_status_delta": {
+        "invalid": -370524,
+        "local_symbol": 370524,
+        "resolved": 0,
+        "unsupported": 0
+      },
+      "checkpoint": "lexical_scope",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transition": "lexical false-invalid occurrences become local-symbol occurrences",
+      "expected_impact_rule": "true references remain exact; local symbols create no edges",
+      "synthetic_reference_status_delta": {
+        "invalid": -6,
+        "local_symbol": 6,
+        "resolved": 0,
+        "unsupported": 0
+      }
+    },
+    "4": {
+      "checkpoint": "provenance_subtypes",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_error_provenance": {
+        "changed": 0,
+        "inherited": 32,
+        "new": 0
+      },
+      "expected_impact_delta": 0,
+      "expected_outlier_provenance": {
+        "historical": 155,
+        "novel": 0
+      },
+      "expected_reclassification": "formula error and consistency atomics gain cycle provenance; value atomics gain a subtype and subtype-accurate wording",
+      "expected_reference_status_delta": {
+        "invalid": 0,
+        "local_symbol": 0,
+        "resolved": 0,
+        "unsupported": 0
+      },
+      "expected_review_count_delta": 0,
+      "expected_value_subtypes": {
+        "added_population": 16,
+        "cleared_population": 0,
+        "replacement": 257
+      }
+    },
+    "5": {
+      "checkpoint": "structural_events",
+      "expected_atomic_delta": -108,
+      "expected_axis_atomics": 70,
+      "expected_axis_event_groups": 14,
+      "expected_conditional_format_delta": -108,
+      "expected_conditional_order_findings": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0,
+      "expected_reclassification": "conditional-format priority renumbering caused only by rule additions and removals stops emitting independent findings; row/column atomics gain typed region events without new finding classes",
+      "expected_reference_status_delta": {
+        "invalid": 0,
+        "local_symbol": 0,
+        "resolved": 0,
+        "unsupported": 0
+      },
+      "expected_review_count_delta": -108,
+      "expected_severity_delta": {
+        "critical": 0,
+        "expected": 0,
+        "info": 0,
+        "warning": -108
+      }
+    },
+    "6": {
+      "checkpoint": "compact_dependency_index",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0,
+      "expected_materialized_member_edges": 0,
+      "expected_reclassification": "no finding change; per-cell NetworkX expansion is replaced by direct edges plus rectangular range descriptors indexed by sheet and bounded row/column intervals",
+      "expected_reference_status_delta": {
+        "invalid": 0,
+        "local_symbol": 0,
+        "resolved": 0,
+        "unsupported": 0
+      },
+      "expected_review_count_delta": 0,
+      "performance_targets": {
+        "max_median_elapsed_seconds": 60,
+        "max_median_peak_rss_mib": 800
+      }
+    },
+    "7": {
+      "checkpoint": "budget_before_enrichment",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0,
+      "expected_reclassification": "no finding change on this workload because nothing hit the budget; impact closures and grid excerpts now run only for retained atomics, and dependency capability coverage stays checked while the affected artifact output degrades",
+      "expected_review_count_delta": 0
+    },
+    "8": {
+      "checkpoint": "semantic_pattern_groups",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0,
+      "expected_mixed_pattern_groups": 0,
+      "expected_pattern_review_items": 119,
+      "expected_reclassification": "no atomic change; an additive semantic pattern layer collapses 1,658 atomics into 119 pure groups while spatial review_counts stay unchanged for compatibility",
+      "expected_review_count_delta": 0
+    },
+    "9": {
+      "checkpoint": "analyst_surfaces",
+      "expected_atomic_delta": 0,
+      "expected_coverage_transitions": [],
+      "expected_impact_delta": 0,
+      "expected_pattern_review_delta": 0,
+      "expected_reclassification": "presentation only; UI, HTML, Excel, and human CLI lead with semantic pattern groups, machine JSON stays atomic with an opt-in versioned review summary",
+      "expected_review_count_delta": 0
+    }
+  }
+}

@@ -32,6 +32,7 @@ from qc_tool.excel.interaction import (
 from qc_tool.excel.periods import Period, is_period_after, parse_period
 from qc_tool.excel.references import ReferenceStatus, resolve_reference
 from qc_tool.excel.regions import TableRegion, detect_regions
+from qc_tool.excel.workbook_risks import workbook_risk_findings
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot, display_cell_value
 from qc_tool.progress import CancellationToken, check_cancelled
@@ -367,6 +368,7 @@ def preflight_workbook(
     workbook: WorkbookSnapshot,
     profile: DeliverableProfile,
     *,
+    defer_impacts: bool = False,
     cancellation_token: CancellationToken | None = None,
 ) -> ExcelPreflightResult:
     check_cancelled(cancellation_token)
@@ -388,20 +390,11 @@ def preflight_workbook(
                 message="workbook calculation mode is manual; saved values may be stale",
             )
         )
-    for target in workbook.external_links:
-        result.findings.append(
-            Finding(
-                artifact="excel",
-                finding_class=FindingClass.EXTERNAL_LINK,
-                element="external workbook link",
-                current_value=target,
-                message=f"workbook depends on external source {target!r}",
-            )
-        )
+    result.findings.extend(workbook_risk_findings(workbook))
     result.coverage.append(
         CoverageItem(
             check_id="excel-workbook-settings",
-            label="Workbook calculation and external links",
+            label="Workbook calculation and package risks",
             artifact="excel",
             state=CoverageState.CHECKED,
             findings=len(result.findings),
@@ -422,6 +415,7 @@ def preflight_workbook(
                 workbook,
                 self_alignment,
                 profile,
+                cycle=False,
                 cancellation_token=cancellation_token,
             )
         )
@@ -481,7 +475,8 @@ def preflight_workbook(
             cancellation_token=cancellation_token,
         )
         result.dependency_graph = dependency_graph
-        annotate_impacts(result.findings, dependency_graph)
+        if not defer_impacts:
+            annotate_impacts(result.findings, dependency_graph)
         dependency_state = dependency_graph.coverage_state
         dependency_detail = dependency_graph.coverage_detail
     else:

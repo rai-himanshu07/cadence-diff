@@ -217,11 +217,59 @@ def _run_parser() -> argparse.ArgumentParser:
         help="print atomic findings instead of grouped review items",
     )
     parser.add_argument(
+        "--json-review-summary",
+        action="store_true",
+        help=(
+            "add a versioned semantic review summary to the JSON export; "
+            "atomic findings remain unchanged"
+        ),
+    )
+    parser.add_argument(
         "--allow-large-workbooks",
         action="store_true",
         help=(
             "override OOXML workload refusal for this run; requires sufficient "
             "local memory and degrades workload coverage"
+        ),
+    )
+    parser.add_argument(
+        "--accept-absolute",
+        type=float,
+        default=0.0,
+        metavar="VALUE",
+        help=(
+            "analyst acceptance threshold: numeric differences within this "
+            "absolute value report as within-tolerance Info in cycle comparisons "
+            "(default 0 = off)"
+        ),
+    )
+    parser.add_argument(
+        "--accept-percent",
+        type=float,
+        default=0.0,
+        metavar="PCT",
+        help=(
+            "analyst acceptance threshold as a percentage, e.g. 0.1 for 0.1%%; "
+            "differences within either bound report as within-tolerance Info "
+            "in cycle comparisons (default 0 = off)"
+        ),
+    )
+    parser.add_argument(
+        "--sheets",
+        default="",
+        metavar="NAMES",
+        help=(
+            "comma-separated Excel sheet names to compare; other sheets "
+            "produce no findings (files still load fully; disclosed)"
+        ),
+    )
+    parser.add_argument(
+        "--slides",
+        default="",
+        metavar="INDEXES",
+        help=(
+            "comma-separated 1-based PPT slide numbers or ranges (e.g. 1,3-5) "
+            "to compare; deck-level findings always report"
         ),
     )
     parser.add_argument(
@@ -317,8 +365,36 @@ def _parse_password_sources(ns: argparse.Namespace, files: dict[str, Path]) -> d
     return passwords
 
 
+def _parse_sheet_list(raw: str) -> list[str] | None:
+    names = [part.strip() for part in raw.split(",") if part.strip()]
+    return names or None
+
+
+def _parse_slide_list(raw: str) -> list[int] | None:
+    """Parse '1,3-5' style 1-based slide selections."""
+    indexes: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        start, sep, end = part.partition("-")
+        try:
+            if sep:
+                first, last = int(start), int(end)
+            else:
+                first = last = int(part)
+        except ValueError as exc:
+            raise ValueError(f"invalid slide selection {part!r}") from exc
+        if first < 1 or last < first:
+            raise ValueError(f"invalid slide selection {part!r}")
+        indexes.update(range(first, last + 1))
+    return sorted(indexes) or None
+
+
 def _cmd_run(args: list[str]) -> int:
     ns = _run_parser().parse_args(args)
+    if ns.accept_absolute < 0 or ns.accept_percent < 0:
+        raise ValueError("acceptance thresholds cannot be negative")
     files = {
         role: getattr(ns, role)
         for role in _ROLES
@@ -332,12 +408,17 @@ def _cmd_run(args: list[str]) -> int:
         if not path.exists():
             raise ValueError(f"{role}: {path} not found")
 
-    from qc_tool.coverage import QCRunMode
+    from qc_tool.coverage import QCRunMode, capability_limited
     from qc_tool.findings import Severity
     from qc_tool.progress import ProgressEvent
     from qc_tool.report.json_report import write_json_report
-    from qc_tool.review import build_review_groups, review_counts
-    from qc_tool.ui.app import perform_run
+    from qc_tool.review import (
+        build_pattern_groups,
+        build_review_groups,
+        count_pattern_groups,
+        review_counts,
+    )
+    from qc_tool.run_service import perform_run
 
     data_dir = ns.data_dir or default_data_dir()
     private_directory(data_dir)
@@ -365,26 +446,43 @@ def _cmd_run(args: list[str]) -> int:
         profile,
         mode=QCRunMode(mode_value),
         allow_large_workbooks=ns.allow_large_workbooks,
+        acceptance_absolute=ns.accept_absolute,
+        acceptance_relative=ns.accept_percent / 100.0,
+        compare_sheets=_parse_sheet_list(ns.sheets),
+        compare_slides=_parse_slide_list(ns.slides),
         on_progress=on_progress,
     )
     result = artifacts.result
 
     print(f"mode: {result.mode.value}   profile: {result.profile_name}")
     print("files:", "  ".join(f"{r}={n}" for r, n in result.files.items()))
-    groups = build_review_groups(result.findings)
-    grouped_counts = review_counts(groups)
+    if capability_limited(result.coverage):
+        print(
+            "status: capability-limited - one or more required checks were "
+            "unavailable, so a low finding count is not a clean result"
+        )
+    groups = build_pattern_groups(result.findings)
+    pattern_counts = count_pattern_groups(groups)
+    grouped_counts = review_counts(build_review_groups(result.findings))
     print(
-        "review items:",
+        "pattern review items:",
+        "  ".join(
+            f"{severity.value}={count}"
+            for severity, count in pattern_counts.review_items.items()
+        ),
+    )
+    print(
+        "spatial review items:",
         "  ".join(
             f"{severity.value}={count}"
             for severity, count in grouped_counts.review_items.items()
         ),
     )
     print(
-        "affected findings:",
+        "atomic findings:",
         "  ".join(
             f"{severity.value}={count}"
-            for severity, count in grouped_counts.atomic_findings.items()
+            for severity, count in pattern_counts.atomic_findings.items()
         ),
     )
     if result.coverage:
@@ -439,7 +537,12 @@ def _cmd_run(args: list[str]) -> int:
         print(f"  ... {len(ranked) - ns.top} more (see reports)")
     print("reports:", "  ".join(str(p) for p in artifacts.report_paths.values()))
     if ns.json is not None:
-        write_json_report(result, ns.json, include_context=ns.json_context)
+        write_json_report(
+            result,
+            ns.json,
+            include_context=ns.json_context,
+            include_review_summary=ns.json_review_summary,
+        )
         print("json:", ns.json)
     print(f"history: run #{artifacts.run_id} in {data_dir}")
     if ns.attestation is not None:

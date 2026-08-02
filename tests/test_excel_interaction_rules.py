@@ -279,7 +279,9 @@ def test_conditional_format_diff_detects_targets_rule_priority_stop_style_invent
 
     assert any("target" in finding.message for finding in conditional_findings)
     assert any("condition" in finding.message for finding in conditional_findings)
-    assert any("priority" in finding.message for finding in conditional_findings)
+    assert not any(
+        "evaluation order" in finding.message for finding in conditional_findings
+    )
     assert any("stop-if-true" in finding.message for finding in conditional_findings)
     assert any("style" in finding.message for finding in conditional_findings)
     assert any("removed" in finding.message for finding in conditional_findings)
@@ -310,10 +312,10 @@ def test_interaction_findings_roundtrip_history_and_keep_formulas_inert(
     report_path = tmp_path / "interaction-report.xlsx"
     write_excel_report(result, report_path)
     findings_sheet = load_workbook(report_path, data_only=False)["Findings"]
-    assert findings_sheet["H2"].value == "=A1>0"
-    assert findings_sheet["H2"].data_type == "s"
-    assert findings_sheet["I2"].value == "=A1>10"
-    assert findings_sheet["I2"].data_type == "s"
+    assert findings_sheet["N2"].value == "=A1>0"
+    assert findings_sheet["N2"].data_type == "s"
+    assert findings_sheet["O2"].value == "=A1>10"
+    assert findings_sheet["O2"].data_type == "s"
     assert "conditional_format_changed" in render_html_report(result)
 
 

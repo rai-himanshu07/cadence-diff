@@ -1,0 +1,31 @@
+{
+  "atomic_findings": 1658,
+  "coverage_states": {
+    "checked": 8,
+    "degraded": 1,
+    "unavailable": 3
+  },
+  "median_elapsed_seconds": 19.33,
+  "median_peak_rss_mib": 350.8,
+  "mixed_pattern_groups": 0,
+  "pattern_review_counts": {
+    "critical": 26,
+    "expected": 7,
+    "info": 7,
+    "warning": 79
+  },
+  "review_counts": {
+    "critical": 106,
+    "expected": 18,
+    "info": 7,
+    "warning": 78
+  },
+  "severity": {
+    "critical": 335,
+    "expected": 18,
+    "info": 8,
+    "warning": 1297
+  },
+  "source_hashes_unchanged": true,
+  "trials": 3
+}

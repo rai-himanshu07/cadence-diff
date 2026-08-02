@@ -21,7 +21,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import column_index_from_string, range_boundaries
 
 from qc_tool.config.profile import Orientation, RegionOverride, SheetProfile
-from qc_tool.excel.periods import is_period_label
+from qc_tool.excel.periods import Period, is_period_label, parse_period
 from qc_tool.io.model import SheetSnapshot
 
 #: Minimum count and share of period labels required to call an axis.
@@ -106,6 +106,60 @@ def _axis_is_periodic(values: Sequence[object]) -> bool:
         return False
     hits = sum(1 for v in present if is_period_label(v))
     return hits >= _MIN_PERIODS and hits / len(present) >= _PERIOD_SHARE
+
+
+def period_positions(sheet: SheetSnapshot, region: TableRegion) -> dict[int, Period]:
+    """Map each period-axis position (row or column number) to its `Period`.
+
+    For ``rows`` the detected `key_col` is tried first, then every region
+    column, so profile-pinned regions with a non-period key column still
+    resolve. Positions whose label does not parse are absent — callers must
+    treat them as non-recent. Empty for ``none`` axes.
+    """
+    if region.period_axis == "rows":
+        candidates = [region.key_col] if region.key_col is not None else []
+        candidates += [
+            col
+            for col in range(region.min_col, region.max_col + 1)
+            if col not in candidates
+        ]
+        for col in candidates:
+            start = region.min_row + (1 if region.header_row == region.min_row else 0)
+            values = [
+                (row, sheet.cells[(row, col)].value)
+                for row in range(start, region.max_row + 1)
+                if (row, col) in sheet.cells
+            ]
+            if not _axis_is_periodic([value for _, value in values]):
+                continue
+            positions = {
+                row: period
+                for row, value in values
+                if (period := parse_period(value)) is not None
+            }
+            if positions:
+                return positions
+        return {}
+    if region.period_axis == "columns":
+        rows = [region.header_row] if region.header_row is not None else []
+        rows += [row for row in range(region.min_row, region.max_row + 1) if row not in rows]
+        for row in rows:
+            values = [
+                (col, sheet.cells[(row, col)].value)
+                for col in range(region.min_col + 1, region.max_col + 1)
+                if (row, col) in sheet.cells
+            ]
+            if not _axis_is_periodic([value for _, value in values]):
+                continue
+            positions = {
+                col: period
+                for col, value in values
+                if (period := parse_period(value)) is not None
+            }
+            if positions:
+                return positions
+        return {}
+    return {}
 
 
 def _infer_region(

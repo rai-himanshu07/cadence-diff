@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 _MIN_KEY_MATCH_RATIO = 0.5
 _MIN_CONFIDENCE_AXIS_SIZE = 4
+_MIN_BLOCK_LABEL_OVERLAP = 0.8
 
 AxisKey = tuple[object, ...]
 
@@ -106,15 +107,33 @@ def _column_is_labelish(sheet: SheetSnapshot, col: int, rows: range) -> bool:
     return non_numeric / len(values) >= 0.8
 
 
+def _column_is_volatile_derived(sheet: SheetSnapshot, col: int, rows: range) -> bool:
+    """Predominantly formula-derived AND period/date-valued: a display value
+    (e.g. a derived "data through" date) that moves every cycle, never row
+    identity."""
+    cells = [sheet.cells[(row, col)] for row in rows if (row, col) in sheet.cells]
+    if not cells:
+        return False
+    formulas = sum(1 for cell in cells if cell.has_formula)
+    periods = sum(1 for cell in cells if parse_period(cell.value) is not None)
+    return formulas / len(cells) >= 0.5 and periods / len(cells) >= 0.5
+
+
 def _long_key_columns(sheet: SheetSnapshot, region: TableRegion) -> list[int]:
-    """Leading label/period columns of a long region (identity columns)."""
+    """Leading label/period columns of a long region (identity columns).
+
+    The first label column anchors identity even when formula-derived;
+    additional components must be stable, so volatile derived period columns
+    never churn the composite key.
+    """
     data_rows = range((region.header_row or region.min_row) + 1, region.max_row + 1)
     key_cols: list[int] = []
     for col in range(region.min_col, region.max_col + 1):
-        if _column_is_labelish(sheet, col, data_rows):
-            key_cols.append(col)
-        else:
+        if not _column_is_labelish(sheet, col, data_rows):
             break
+        if key_cols and _column_is_volatile_derived(sheet, col, data_rows):
+            break
+        key_cols.append(col)
     return key_cols or [region.key_col or region.min_col]
 
 
@@ -299,6 +318,47 @@ def _align_wide(
     return RegionAlignment(base_region, curr_region, rows, columns)
 
 
+def _block_stable_labels(
+    sheet: SheetSnapshot, region: TableRegion
+) -> tuple[str, ...]:
+    col = region.key_col or region.min_col
+    labels: list[str] = []
+    for row in range(region.min_row, region.max_row + 1):
+        cell = sheet.cells.get((row, col))
+        if (
+            cell is not None
+            and isinstance(cell.value, str)
+            and cell.value.strip()
+            and not cell.has_formula
+            and parse_period(cell.value) is None
+        ):
+            labels.append(cell.value)
+    return tuple(labels)
+
+
+def _block_labels_are_stable(sheet: SheetSnapshot, region: TableRegion) -> bool:
+    """Block rows may key-align only on constant text labels. Formula-derived
+    or period-valued "labels" are display values that move every cycle; using
+    them as identity turns KPI refreshes into phantom row events."""
+    row_count = region.max_row - region.min_row + 1
+    labels = _block_stable_labels(sheet, region)
+    if not labels or row_count <= 0:
+        return False
+    return len(labels) / row_count >= 0.6 and len(set(labels)) == len(labels)
+
+
+def _block_labels_overlap(
+    base_sheet: SheetSnapshot,
+    curr_sheet: SheetSnapshot,
+    base_region: TableRegion,
+    curr_region: TableRegion,
+) -> bool:
+    baseline = set(_block_stable_labels(base_sheet, base_region))
+    current = set(_block_stable_labels(curr_sheet, curr_region))
+    total = max(len(baseline), len(current))
+    return bool(total) and len(baseline & current) / total >= _MIN_BLOCK_LABEL_OVERLAP
+
+
 def _align_block(
     base_sheet: SheetSnapshot,
     curr_sheet: SheetSnapshot,
@@ -307,10 +367,26 @@ def _align_block(
 ) -> RegionAlignment:
     label_base = [base_region.key_col or base_region.min_col]
     label_curr = [curr_region.key_col or curr_region.min_col]
-    rows = _align_axis(
-        _row_entries(base_sheet, base_region, label_base, base_region.min_row),
-        _row_entries(curr_sheet, curr_region, label_curr, curr_region.min_row),
-    )
+    if (
+        _block_labels_are_stable(base_sheet, base_region)
+        and _block_labels_are_stable(curr_sheet, curr_region)
+        and _block_labels_overlap(
+            base_sheet,
+            curr_sheet,
+            base_region,
+            curr_region,
+        )
+    ):
+        rows = _align_axis(
+            _row_entries(base_sheet, base_region, label_base, base_region.min_row),
+            _row_entries(curr_sheet, curr_region, label_curr, curr_region.min_row),
+        )
+    else:
+        rows = _align_axis(
+            _positional_entries(range(base_region.min_row, base_region.max_row + 1)),
+            _positional_entries(range(curr_region.min_row, curr_region.max_row + 1)),
+            method="positional",
+        )
     columns = _align_axis(
         _positional_entries(range(base_region.min_col, base_region.max_col + 1)),
         _positional_entries(range(curr_region.min_col, curr_region.max_col + 1)),

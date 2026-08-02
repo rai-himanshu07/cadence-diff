@@ -18,6 +18,7 @@ import posixpath
 import re
 import sys
 import zipfile
+from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
@@ -43,6 +44,8 @@ from qc_tool.io.model import (
     PivotDescriptor,
     SheetSnapshot,
     TableDescriptor,
+    WorkbookRisk,
+    WorkbookRiskKind,
     WorkbookSnapshot,
     WorkbookWorkload,
     is_cell_value,
@@ -68,6 +71,51 @@ SUPPORTED_SUFFIXES = {".xlsx", ".xlsm", ".xlsb"}
 
 _PIVOT_TABLE_RE = re.compile(r"^xl/pivotTables/pivotTable\d+\.xml$")
 _PIVOT_CACHE_RE = re.compile(r"^xl/pivotCache/pivotCacheDefinition\d+\.xml$")
+_OOXML_RISKY_PARTS = {
+    "xl/vbaproject.bin": WorkbookRiskKind.VBA_PROJECT,
+    "xl/connections.xml": WorkbookRiskKind.EXTERNAL_DATA_CONNECTION,
+}
+_OOXML_RISKY_PATHS = {
+    "/activex/": WorkbookRiskKind.ACTIVEX_CONTROL,
+    "/ctrlprops/": WorkbookRiskKind.CONTROL_CONTENT,
+    "/dialogsheets/": WorkbookRiskKind.DIALOG_SHEET,
+    "/embeddings/": WorkbookRiskKind.EMBEDDED_OLE,
+    "/externalconnections/": WorkbookRiskKind.EXTERNAL_DATA_CONNECTION,
+    "/externallinks/": WorkbookRiskKind.EXTERNAL_WORKBOOK_LINK,
+    "/macrosheets/": WorkbookRiskKind.EXCEL4_MACRO_SHEET,
+    "/querytables/": WorkbookRiskKind.QUERY_TABLE,
+    "/customui/": WorkbookRiskKind.CUSTOM_OFFICE_UI,
+}
+_OOXML_RISKY_RELATIONSHIPS = {
+    "activexcontrol": WorkbookRiskKind.ACTIVEX_CONTROL,
+    "attachedtoolbars": WorkbookRiskKind.CUSTOM_OFFICE_UI,
+    "connections": WorkbookRiskKind.EXTERNAL_DATA_CONNECTION,
+    "ctrlprop": WorkbookRiskKind.CONTROL_CONTENT,
+    "customui": WorkbookRiskKind.CUSTOM_OFFICE_UI,
+    "dialogsheet": WorkbookRiskKind.DIALOG_SHEET,
+    "externallinkpath": WorkbookRiskKind.EXTERNAL_WORKBOOK_LINK,
+    "macrosheet": WorkbookRiskKind.EXCEL4_MACRO_SHEET,
+    "oleobject": WorkbookRiskKind.EMBEDDED_OLE,
+    "querytable": WorkbookRiskKind.QUERY_TABLE,
+    "vbaproject": WorkbookRiskKind.VBA_PROJECT,
+}
+_XLSB_FEATURE_RISKS = {
+    "VBA project": WorkbookRiskKind.VBA_PROJECT,
+    "external data connections": WorkbookRiskKind.EXTERNAL_DATA_CONNECTION,
+    "ActiveX controls": WorkbookRiskKind.ACTIVEX_CONTROL,
+    "control properties": WorkbookRiskKind.CONTROL_CONTENT,
+    "dialog sheets": WorkbookRiskKind.DIALOG_SHEET,
+    "embedded OLE content": WorkbookRiskKind.EMBEDDED_OLE,
+    "external workbook links": WorkbookRiskKind.EXTERNAL_WORKBOOK_LINK,
+    "Excel 4.0 macro sheets": WorkbookRiskKind.EXCEL4_MACRO_SHEET,
+    "external query tables": WorkbookRiskKind.QUERY_TABLE,
+    "custom Office UI": WorkbookRiskKind.CUSTOM_OFFICE_UI,
+    "custom Office toolbars": WorkbookRiskKind.CUSTOM_OFFICE_UI,
+    "external relationships": WorkbookRiskKind.EXTERNAL_RELATIONSHIP,
+    "unreadable relationship metadata": (
+        WorkbookRiskKind.UNREADABLE_RELATIONSHIP_METADATA
+    ),
+}
 _MIB = 1024 * 1024
 _WORKLOAD_LIMITS = (
     ("cell_count", 1_000_000, 5_000_000, "physical cells"),
@@ -283,7 +331,7 @@ def _load_ooxml_oracle(
         formula_detail="Formula text read directly from OOXML",
         calculation_mode=wb_formulas.calculation.calcMode,
         full_calc_on_load=wb_formulas.calculation.fullCalcOnLoad,
-        external_links=_parse_external_links(data),
+        intrinsic_risks=_extract_ooxml_risks(data),
         workload=workload,
     )
     snapshot.formula_ranges.extend(
@@ -695,7 +743,7 @@ def _load_ooxml_streaming(
             formula_detail="Formula text read directly from OOXML",
             calculation_mode=wb_formulas.calculation.calcMode,
             full_calc_on_load=wb_formulas.calculation.fullCalcOnLoad,
-            external_links=_parse_external_links(data),
+            intrinsic_risks=_extract_ooxml_risks(data),
             workload=workload,
         )
         epoch = wb_formulas.epoch
@@ -793,19 +841,56 @@ def _relationship_targets(
     return targets
 
 
-def _parse_external_links(data: bytes) -> list[str]:
-    """Return external workbook targets retained in the OOXML package."""
-    targets: set[str] = set()
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for part in zf.namelist():
-            if not (part.startswith("xl/externalLinks/_rels/") and part.endswith(".rels")):
+def _extract_ooxml_risks(data: bytes) -> list[WorkbookRisk]:
+    """Aggregate structural package risks without retaining relationship targets."""
+    part_counts: Counter[WorkbookRiskKind] = Counter()
+    relationship_counts: Counter[WorkbookRiskKind] = Counter()
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = archive.namelist()
+        for name in names:
+            lowered = "/" + name.replace("\\", "/").lower().lstrip("/")
+            exact = lowered.lstrip("/")
+            kind = _OOXML_RISKY_PARTS.get(exact)
+            if kind is not None:
+                part_counts[kind] += 1
+            if exact.endswith(".rels") or "/_rels/" in lowered:
                 continue
-            root = ElementTree.fromstring(zf.read(part))
+            for segment, path_kind in _OOXML_RISKY_PATHS.items():
+                if segment in lowered:
+                    part_counts[path_kind] += 1
+                    break
+        for part in names:
+            if not part.lower().endswith(".rels"):
+                continue
+            try:
+                root = ElementTree.fromstring(archive.read(part))
+            except ElementTree.ParseError:
+                relationship_counts[
+                    WorkbookRiskKind.UNREADABLE_RELATIONSHIP_METADATA
+                ] += 1
+                continue
             for relationship in root:
-                target = relationship.get("Target")
-                if relationship.get("TargetMode") == "External" and target:
-                    targets.add(target)
-    return sorted(targets)
+                if _local_name(relationship.tag) != "Relationship":
+                    continue
+                relationship_kind = (
+                    relationship.get("Type", "").rsplit("/", 1)[-1].lower()
+                )
+                kind = _OOXML_RISKY_RELATIONSHIPS.get(relationship_kind)
+                if kind is not None:
+                    relationship_counts[kind] += 1
+                if (
+                    relationship.get("TargetMode") == "External"
+                    and relationship_kind != "hyperlink"
+                ):
+                    relationship_counts[WorkbookRiskKind.EXTERNAL_RELATIONSHIP] += 1
+    kinds = set(part_counts) | set(relationship_counts)
+    return [
+        WorkbookRisk(
+            kind=kind,
+            count=max(part_counts[kind], relationship_counts[kind]),
+        )
+        for kind in sorted(kinds, key=lambda item: item.value)
+    ]
 
 
 def _parse_pivots(data: bytes) -> list[PivotDescriptor]:
@@ -909,6 +994,17 @@ def _extract_xlsb_formulas(data: bytes, formula_scan: XlsbFormulaScan) -> Formul
     raise FormulaEnrichmentError(f"no XLSB formula adapter is configured for {sys.platform}")
 
 
+def _xlsb_risks(formula_scan: XlsbFormulaScan | None) -> list[WorkbookRisk]:
+    """Map scanner features to the same typed aggregate risk contract."""
+    if formula_scan is None:
+        return []
+    return [
+        WorkbookRisk(kind=kind)
+        for feature in formula_scan.risky_features
+        if (kind := _XLSB_FEATURE_RISKS.get(feature)) is not None
+    ]
+
+
 def _load_xlsb(
     data: bytes,
     *,
@@ -932,6 +1028,7 @@ def _load_xlsb(
         chart_detail="XLSB chart metadata is unavailable",
         interaction_rule_detail="XLSB interaction-rule metadata is unavailable",
         conditional_format_style_detail=("XLSB conditional-format style metadata is unavailable"),
+        intrinsic_risks=_xlsb_risks(formula_scan),
     )
     with open_xlsb(io.BytesIO(data)) as wb:
         for sheet_name in wb.sheets:

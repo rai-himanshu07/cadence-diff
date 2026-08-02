@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11"
 keywords = ["qc", "excel", "powerpoint", "diff", "reporting", "openpyxl"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 3 - Alpha",
   "Environment :: Web Environment",
   "Intended Audience :: Financial and Insurance Industry",
   "Operating System :: OS Independent",
@@ -26,7 +26,6 @@ dependencies = [
   "msoffcrypto-tool>=5.4",
   "python-pptx>=1.0",
   "rapidfuzz>=3.9",
-  "networkx>=3.2",
   "pydantic>=2.7",
   "pyyaml>=6.0",
   "jinja2>=3.1",
@@ -36,7 +35,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=1.0", "ruff", "pyright", "psutil>=6.0"]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=1.0",
+  "ruff",
+  "pyright",
+  "psutil>=6.0",
+  "networkx>=3.2",  # tests/dependency_oracle.py parity only
+]
 
 [project.scripts]
 cadence-diff = "qc_tool.cli:main"

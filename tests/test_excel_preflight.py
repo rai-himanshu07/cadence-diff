@@ -20,6 +20,8 @@ from qc_tool.io.model import (
     NamedRange,
     PivotDescriptor,
     SheetSnapshot,
+    WorkbookRisk,
+    WorkbookRiskKind,
     WorkbookSnapshot,
 )
 
@@ -92,7 +94,9 @@ def test_preflight_detects_intrinsic_structure_and_period_failures() -> None:
         ],
         pivots=[PivotDescriptor("Pivot", "A1:B2", "Missing", "A1:B2")],
         calculation_mode="manual",
-        external_links=["file:///old/source.xlsx"],
+        intrinsic_risks=[
+            WorkbookRisk(WorkbookRiskKind.EXTERNAL_WORKBOOK_LINK)
+        ],
     )
 
     result = preflight_workbook(workbook, default_profile())

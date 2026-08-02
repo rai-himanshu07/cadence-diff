@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from nicegui import ui
 from nicegui.testing import User
 
 from qc_tool.engine import QCRunResult, compare_findings
@@ -253,5 +254,8 @@ async def test_rerun_blocked_until_files_reselected(
 
     create_pages(work_dir)
     await user.open(f"/?rerun={artifacts.run_id}")
-    user.find("Run QC now").click()
+    # The readiness bar states the blocker before the analyst presses Run QC.
     await user.should_see(f"Re-QC of run #{artifacts.run_id} is blocked")
+    run_button = user.find("Run QC").elements.pop()
+    assert isinstance(run_button, ui.button)
+    assert run_button.enabled is False

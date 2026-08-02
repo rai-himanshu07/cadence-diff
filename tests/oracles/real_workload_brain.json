@@ -1,0 +1,84 @@
+{
+  "acceptance_notes": {
+    "criticals": "335 (step13) -> 118; remaining criticals are genuinely material old-history edits, real deletions, real label rewrites, and one config text flip the refresh-block rule no longer launders.",
+    "expected": "29 -> 7: every remaining expected finding is genuine cadence (weekly rolling window entries, advancing data-through key dates).",
+    "noise_tier": "all 87 sub-ULP constants remain INFO.",
+    "story_coverage": "1289/1445 = 89.2% non-residual; conditional-format and chart-label changes stay residual (no evidence link).",
+    "table_growth": "sideways table extension reports WARNING alongside its columns event; never expected.",
+    "vs_step13": "1658 -> 1445 atomics: 13 in-place pairs merged; ~200 alignment phantoms resolved (six KPI-panel delete/growth/insert triples; 15 composite-key churn deletions; 153 formula_inconsistent records proven to be run-membership artifacts - the column truly holds 2 uniform section patterns; 12 fake growths)."
+  },
+  "atomic_findings": 1445,
+  "baseline_reference": "real_workload_step13.json",
+  "coverage_states": {
+    "checked": 9,
+    "degraded": 1,
+    "unavailable": 3
+  },
+  "formula_inconsistent": 2,
+  "history_run_id": 14,
+  "key_changes": {
+    "key_replacement": 5
+  },
+  "median_elapsed_seconds": 21.82,
+  "median_peak_rss_mib": 351.3,
+  "mixed_pattern_groups": 0,
+  "pattern_review_counts": {
+    "critical": 18,
+    "expected": 2,
+    "info": 12,
+    "warning": 43
+  },
+  "review_counts": {
+    "critical": 47,
+    "expected": 7,
+    "info": 40,
+    "warning": 86
+  },
+  "row_events": {
+    "column_inserted": 2,
+    "row_deleted": 5,
+    "row_growth": 4,
+    "row_inserted": 7,
+    "row_key_changed": 5
+  },
+  "severity": {
+    "critical": 118,
+    "expected": 7,
+    "info": 127,
+    "warning": 1193
+  },
+  "source_hashes_unchanged": true,
+  "story_kinds": {
+    "data_refresh": {
+      "members": 82,
+      "stories": 1
+    },
+    "inherited": {
+      "members": 34,
+      "stories": 1
+    },
+    "representation_noise": {
+      "members": 87,
+      "stories": 1
+    },
+    "residual": {
+      "members": 156,
+      "stories": 1
+    },
+    "structure_driver": {
+      "members": 1086,
+      "stories": 1
+    }
+  },
+  "trials": 3,
+  "trials_consistent": true,
+  "value_materiality": {
+    "material": 97,
+    "noise": 87,
+    "recent_restatement": 71,
+    "unset": 18
+  },
+  "workload_id": "cycle-pair",
+  "wrapped_formula_changes": 1042,
+  "wrapper_skeletons": 3
+}

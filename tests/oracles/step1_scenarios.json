@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {"id": "lexical-let", "owner_step": 3, "kind": "formula"},
+    {"id": "lexical-lambda", "owner_step": 3, "kind": "formula"},
+    {"id": "lexical-nested-scope", "owner_step": 3, "kind": "formula"},
+    {"id": "lexical-shadowing", "owner_step": 3, "kind": "formula"},
+    {"id": "lexical-higher-order", "owner_step": 3, "kind": "formula"},
+    {"id": "lexical-unsupported-syntax", "owner_step": 3, "kind": "formula"},
+    {"id": "formula-error-inherited", "owner_step": 4, "kind": "finding"},
+    {"id": "formula-error-new", "owner_step": 4, "kind": "finding"},
+    {"id": "consistency-historical", "owner_step": 4, "kind": "finding"},
+    {"id": "consistency-novel", "owner_step": 4, "kind": "finding"},
+    {"id": "value-added-population", "owner_step": 4, "kind": "finding"},
+    {"id": "value-replacement", "owner_step": 4, "kind": "finding"},
+    {"id": "conditional-rule-insertion", "owner_step": 5, "kind": "structure"},
+    {"id": "conditional-rule-reorder", "owner_step": 5, "kind": "structure"},
+    {"id": "axis-rolling-turnover", "owner_step": 5, "kind": "axis"},
+    {"id": "axis-key-replacement", "owner_step": 5, "kind": "axis"},
+    {"id": "axis-physical-insertion", "owner_step": 5, "kind": "axis"},
+    {"id": "axis-physical-deletion", "owner_step": 5, "kind": "axis"},
+    {"id": "repeated-transformation-patterns", "owner_step": 8, "kind": "review"},
+    {"id": "invalid-heavy-dependencies", "owner_step": 2, "kind": "dependency"},
+    {"id": "range-heavy-dependencies", "owner_step": 6, "kind": "dependency"},
+    {"id": "xlsb-customxml-relationship", "owner_step": 12, "kind": "xlsb"},
+    {
+      "id": "worker-crash",
+      "owner_step": 11,
+      "kind": "queue",
+      "fixture": {
+        "events": ["starting", "running", "worker_exit_nonzero"],
+        "expected_terminal_status": "failed"
+      }
+    },
+    {
+      "id": "queue-refresh",
+      "owner_step": 11,
+      "kind": "queue",
+      "fixture": {
+        "persisted_statuses": ["running", "queued", "queued"],
+        "expected_execution_order": ["active", "queued-1", "queued-2"]
+      }
+    }
+  ]
+}

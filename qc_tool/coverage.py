@@ -33,3 +33,8 @@ class MappingCoverage(BaseModel):
     mismatched: int = 0
     unresolved: int = 0
     unmapped: int = 0
+
+
+def capability_limited(coverage: list[CoverageItem]) -> bool:
+    """Whether any required check could not run, so zero findings is not clean."""
+    return any(item.state is CoverageState.UNAVAILABLE for item in coverage)

@@ -117,7 +117,7 @@ def test_key_alignment_marks_low_confidence_positional_fallback() -> None:
     assert aligned.low_confidence_fallback
 
 
-def test_low_confidence_alignment_degrades_and_skips_cell_comparison(
+def test_disjoint_block_labels_align_positionally_and_remain_visible(
     tmp_path: Path,
 ) -> None:
     baseline = tmp_path / "baseline.xlsx"
@@ -144,14 +144,14 @@ def test_low_confidence_alignment_degrades_and_skips_cell_comparison(
     formula_coverage = next(
         item for item in result.coverage if item.check_id == "excel-formulas"
     )
-    assert value_coverage.state is CoverageState.DEGRADED
-    assert formula_coverage.state is CoverageState.DEGRADED
-    assert "Low-confidence" in value_coverage.detail
-    assert sum(
+    assert value_coverage.state is CoverageState.CHECKED
+    assert formula_coverage.state is CoverageState.CHECKED
+    assert not value_coverage.detail
+    assert not any(
         finding.finding_class is FindingClass.ALIGNMENT_LOW_CONFIDENCE
         for finding in result.findings
-    ) == 1
-    assert not any(
+    )
+    assert any(
         finding.finding_class is FindingClass.VALUE_CHANGED
         for finding in result.findings
     )

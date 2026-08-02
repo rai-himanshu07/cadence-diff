@@ -1,0 +1,61 @@
+{
+  "atomic_findings": 1658,
+  "axis_event_groups": 14,
+  "axis_subtypes": {
+    "column_inserted:physical_insertion": 2,
+    "row_deleted:key_replacement": 13,
+    "row_deleted:physical_deletion": 14,
+    "row_deleted:rolling_turnover": 4,
+    "row_growth:extent_growth": 12,
+    "row_growth:rolling_turnover": 4,
+    "row_inserted:key_replacement": 13,
+    "row_inserted:physical_insertion": 8
+  },
+  "conditional_format_findings": 15,
+  "conditional_order_findings": 0,
+  "coverage_states": {
+    "checked": 8,
+    "degraded": 1,
+    "unavailable": 3
+  },
+  "error_provenance": {
+    "changed": 0,
+    "inherited": 32,
+    "new": 0
+  },
+  "object_event_groups": 16,
+  "outlier_provenance": {
+    "historical_pattern": 51,
+    "inherited": 104,
+    "new": 0
+  },
+  "projected_concrete_edges": 15815995,
+  "reference_statuses": {
+    "invalid": 112,
+    "local_symbol": 370524,
+    "resolved": 370521,
+    "unsupported": 266
+  },
+  "review_counts": {
+    "critical": 106,
+    "expected": 18,
+    "info": 7,
+    "warning": 78
+  },
+  "severity": {
+    "critical": 335,
+    "expected": 18,
+    "info": 8,
+    "warning": 1297
+  },
+  "source_hashes_unchanged": true,
+  "unchanged_chart_findings": {
+    "chart_geometry_changed": 1,
+    "chart_labels_changed": 8
+  },
+  "value_subtypes": {
+    "added_population": 16,
+    "cleared_population": 0,
+    "replacement": 257
+  }
+}

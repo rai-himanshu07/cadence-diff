@@ -52,6 +52,10 @@ _RISKY_RELATIONSHIP_KINDS = {
     "querytable": "external query tables",
     "vbaproject": "VBA project",
 }
+#: Relationship kinds allowed to target a package part outside ``xl/``.
+#: These are metadata parts opened for risk inspection only; they are never
+#: treated as worksheets. Every other non-``xl/`` target fails closed.
+_NON_XL_RELATIONSHIP_KINDS = {"customxml": "customXml/"}
 
 
 class XlsbFormulaScanError(ValueError):
@@ -145,7 +149,7 @@ def _read_wide_string(payload: bytes, position: int) -> tuple[str, int]:
     return value, end
 
 
-def _resolve_target(source_part: str, target: str) -> str:
+def _resolve_target(source_part: str, target: str, *, kind: str = "") -> str:
     normalized_target = target.replace("\\", "/")
     if normalized_target.startswith("/"):
         resolved = posixpath.normpath(normalized_target.lstrip("/"))
@@ -153,9 +157,14 @@ def _resolve_target(source_part: str, target: str) -> str:
         resolved = posixpath.normpath(
             posixpath.join(posixpath.dirname(source_part), normalized_target)
         )
-    if resolved == ".." or resolved.startswith("../") or not resolved.startswith("xl/"):
+    if resolved == ".." or resolved.startswith("../"):
         raise XlsbFormulaScanError(f"unsafe workbook relationship target {target!r}")
-    return resolved
+    if resolved.startswith("xl/"):
+        return resolved
+    prefix = _NON_XL_RELATIONSHIP_KINDS.get(kind)
+    if prefix is not None and resolved.startswith(prefix):
+        return resolved
+    raise XlsbFormulaScanError(f"unsafe workbook relationship target {target!r}")
 
 
 def _workbook_relationships(archive: zipfile.ZipFile) -> dict[str, _Relationship]:
@@ -182,9 +191,10 @@ def _workbook_relationships(archive: zipfile.ZipFile) -> dict[str, _Relationship
             raise XlsbFormulaScanError(
                 f"duplicate workbook relationship id {relationship_id!r}"
             )
+        kind = relationship_type.rsplit("/", 1)[-1].lower()
         relationships[relationship_id] = _Relationship(
-            target=_resolve_target("xl/workbook.bin", target),
-            kind=relationship_type.rsplit("/", 1)[-1].lower(),
+            target=_resolve_target("xl/workbook.bin", target, kind=kind),
+            kind=kind,
         )
     return relationships
 

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "identities": [
+    ["excel", "formula_error", "Synthetic", "", "B2", ""],
+    ["excel", "formula_inconsistent", "Synthetic", "", "B3", ""],
+    ["excel", "value_changed", "Synthetic", "", "B4", ""],
+    ["excel", "conditional_format_changed", "Synthetic", "", "", "expression rule 1"],
+    ["excel", "row_deleted", "Synthetic", "", "row 7", ""]
+  ]
+}

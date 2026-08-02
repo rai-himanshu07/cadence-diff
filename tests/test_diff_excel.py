@@ -8,9 +8,16 @@ from qc_tool.config.profile import DeliverableProfile
 from qc_tool.excel.align import WorkbookAlignment, align_workbooks
 from qc_tool.excel.diff_structure import diff_workbook_structure
 from qc_tool.excel.diff_values import diff_workbook_values
-from qc_tool.findings import Finding, FindingClass
+from qc_tool.findings import (
+    Finding,
+    FindingClass,
+    FindingExpectedReason,
+    FindingTemporalContext,
+    Severity,
+)
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.model import WorkbookSnapshot
+from qc_tool.triage.rules import assign_severity
 from tests.fixtures.manifest_schema import FixtureManifest
 
 REFRESH_PROFILE = DeliverableProfile.model_validate(
@@ -64,10 +71,18 @@ def test_seeded_value_changes_detected(
     ]
     locations = {(f.sheet, f.location) for f in unexpected}
     e01, e06 = manifest.defect("E01"), manifest.defect("E06")
-    # Exactly the two seeded historical edits — zero false positives (criterion 1+2).
-    assert locations == {("Long_Monthly", e01.cell), ("Wide_Weekly", e06.cell)}
+    e19, e20 = manifest.defect("E19"), manifest.defect("E20")
+    # Exactly the four seeded historical edits — zero false positives.
+    assert locations == {
+        ("Long_Monthly", e01.cell),
+        ("Long_Monthly", e19.cell),
+        ("Long_Monthly", e20.cell),
+        ("Wide_Weekly", e06.cell),
+    }
 
-    e01_finding = next(f for f in unexpected if f.sheet == "Long_Monthly")
+    e01_finding = next(
+        f for f in unexpected if f.sheet == "Long_Monthly" and f.location == e01.cell
+    )
     assert float(e01_finding.baseline_value or "") == float(e01.baseline or "")
     assert float(e01_finding.current_value or "") == float(e01.current or "")
 
@@ -205,18 +220,35 @@ def test_period_advanced_rule(base: object, curr: object, expected: bool) -> Non
     assert _period_advanced(base, curr) is expected
 
 
-def test_kpi_refresh_expected_without_profile(
+def test_kpi_refresh_is_warning_without_profile(
     baseline: WorkbookSnapshot, current: WorkbookSnapshot, alignment: WorkbookAlignment
 ) -> None:
     """No profile needed: the KPI block contains an advancing period label
-    (Cycle May-26 -> Jun-26), so its constant refreshes classify expected."""
+    (Cycle May-26 -> Jun-26), so numeric changes get current-period context."""
     findings = diff_workbook_values(baseline, current, alignment, None)
     changed = _by_class(findings, FindingClass.VALUE_CHANGED)
     dashboard = [f for f in changed if f.sheet == "Dashboard"]
     assert dashboard, "KPI refresh should still be reported"
-    assert all(f.expected_growth for f in dashboard)
+    by_location = {finding.location: finding for finding in dashboard}
+    assert by_location["B5"].expected_reason is (
+        FindingExpectedReason.PERIOD_PROGRESSION
+    )
+    assert assign_severity(by_location["B5"]) is Severity.EXPECTED
+    for location in ("B2", "B3", "B4"):
+        finding = by_location[location]
+        assert finding.expected_reason is None
+        assert finding.temporal_context is FindingTemporalContext.CURRENT_PERIOD
+        assert assign_severity(finding) is Severity.WARNING
     unexpected = {(f.sheet, f.location) for f in changed if not f.expected_growth}
-    assert unexpected == {("Long_Monthly", "C7"), ("Wide_Weekly", "E2")}
+    assert unexpected == {
+        ("Dashboard", "B2"),
+        ("Dashboard", "B3"),
+        ("Dashboard", "B4"),
+        ("Long_Monthly", "C7"),
+        ("Long_Monthly", "D4"),
+        ("Long_Monthly", "C21"),
+        ("Wide_Weekly", "E2"),
+    }
 
 
 def test_period_regression_is_not_refresh() -> None:

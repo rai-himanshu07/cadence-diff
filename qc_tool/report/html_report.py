@@ -12,9 +12,11 @@ from typing import TypedDict
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from qc_tool.coverage import capability_limited
 from qc_tool.engine import QCRunResult
-from qc_tool.review import build_review_groups, review_counts
+from qc_tool.review import build_pattern_groups, count_pattern_groups
 from qc_tool.security import private_directory, private_file
+from qc_tool.story import build_stories
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +33,18 @@ class _HtmlMember(TypedDict):
     comment: str
     element: str
     root: str
+    provenance: str
+    subtype: str
+    materiality: str
+    temporal_context: str
+    expected_reason: str
+    evidence_tags: str
     waiver: str
 
 
 def _member_payload(result: QCRunResult) -> dict[str, list[_HtmlMember]]:
     payload: dict[str, list[_HtmlMember]] = {}
-    for group in build_review_groups(result.findings):
+    for group in build_pattern_groups(result.findings):
         payload[group.group_id] = [
             {
                 "finding_id": finding.finding_id,
@@ -50,6 +58,26 @@ def _member_payload(result: QCRunResult) -> dict[str, list[_HtmlMember]]:
                 "comment": finding.analyst_comment,
                 "element": finding.element or "",
                 "root": finding.root_cause_key,
+                "provenance": (
+                    finding.provenance.value if finding.provenance is not None else ""
+                ),
+                "subtype": finding.subtype.value if finding.subtype is not None else "",
+                "materiality": (
+                    finding.materiality.value if finding.materiality is not None else ""
+                ),
+                "temporal_context": (
+                    finding.temporal_context.value
+                    if finding.temporal_context is not None
+                    else ""
+                ),
+                "expected_reason": (
+                    finding.expected_reason.value
+                    if finding.expected_reason is not None
+                    else ""
+                ),
+                "evidence_tags": "; ".join(
+                    sorted(tag.value for tag in finding.evidence_tags)
+                ),
                 "waiver": (
                     f"{finding.waiver_reason} (expires {finding.waiver_expires})"
                     if finding.waiver_reason
@@ -68,12 +96,14 @@ _ENV = Environment(
 
 def render_html_report(result: QCRunResult) -> str:
     template = _ENV.get_template("report.html.j2")
-    groups = build_review_groups(result.findings)
+    groups = build_pattern_groups(result.findings)
     return template.render(
         result=result,
         groups=groups,
+        stories=build_stories(result.findings),
         member_payload=_member_payload(result),
-        counts=review_counts(groups),
+        counts=count_pattern_groups(groups),
+        capability_limited=capability_limited(result.coverage),
         generated_at=dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
     )
 

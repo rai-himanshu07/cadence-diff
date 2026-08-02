@@ -9,6 +9,7 @@ from nicegui import ui
 
 GUIDE_SECTIONS = (
     ("start", "Start here"),
+    ("example", "Worked example"),
     ("modes", "Choose a mode"),
     ("files", "Files and formats"),
     ("profiles", "Profiles and controls"),
@@ -21,7 +22,164 @@ GUIDE_SECTIONS = (
     ("network", "Network access"),
     ("troubleshooting", "Troubleshooting"),
     ("signoff", "Before sign-off"),
+    ("glossary", "Glossary"),
 )
+
+COMMON_TASKS = (
+    ("See a worked example", "example"),
+    ("Run a first preflight", "modes"),
+    ("Review a reporting cycle", "review"),
+    ("Re-QC after a correction", "reqc"),
+    ("Share evidence safely", "privacy"),
+    ("Interpret a capability-limited run", "coverage"),
+)
+
+#: A deliberately tiny weekly tracker used to show what each check reports.
+EXAMPLE_BASELINE = (
+    ("Week", "Units", "Price", "Revenue"),
+    ("2026-06-05", "120", "9.50", "=B2*C2"),
+    ("2026-06-12", "135", "9.50", "=B3*C3"),
+    ("2026-06-19", "128", "9.50", "=B4*C4"),
+    ("2026-06-26", "141", "9.50", "=B5*C5"),
+)
+
+EXAMPLE_CURRENT = (
+    ("Week", "Units", "Price", "Revenue"),
+    ("2026-06-05", "120", "9.50", "=B2*C2"),
+    ("2026-06-12", "135", "9.50", "=B3*C3"),
+    ("2026-06-19", "128", "9.50", "1216"),
+    ("2026-06-26", "152", "9.50", "=B5*C5"),
+    ("2026-07-03", "147", "9.50", "=B6*C6"),
+)
+
+EXAMPLE_FINDINGS = (
+    (
+        "Critical",
+        "formula replaced by a constant",
+        "Revenue!D4",
+        "<code>=B4*C4</code> became the typed literal <code>1216</code>. The cell "
+        "no longer recalculates, so next week's edit will silently go stale.",
+    ),
+    (
+        "Critical",
+        "historical value changed",
+        "Revenue!B4",
+        "A closed week moved from 141 to 152. History should not move; this is "
+        "reported as material because it is outside the recent window.",
+    ),
+    (
+        "Expected",
+        "cadence growth",
+        "Revenue!A6:D6",
+        "The new 2026-07-03 row continues the weekly cadence and reuses the same "
+        "formula pattern, so it is recorded as expected rather than flagged.",
+    ),
+)
+
+GLOSSARY = (
+    (
+        "pattern group",
+        "One analyst decision covering findings that repeat the same semantic "
+        "pattern. Counted as a review item.",
+    ),
+    (
+        "atomic finding",
+        "One individual difference or control result. Every export, history "
+        "record, and attestation keeps atomic evidence.",
+    ),
+    (
+        "story",
+        "A severity-neutral narrative linking findings across classes by proved "
+        "evidence edges. Stories never change counts or severities.",
+    ),
+    (
+        "scope",
+        "The sheets and slides the run compared. Everything is compared unless "
+        "a narrower scope was selected and disclosed.",
+    ),
+    (
+        "coverage",
+        "Whether each check was checked, degraded, or unavailable. A low finding "
+        "count with unavailable checks is not a clean result.",
+    ),
+    (
+        "Expected reason",
+        "The typed justification for an Expected finding, such as cadence "
+        "growth or a rolling chart window.",
+    ),
+)
+
+#: Client-side only: no network, no external assets. Runs after NiceGUI mounts.
+GUIDE_SCRIPT = """
+(function () {
+  const box = document.getElementById('guide-q');
+  if (!box || box.dataset.wired) return;
+  box.dataset.wired = '1';
+  const count = document.getElementById('guide-q-count');
+  const sections = Array.from(document.querySelectorAll('.guide-section'));
+  const links = Array.from(document.querySelectorAll('.guide-toc-link'));
+  const mobile = () => window.matchMedia('(max-width: 640px)').matches;
+
+  sections.forEach(function (s) {
+    const title = s.querySelector('.guide-section-title');
+    if (!title) return;
+    title.setAttribute('role', 'button');
+    title.setAttribute('tabindex', '0');
+    const toggle = function () {
+      s.classList.toggle('collapsed');
+      title.setAttribute('aria-expanded', String(!s.classList.contains('collapsed')));
+    };
+    title.addEventListener('click', toggle);
+    title.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+    if (mobile() && s.id !== 'start') s.classList.add('collapsed');
+    title.setAttribute('aria-expanded', String(!s.classList.contains('collapsed')));
+  });
+
+  const openTarget = function () {
+    const id = (location.hash || '').slice(1);
+    if (!id) return;
+    const s = document.getElementById(id);
+    if (s && s.classList.contains('collapsed')) {
+      s.classList.remove('collapsed');
+      s.querySelector('.guide-section-title')?.setAttribute('aria-expanded', 'true');
+    }
+    s?.scrollIntoView({ block: 'start' });
+  };
+  window.addEventListener('hashchange', openTarget);
+  openTarget();
+
+  box.addEventListener('input', function () {
+    const q = box.value.trim().toLowerCase();
+    let hits = 0;
+    sections.forEach(function (s) {
+      const match = !q || s.innerText.toLowerCase().indexOf(q) !== -1;
+      s.hidden = !match;
+      if (q && match) { hits += 1; s.classList.remove('collapsed'); }
+    });
+    links.forEach(function (a) {
+      const id = (a.getAttribute('href') || '').split('#')[1];
+      const s = document.getElementById(id);
+      a.hidden = Boolean(q) && Boolean(s) && s.hidden;
+    });
+    count.textContent = q
+      ? hits + ' matching topic' + (hits === 1 ? '' : 's')
+      : '';
+  });
+
+  const more = document.getElementById('guide-toc-more');
+  if (more) {
+    more.addEventListener('click', function () {
+      const toc = document.querySelector('.guide-toc');
+      toc.classList.toggle('expanded');
+      more.textContent = toc.classList.contains('expanded')
+        ? 'Fewer topics'
+        : 'All topics';
+    });
+  }
+})();
+"""
 
 PROFILE_CONTROLS_EXAMPLE = "\n".join(
     (
@@ -105,11 +263,24 @@ def render_guide() -> None:
         "reviewing findings, sharing evidence safely, and automating runs."
     ).classes("guide-page-lede")
 
+    ui.html(
+        '<div class="guide-search">'
+        '<input id="guide-q" type="search" autocomplete="off" '
+        'placeholder="Search the guide" aria-label="Search the guide">'
+        '<span id="guide-q-count" class="guide-search-count"></span>'
+        "</div>"
+    )
+    with ui.element("div").classes("guide-tasks"):
+        ui.label("Common tasks").classes("guide-tasks-title")
+        for label, anchor in COMMON_TASKS:
+            ui.link(label, f"/guide#{anchor}").classes("guide-task-link")
+
     with ui.element("div").classes("guide-layout"):
         with ui.element("aside").classes("guide-toc"):
             ui.label("On this page").classes("guide-toc-title")
             for anchor, title in GUIDE_SECTIONS:
                 ui.link(title, f"/guide#{anchor}").classes("guide-toc-link")
+            ui.html('<button id="guide-toc-more" type="button">All topics</button>')
 
         with ui.element("article").classes("guide-content"):
             with _guide_section("start", "Start here"):
@@ -131,6 +302,57 @@ def render_guide() -> None:
                     "Sources are read-only",
                     "QC Tool copies uploaded files into managed local storage and verifies source "
                     "integrity in tests. It does not repair or overwrite source deliverables.",
+                )
+
+            with _guide_section("example", "Worked example"):
+                _paragraph(
+                    "A four-week revenue tracker, refreshed for a new week. The "
+                    "sample is deliberately tiny so every reported finding can be "
+                    "traced by eye. Upload the previous file as Baseline and the "
+                    "refreshed file as Current, then run a cycle comparison."
+                )
+                _paragraph("Baseline — last week's file:")
+                _table(
+                    list(EXAMPLE_BASELINE[0]),
+                    [list(row) for row in EXAMPLE_BASELINE[1:]],
+                )
+                _paragraph("Current — this week's file, with three differences:")
+                _table(
+                    list(EXAMPLE_CURRENT[0]),
+                    [list(row) for row in EXAMPLE_CURRENT[1:]],
+                )
+                _paragraph("QC Tool reports exactly this:")
+                _table(
+                    ["Severity", "Finding", "Where", "Why"],
+                    [list(row) for row in EXAMPLE_FINDINGS],
+                )
+                _paragraph(
+                    "Two decisions need an analyst and one does not. That split is "
+                    "the whole point: growth is recognised as growth, so the "
+                    "hardcoded formula and the moved history stay visible instead "
+                    "of drowning in a diff of every changed cell."
+                )
+                _list(
+                    [
+                        "Open the <strong>Review queue</strong>: the two Critical items are the top rows.",
+                        "Select a row to see baseline and current values side by side with the surrounding cells.",
+                        "Set <strong>Show severities</strong> to include Expected when you want to audit the growth row itself.",
+                        "Add a comment such as <code>confirmed with data owner</code>, then export — the comment travels with the report.",
+                        "Fix the source file, then use <strong>Re-QC</strong> to prove the two Critical items are resolved.",
+                    ]
+                )
+                _callout(
+                    "Why the new week is not a finding",
+                    "Cadence growth is inferred from the period column and the reused "
+                    "formula pattern. If the new row had broken the pattern, or landed "
+                    "in the middle of history, it would be reported instead of accepted.",
+                )
+                _callout(
+                    "Same file twice proves nothing",
+                    "If Baseline and Current are the same file, the run reports almost "
+                    "nothing and that clean result is meaningless. The Compare page "
+                    "warns when the two look identical.",
+                    warning=True,
                 )
 
             with _guide_section("modes", "Choose the right QC mode"):
@@ -248,6 +470,61 @@ def render_guide() -> None:
                         ["Expected", "Cadence growth, approved waiver, or reviewed expected change"],
                     ],
                 )
+                _paragraph(
+                    "Numeric value changes carry magnitude and temporal context as separate "
+                    "axes. Representation noise (display-identical, ULP-scale) is Info. "
+                    "Per-range acceptance_bands report in-band changes as visible "
+                    "within-tolerance Info. A current or recent in-window change is Warning "
+                    "only when it clears hard anomaly guards: sign flips, zero-boundary "
+                    "changes, and 10x-or-greater magnitude ratios remain Critical regardless "
+                    "of position. Historical material changes stay Critical. An implicit "
+                    "numeric refresh block is Warning; a profile-declared refresh range may "
+                    "be Expected. restatement_windows controls the local recency window, and "
+                    "profiles can still override materiality_severity."
+                )
+                _paragraph(
+                    "Inherited errors remain literal and evidence aware: an explicit NA() "
+                    "formula may report as Info, and a formula-backed concentrated or "
+                    "contiguous data-state population may report as Warning when formula "
+                    "text is unavailable. Structural, new, or changed errors remain "
+                    "Critical. Inherited consistency deviations can report as Info. "
+                    "In-place key changes on formula-derived labels are "
+                    "Warnings that point at the upstream driver; constant-key rewrites of "
+                    "history remain Critical."
+                )
+                _paragraph(
+                    "Change stories are one of the result views, alongside the review "
+                    "queue, coverage, and atomic evidence. "
+                    "They link structural drivers (new table columns, named ranges, data "
+                    "validations) to the formula rollouts referencing them, isolate "
+                    "export noise, in-window restatements, derived-label churn, and "
+                    "inherited conditions, and leave everything unexplained in a residual "
+                    "story — the true review queue. Stories never alter severities or "
+                    "counts."
+                )
+                _paragraph(
+                    "Two run-time controls exist on the run form and CLI: an analyst "
+                    "acceptance threshold (absolute value and/or percentage; either "
+                    "bound accepts; in-band changes stay visible as within-tolerance "
+                    "Info and the threshold is disclosed with the run) and a "
+                    "comparison scope (pick sheets and slides; files still load fully "
+                    "so cross-references resolve; the validated scope is disclosed and "
+                    "out-of-scope findings are simply not reported; comparison-scope "
+                    "coverage shows Excel selected/total, PowerPoint selected/total, and "
+                    "files loaded fully). Both default off."
+                )
+                _paragraph(
+                    "Saved-error populations that reach 200 cells by sheer mass, or at "
+                    "least 20 cells with concentration or contiguity evidence, are grouped "
+                    "as one incident rather than hundreds of independent decisions. Mass "
+                    "alone is a grouping detector, not a severity rule. Warning requires "
+                    "formula presence plus concentration or contiguity; sparse value-only "
+                    "mass stays Critical. Only data-state errors (#N/A, #DIV/0!, #VALUE!, "
+                    "#NUM!) can be Warning. Structural breakage (#REF!, #NAME?, #NULL!) "
+                    "and new or changed errors always stay Critical. Intrinsic workbook "
+                    "risks, including external links and active content, produce Critical "
+                    "findings in preflight, cycle-comparison, and final-package modes."
+                )
                 _callout(
                     "Zero findings is not automatically a full pass",
                     "A run with unavailable or degraded checks has a narrower conclusion. Record "
@@ -271,18 +548,24 @@ def render_guide() -> None:
                 )
 
             with _guide_section("review", "Review findings in one place"):
+                _paragraph(
+                    "Results open on the Review queue. The run header keeps the outcome, "
+                    "capability state, decision counts, scope, exports, and Re-QC visible "
+                    "in every view, and Stories, Coverage, and Atomic evidence are one "
+                    "click away."
+                )
                 _list(
                     [
-                        "Filter by severity, but inspect the coverage table first.",
-                        "Review-item counts are analyst decisions; affected-finding counts are the underlying atomic evidence.",
-                        "Review groups are the default. Open a group for paged atomic members, or switch to Individual findings.",
+                        "Filter by severity or free text, and read the capability status before concluding a run is clean.",
+                        "Pattern review-item counts are analyst decisions; atomic-finding counts are the underlying evidence. Spatial review counts remain a compatibility metric.",
+                        "Select a review item to see its evidence axes, baseline/current values, impacts, and nearby cells in the detail panel.",
+                        "Open a group for paged atomic members, or use the Atomic evidence view for every individual finding.",
                         "Use Unreviewed only to preserve prior member decisions; Replace all is an explicit bulk override.",
-                        "Expand an individual finding to see baseline/current values, element details, impacts, and nearby cells.",
                         "A shared <strong>root cause</strong> key groups multiple truthful symptoms at one location.",
                         "Use the severity selector only for an analyst disposition; it does not rewrite engine logic.",
                         "Add a comment explaining evidence, approval, source, or required follow-up.",
                         "Exports are regenerated from the reviewed state so comments and overrides are included.",
-                        "Excel and HTML exports lead with review groups while retaining every atomic finding; Excel links stay inside the report workbook.",
+                        "Excel and HTML exports lead with semantic pattern groups while retaining every atomic finding; Excel links stay inside the report workbook.",
                     ]
                 )
                 _callout(
@@ -321,6 +604,38 @@ def render_guide() -> None:
                         "Review new coverage as well as the delta; a missing capability can change conclusions.",
                     ]
                 )
+                _paragraph(
+                    "History is also a shelf you curate. Tick one or more runs to "
+                    "act on them together."
+                )
+                _table(
+                    ["Action", "Effect"],
+                    [
+                        [
+                            "Archive",
+                            "Hides the run from the default list and keeps every record, finding, comment, and report. Switch the shelf filter to Archived to see or restore them.",
+                        ],
+                        [
+                            "Restore",
+                            "Returns archived runs to the active list.",
+                        ],
+                        [
+                            "Export selected (.zip)",
+                            "One private zip with each selected run's Excel and HTML reports plus a manifest of run ids, modes, profiles, display filenames, and counts. No filesystem paths are included.",
+                        ],
+                        [
+                            "Delete",
+                            "Permanently removes the history records, analyst annotations, and stored report files after an explicit confirmation. Source deliverables are never touched.",
+                        ],
+                    ],
+                )
+                _callout(
+                    "Archive before you delete",
+                    "Deletion also removes the evidence a later audit or Re-QC delta "
+                    "would rely on. Archiving retires a run from view without losing "
+                    "anything, so prefer it unless the record must genuinely be gone.",
+                    warning=True,
+                )
 
             with _guide_section("privacy", "Privacy, sharing, and attestations"):
                 _table(
@@ -352,6 +667,14 @@ def render_guide() -> None:
                     """# Headless comparison; exit 2 when critical findings exist
 cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
     --profile monthly --json findings.json --progress
+
+# Analyst acceptance threshold (visible-Info, never suppressed)
+cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
+    --accept-absolute 1 --accept-percent 0.1
+
+# Narrow the comparison scope (files still load fully; disclosed)
+cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
+    --sheets "Dashboard,Data" --slides 1,3-5
 
 # Deliberate local override after reviewing workload refusal
 cadence-diff run --current-excel unusually-large.xlsx --allow-large-workbooks
@@ -418,6 +741,22 @@ qc-tool network local --data-dir data"""
                             "Wait for the next safe boundary. Partial reports are removed and no successful run is recorded.",
                         ],
                         [
+                            "Run queued behind another run",
+                            "One run executes at a time in an owned worker process. Queued "
+                            "requests keep their position across a refresh; cancel one to "
+                            "stop it before it starts.",
+                        ],
+                        [
+                            "Run shown as orphaned",
+                            "The server stopped before the run finished. Nothing is resumed "
+                            "automatically \u2014 submit the run again.",
+                        ],
+                        [
+                            "Password-protected run refused",
+                            "Passwords are never stored in the queue. Start that run when "
+                            "the worker is free instead of queueing it.",
+                        ],
+                        [
                             "XLSB formula checks degraded",
                             "Review coverage detail. Windows needs desktop Excel; Linux needs "
                             "LibreOffice and bubblewrap. Active/external content remains "
@@ -444,11 +783,11 @@ qc-tool network local --data-dir data"""
                             "Review unsupported, invalid, or unparseable reference counts. A dynamic spill with no declared extent is unsupported, not guessed. Symbolic "
                             "aggregate references remain queryable and are disclosed separately.",
                         ],
-                        ["Re-QC file not found", "Select the renamed or replacement artifact again"],
-                        ["Profile will not save", "Correct the validation message or run qc-tool lint"],
+                        ["Re-QC file not found", "Select the renamed or replacement artifact again"],                        ["Profile will not save", "Correct the validation message or run qc-tool lint"],
                         ["Strict privacy verification fails", "Resolve each reported package issue or share only a fingerprint"],
                         ["Network page stops responding", "The temporary exposure may have expired; check qc-tool network status"],
                         ["Few or no findings", "Review coverage for unavailable/degraded checks before concluding clean"],
+                        ["Finished for the day", "Use the power button in the header to stop the server; any queued or running job is recorded as unfinished and must be submitted again"],
                     ],
                 )
 
@@ -470,3 +809,15 @@ qc-tool network local --data-dir data"""
                     "The tool makes checks reproducible and reviewable; it does not replace the "
                     "analyst's responsibility for unsupported visual, business, or upstream-data assertions.",
                 )
+
+            with _guide_section("glossary", "Glossary"):
+                _paragraph(
+                    "The vocabulary used across the results workbench, exports, "
+                    "history, and JSON."
+                )
+                _table(
+                    ["Term", "Meaning"],
+                    [[term, meaning] for term, meaning in GLOSSARY],
+                )
+
+    ui.run_javascript(GUIDE_SCRIPT)

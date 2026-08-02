@@ -2,7 +2,7 @@
 
 from qc_tool.config.profile import DeliverableProfile
 from qc_tool.excel.preflight import preflight_workbook
-from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.findings import Finding, FindingClass, FindingExpectedReason, Severity
 from qc_tool.io.model import (
     CellRecord,
     NamedRange,
@@ -141,6 +141,8 @@ def test_active_and_expired_waivers_preserve_evidence_and_group_roots() -> None:
     )
 
     assert waived.severity is Severity.EXPECTED
+    assert waived.expected_reason is FindingExpectedReason.WAIVER
+    assert waived.expected_growth is True
     assert waived.waiver_reason == "approved model exception"
     assert waived.waiver_expires == "2999-12-31"
     assert logic.severity is Severity.WARNING

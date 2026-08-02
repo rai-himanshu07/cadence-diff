@@ -1,0 +1,58 @@
+{
+  "public_baseline": "cadence-diff==0.1.1",
+  "schema_version": 1,
+  "workloads": {
+    "cycle_pair": {
+      "atomic_findings": 1766,
+      "coverage_states": {
+        "checked": 8,
+        "degraded": 1,
+        "unavailable": 3
+      },
+      "formula_cells": 35468,
+      "formula_findings": {
+        "consistency": 155,
+        "errors": 32,
+        "logic": 1081
+      },
+      "projected_concrete_edges": 15815995,
+      "range_membership": 15816443,
+      "reference_operands": 741423,
+      "reference_statuses": {
+        "invalid": 370636,
+        "resolved": 370521,
+        "unsupported": 266
+      },
+      "review_items": 317,
+      "severity": {
+        "critical": 335,
+        "expected": 18,
+        "info": 8,
+        "warning": 1405
+      },
+      "value_findings": {
+        "added_population": 16,
+        "replacements": 257,
+        "total": 273
+      }
+    },
+    "standalone_1": {
+      "coverage_states": {
+        "checked": 4,
+        "degraded": 2,
+        "unavailable": 8
+      },
+      "findings": 0,
+      "populated_cells_approximate": 412000
+    },
+    "standalone_2": {
+      "coverage_states": {
+        "checked": 4,
+        "degraded": 2,
+        "unavailable": 8
+      },
+      "findings": 0,
+      "populated_cells_approximate": 1950000
+    }
+  }
+}

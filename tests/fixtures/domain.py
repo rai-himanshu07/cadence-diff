@@ -5,6 +5,8 @@ the deck, and the cross-check ground truth always agree without an evaluation
 engine. Seeded-defect deltas are named constants so tests can reference them.
 """
 
+import math
+
 MONTH_LABELS = ["Jan-26", "Feb-26", "Mar-26", "Apr-26", "May-26", "Jun-26"]
 REGION_LABELS = ["North", "South", "East", "West"]
 WEEK_LABELS = [f"W{i:02d}" for i in range(1, 22)]
@@ -20,6 +22,8 @@ ROLLING_WINDOW = 4
 # Seeded-defect deltas (single source of truth for builders and tests).
 E01_DELTA = 1234.0  # Long_Monthly!C7 historical revenue edit (Feb-26 / South)
 E06_DELTA = 777.0  # Wide_Weekly W05 revenue edit
+E20_DELTA = 45.0  # Long_Monthly!C21 restatement inside the 2-month window (May-26 / West)
+# E19: Long_Monthly!D4 cost re-exported one ULP up (Jan-26 / East) - representation noise.
 P04_DELTA = 500.0  # deck table North / Apr-26 edit
 P05_DELTA = 2000.0  # deck trend chart Mar-26 edit
 X03_MARGIN_OFFSET = 0.007  # KPI slide margin figure offset vs workbook
@@ -36,10 +40,24 @@ def monthly_cost(month: int, region: int) -> float:
 
 
 def current_monthly_revenue(month: int, region: int) -> float:
-    """Current-cycle revenue: baseline values plus the seeded E01 edit."""
+    """Current-cycle revenue: baseline values plus the seeded edits."""
     value = monthly_revenue(month, region)
-    if (month, region) == (1, 1):  # Feb-26 / South -> Long_Monthly!C7
+    if (month, region) == (1, 1):  # E01: Feb-26 / South -> Long_Monthly!C7
         value += E01_DELTA
+    if (month, region) == (4, 3):  # E20: May-26 / West -> Long_Monthly!C21
+        value += E20_DELTA
+    return value
+
+
+def current_monthly_cost(month: int, region: int) -> float:
+    """Current-cycle cost: baseline values plus the seeded E19 ULP tick.
+
+    Costs carry cents, so the one-ULP nudge survives the XML float round
+    trip (whole numbers would collapse back to integers).
+    """
+    value = monthly_cost(month, region)
+    if (month, region) == (0, 2):  # E19: Jan-26 / East -> Long_Monthly!D4
+        value = math.nextafter(value, math.inf)
     return value
 
 

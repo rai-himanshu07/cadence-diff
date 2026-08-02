@@ -127,6 +127,22 @@ def _excel_process(app: Any) -> tuple[int, Any, float]:
     return pid, handle, created
 
 
+def _set_manual_calculation(app: Any, com_error: type[BaseException]) -> Any | None:
+    """Set manual calculation, adding a private guard workbook when required."""
+    try:
+        app.Calculation = -4135
+        return None
+    except com_error:
+        guard = app.Workbooks.Add()
+        try:
+            app.Calculation = -4135
+        except Exception:
+            with suppress(Exception):
+                guard.Close(SaveChanges=False)
+            raise
+        return guard
+
+
 def _extract(request: dict[str, object]) -> dict[str, object]:
     import pythoncom  # pyright: ignore[reportMissingModuleSource]
     import pywintypes  # pyright: ignore[reportMissingModuleSource]
@@ -151,7 +167,7 @@ def _extract(request: dict[str, object]) -> dict[str, object]:
         raise RuntimeError("worker formula_cells request is invalid")
 
     pythoncom.CoInitialize()
-    app = workbook = excel_handle = None
+    app = workbook = calculation_guard = excel_handle = None
     try:
         app = win32com.client.DispatchEx("Excel.Application")
         pid, excel_handle, created = _excel_process(app)
@@ -167,10 +183,10 @@ def _extract(request: dict[str, object]) -> dict[str, object]:
         app.EnableEvents = False
         app.DisplayAlerts = False
         app.AskToUpdateLinks = False
-        app.Calculation = -4135
-        app.CalculateBeforeSave = False
         app.Interactive = False
         app.ScreenUpdating = False
+        calculation_guard = _set_manual_calculation(app, pywintypes.com_error)
+        app.CalculateBeforeSave = False
         with suppress(pywintypes.com_error):
             app.AutoRecover.Enabled = False
 
@@ -248,6 +264,9 @@ def _extract(request: dict[str, object]) -> dict[str, object]:
         if workbook is not None:
             with suppress(Exception):
                 workbook.Close(SaveChanges=False)
+        if calculation_guard is not None:
+            with suppress(Exception):
+                calculation_guard.Close(SaveChanges=False)
         if app is not None:
             with suppress(Exception):
                 app.Quit()

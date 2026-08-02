@@ -9,7 +9,7 @@ from typing import TypeVar
 from openpyxl.utils.cell import range_boundaries
 
 from qc_tool.coverage import CoverageState
-from qc_tool.findings import Finding, FindingClass
+from qc_tool.findings import Finding, FindingClass, FindingSubtype
 from qc_tool.io.model import (
     ConditionalFormatDescriptor,
     DataValidationDescriptor,
@@ -324,17 +324,70 @@ def _conditional_label(rule: ConditionalFormatDescriptor) -> str:
     return f"{rule.rule_type} rule {rule.source_index + 1}"
 
 
+def _validation_event_key(rule: DataValidationDescriptor) -> str:
+    return f"excel:{rule.sheet}:data-validation:{rule.source_id or rule.source_index}"
+
+
+def _conditional_event_key(rule: ConditionalFormatDescriptor) -> str:
+    return f"excel:{rule.sheet}:conditional-format:{rule.source_id or rule.source_index}"
+
+
+def _priority_order_key(
+    rule: ConditionalFormatDescriptor,
+) -> tuple[int, int, int]:
+    return (
+        1 if rule.priority is None else 0,
+        rule.priority if rule.priority is not None else 0,
+        rule.source_index,
+    )
+
+
+def _reordered_pairs(
+    pairs: list[tuple[ConditionalFormatDescriptor, ConditionalFormatDescriptor]],
+) -> set[int]:
+    """Paired rules whose relative evaluation order actually inverted.
+
+    Renumbering caused only by additions or removals leaves every paired
+    ordering intact and must not fan out into independent findings.
+    """
+    inverted: set[int] = set()
+    for sheet in {current.sheet for _, current in pairs}:
+        sheet_pairs = [pair for pair in pairs if pair[1].sheet == sheet]
+        baseline_rank = {
+            id(pair[1]): rank
+            for rank, pair in enumerate(
+                sorted(sheet_pairs, key=lambda pair: _priority_order_key(pair[0]))
+            )
+        }
+        current_rank = {
+            id(pair[1]): rank
+            for rank, pair in enumerate(
+                sorted(sheet_pairs, key=lambda pair: _priority_order_key(pair[1]))
+            )
+        }
+        for index, (_, left) in enumerate(sheet_pairs):
+            for _, right in sheet_pairs[index + 1 :]:
+                before = baseline_rank[id(left)] < baseline_rank[id(right)]
+                after = current_rank[id(left)] < current_rank[id(right)]
+                if before != after:
+                    inverted.update((id(left), id(right)))
+    return inverted
+
+
 def _validation_findings(
     baseline: DataValidationDescriptor,
     current: DataValidationDescriptor,
 ) -> list[Finding]:
     findings: list[Finding] = []
     label = _validation_label(current)
+    event_key = _validation_event_key(current)
     if baseline.target_ranges != current.target_ranges:
         findings.append(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.DATA_VALIDATION_CHANGED,
+                subtype=FindingSubtype.OBJECT_TARGET_CHANGED,
+                event_key=event_key,
                 sheet=current.sheet,
                 element=label,
                 baseline_value=_ranges_text(baseline.target_ranges),
@@ -347,6 +400,8 @@ def _validation_findings(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.DATA_VALIDATION_CHANGED,
+                subtype=FindingSubtype.OBJECT_CONDITION_CHANGED,
+                event_key=event_key,
                 sheet=current.sheet,
                 element=label,
                 baseline_value=(
@@ -365,6 +420,8 @@ def _validation_findings(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.DATA_VALIDATION_CHANGED,
+                subtype=FindingSubtype.OBJECT_DISPLAY_CHANGED,
+                event_key=event_key,
                 sheet=current.sheet,
                 element=label,
                 message=f"data-validation {label} display text/settings changed",
@@ -376,14 +433,19 @@ def _validation_findings(
 def _conditional_findings(
     baseline: ConditionalFormatDescriptor,
     current: ConditionalFormatDescriptor,
+    *,
+    order_changed: bool,
 ) -> list[Finding]:
     findings: list[Finding] = []
     label = _conditional_label(current)
+    event_key = _conditional_event_key(current)
     if baseline.target_ranges != current.target_ranges:
         findings.append(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.CONDITIONAL_FORMAT_CHANGED,
+                subtype=FindingSubtype.OBJECT_TARGET_CHANGED,
+                event_key=event_key,
                 sheet=current.sheet,
                 element=label,
                 baseline_value=_ranges_text(baseline.target_ranges),
@@ -400,6 +462,8 @@ def _conditional_findings(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.CONDITIONAL_FORMAT_CHANGED,
+                subtype=FindingSubtype.OBJECT_CONDITION_CHANGED,
+                event_key=event_key,
                 sheet=current.sheet,
                 element=label,
                 baseline_value=" | ".join(baseline.formulas),
@@ -407,11 +471,13 @@ def _conditional_findings(
                 message=f"conditional-format {label} condition changed",
             )
         )
-    if semantic_supported and baseline.priority != current.priority:
+    if semantic_supported and order_changed:
         findings.append(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.CONDITIONAL_FORMAT_CHANGED,
+                subtype=FindingSubtype.OBJECT_ORDER_CHANGED,
+                event_key=event_key,
                 sheet=current.sheet,
                 element=label,
                 baseline_value=(
@@ -420,7 +486,10 @@ def _conditional_findings(
                 current_value=(
                     None if current.priority is None else str(current.priority)
                 ),
-                message=f"conditional-format {label} priority changed",
+                message=(
+                    f"conditional-format {label} evaluation order changed relative "
+                    "to the other retained rules"
+                ),
             )
         )
     if (
@@ -431,6 +500,8 @@ def _conditional_findings(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.CONDITIONAL_FORMAT_CHANGED,
+                subtype=FindingSubtype.OBJECT_SETTINGS_CHANGED,
+                event_key=event_key,
                 sheet=current.sheet,
                 element=label,
                 baseline_value=str(bool(baseline.stop_if_true)),
@@ -447,6 +518,8 @@ def _conditional_findings(
             Finding(
                 artifact="excel",
                 finding_class=FindingClass.CONDITIONAL_FORMAT_CHANGED,
+                subtype=FindingSubtype.OBJECT_STYLE_CHANGED,
+                event_key=event_key,
                 sheet=current.sheet,
                 element=label,
                 baseline_value=baseline.style_key,
@@ -472,6 +545,8 @@ def diff_interaction_rules(
         Finding(
             artifact="excel",
             finding_class=FindingClass.DATA_VALIDATION_CHANGED,
+            subtype=FindingSubtype.OBJECT_REMOVED,
+            event_key=_validation_event_key(rule),
             sheet=rule.sheet,
             element=_validation_label(rule),
             baseline_value=_ranges_text(rule.target_ranges),
@@ -483,6 +558,8 @@ def diff_interaction_rules(
         Finding(
             artifact="excel",
             finding_class=FindingClass.DATA_VALIDATION_CHANGED,
+            subtype=FindingSubtype.OBJECT_ADDED,
+            event_key=_validation_event_key(rule),
             sheet=rule.sheet,
             element=_validation_label(rule),
             current_value=_ranges_text(rule.target_ranges),
@@ -503,6 +580,8 @@ def diff_interaction_rules(
         Finding(
             artifact="excel",
             finding_class=FindingClass.CONDITIONAL_FORMAT_CHANGED,
+            subtype=FindingSubtype.OBJECT_REMOVED,
+            event_key=_conditional_event_key(rule),
             sheet=rule.sheet,
             element=_conditional_label(rule),
             baseline_value=_ranges_text(rule.target_ranges),
@@ -514,6 +593,8 @@ def diff_interaction_rules(
         Finding(
             artifact="excel",
             finding_class=FindingClass.CONDITIONAL_FORMAT_CHANGED,
+            subtype=FindingSubtype.OBJECT_ADDED,
+            event_key=_conditional_event_key(rule),
             sheet=rule.sheet,
             element=_conditional_label(rule),
             current_value=_ranges_text(rule.target_ranges),
@@ -521,8 +602,15 @@ def diff_interaction_rules(
         )
         for rule in added_conditionals
     )
+    reordered = _reordered_pairs(conditional_pairs)
     for baseline_rule, current_rule in conditional_pairs:
-        findings.extend(_conditional_findings(baseline_rule, current_rule))
+        findings.extend(
+            _conditional_findings(
+                baseline_rule,
+                current_rule,
+                order_changed=id(current_rule) in reordered,
+            )
+        )
     return findings
 
 

@@ -93,11 +93,12 @@ def encrypt_file(src: Path, dest: Path, password: str) -> None:
 
 def _xlsb_rows(*, current: bool) -> list[list[CellValue]]:
     months = domain.CURRENT_MONTHS if current else domain.BASELINE_MONTHS
-    revenue_fn = domain.current_monthly_revenue if current else domain.monthly_revenue
     rows: list[list[CellValue]] = [["Period", "Region", "Revenue", "Cost", "Margin"]]
     for month in range(months):
         for region in range(len(domain.REGION_LABELS)):
-            revenue = revenue_fn(month, region)
+            revenue = domain.monthly_revenue(month, region)
+            if current and (month, region) == (1, 1):
+                revenue += domain.E01_DELTA  # XB01 mirrors E01 only
             cost = domain.monthly_cost(month, region)
             rows.append(
                 [

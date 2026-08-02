@@ -254,9 +254,8 @@ def test_unsupported_structured_dependency_degrades_coverage() -> None:
 
     assert graph.coverage_state is CoverageState.DEGRADED
     assert coverage.state is CoverageState.DEGRADED
-    assert graph.unsupported_references == [
-        "Data!C3: A1Table[[#Data],[Amount],[Cost]]"
-    ]
+    assert graph.unsupported_references == ["structured_reference"]
+    assert graph.unsupported_reason_counts == {"structured_reference": 1}
 
 
 def test_table_structure_diff_detects_rename_range_and_schema_changes() -> None:

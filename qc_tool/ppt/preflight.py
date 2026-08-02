@@ -103,6 +103,7 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
                     artifact="ppt",
                     finding_class=FindingClass.PPT_EMPTY_SLIDE,
                     slide=slide.display_name,
+                    slide_index=slide.index + 1,
                     location=f"slide {slide.index + 1}",
                     message=f"slide {slide.index + 1} is empty",
                 )
@@ -118,6 +119,7 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
                         artifact="ppt",
                         finding_class=FindingClass.PPT_DRAFT_TOKEN,
                         slide=slide.display_name,
+                        slide_index=slide.index + 1,
                         location=f"slide {slide.index + 1}",
                         current_value=text,
                         element=token,
@@ -166,6 +168,7 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
                             artifact="ppt",
                             finding_class=FindingClass.PPT_TABLE_BLANK,
                             slide=slide.display_name,
+                            slide_index=slide.index + 1,
                             location=f"slide {slide.index + 1}",
                             element=f"table {table_index}, row {row_index}, column {col_index + 1}",
                             message=(
@@ -214,6 +217,7 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
                             artifact="ppt",
                             finding_class=FindingClass.PPT_CHART_LENGTH_MISMATCH,
                             slide=slide.display_name,
+                            slide_index=slide.index + 1,
                             location=f"slide {slide.index + 1}",
                             element=series_element,
                             baseline_value=str(len(categories)),
@@ -230,6 +234,7 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
                             artifact="ppt",
                             finding_class=FindingClass.PPT_CHART_VALUE_MISSING,
                             slide=slide.display_name,
+                            slide_index=slide.index + 1,
                             location=f"slide {slide.index + 1}",
                             element=categories[index],
                             message=(

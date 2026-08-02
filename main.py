@@ -4,5 +4,6 @@ from pathlib import Path
 
 from qc_tool.ui.app import run_app
 
-if __name__ in {"__main__", "__mp_main__"}:  # __mp_main__: NiceGUI multiprocessing
+# Only `__main__`: a spawned QC worker re-imports this file as `__mp_main__`.
+if __name__ == "__main__":
     run_app(Path(__file__).parent / "data")

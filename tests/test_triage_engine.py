@@ -62,9 +62,9 @@ def _one(result: QCRunResult, cls: FindingClass, **attrs: str) -> Finding:
 
 
 def test_default_severities(result: QCRunResult) -> None:
-    assert _one(result, FindingClass.VALUE_CHANGED, sheet="Long_Monthly").severity is (
-        Severity.CRITICAL
-    )
+    assert _one(
+        result, FindingClass.VALUE_CHANGED, sheet="Long_Monthly", location="C7"
+    ).severity is (Severity.CRITICAL)
     assert _one(result, FindingClass.FORMULA_HARDCODED).severity is Severity.CRITICAL
     assert _one(result, FindingClass.CROSSCHECK_MISMATCH).severity is Severity.CRITICAL
     assert _one(result, FindingClass.NUMBER_FORMAT_CHANGED).severity is Severity.WARNING

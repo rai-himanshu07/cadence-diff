@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "source_hashes_unchanged": true,
+  "workloads": {
+    "cycle_pair": {
+      "chart_part_count": 6,
+      "changed_chart_part_count": 4,
+      "changed_drawing_anchor_count": 1,
+      "current_formula_cell_count": 35468,
+      "current_physical_cell_count": 49973,
+      "formula_changes": {
+        "added": 98,
+        "exact_baseline_subtree": 1048,
+        "formula_to_formula": 1076,
+        "token_transition_shapes": 16,
+        "total": 1174
+      },
+      "inherited_explicit_na_count": 32,
+      "kpi_panel_count": 6,
+      "numeric_constant_changes": {
+        "display_residue": 87,
+        "historical_substantive": 97,
+        "recent_substantive": 71,
+        "substantive": 168,
+        "total": 255
+      },
+      "sheet_count": 27,
+      "sideways_table_changes": {
+        "added_columns": 2,
+        "count": 1,
+        "row_span_unchanged": true
+      },
+      "volatile_formula_date_columns_present": true
+    },
+    "xlsb_a": {
+      "active_or_external_risk_count": 0,
+      "cached_cell_count": 412291,
+      "cached_errors": {
+        "na": 1518,
+        "total": 1520,
+        "value": 2
+      },
+      "concentrated_formula_populations": {
+        "count": 4,
+        "formula_presence_for_every_member": true,
+        "maximum_member_count": 40,
+        "maximum_share_basis_points": 8300,
+        "minimum_member_count": 39,
+        "minimum_share_basis_points": 7400
+      },
+      "conversion_coordinate_mismatch": {
+        "missing": 3206,
+        "unexpected": 1263
+      },
+      "error_population_count": 17,
+      "raw_formula_record_count": 66332,
+      "scanner_formula_coordinate_count": 66332,
+      "sheet_count": 13,
+      "sparse_value_only_mass": {
+        "count": 1235,
+        "formula_record_count": 0,
+        "longest_run": 3,
+        "run_count": 1139,
+        "share_basis_points": 659
+      }
+    },
+    "xlsb_b": {
+      "cached_cell_count": 1945767,
+      "cached_error_count": 0,
+      "cycle_external_findings_before_fix": 0,
+      "external_link_part_count": 2,
+      "external_path_relationship_count": 4,
+      "raw_formula_record_count": 1662760,
+      "scanner_formula_coordinate_count": 1662760,
+      "sheet_count": 15,
+      "workbook_external_link_relationship_count": 1
+    }
+  }
+}

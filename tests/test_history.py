@@ -3,12 +3,13 @@
 import datetime as dt
 import json
 import sqlite3
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from qc_tool.engine import QCRunResult
-from qc_tool.history.store import RunHistory, sha256_file
+from qc_tool.history.store import RunHistory, export_runs_archive, sha256_file
 
 
 def test_record_and_list_runs(
@@ -38,6 +39,106 @@ def test_record_and_list_runs(
     assert newest.review_counts["critical"] <= newest.counts["critical"]
     assert newest.started_at.tzinfo is not None  # timezone-aware UTC
     assert newest.findings == []  # listing stays lightweight
+
+
+def test_archive_hides_runs_without_losing_them(
+    qc_result: QCRunResult, tmp_path: Path
+) -> None:
+    history = RunHistory(tmp_path / "history.sqlite3")
+    keep = history.record_run(qc_result, file_hashes={}, report_paths={})
+    retire = history.record_run(qc_result, file_hashes={}, report_paths={})
+
+    assert history.set_archived([retire], True) == 1
+
+    active = history.list_runs(include_archived=False)
+    assert [run.run_id for run in active] == [keep]
+    assert {run.run_id: run.archived for run in history.list_runs()} == {
+        keep: False,
+        retire: True,
+    }
+    # The evidence itself survives archiving.
+    assert history.get_run(retire).findings
+
+    assert history.set_archived([retire], False) == 1
+    assert [run.run_id for run in history.list_runs(include_archived=False)] == [
+        retire,
+        keep,
+    ]
+
+
+def test_delete_removes_records_annotations_and_managed_reports(
+    qc_result: QCRunResult, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    runs_root = work_dir / "runs"
+    report = runs_root / "abc" / "report.html"
+    report.parent.mkdir(parents=True)
+    report.write_text("<html></html>", encoding="utf-8")
+    history = RunHistory(work_dir / "history.sqlite3")
+    run_id = history.record_run(
+        qc_result, file_hashes={}, report_paths={"html": str(report)}
+    )
+    finding_id = history.get_run(run_id).findings[0].finding_id
+    history.set_annotation(run_id, finding_id, severity="info", comment="checked")
+
+    assert history.delete_runs([run_id], managed_root=runs_root) == 1
+
+    assert history.list_runs() == []
+    assert history.get_annotations(run_id) == {}
+    assert not report.exists()
+    assert not report.parent.exists()  # the emptied run directory goes too
+
+
+def test_delete_never_touches_files_outside_the_managed_root(
+    qc_result: QCRunResult, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    runs_root = work_dir / "runs"
+    runs_root.mkdir(parents=True)
+    outsider = tmp_path / "not-ours.html"
+    outsider.write_text("keep me", encoding="utf-8")
+    history = RunHistory(work_dir / "history.sqlite3")
+    run_id = history.record_run(
+        qc_result, file_hashes={}, report_paths={"html": str(outsider)}
+    )
+
+    assert history.delete_runs([run_id], managed_root=runs_root) == 1
+
+    assert history.list_runs() == []
+    assert outsider.read_text(encoding="utf-8") == "keep me"
+
+
+def test_export_archive_bundles_reports_and_a_path_free_manifest(
+    qc_result: QCRunResult, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    runs_root = work_dir / "runs"
+    report = runs_root / "abc" / "report.html"
+    report.parent.mkdir(parents=True)
+    report.write_text("<html>report</html>", encoding="utf-8")
+    outsider = tmp_path / "escape.html"
+    outsider.write_text("secret", encoding="utf-8")
+    history = RunHistory(work_dir / "history.sqlite3")
+    inside = history.record_run(
+        qc_result, file_hashes={}, report_paths={"html": str(report)}
+    )
+    outside = history.record_run(
+        qc_result, file_hashes={}, report_paths={"html": str(outsider)}
+    )
+
+    bundle = export_runs_archive(
+        history.list_runs(), work_dir / "exports" / "runs.zip", managed_root=runs_root
+    )
+
+    with zipfile.ZipFile(bundle) as archive:
+        names = set(archive.namelist())
+        manifest = json.loads(archive.read("manifest.json"))
+    assert f"run-{inside}/html.html" in names
+    assert not any(name.startswith(f"run-{outside}/") for name in names)
+    assert {entry["run_id"] for entry in manifest["runs"]} == {inside, outside}
+    # A manifest is evidence, not a path leak.
+    assert str(work_dir) not in json.dumps(manifest)
+    assert bundle.stat().st_mode & 0o077 == 0
 
 
 def test_get_run_roundtrips_findings(qc_result: QCRunResult, tmp_path: Path) -> None:
@@ -107,6 +208,8 @@ def test_legacy_run_rehydrates_after_optional_contract_expansion(tmp_path: Path)
                         {
                             "artifact": "excel",
                             "finding_class": "value_changed",
+                            "expected_growth": True,
+                            "materiality": "recent_restatement",
                             "message": "legacy finding",
                         }
                     ]
@@ -123,6 +226,12 @@ def test_legacy_run_rehydrates_after_optional_contract_expansion(tmp_path: Path)
     assert len(record.findings) == 1
     finding = record.findings[0]
     assert finding.message == "legacy finding"
+    assert finding.expected_growth is True
+    assert finding.expected_reason is None
+    assert finding.materiality is not None
+    assert finding.materiality.value == "recent_restatement"
+    assert finding.temporal_context is None
+    assert finding.evidence_tags == set()
     assert finding.impacts == []
     assert finding.current_excerpt is None
 
@@ -194,7 +303,7 @@ def test_annotations_flow_into_reports(qc_result: QCRunResult, tmp_path: Path) -
     write_excel_report(result, path)
     sheet = load_workbook(path)["Findings"]
     assert sheet["B2"].value == "info *"  # override marker
-    assert sheet["L2"].value == "reviewed & accepted"
+    assert sheet["R2"].value == "reviewed & accepted"
 
     html = render_html_report(result)
     assert r'"comment": "reviewed \u0026 accepted"' in html

@@ -16,7 +16,13 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
     write_excel_report(qc_result, path)
 
     workbook = load_workbook(path)
-    assert workbook.sheetnames == ["Summary", "Coverage", "Review Groups", "Findings"]
+    assert workbook.sheetnames == [
+        "Summary",
+        "Stories",
+        "Coverage",
+        "Review Groups",
+        "Findings",
+    ]
 
     findings_sheet = workbook["Findings"]
     assert findings_sheet.max_row == len(qc_result.findings) + 1
@@ -32,8 +38,8 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
     assert "fixture" in summary_text  # profile name
     assert "cycle_comparison" in summary_text
     assert "current.xlsx" in summary_text
-    assert "Critical review items" in summary_text
-    assert "Critical affected findings" in summary_text
+    assert "Critical pattern review items" in summary_text
+    assert "Critical atomic findings" in summary_text
 
     coverage = workbook["Coverage"]
     assert coverage["A1"].value == "Artifact"
@@ -46,7 +52,13 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
     assert review_groups["J2"].hyperlink.location.startswith("'Findings'!A")
     assert "Clear any Findings sheet filter" in review_groups["J2"].hyperlink.tooltip
     assert summary["D3"].hyperlink is not None
-    assert summary["D3"].hyperlink.location == "'Review Groups'!A1"
+    assert summary["D3"].hyperlink.location == "'Stories'!A1"
+    assert summary["D4"].hyperlink is not None
+    assert summary["D4"].hyperlink.location == "'Review Groups'!A1"
+
+    stories_sheet = workbook["Stories"]
+    assert stories_sheet["A1"].value == "Story"
+    assert stories_sheet.max_row >= 2  # at least one story for the fixture pair
 
 
 def test_excel_report_discloses_xlsb_degradation(fixture_dir: Path, tmp_path: Path) -> None:
@@ -81,10 +93,10 @@ def test_excel_report_keeps_formula_text_inert(tmp_path: Path) -> None:
 
     workbook = load_workbook(path, data_only=False)
     findings = workbook["Findings"]
-    assert findings["H2"].value.startswith("=HYPERLINK")
-    assert findings["H2"].data_type == "s"
-    assert findings["I2"].value == "=1+1"
-    assert findings["I2"].data_type == "s"
+    assert findings["N2"].value.startswith("=HYPERLINK")
+    assert findings["N2"].data_type == "s"
+    assert findings["O2"].value == "=1+1"
+    assert findings["O2"].data_type == "s"
 
 
 def test_html_report_contents(qc_result: QCRunResult, tmp_path: Path) -> None:
@@ -100,8 +112,8 @@ def test_html_report_contents(qc_result: QCRunResult, tmp_path: Path) -> None:
         assert f'class="card {severity.value}"' in html
     # Self-contained: no external asset references.
     assert "http://" not in html and "https://" not in html
-    assert "review items" in html
-    assert "affected findings" in html
+    assert "pattern review items" in html
+    assert "atomic findings" in html
     # Every atomic finding remains available in safely escaped inline JSON.
     assert all(finding.finding_id in html for finding in qc_result.findings)
     assert "data-member-body" in html
@@ -132,10 +144,15 @@ def test_html_report_escapes_client_content() -> None:
 
 def test_json_context_is_private_and_opt_in(qc_result: QCRunResult) -> None:
     private_payload = result_payload(qc_result)
+    assert private_payload["schema_version"] == 1
     assert private_payload["context_included"] is False
     assert private_payload["mapping_suggestions"] == []
     assert all(
         "baseline_excerpt" not in finding and "current_excerpt" not in finding
+        for finding in private_payload["findings"]
+    )
+    assert all(
+        {"expected_reason", "temporal_context", "evidence_tags"} <= finding.keys()
         for finding in private_payload["findings"]
     )
 

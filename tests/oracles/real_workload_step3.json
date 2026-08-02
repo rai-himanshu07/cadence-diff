@@ -1,0 +1,36 @@
+{
+  "atomic_findings": 1766,
+  "coverage_states": {
+    "checked": 8,
+    "degraded": 1,
+    "unavailable": 3
+  },
+  "formula_count": 35468,
+  "lexical_formula_count": 10374,
+  "operand_count": 741423,
+  "projected_concrete_edges": 15815995,
+  "range_membership": 15816443,
+  "reference_reasons": {
+    "invalid:structured_reference": 112,
+    "unsupported:structured_reference": 266
+  },
+  "reference_statuses": {
+    "invalid": 112,
+    "local_symbol": 370524,
+    "resolved": 370521,
+    "unsupported": 266
+  },
+  "review_counts": {
+    "critical": 106,
+    "expected": 18,
+    "info": 7,
+    "warning": 186
+  },
+  "severity": {
+    "critical": 335,
+    "expected": 18,
+    "info": 8,
+    "warning": 1405
+  },
+  "source_hashes_unchanged": true
+}

@@ -1,0 +1,40 @@
+{
+  "description": "Anonymous standalone preflight aggregates for two local XLSB references.",
+  "reference_a": {
+    "atomic_findings": 760,
+    "columnar_error_population_atomics": 647,
+    "coverage_states": {
+      "degraded": 6,
+      "unavailable": 8
+    },
+    "external_link_findings": 0,
+    "file_format": "xlsb",
+    "mode": "current_file_preflight",
+    "severity": {
+      "critical": 112,
+      "expected": 0,
+      "info": 0,
+      "warning": 648
+    }
+  },
+  "reference_a_notes": "13-sheet tracker; 1,520 saved #N/A; one 1,235-cell lookup-gap column qualifies by mass, chart-gap columns by share; scattered errors stay critical.",
+  "reference_b": {
+    "atomic_findings": 2,
+    "columnar_error_population_atomics": 0,
+    "coverage_states": {
+      "checked": 4,
+      "degraded": 2,
+      "unavailable": 8
+    },
+    "external_link_findings": 2,
+    "file_format": "xlsb",
+    "mode": "current_file_preflight",
+    "severity": {
+      "critical": 2,
+      "expected": 0,
+      "info": 0,
+      "warning": 0
+    }
+  },
+  "reference_b_notes": "large utilization tool; scanner-proven external relationships/workbook links surface as EXTERNAL_LINK findings instead of a zero-finding 'clean'."
+}

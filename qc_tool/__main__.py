@@ -2,5 +2,6 @@
 
 from qc_tool.cli import main
 
-if __name__ in {"__main__", "__mp_main__"}:  # __mp_main__: NiceGUI multiprocessing
+# Only `__main__`: a spawned QC worker re-imports this file as `__mp_main__`.
+if __name__ == "__main__":
     raise SystemExit(main())

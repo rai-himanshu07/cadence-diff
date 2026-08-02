@@ -4,7 +4,7 @@ import difflib
 
 from qc_tool.config.profile import PptProfile
 from qc_tool.crosscheck.numbers import numeric_skeleton as _numeric_skeleton
-from qc_tool.findings import Finding, FindingClass
+from qc_tool.findings import Finding, FindingClass, FindingExpectedReason
 from qc_tool.ppt.element_diff import diff_slide_elements
 from qc_tool.ppt.match import SlideMatching
 from qc_tool.ppt.model import SlideContent
@@ -37,8 +37,11 @@ def _text_findings(baseline: SlideContent, current: SlideContent) -> list[Findin
                 Finding(
                     artifact="ppt",
                     finding_class=FindingClass.SLIDE_TEXT_CHANGED,
-                    expected_growth=expected,
+                    expected_reason=(
+                        FindingExpectedReason.FIGURE_REFRESH if expected else None
+                    ),
                     slide=slide,
+                    slide_index=current.index + 1,
                     baseline_value=baseline_line,
                     current_value=current_line,
                     message=(
@@ -53,6 +56,7 @@ def _text_findings(baseline: SlideContent, current: SlideContent) -> list[Findin
                     artifact="ppt",
                     finding_class=FindingClass.SLIDE_TEXT_CHANGED,
                     slide=slide,
+                    slide_index=current.index + 1,
                     baseline_value=line,
                     message=f"{slide}: text removed",
                 )
@@ -63,6 +67,7 @@ def _text_findings(baseline: SlideContent, current: SlideContent) -> list[Findin
                     artifact="ppt",
                     finding_class=FindingClass.SLIDE_TEXT_CHANGED,
                     slide=slide,
+                    slide_index=current.index + 1,
                     current_value=line,
                     message=f"{slide}: text added",
                 )
@@ -83,6 +88,7 @@ def diff_decks(
                 artifact="ppt",
                 finding_class=FindingClass.SLIDE_ADDED,
                 slide=slide.display_name,
+                slide_index=slide.index + 1,
                 location=f"slide {slide.index + 1}",
                 message=f"slide {slide.display_name!r} added in current deck",
             )
@@ -93,7 +99,8 @@ def diff_decks(
                 artifact="ppt",
                 finding_class=FindingClass.SLIDE_REMOVED,
                 slide=slide.display_name,
-                location=f"slide {slide.index + 1}",
+                baseline_slide_index=slide.index + 1,
+                baseline_location=f"slide {slide.index + 1}",
                 message=f"slide {slide.display_name!r} removed from current deck",
             )
         )
@@ -102,8 +109,9 @@ def diff_decks(
             Finding(
                 artifact="ppt",
                 finding_class=FindingClass.SLIDE_REORDERED,
-                expected_growth=True,
+                expected_reason=FindingExpectedReason.PRESENTATION_REORDER,
                 slide=current_slide.display_name,
+                slide_index=current_slide.index + 1,
                 baseline_value=f"position {baseline_slide.index + 1}",
                 current_value=f"position {current_slide.index + 1}",
                 message=(

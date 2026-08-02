@@ -8,8 +8,9 @@ diff logic from raw artifacts.
 from collections import Counter
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer, model_validator
 
 
 class FindingClass(StrEnum):
@@ -30,6 +31,8 @@ class FindingClass(StrEnum):
     COLUMN_DELETED = "column_deleted"
     ROW_INSERTED = "row_inserted"
     COLUMN_INSERTED = "column_inserted"
+    ROW_KEY_CHANGED = "row_key_changed"
+    COLUMN_KEY_CHANGED = "column_key_changed"
     ROW_GROWTH = "row_growth"
     COLUMN_GROWTH = "column_growth"
     SHEET_ADDED = "sheet_added"
@@ -55,6 +58,7 @@ class FindingClass(StrEnum):
     PERIOD_GAP = "period_gap"
     CALCULATION_MODE = "calculation_mode"
     EXTERNAL_LINK = "external_link"
+    ACTIVE_CONTENT = "active_content"
     NAMED_RANGE_INVALID = "named_range_invalid"
     CHART_REFERENCE_INVALID = "chart_reference_invalid"
     CHART_LENGTH_MISMATCH = "chart_length_mismatch"
@@ -102,6 +106,105 @@ class Severity(StrEnum):
     EXPECTED = "expected"
 
 
+class FindingProvenance(StrEnum):
+    """Cycle history of a current-state observation, proven against the baseline.
+
+    Only assigned when the cell has a confidently aligned baseline counterpart;
+    otherwise it stays unset rather than guessing a regression.
+    """
+
+    NEW = "new"
+    CHANGED = "changed"
+    INHERITED = "inherited"
+    HISTORICAL_PATTERN = "historical_pattern"
+
+
+class Materiality(StrEnum):
+    """Numeric materiality tier of a value delta.
+
+    New findings use only magnitude/acceptance states. ``recent_restatement``
+    remains solely so stored evidence from earlier versions can rehydrate.
+    """
+
+    NOISE = "noise"
+    WITHIN_TOLERANCE = "within_tolerance"
+    RECENT_RESTATEMENT = "recent_restatement"
+    MATERIAL = "material"
+
+
+class FindingTemporalContext(StrEnum):
+    """Where a finding sits relative to its proved local period edge."""
+
+    CURRENT_PERIOD = "current_period"
+    RECENT_WINDOW = "recent_window"
+    HISTORICAL = "historical"
+
+
+class FindingExpectedReason(StrEnum):
+    """Closed evidence reasons that may produce an Expected finding."""
+
+    PERIOD_PROGRESSION = "period_progression"
+    CADENCE_EXTENSION = "cadence_extension"
+    ROLLING_WINDOW = "rolling_window"
+    PROFILE_REFRESH = "profile_refresh"
+    FIGURE_REFRESH = "figure_refresh"
+    PRESENTATION_REORDER = "presentation_reorder"
+    WAIVER = "waiver"
+
+
+class FindingEvidenceTag(StrEnum):
+    """Bounded, additive evidence carried outside finding identity."""
+
+    DISPLAY_EQUIVALENT = "display_equivalent"
+    ULP_SCALE = "ulp_scale"
+    EXPLICIT_NA = "explicit_na"
+    FORMULA_TEXT = "formula_text"
+    FORMULA_PRESENCE = "formula_presence"
+    CACHED_VALUE_ONLY = "cached_value_only"
+    CONCENTRATED_POPULATION = "concentrated_population"
+    CONTIGUOUS_POPULATION = "contiguous_population"
+    SPARSE_MASS_POPULATION = "sparse_mass_population"
+    STRUCTURAL_ERROR = "structural_error"
+    EXACT_WRAPPER = "exact_wrapper"
+    SHAPE_WRAPPER = "shape_wrapper"
+    ADDED_REFERENCE = "added_reference"
+    RESOLVED_DRIVER = "resolved_driver"
+    EXACT_COLOCATION = "exact_colocation"
+
+
+class FindingSubtype(StrEnum):
+    """Precise mechanic behind a finding, orthogonal to its class."""
+
+    # constant-value mechanics
+    VALUE_ADDED_POPULATION = "added_population"
+    VALUE_CLEARED_POPULATION = "cleared_population"
+    VALUE_REPLACEMENT = "replacement"
+    # formula-logic mechanics
+    FORMULA_WRAPPED = "wrapped"
+    FORMULA_UNWRAPPED = "unwrapped"
+    #: Same saved error dominating one column: one systemic lookup-gap
+    #: population, not N independent incidents.
+    COLUMNAR_ERROR_POPULATION = "columnar_error_population"
+    # region-level row/column events shared by every atomic of one region axis
+    AXIS_ROLLING_TURNOVER = "rolling_turnover"
+    AXIS_KEY_REPLACEMENT = "key_replacement"
+    AXIS_KEY_DERIVED_LABEL = "derived_label_change"
+    AXIS_PHYSICAL_INSERTION = "physical_insertion"
+    AXIS_PHYSICAL_DELETION = "physical_deletion"
+    AXIS_EXTENT_GROWTH = "extent_growth"
+    # structural object events shared by every atomic of one rule or table edit
+    OBJECT_ADDED = "object_added"
+    OBJECT_REMOVED = "object_removed"
+    OBJECT_RENAMED = "object_renamed"
+    OBJECT_TARGET_CHANGED = "object_target_changed"
+    OBJECT_CONDITION_CHANGED = "object_condition_changed"
+    OBJECT_DISPLAY_CHANGED = "object_display_changed"
+    OBJECT_STYLE_CHANGED = "object_style_changed"
+    OBJECT_ORDER_CHANGED = "object_order_changed"
+    OBJECT_COLUMNS_CHANGED = "object_columns_changed"
+    OBJECT_SETTINGS_CHANGED = "object_settings_changed"
+
+
 class GridExcerpt(BaseModel):
     """A small neighborhood of sheet cells around a finding, for in-UI context."""
 
@@ -117,12 +220,29 @@ class Finding(BaseModel):
     artifact: str  # "excel" | "ppt" | "crosscheck"
     finding_class: FindingClass
     severity: Severity | None = None  # assigned by the triage rule engine
+    #: Compatibility output for earlier history/report consumers. New producers
+    #: set ``expected_reason`` and the validator derives this boolean.
     expected_growth: bool = False
+    expected_reason: FindingExpectedReason | None = None
+    #: Additive evidence detail; never part of the cross-run identity tuple.
+    provenance: FindingProvenance | None = None
+    subtype: FindingSubtype | None = None
+    #: Numeric materiality tier for value deltas; additive, never identity.
+    materiality: Materiality | None = None
+    temporal_context: FindingTemporalContext | None = None
+    evidence_tags: set[FindingEvidenceTag] = Field(
+        default_factory=set,
+        max_length=len(FindingEvidenceTag),
+    )
+    #: Stable identity of the underlying edit, shared by its fan-out atomics.
+    event_key: str = ""
     sheet: str | None = None
     location: str | None = None  # current-side A1 ref / range / axis span
     baseline_location: str | None = None
     element: str | None = None  # named range / chart / pivot / slide element
     slide: str | None = None
+    slide_index: int | None = Field(default=None, ge=1)
+    baseline_slide_index: int | None = Field(default=None, ge=1)
     baseline_value: str | None = None
     current_value: str | None = None
     message: str
@@ -135,6 +255,23 @@ class Finding(BaseModel):
     root_cause_key: str = ""
     waiver_reason: str = ""
     waiver_expires: str = ""
+
+    @model_validator(mode="after")
+    def derive_expected_growth(self) -> Self:
+        if self.expected_reason is not None:
+            self.expected_growth = True
+        return self
+
+    def mark_expected(self, reason: FindingExpectedReason) -> None:
+        """Set the canonical reason and its legacy compatibility projection."""
+        self.expected_reason = reason
+        self.expected_growth = True
+
+    @field_serializer("evidence_tags")
+    def serialize_evidence_tags(
+        self, evidence_tags: set[FindingEvidenceTag]
+    ) -> list[str]:
+        return sorted(tag.value for tag in evidence_tags)
 
 
 @dataclass(slots=True)
@@ -157,7 +294,12 @@ def limit_findings(
     kept: Counter[tuple[str, FindingClass, str]] = Counter()
     omitted: Counter[tuple[str, FindingClass, str]] = Counter()
     for finding in findings:
-        scope = finding.sheet or finding.slide or "workbook/package"
+        scope = (
+            finding.sheet
+            or (f"slide {finding.slide_index}" if finding.slide_index is not None else None)
+            or finding.slide
+            or "workbook/package"
+        )
         key = (finding.artifact, finding.finding_class, scope)
         if kept[key] < max_per_class_scope:
             retained.append(finding)

@@ -1,0 +1,35 @@
+{
+  "atomic_findings": 1658,
+  "budget_omitted": 0,
+  "coverage_states": {
+    "checked": 8,
+    "degraded": 1,
+    "unavailable": 3
+  },
+  "dependency_index": {
+    "direct_edges": 53386,
+    "materialized_member_edges": 0,
+    "range_descriptors": 158955,
+    "symbolic_references": 0
+  },
+  "event_groups": {
+    "axis": 14,
+    "object": 16
+  },
+  "median_elapsed_seconds": 20.77,
+  "median_peak_rss_mib": 350.8,
+  "review_counts": {
+    "critical": 106,
+    "expected": 18,
+    "info": 7,
+    "warning": 78
+  },
+  "severity": {
+    "critical": 335,
+    "expected": 18,
+    "info": 8,
+    "warning": 1297
+  },
+  "source_hashes_unchanged": true,
+  "trials": 3
+}

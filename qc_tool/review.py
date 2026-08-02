@@ -12,7 +12,8 @@ from typing import TypeAlias
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
 
-from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.excel.formula_tokens import tokenize_formula
+from qc_tool.findings import Finding, FindingClass, FindingSubtype, Severity
 
 Coordinate: TypeAlias = tuple[int, int]
 Rectangle: TypeAlias = tuple[int, int, int, int]
@@ -20,6 +21,12 @@ FindingIdentity: TypeAlias = tuple[str, ...]
 
 _A1_RE = re.compile(r"^\$?[A-Z]{1,3}\$?[1-9]\d*$", re.IGNORECASE)
 _FINDING_ID_RE = re.compile(r"^F(\d+)$")
+_PRESENTATION_CLASSES = frozenset(
+    {
+        FindingClass.NUMBER_FORMAT_CHANGED,
+        FindingClass.STYLE_CHANGED,
+    }
+)
 _GROUPABLE_CLASSES = frozenset(
     {
         FindingClass.VALUE_CHANGED,
@@ -405,6 +412,179 @@ def review_counts(groups: list[ReviewGroup]) -> ReviewCounts:
         review_items[group.severity] += 1
         atomic_findings[group.severity] += group.member_count
     return ReviewCounts(review_items=review_items, atomic_findings=atomic_findings)
+
+
+# --- semantic pattern groups -------------------------------------------------
+
+
+def _formula_signature(formula: str | None) -> tuple[str, ...]:
+    """Token shape with concrete references and literals abstracted away."""
+    if not formula:
+        return ()
+    try:
+        tokens = tokenize_formula(formula)
+    except Exception:  # malformed formulas keep their own stable shape
+        return ("<unparsed>",)
+    shape: list[str] = []
+    for token in tokens:
+        if token.type == "OPERAND" and token.subtype == "RANGE":
+            shape.append("REF")
+        elif token.type == "OPERAND" and token.subtype == "NUMBER":
+            shape.append("NUM")
+        elif token.type == "OPERAND" and token.subtype == "TEXT":
+            shape.append("TEXT")
+        else:
+            shape.append(token.value.casefold())
+    return tuple(shape)
+
+
+def _transformation_shape(finding: Finding) -> str:
+    if finding.finding_class is FindingClass.FORMULA_INCONSISTENT:
+        # The dominant pattern stays exact so one group never mixes two patterns.
+        payload: tuple[tuple[str, ...], tuple[str, ...]] = (
+            (finding.baseline_value or "",),
+            _formula_signature(finding.current_value),
+        )
+    elif finding.finding_class is FindingClass.FORMULA_LOGIC_CHANGED:
+        if (
+            finding.subtype
+            in (FindingSubtype.FORMULA_WRAPPED, FindingSubtype.FORMULA_UNWRAPPED)
+            and finding.event_key
+        ):
+            # One wrapper rollout = one skeleton, regardless of the varied
+            # inner formulas it wrapped.
+            payload = ((finding.event_key,), ())
+        else:
+            payload = (
+                _formula_signature(finding.baseline_value),
+                _formula_signature(finding.current_value),
+            )
+    elif finding.finding_class in _PRESENTATION_CLASSES:
+        payload = ((finding.baseline_value or "",), (finding.current_value or "",))
+    else:
+        return ""
+    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def _baseline_translation_mode(finding: Finding) -> str:
+    if finding.baseline_location is None:
+        return "no-baseline"
+    baseline = _coordinate(finding.baseline_location)
+    current = _coordinate(finding.location)
+    if baseline is None or current is None:
+        return "marker"
+    return "in-place" if baseline == current else "translated"
+
+
+def _pattern_key(finding: Finding) -> tuple[object, ...]:
+    severity = finding.severity or Severity.WARNING
+    population_event = (
+        finding.event_key
+        if finding.subtype is FindingSubtype.COLUMNAR_ERROR_POPULATION
+        else ""
+    )
+    return (
+        finding.artifact,
+        finding.sheet or "",
+        finding.slide or "",
+        finding.slide_index or 0,
+        finding.baseline_slide_index or 0,
+        finding.finding_class.value,
+        severity.value,
+        finding.expected_growth,
+        finding.expected_reason.value if finding.expected_reason is not None else "",
+        finding.provenance.value if finding.provenance is not None else "",
+        finding.subtype.value if finding.subtype is not None else "",
+        finding.materiality.value if finding.materiality is not None else "",
+        (
+            finding.temporal_context.value
+            if finding.temporal_context is not None
+            else ""
+        ),
+        tuple(sorted(tag.value for tag in finding.evidence_tags)),
+        population_event,
+        _transformation_shape(finding),
+        _baseline_translation_mode(finding),
+        finding.waiver_reason,
+        finding.waiver_expires,
+    )
+
+
+def _pattern_group(key: tuple[object, ...], members: tuple[Finding, ...]) -> ReviewGroup:
+    representative = members[0]
+    coordinates = {
+        coordinate
+        for member in members
+        if (coordinate := _coordinate(member.location)) is not None
+    }
+    baseline_coordinates = {
+        coordinate
+        for member in members
+        if (coordinate := _coordinate(member.baseline_location)) is not None
+    }
+    ranges = tuple(_range(item) for item in _rectangles(coordinates))
+    baseline_ranges = (
+        tuple(_range(item) for item in _rectangles(baseline_coordinates))
+        if len(baseline_coordinates) == len(members)
+        else ()
+    )
+    return ReviewGroup(
+        group_id=_group_id(key, members),
+        finding_class=representative.finding_class,
+        severity=representative.severity or Severity.WARNING,
+        artifact=representative.artifact,
+        sheet=representative.sheet,
+        slide=representative.slide,
+        element=representative.element or "",
+        expected_growth=representative.expected_growth,
+        ranges=ranges,
+        bounding_range=(
+            _bounding_range(coordinates)
+            if coordinates
+            else representative.location or representative.baseline_location or ""
+        ),
+        baseline_ranges=baseline_ranges,
+        baseline_bounding_range=(
+            _bounding_range(baseline_coordinates) if baseline_ranges else ""
+        ),
+        baseline_mixed=0 < len(baseline_coordinates) < len(members),
+        members=members,
+        spatial=False,
+    )
+
+
+def build_pattern_groups(findings: list[Finding]) -> list[ReviewGroup]:
+    """Semantically pure review groups keyed on meaning, not adjacency.
+
+    One group may span disconnected ranges. Every member shares its finding
+    class, severity, expected state, provenance, subtype, transformation shape,
+    baseline-translation mode, and waiver state.
+    """
+    partitions: dict[tuple[object, ...], list[Finding]] = defaultdict(list)
+    for finding in findings:
+        partitions[_pattern_key(finding)].append(finding)
+    groups = [
+        _pattern_group(key, tuple(sorted(members, key=_finding_order)))
+        for key, members in partitions.items()
+    ]
+    ordered = sorted(groups, key=_review_sort_key)
+    seen: dict[str, int] = defaultdict(int)
+    unique: list[ReviewGroup] = []
+    for group in ordered:
+        seen[group.group_id] += 1
+        occurrence = seen[group.group_id]
+        unique.append(
+            group
+            if occurrence == 1
+            else replace(group, group_id=f"{group.group_id}-{occurrence}")
+        )
+    return unique
+
+
+def count_pattern_groups(groups: list[ReviewGroup]) -> ReviewCounts:
+    """Count semantic pattern decisions and their atomic members by severity."""
+    return review_counts(groups)
 
 
 def format_group_ranges(group: ReviewGroup, *, max_spans: int = 3) -> str:

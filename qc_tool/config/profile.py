@@ -13,7 +13,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field
 
-from qc_tool.findings import FindingClass, Severity
+from qc_tool.findings import FindingClass, Materiality, Severity
 from qc_tool.security import private_directory, private_file
 
 Orientation = Literal["long", "wide", "block"]
@@ -28,6 +28,20 @@ class NumericTolerance(BaseModel):
     relative: float = 0.0
 
 
+class RestatementWindows(BaseModel):
+    """Trailing distinct-period counts treated as restatement-prone.
+
+    Constants restated inside the window are expected data-lag corrections
+    (WARNING tier); outside it they threaten history integrity. A window of
+    0 disables recency for that cadence. Date-keyed axes use the window of
+    their inferred cadence (median spacing).
+    """
+
+    week: int = Field(default=8, ge=0)
+    month: int = Field(default=2, ge=0)
+    quarter: int = Field(default=1, ge=0)
+
+
 class RegionOverride(BaseModel):
     """Pins one table region, replacing auto-detection for its sheet."""
 
@@ -35,6 +49,21 @@ class RegionOverride(BaseModel):
     orientation: Orientation
     header_row: int | None = None
     key_column: str | None = None  # column letter holding row identity
+
+    model_config = {"populate_by_name": True}
+
+
+class AcceptanceBand(BaseModel):
+    """A declared per-range tolerance: in-band changes stay visible as INFO.
+
+    Unlike the global suppress-style ``NumericTolerance``, an in-band change
+    still produces a finding (tier ``within_tolerance``) so an auditor sees
+    every accepted difference.
+    """
+
+    cell_range: str = Field(alias="range")
+    absolute: float = Field(default=0.0, ge=0.0)
+    relative: float = Field(default=0.0, ge=0.0)
 
     model_config = {"populate_by_name": True}
 
@@ -68,6 +97,8 @@ class SheetProfile(BaseModel):
     #: expected each cadence (still reported, classed as expected), while
     #: format/style/formula findings remain fully active.
     refresh_ranges: list[str] = Field(default_factory=list)
+    #: Declared numeric tolerance bands; in-band changes report as INFO.
+    acceptance_bands: list[AcceptanceBand] = Field(default_factory=list)
     regions: list[RegionOverride] = Field(default_factory=list)
     cadence_bands: list[CadenceBand] = Field(default_factory=list)
     availability_rules: list[ExcelAvailabilityRule] = Field(default_factory=list)
@@ -183,12 +214,16 @@ class DeliverableProfile(BaseModel):
     name: str
     description: str = ""
     tolerance: NumericTolerance = Field(default_factory=NumericTolerance)
+    restatement_windows: RestatementWindows = Field(default_factory=RestatementWindows)
     excel: ExcelProfile = Field(default_factory=ExcelProfile)
     ppt: PptProfile = Field(default_factory=PptProfile)
     crosscheck: CrosscheckProfile = Field(default_factory=CrosscheckProfile)
     waivers: list[FindingWaiver] = Field(default_factory=list)
     #: Per-class severity overrides applied to non-expected findings.
     severity: dict[FindingClass, Severity] = Field(default_factory=dict)
+    #: Per-tier severity overrides; absent tiers use the built-in mapping
+    #: (noise/within_tolerance -> info, recent_restatement -> warning).
+    materiality_severity: dict[Materiality, Severity] = Field(default_factory=dict)
 
     def sheet_profile(self, sheet_name: str) -> SheetProfile | None:
         return self.excel.sheets.get(sheet_name)
