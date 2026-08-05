@@ -52,6 +52,7 @@ from qc_tool.io.model import (
 )
 from qc_tool.io.ooxml_chart import ChartParseError, parse_ooxml_charts
 from qc_tool.io.ooxml_interaction import extract_worksheet_interactions
+from qc_tool.io.ooxml_metadata import scan_workbook_metadata
 from qc_tool.io.ooxml_names import scan_defined_names
 from qc_tool.io.ooxml_worksheet import (
     OOXMLMetadataError,
@@ -860,6 +861,7 @@ def _apply_vba(snapshot: WorkbookSnapshot, data: bytes) -> None:
         snapshot.vba = scan_vba_project(data)
     except VbaReadError as exc:  # defensive: the scan already fails closed
         snapshot.vba = VbaProjectScan(present=True, available=False, detail=str(exc))
+    snapshot.metadata = scan_workbook_metadata(data)
 
 
 def _extract_ooxml_risks(data: bytes) -> list[WorkbookRisk]:

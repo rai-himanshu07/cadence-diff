@@ -66,6 +66,7 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
     FindingClass.FORMULA_INCONSISTENT: TargetRule.EXCEL_LOCATION,
     FindingClass.NUMBER_FORMAT_CHANGED: TargetRule.EXCEL_LOCATION,
     FindingClass.STYLE_CHANGED: TargetRule.EXCEL_LOCATION,
+    FindingClass.CELL_COMMENT_CHANGED: TargetRule.EXCEL_LOCATION,
     # --- Excel axis and region evidence --------------------------------------
     FindingClass.ROW_DELETED: TargetRule.EXCEL_LOCATION,
     FindingClass.COLUMN_DELETED: TargetRule.EXCEL_LOCATION,
@@ -109,6 +110,10 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
     FindingClass.ACTIVE_CONTENT: TargetRule.NONE,
     #: A VBA module has no cell or slide the analyst could be taken to.
     FindingClass.VBA_MODULE_CHANGED: TargetRule.NONE,
+    #: Queries and connections are workbook-level, not addressable locations.
+    FindingClass.POWER_QUERY_CHANGED: TargetRule.NONE,
+    FindingClass.CONNECTION_CHANGED: TargetRule.NONE,
+    FindingClass.EXTERNAL_CONNECTION: TargetRule.NONE,
     FindingClass.NAMED_RANGE_INVALID: TargetRule.NONE,
     FindingClass.CHART_REFERENCE_INVALID: TargetRule.NONE,
     FindingClass.CHART_LENGTH_MISMATCH: TargetRule.NONE,

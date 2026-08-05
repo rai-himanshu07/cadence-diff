@@ -41,6 +41,10 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.ACTIVE_CONTENT: Severity.CRITICAL,
     #: Macro logic can rewrite any figure in the deliverable.
     FindingClass.VBA_MODULE_CHANGED: Severity.CRITICAL,
+    #: Query and connection edits change where the numbers came from.
+    FindingClass.POWER_QUERY_CHANGED: Severity.CRITICAL,
+    FindingClass.CONNECTION_CHANGED: Severity.CRITICAL,
+    FindingClass.EXTERNAL_CONNECTION: Severity.CRITICAL,
     FindingClass.NAMED_RANGE_INVALID: Severity.CRITICAL,
     FindingClass.CHART_REFERENCE_INVALID: Severity.CRITICAL,
     FindingClass.PIVOT_SOURCE_INVALID: Severity.CRITICAL,
@@ -106,6 +110,7 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.PPT_CHART_LEGEND_CHANGED: Severity.WARNING,
     FindingClass.PPT_CHART_LABELS_CHANGED: Severity.WARNING,
     # Presentation-only and additive events: info.
+    FindingClass.CELL_COMMENT_CHANGED: Severity.INFO,
     FindingClass.STYLE_CHANGED: Severity.INFO,
     FindingClass.CHART_GEOMETRY_CHANGED: Severity.INFO,
     FindingClass.PPT_SHAPE_GEOMETRY_CHANGED: Severity.INFO,

@@ -39,6 +39,13 @@ from qc_tool.excel.dependency import (
     build_dependency_graph,
     limit_impacts,
 )
+from qc_tool.excel.diff_metadata import (
+    comment_coverage,
+    connection_coverage,
+    diff_workbook_metadata,
+    external_connection_findings,
+    power_query_coverage,
+)
 from qc_tool.excel.diff_structure import diff_workbook_structure
 from qc_tool.excel.diff_values import diff_workbook_values
 from qc_tool.excel.diff_vba import diff_workbook_vba, vba_coverage
@@ -679,6 +686,11 @@ def run_qc(
         vba_findings = diff_workbook_vba(base_wb, curr_wb)
         findings.extend(vba_findings)
         result.coverage.append(vba_coverage(base_wb, curr_wb))
+        findings.extend(diff_workbook_metadata(base_wb, curr_wb))
+        findings.extend(external_connection_findings(curr_wb))
+        result.coverage.append(comment_coverage(base_wb, curr_wb))
+        result.coverage.append(power_query_coverage(base_wb, curr_wb))
+        result.coverage.append(connection_coverage(base_wb, curr_wb))
         if disclosure := _pair_formula_disclosure(base_wb, curr_wb):
             result.disclosures.append(disclosure)
         report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)

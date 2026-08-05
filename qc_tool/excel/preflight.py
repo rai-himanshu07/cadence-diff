@@ -24,6 +24,12 @@ from qc_tool.excel.dependency import (
     build_dependency_graph,
     limit_impacts,
 )
+from qc_tool.excel.diff_metadata import (
+    comment_coverage,
+    connection_coverage,
+    external_connection_findings,
+    power_query_coverage,
+)
 from qc_tool.excel.diff_vba import vba_coverage
 from qc_tool.excel.formulas import diff_workbook_formulas
 from qc_tool.excel.interaction import (
@@ -439,6 +445,10 @@ def preflight_workbook(
     )
     result.coverage.append(defined_name_scope_coverage(workbook))
     result.coverage.append(vba_coverage(workbook))
+    result.findings.extend(external_connection_findings(workbook))
+    result.coverage.append(comment_coverage(workbook))
+    result.coverage.append(power_query_coverage(workbook))
+    result.coverage.append(connection_coverage(workbook))
 
     formula_start = len(result.findings)
     if workbook.formula_presence_available:
