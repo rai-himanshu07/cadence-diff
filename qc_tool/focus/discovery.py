@@ -88,6 +88,7 @@ class OpenDocument:
     is_addin: bool = False
     hidden_instance: bool = False
     visibility_unproved: bool = False
+    object_model_window_handle: int = 0
 
     @property
     def instance_key(self) -> tuple[int, str]:
@@ -150,6 +151,9 @@ class DiscoveryResult:
                     is_addin=bool(item["is_addin"]),
                     hidden_instance=bool(item["hidden_instance"]),
                     visibility_unproved=bool(item["visibility_unproved"]),
+                    object_model_window_handle=int(
+                        item.get("object_model_window_handle", 0)
+                    ),
                 )
                 for item in payload.get("documents") or ()
             )

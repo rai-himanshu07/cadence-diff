@@ -110,7 +110,11 @@ def focus_document(document: OpenDocument, request: dict[str, object]) -> str:
         or not isinstance(expected, str)
     ):
         return FocusOutcome.INVALID_REQUEST.value
-    window_object = win32_office.object_from_window(handles[0])
+    if not document.object_model_window_handle:
+        return FocusOutcome.TARGET_WINDOW_MISSING.value
+    window_object = win32_office.object_from_window(
+        document.object_model_window_handle
+    )
     if window_object is None:
         return FocusOutcome.TARGET_WINDOW_MISSING.value
     return navigate_powerpoint(

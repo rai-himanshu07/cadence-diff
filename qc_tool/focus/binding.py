@@ -216,14 +216,15 @@ def _eligibility_refusal(
     document: OpenDocument, request: BindingRequest
 ) -> BindOutcome | None:
     """Policy refusal for one candidate, evaluated before any hashing."""
-    if document.path_kind is PathKind.URL:
-        return BindOutcome.UNSUPPORTED_LOCATION
-    if document.path_kind not in {PathKind.LOCAL, PathKind.UNC}:
+    path_kind = document.path_kind
+    if path_kind not in {PathKind.LOCAL, PathKind.UNC, PathKind.URL}:
         return BindOutcome.UNSUPPORTED_LOCATION
     if document.autosave is None:
         return BindOutcome.AUTOSAVE_STATE_UNPROVED
     if document.autosave:
         return BindOutcome.AUTOSAVE_ENABLED
+    if path_kind is PathKind.URL:
+        return BindOutcome.UNSUPPORTED_LOCATION
     if document.saved is None:
         return BindOutcome.SAVED_STATE_UNPROVED
     path = Path(document.full_name)

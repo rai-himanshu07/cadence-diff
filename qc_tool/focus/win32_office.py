@@ -16,6 +16,7 @@ import logging
 import sys
 from collections.abc import Callable
 from ctypes import wintypes
+from dataclasses import replace
 from typing import Any
 
 from qc_tool.focus.discovery import (
@@ -325,6 +326,7 @@ def discover(application: FocusApplication) -> DiscoveryResult:
             if observed is None:
                 continue
             document, protected = observed
+            document = replace(document, object_model_window_handle=candidate)
             documents[document.instance_key] = document
             reached = True
             if visible:

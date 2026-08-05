@@ -117,7 +117,11 @@ def focus_document(document: OpenDocument, request: dict[str, object]) -> str:
         return FocusOutcome.INVALID_REQUEST.value
     raw_address = request.get("address")
     address = raw_address if isinstance(raw_address, str) and raw_address else None
-    window_object = win32_office.object_from_window(handles[0])
+    if not document.object_model_window_handle:
+        return FocusOutcome.TARGET_WINDOW_MISSING.value
+    window_object = win32_office.object_from_window(
+        document.object_model_window_handle
+    )
     if window_object is None:
         return FocusOutcome.TARGET_WINDOW_MISSING.value
     return navigate_excel(

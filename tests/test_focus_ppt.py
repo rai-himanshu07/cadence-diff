@@ -203,3 +203,48 @@ def test_focus_document_refuses_off_windows() -> None:
         autosave=False,
     )
     assert focus_document(document, {}) == FocusOutcome.UNSUPPORTED_PLATFORM.value
+
+
+def test_focus_document_uses_native_object_handle_and_visible_foreground_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_tool.focus import ppt_focus, win32_office
+
+    window, _presentation = _window()
+    acquired: list[int] = []
+    foreground: list[int] = []
+    monkeypatch.setattr(ppt_focus.sys, "platform", "win32")
+    monkeypatch.setattr(
+        win32_office,
+        "object_from_window",
+        lambda handle: acquired.append(handle) or window,
+    )
+    monkeypatch.setattr(
+        win32_office,
+        "set_foreground_window",
+        lambda handle: foreground.append(handle) or True,
+    )
+    document = OpenDocument(
+        application=FocusApplication.POWERPOINT,
+        process_id=1,
+        process_created=1.0,
+        windows_session_id=1,
+        full_name=FULL_NAME,
+        window_count=1,
+        visible_window_count=1,
+        visible_window_handles=(201,),
+        saved=True,
+        autosave=False,
+        object_model_window_handle=808,
+    )
+
+    assert focus_document(
+        document,
+        {
+            "slide_index": 2,
+            "path_salt": SALT.hex(),
+            "expected_path_digest": DIGEST,
+        },
+    ) == FocusOutcome.FOCUSED.value
+    assert acquired == [808]
+    assert foreground == [201]

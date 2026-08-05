@@ -34,9 +34,10 @@ logger = logging.getLogger(__name__)
 #: Total helper budget for one action, including COM startup.
 DEFAULT_HELPER_TIMEOUT_SECONDS = 25.0
 
-#: Frozen cool-down floor. No post-dispatch p99 has been measured yet, so the
-#: plan's ``max(30 seconds, 2x measured p99)`` reduces to its floor.
-FOCUS_COOLDOWN_SECONDS = 30.0
+#: Step 9 measured 20 dispatched actions: empirical p99/max = 4.141 seconds.
+MEASURED_FOCUS_P99_SECONDS = 4.141
+#: The approved bound is ``max(30 seconds, 2x measured p99)``.
+FOCUS_COOLDOWN_SECONDS = max(30.0, 2 * MEASURED_FOCUS_P99_SECONDS)
 
 #: One process-global lock, shared by every navigator in this server process.
 _REQUEST_LOCK = asyncio.Lock()
@@ -154,13 +155,12 @@ class FocusNavigator:
         self._clock = clock
         self._lock = _REQUEST_LOCK
         self._cooldown_until: float | None = None
-        self._disabled = False
         self._health_check_pending = False
 
     @property
     def disabled(self) -> bool:
-        """A post-dispatch timeout disables focus until the server restarts."""
-        return self._disabled
+        """Compatibility property; measured recovery no longer disables focus."""
+        return False
 
     def cooling_down(self) -> bool:
         if self._cooldown_until is None:
@@ -175,8 +175,6 @@ class FocusNavigator:
             return await asyncio.to_thread(self._submit_locked, request)
 
     def _submit_locked(self, request: dict[str, object]) -> FocusReply:
-        if self._disabled:
-            return FocusReply(FocusOutcome.FOCUS_DISABLED)
         if self.cooling_down():
             return FocusReply(FocusOutcome.COOLING_DOWN)
         if self._health_check_pending:
@@ -209,17 +207,15 @@ class FocusNavigator:
         return self._reply(run)
 
     def _timeout_reply(self, run: HelperRun) -> FocusReply:
+        self._cooldown_until = self._clock() + self._cooldown
+        self._health_check_pending = True
         if run.stage in DISPATCHED_STAGES:
-            # An Office call may already be running; refuse everything after it.
-            self._disabled = True
             logger.warning("focus-timeout-after-dispatch")
             return FocusReply(
                 FocusOutcome.TIMEOUT_ACTION_MAY_HAVE_COMPLETED,
                 stage=run.stage,
                 duration_seconds=run.duration_seconds,
             )
-        self._cooldown_until = self._clock() + self._cooldown
-        self._health_check_pending = True
         logger.warning("focus-timeout-before-dispatch")
         return FocusReply(
             FocusOutcome.TIMEOUT_NO_ACTION_DISPATCHED,

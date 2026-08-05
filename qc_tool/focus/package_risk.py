@@ -125,11 +125,45 @@ def _escapes_package(target: str) -> bool:
     text = target.replace("\\", "/").strip()
     if not text:
         return True
+    if text.startswith("//") or "://" in text:
+        return True
     if text.startswith("/"):
         text = text.lstrip("/")
     if len(text) >= 2 and text[1] == ":":
         return True
     return posixpath.normpath(text).startswith("..")
+
+
+def _relationship_source_part(relationship_part: str) -> str | None:
+    normalized = relationship_part.replace("\\", "/").lstrip("/")
+    if normalized == "_rels/.rels":
+        return ""
+    marker = "/_rels/"
+    if marker not in normalized:
+        return None
+    parent, relationship_name = normalized.rsplit(marker, 1)
+    if not relationship_name.endswith(".rels") or relationship_name == ".rels":
+        return None
+    return posixpath.join(parent, relationship_name.removesuffix(".rels"))
+
+
+def _relationship_target_escapes(relationship_part: str, target: str) -> bool:
+    text = target.replace("\\", "/").strip()
+    source_part = _relationship_source_part(relationship_part)
+    if not text or source_part is None:
+        return True
+    if text.startswith("//") or "://" in text:
+        return True
+    if len(text) >= 2 and text[1] == ":":
+        return True
+    path = text.split("#", 1)[0].split("?", 1)[0]
+    if path.startswith("/"):
+        resolved = posixpath.normpath(path.lstrip("/"))
+    else:
+        resolved = posixpath.normpath(
+            posixpath.join(posixpath.dirname(source_part), path)
+        )
+    return resolved in {"", ".", ".."} or resolved.startswith("../")
 
 
 def _relationship_risks(archive: zipfile.ZipFile) -> set[PackageRiskKind]:
@@ -156,7 +190,7 @@ def _relationship_risks(archive: zipfile.ZipFile) -> set[PackageRiskKind]:
             suffix = posixpath.splitext(target.split("?", 1)[0])[1].lower()
             if suffix in _EXECUTABLE_SUFFIXES:
                 risks.add(PackageRiskKind.UNKNOWN_EXECUTABLE_RELATIONSHIP)
-            if not external and _escapes_package(target):
+            if not external and _relationship_target_escapes(part, target):
                 risks.add(PackageRiskKind.PATH_TRAVERSAL)
     return risks
 

@@ -455,6 +455,31 @@ def test_traversal_relationship_target_refuses(tmp_path: Path) -> None:
     assert PackageRiskKind.PATH_TRAVERSAL in scan_focus_package(path).risks
 
 
+def test_valid_parent_relationship_target_stays_inside_package(tmp_path: Path) -> None:
+    rels = (
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+        b'relationships"><Relationship Id="rId1" Type="http://schemas.openxml'
+        b'formats.org/officeDocument/2006/relationships/slideLayout" '
+        b'Target="../slideLayouts/slideLayout1.xml"/></Relationships>'
+    )
+    path = _package(
+        tmp_path / "valid-parent.pptx",
+        {"ppt/slides/_rels/slide1.xml.rels": rels},
+    )
+    assert PackageRiskKind.PATH_TRAVERSAL not in scan_focus_package(path).risks
+
+
+def test_root_relationship_target_stays_inside_package(tmp_path: Path) -> None:
+    rels = (
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+        b'relationships"><Relationship Id="rId1" Type="http://schemas.openxml'
+        b'formats.org/officeDocument/2006/relationships/officeDocument" '
+        b'Target="ppt/presentation.xml"/></Relationships>'
+    )
+    path = _package(tmp_path / "root.pptx", {"_rels/.rels": rels})
+    assert PackageRiskKind.PATH_TRAVERSAL not in scan_focus_package(path).risks
+
+
 def test_malformed_relationship_metadata_refuses(tmp_path: Path) -> None:
     path = _package(tmp_path / "bad.xlsx", {"xl/_rels/workbook.xml.rels": b"<not-xml"})
     scan = scan_focus_package(path)
@@ -704,6 +729,20 @@ def test_url_only_document_is_unsupported(workspace) -> None:
         _discovery(_excel(full_name="https://contoso.sharepoint.com/a.xlsx")),
     )
     assert outcome is BindOutcome.UNSUPPORTED_LOCATION
+
+
+def test_url_with_autosave_on_reports_autosave_refusal_first(workspace) -> None:
+    managed_root, _source, digest = workspace
+    outcome, _document, _identity = resolve_binding(
+        _request(managed_root, digest),
+        _discovery(
+            _excel(
+                full_name="https://contoso.sharepoint.com/a.xlsx",
+                autosave=True,
+            )
+        ),
+    )
+    assert outcome is BindOutcome.AUTOSAVE_ENABLED
 
 
 def test_never_saved_document_is_unsupported(workspace) -> None:

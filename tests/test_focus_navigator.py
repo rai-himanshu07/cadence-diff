@@ -16,6 +16,7 @@ from qc_tool.focus.discovery import (
 from qc_tool.focus.navigator import (
     DEFAULT_HELPER_TIMEOUT_SECONDS,
     FOCUS_COOLDOWN_SECONDS,
+    MEASURED_FOCUS_P99_SECONDS,
     FocusNavigator,
     FocusReply,
     HelperRun,
@@ -325,16 +326,33 @@ async def test_unhealthy_check_stops_the_replacement_request() -> None:
 
 
 @pytest.mark.parametrize("stage", sorted(DISPATCHED_STAGES))
-async def test_timeout_after_dispatch_disables_focus_until_restart(
+async def test_timeout_after_dispatch_cools_down_then_health_checks(
     stage: FocusStage,
 ) -> None:
-    navigator = FocusNavigator(runner=_runner(HelperRun(timed_out=True, stage=stage)))
+    clock = {"now": 0.0}
+    replies = [
+        HelperRun(timed_out=True, stage=stage),
+        HelperRun(payload={"outcome": "healthy", "complete": True, "reasons": []}),
+        HelperRun(payload={"outcome": "focused"}),
+    ]
+    seen: list[dict[str, object]] = []
+
+    def runner(request: dict[str, object], _timeout: float) -> HelperRun:
+        seen.append(request)
+        return replies[len(seen) - 1]
+
+    navigator = FocusNavigator(runner=runner, clock=lambda: clock["now"])
     reply = await navigator.submit(_request())
     assert reply.outcome is FocusOutcome.TIMEOUT_ACTION_MAY_HAVE_COMPLETED
     assert reply.dispatched
-    assert navigator.disabled
+    assert not navigator.disabled
+    assert navigator.cooling_down()
     later = await navigator.submit(_request())
-    assert later.outcome is FocusOutcome.FOCUS_DISABLED
+    assert later.outcome is FocusOutcome.COOLING_DOWN
+    clock["now"] += FOCUS_COOLDOWN_SECONDS
+    recovered = await navigator.submit(_request())
+    assert recovered.outcome is FocusOutcome.FOCUSED
+    assert seen[1]["action"] == FocusAction.HEALTH_CHECK.value
 
 
 async def test_every_navigator_shares_one_process_global_lock() -> None:
@@ -369,6 +387,11 @@ async def test_requests_are_serialised_server_wide() -> None:
 async def test_cooldown_floor_cannot_be_lowered() -> None:
     navigator = FocusNavigator(runner=_runner(HelperRun()), cooldown_seconds=1.0)
     assert navigator._cooldown == FOCUS_COOLDOWN_SECONDS
+
+
+def test_live_latency_measurement_keeps_the_thirty_second_floor() -> None:
+    assert MEASURED_FOCUS_P99_SECONDS == 4.141
+    assert 2 * MEASURED_FOCUS_P99_SECONDS < FOCUS_COOLDOWN_SECONDS == 30.0
 
 
 def test_default_timeout_is_bounded() -> None:
