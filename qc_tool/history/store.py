@@ -19,6 +19,13 @@ from qc_tool.coverage import CoverageItem, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import Finding, Severity
+from qc_tool.focus.model import (
+    EMPTY_SIDECAR_JSON,
+    FocusTargetSeed,
+    FocusTargetSidecar,
+    decode_focus_targets,
+    encode_focus_targets,
+)
 from qc_tool.review import build_pattern_groups, build_review_groups
 from qc_tool.review import count_pattern_groups as count_pattern_review_groups
 from qc_tool.review import review_counts as count_review_groups
@@ -49,7 +56,8 @@ CREATE TABLE IF NOT EXISTS runs (
     review_counts TEXT NOT NULL DEFAULT '{}',
     pattern_review_counts TEXT NOT NULL DEFAULT '{}',
     story_counts TEXT NOT NULL DEFAULT '{}',
-    comparison_scope TEXT NOT NULL DEFAULT '{}'
+    comparison_scope TEXT NOT NULL DEFAULT '{}',
+    focus_targets TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS annotations (
     run_id INTEGER NOT NULL,
@@ -88,6 +96,9 @@ _MIGRATIONS = {
         "ALTER TABLE runs ADD COLUMN comparison_scope TEXT NOT NULL DEFAULT '{}'"
     ),
     "archived": "ALTER TABLE runs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+    "focus_targets": (
+        "ALTER TABLE runs ADD COLUMN focus_targets TEXT NOT NULL DEFAULT '{}'"
+    ),
 }
 
 
@@ -117,6 +128,8 @@ class RunRecord:
     mapping_coverage: MappingCoverage | None = None
     mapping_suggestions: list[MappingSuggestion] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    #: Private desktop-focus locators; never exported, reported, or attested.
+    focus_targets: FocusTargetSidecar = field(default_factory=FocusTargetSidecar)
 
 
 def sha256_file(path: Path) -> str:
@@ -171,6 +184,7 @@ class RunHistory:
         report_paths: dict[str, str],
         file_paths: dict[str, str] | None = None,
         rerun_of: int | None = None,
+        focus_targets: dict[str, tuple[FocusTargetSeed, ...]] | None = None,
     ) -> int:
         started_at = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         counts = {sev.value: count for sev, count in result.counts.items()}
@@ -202,8 +216,8 @@ class RunHistory:
                     disclosures, verified_crosschecks, findings, report_paths,
                     file_paths, rerun_of, mode, coverage, mapping_coverage,
                     mapping_suggestions, review_counts, pattern_review_counts,
-                    story_counts, comparison_scope
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    story_counts, comparison_scope, focus_targets
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     started_at,
@@ -231,6 +245,11 @@ class RunHistory:
                     json.dumps(pattern_counts),
                     json.dumps(story_counts),
                     json.dumps(result.comparison_scope.model_dump(mode="json")),
+                    (
+                        encode_focus_targets(focus_targets)
+                        if focus_targets
+                        else EMPTY_SIDECAR_JSON
+                    ),
                 ),
             )
             run_id = cursor.lastrowid
@@ -276,6 +295,7 @@ class RunHistory:
                 for item in json.loads(row["mapping_suggestions"])
             ],
             findings=findings,
+            focus_targets=decode_focus_targets(row["focus_targets"]),
         )
 
     def list_runs(self, limit: int = 50, *, include_archived: bool = True) -> list[RunRecord]:
@@ -426,7 +446,9 @@ def export_runs_archive(
     """Bundle the stored reports for several runs into one private zip.
 
     Entry names are generated here, never taken from stored paths, and a source
-    file is included only when it resolves inside ``managed_root``.
+    file is included only when it resolves inside ``managed_root``. The private
+    focus-target sidecar is deliberately absent from both the entries and the
+    manifest: it is local operational metadata, not shareable evidence.
     """
     root = managed_root.resolve()
     manifest: list[dict[str, object]] = []

@@ -93,6 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MINUTES",
         help="temporary LAN duration (1-1440 minutes)",
     )
+    parser.add_argument(
+        "--desktop-focus",
+        action="store_true",
+        help=(
+            "opt in to jumping from a finding to the same location in an "
+            "already-open Windows Excel or PowerPoint document (Windows and "
+            "loopback only; off by default)"
+        ),
+    )
     return parser
 
 
@@ -129,6 +138,7 @@ def _cmd_serve(args: list[str]) -> int:
         host=config.host,
         network_mode=config.network,
         expires_at=config.expires_at,
+        desktop_focus=ns.desktop_focus,
     )
     return 0
 

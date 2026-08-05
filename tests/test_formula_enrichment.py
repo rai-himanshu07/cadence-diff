@@ -3,6 +3,8 @@
 import json
 import os
 import subprocess
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +12,14 @@ import pytest
 from openpyxl import Workbook
 
 import qc_tool.io.libreoffice_formula as libreoffice_formula_module
-from qc_tool.io.excel_formula import _load_worker_result, extract_formulas_with_excel
+from qc_tool.io.excel_formula import (
+    _load_worker_result,
+    _terminate_owned_excel,
+    extract_formulas_with_excel,
+)
 from qc_tool.io.excel_formula_worker import (
     _grid,
+    _read_formula_grid,
     _rectangles,
     _set_manual_calculation,
 )
@@ -211,6 +218,77 @@ def test_excel_adapter_protocol_is_testable_without_windows() -> None:
     assert extraction.formulas == {"Data": {(1, 1): "=20+22"}}
 
 
+def test_excel_cleanup_contains_process_termination_denial(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeWin32Error(Exception):
+        pass
+
+    status_path = tmp_path / "excel-status.json"
+    status_path.write_text(json.dumps({"pid": 1234, "created": 10.0}), encoding="utf-8")
+    handle = object()
+    terminated = False
+    closed = False
+
+    def terminate_process(process_handle: object, exit_code: int) -> None:
+        nonlocal terminated
+        assert process_handle is handle and exit_code == 1
+        terminated = True
+        raise FakeWin32Error(5, "Access is denied")
+
+    def close_handle(process_handle: object) -> None:
+        nonlocal closed
+        assert process_handle is handle
+        closed = True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pywintypes",
+        types.SimpleNamespace(error=FakeWin32Error),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32api",
+        types.SimpleNamespace(
+            OpenProcess=lambda access, inherit, pid: handle,
+            TerminateProcess=terminate_process,
+            CloseHandle=close_handle,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32con",
+        types.SimpleNamespace(
+            PROCESS_QUERY_INFORMATION=1,
+            PROCESS_TERMINATE=2,
+            SYNCHRONIZE=8,
+            WAIT_TIMEOUT=258,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32event",
+        types.SimpleNamespace(WaitForSingleObject=lambda process_handle, timeout: 258),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32process",
+        types.SimpleNamespace(
+            GetProcessTimes=lambda process_handle: {
+                "CreationTime": types.SimpleNamespace(timestamp=lambda: 10.0)
+            },
+            GetModuleFileNameEx=lambda *args: (_ for _ in ()).throw(
+                AssertionError("process image must not be queried")
+            ),
+        ),
+    )
+
+    _terminate_owned_excel(status_path)
+
+    assert terminated
+    assert closed
+
+
 def test_excel_formula_rectangles_and_shapes() -> None:
     assert _rectangles({(1, 1), (1, 2), (2, 1), (2, 2), (4, 3)}) == [
         (1, 1, 2, 2),
@@ -219,6 +297,24 @@ def test_excel_formula_rectangles_and_shapes() -> None:
     assert _grid("=A1", 1, 1) == [["=A1"]]
     assert _grid(("=A1", "=B1"), 1, 2) == [["=A1", "=B1"]]
     assert _grid((("=A1",), ("=A2",)), 2, 1) == [["=A1"], ["=A2"]]
+
+    class FakeComError(Exception):
+        pass
+
+    class FormulaRange:
+        Formula2: object = (("=A1", "=B1"),)
+
+        @property
+        def HasFormula(self) -> object:
+            raise AssertionError("HasFormula must not gate Formula2 extraction")
+
+    assert _read_formula_grid(FormulaRange(), 1, 2, "Data", FakeComError) == [
+        ["=A1", "=B1"]
+    ]
+
+    FormulaRange.Formula2 = (("=A1", 42),)
+    with pytest.raises(RuntimeError, match="1 requested formula cells"):
+        _read_formula_grid(FormulaRange(), 1, 2, "Data", FakeComError)
 
 
 def test_excel_manual_calculation_retries_with_a_guard_workbook() -> None:

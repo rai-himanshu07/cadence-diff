@@ -42,6 +42,8 @@ class FigureOccurrence:
     line_skeleton: str
     figure_index: int
     figure: ParsedFigure
+    #: 1-based slide position in the deck this occurrence was extracted from.
+    slide_index: int
 
     @property
     def context(self) -> str:
@@ -122,6 +124,7 @@ def extract_deck_figures(deck: DeckSnapshot) -> list[FigureOccurrence]:
                         line_skeleton=numeric_skeleton(line),
                         figure_index=index,
                         figure=figure,
+                        slide_index=slide.index + 1,
                     )
                 )
         for table in slide.tables:
@@ -143,6 +146,7 @@ def extract_deck_figures(deck: DeckSnapshot) -> list[FigureOccurrence]:
                             line_skeleton=f"table:{row_label}/{header}",
                             figure_index=0,
                             figure=figures[0],
+                            slide_index=slide.index + 1,
                         )
                     )
         for chart in slide.charts:
@@ -178,6 +182,7 @@ def extract_deck_figures(deck: DeckSnapshot) -> list[FigureOccurrence]:
                                 ),
                                 figure_index=figure_index,
                                 figure=figure,
+                                slide_index=slide.index + 1,
                             )
                         )
     return occurrences
@@ -343,6 +348,7 @@ def verify_mappings(
                     artifact="crosscheck",
                     finding_class=FindingClass.CROSSCHECK_UNRESOLVED,
                     slide=mapping.slide,
+                    slide_index=occurrence.slide_index,
                     element=display,
                     location=f"{mapping.source_sheet}!{mapping.source_cell}",
                     message=(
@@ -361,6 +367,7 @@ def verify_mappings(
                 artifact="crosscheck",
                 finding_class=FindingClass.CROSSCHECK_MISMATCH,
                 slide=mapping.slide,
+                slide_index=occurrence.slide_index,
                 element=display,
                 location=f"{mapping.source_sheet}!{mapping.source_cell}",
                 baseline_value=display_cell_value(value),

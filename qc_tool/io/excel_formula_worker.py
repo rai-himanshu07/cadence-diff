@@ -76,6 +76,38 @@ def _grid(value: object, rows: int, columns: int) -> list[list[object]]:
     return grid
 
 
+def _read_formula_grid(
+    target: Any,
+    rows: int,
+    columns: int,
+    sheet_name: str,
+    com_error: type[BaseException],
+) -> list[list[str]]:
+    try:
+        raw_grid = target.Formula2
+    except com_error as exc:
+        raise RuntimeError(
+            "this Excel build does not provide reliable Formula2 access"
+        ) from exc
+    grid = _grid(raw_grid, rows, columns)
+    formulas: list[list[str]] = []
+    invalid_count = 0
+    for values in grid:
+        formula_row: list[str] = []
+        for formula in values:
+            if isinstance(formula, str) and formula.startswith("="):
+                formula_row.append(formula)
+            else:
+                invalid_count += 1
+        formulas.append(formula_row)
+    if invalid_count:
+        raise RuntimeError(
+            f"Excel did not expose Formula2 for {invalid_count} requested formula "
+            f"cells in {sheet_name}"
+        )
+    return formulas
+
+
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -222,23 +254,15 @@ def _extract(request: dict[str, object]) -> dict[str, object]:
             cells: list[dict[str, object]] = []
             for row_1, col_1, row_2, col_2 in _rectangles(coordinates):
                 target = sheet.Range(sheet.Cells(row_1, col_1), sheet.Cells(row_2, col_2))
-                if target.HasFormula is not True:
-                    raise RuntimeError(
-                        f"Excel did not confirm every requested formula in {sheet_name}"
-                    )
-                try:
-                    raw_grid = target.Formula2
-                except pywintypes.com_error as exc:
-                    raise RuntimeError(
-                        "this Excel build does not provide reliable Formula2 access"
-                    ) from exc
-                grid = _grid(raw_grid, row_2 - row_1 + 1, col_2 - col_1 + 1)
+                grid = _read_formula_grid(
+                    target,
+                    row_2 - row_1 + 1,
+                    col_2 - col_1 + 1,
+                    sheet_name,
+                    pywintypes.com_error,
+                )
                 for row_offset, values in enumerate(grid):
                     for column_offset, formula in enumerate(values):
-                        if not isinstance(formula, str) or not formula.startswith("="):
-                            raise RuntimeError(
-                                f"Excel returned invalid Formula2 text in {sheet_name}"
-                            )
                         cells.append(
                             {
                                 "row": row_1 + row_offset,

@@ -887,4 +887,5 @@ def diff_slide_elements(
         )
     for finding in findings:
         finding.slide_index = current.index + 1
+        finding.baseline_slide_index = baseline.index + 1
     return findings

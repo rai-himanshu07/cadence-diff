@@ -72,6 +72,8 @@ def _text_findings(baseline: SlideContent, current: SlideContent) -> list[Findin
                     message=f"{slide}: text added",
                 )
             )
+    for finding in findings:
+        finding.baseline_slide_index = baseline.index + 1
     return findings
 
 
@@ -112,6 +114,7 @@ def diff_decks(
                 expected_reason=FindingExpectedReason.PRESENTATION_REORDER,
                 slide=current_slide.display_name,
                 slide_index=current_slide.index + 1,
+                baseline_slide_index=baseline_slide.index + 1,
                 baseline_value=f"position {baseline_slide.index + 1}",
                 current_value=f"position {current_slide.index + 1}",
                 message=(

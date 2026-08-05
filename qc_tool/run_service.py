@@ -14,6 +14,8 @@ from pathlib import Path
 from qc_tool.config.profile import DeliverableProfile, NumericTolerance
 from qc_tool.coverage import QCRunMode
 from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings, run_qc
+from qc_tool.focus.model import FocusTargetSeed
+from qc_tool.focus.targets import build_focus_targets
 from qc_tool.history.store import RunHistory, sha256_file
 from qc_tool.progress import (
     CancellationToken,
@@ -36,6 +38,20 @@ class RunArtifacts:
     report_paths: dict[str, Path]
     rerun_of: int | None = None
     delta: FindingsDelta | None = None
+
+
+def _focus_targets(
+    result: QCRunResult, file_hashes: dict[str, str]
+) -> dict[str, tuple[FocusTargetSeed, ...]]:
+    """Private desktop-focus locators; a failure here never fails the QC run."""
+    try:
+        return build_focus_targets(
+            result.findings, mode=result.mode, file_hashes=file_hashes
+        )
+    except Exception:
+        # Fixed code only: never log locators, paths, values, or exception text.
+        logger.warning("focus-target-generation-failed")
+        return {}
 
 
 def perform_run(
@@ -132,6 +148,7 @@ def perform_run(
             report_paths={kind: str(path) for kind, path in report_paths.items()},
             file_paths={role: str(path) for role, path in files.items()},
             rerun_of=rerun_of,
+            focus_targets=_focus_targets(result, file_hashes),
         )
         recorded = True
         report_progress(

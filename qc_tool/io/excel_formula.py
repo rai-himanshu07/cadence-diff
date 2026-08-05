@@ -159,6 +159,7 @@ def _terminate_owned_excel(status_path: Path) -> None:
         return
     pid, expected_created = identity
     try:
+        import pywintypes  # pyright: ignore[reportMissingModuleSource]
         import win32api  # pyright: ignore[reportMissingModuleSource]
         import win32con  # pyright: ignore[reportMissingModuleSource]
         import win32event  # pyright: ignore[reportMissingModuleSource]
@@ -169,21 +170,25 @@ def _terminate_owned_excel(status_path: Path) -> None:
         handle = win32api.OpenProcess(
             win32con.PROCESS_QUERY_INFORMATION
             | win32con.PROCESS_TERMINATE
-            | win32con.PROCESS_VM_READ
             | win32con.SYNCHRONIZE,
             False,
             pid,
         )
-    except OSError:
+    except (OSError, pywintypes.error):
         return
     try:
+        if win32event.WaitForSingleObject(handle, 10_000) != win32con.WAIT_TIMEOUT:
+            return
         created = win32process.GetProcessTimes(handle)["CreationTime"].timestamp()
-        image = Path(win32process.GetModuleFileNameEx(handle, 0)).name.lower()
-        if abs(created - expected_created) > 0.01 or image != "excel.exe":
+        if abs(created - expected_created) > 0.01:
             return
         if win32event.WaitForSingleObject(handle, 0) == win32con.WAIT_TIMEOUT:
             win32api.TerminateProcess(handle, 1)
             win32event.WaitForSingleObject(handle, 10_000)
+    except (OSError, pywintypes.error):
+        # Windows can deny process queries or termination after the handle opens.
+        # Never turn best-effort owned-process cleanup into a failed QC run.
+        return
     finally:
         win32api.CloseHandle(handle)
 

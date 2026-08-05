@@ -32,7 +32,7 @@ def test_default_data_dir_is_user_scoped() -> None:
 def test_main_passes_args_to_run_app(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[Path, int, str, str]] = []
+    calls: list[tuple[Path, int, str, str, bool]] = []
 
     def fake_run_app(
         work_dir: Path,
@@ -41,17 +41,21 @@ def test_main_passes_args_to_run_app(
         host: str = "127.0.0.1",
         network_mode=None,
         expires_at=None,
+        desktop_focus: bool = False,
     ) -> None:
         assert network_mode is not None
-        calls.append((work_dir, port, host, network_mode.value))
+        calls.append((work_dir, port, host, network_mode.value, desktop_focus))
 
     import qc_tool.ui.app as app_module
 
     monkeypatch.setattr(app_module, "run_app", fake_run_app)
     data_dir = tmp_path / "custom"
     cli.main(["--data-dir", str(data_dir), "--port", "9123"])
-    assert calls == [(data_dir, 9123, "127.0.0.1", "local")]
+    assert calls == [(data_dir, 9123, "127.0.0.1", "local", False)]
     assert data_dir.exists()  # created on demand
+    calls.clear()
+    cli.main(["--data-dir", str(data_dir), "--desktop-focus"])
+    assert calls == [(data_dir, 8080, "127.0.0.1", "local", True)]
 
 
 def test_serve_uses_temporary_lan_override(

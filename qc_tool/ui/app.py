@@ -37,6 +37,11 @@ from qc_tool.coverage import (
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings
 from qc_tool.findings import Finding, FindingClass, GridExcerpt, Severity
+from qc_tool.focus.binding import BindOutcome
+from qc_tool.focus.model import FocusTargetSeed
+from qc_tool.focus.protocol import FocusOutcome
+from qc_tool.focus.service import ROLE_LABELS as FOCUS_ROLE_LABELS
+from qc_tool.focus.service import BindReport, FocusService, TokenRejection
 from qc_tool.history.run_state import RunStateRecord, RunStatus
 from qc_tool.history.store import RunHistory, RunRecord, export_runs_archive, sha256_file
 from qc_tool.io.peek import peek_sheet_names, peek_slide_titles
@@ -744,6 +749,7 @@ def _render_result_view(
     history: RunHistory | None = None,
     run_id: int | None = None,
     profiles_dir: Path | None = None,
+    focus_actions: Callable[[Finding], None] | None = None,
 ) -> None:
     """Results workbench: a compact run header, then Review queue (default),
     Stories, Coverage, Atomic evidence, and Mapping review. Only the active
@@ -1077,6 +1083,10 @@ def _render_result_view(
                 f"{group.sheet or group.slide or ''} · {format_group_ranges(group)}"
             ).classes("runmeta")
             _render_evidence_body(member)
+            # A multi-member group must never focus an arbitrary representative;
+            # its members are chosen explicitly in the affected-findings dialog.
+            if focus_actions is not None and group.member_count == 1:
+                focus_actions(member)
             with ui.row().classes("items-center gap-2 mt-2"):
                 ui.button(
                     "View affected findings",
@@ -1137,6 +1147,8 @@ def _render_result_view(
                     ui.label(member.finding_id).classes("detail-id")
                     ui.label(member.message).classes("detail-msg")
                     _render_evidence_body(member)
+                    if focus_actions is not None:
+                        focus_actions(member)
 
             def on_member_select(e: events.GenericEventArguments) -> None:
                 show_member(str(e.args.get("id", "")))
@@ -1477,7 +1489,172 @@ def _result_from_record(record: RunRecord) -> QCRunResult:
     )
 
 
-def _render_completed_run(container: ui.element, work_dir: Path, run_id: int) -> None:
+def _focus_actions(
+    service: "FocusService | None", record: RunRecord
+) -> Callable[[Finding], None] | None:
+    """Per-finding desktop actions, or ``None`` when focus is not available."""
+    if service is None or not service.available:
+        return None
+    client_id = str(ui.context.client.id)
+
+    def render(finding: Finding) -> None:
+        _render_focus_actions(service, record, finding, client_id)
+
+    return render
+
+
+def _render_focus_actions(
+    service: "FocusService",
+    record: RunRecord,
+    finding: Finding,
+    client_id: str,
+) -> None:
+    """Explicit per-role Bind and Focus actions for one atomic finding."""
+    seeds = service.seeds(record, finding.finding_id)
+    if not seeds:
+        return
+    container = ui.element("div").classes("focusrow")
+
+    def paint() -> None:
+        container.clear()
+        # Rerendering a detail retires every token issued under the old revision.
+        service.new_revision(client_id)
+        with container, ui.row().classes("items-center gap-2 mt-2 flex-wrap"):
+            ui.label("Open in desktop Office").classes("dk")
+            for seed in sorted(seeds, key=lambda item: item.role.value):
+                _render_role_action(service, record, finding, client_id, seed, paint)
+
+    paint()
+
+
+def _render_role_action(
+    service: "FocusService",
+    record: RunRecord,
+    finding: Finding,
+    client_id: str,
+    seed: FocusTargetSeed,
+    repaint: Callable[[], None],
+) -> None:
+    role = seed.role
+    label = FOCUS_ROLE_LABELS[role]
+    if service.binding(client_id, record.run_id, role) is None:
+
+        async def bind() -> None:
+            report = await service.bind(client_id, record, role)
+            if not report.offered:
+                ui.notify(
+                    f"Cannot bind the {label} document: "
+                    f"{report.outcome.value.replace('_', ' ')}",
+                    type="warning",
+                )
+                return
+            _confirm_binding(service, record, client_id, report, repaint)
+
+        ui.button(f"Bind {label}", on_click=bind).classes("ghostbtn").props(
+            "no-caps flat dense"
+        )
+        return
+
+    token = service.issue_token(client_id, record.run_id, finding.finding_id, role)
+
+    async def focus() -> None:
+        claim = service.consume_token(client_id, token)
+        if isinstance(claim, TokenRejection):
+            ui.notify(
+                "This action expired; reopen the finding and try again.",
+                type="warning",
+            )
+            repaint()
+            return
+        reply = await service.focus(client_id, record, claim)
+        if reply.outcome is FocusOutcome.FOCUSED:
+            ui.notify(f"Opened the {label} document", type="positive")
+        elif reply.outcome is FocusOutcome.FOCUSED_WITHOUT_FOREGROUND:
+            ui.notify(
+                f"Opened the {label} document; Windows kept the current window "
+                "in front.",
+                type="info",
+            )
+        else:
+            ui.notify(
+                f"No desktop action was taken: {reply.code.replace('_', ' ')}",
+                type="warning",
+            )
+        repaint()
+
+    ui.button(f"Focus {label}", on_click=focus).classes("primarybtn").props(
+        "no-caps flat dense"
+    )
+
+
+def _confirm_binding(
+    service: "FocusService",
+    record: RunRecord,
+    client_id: str,
+    report: BindReport,
+    repaint: Callable[[], None],
+) -> None:
+    """Explicit confirmation of the sole byte-identical open document."""
+    label = FOCUS_ROLE_LABELS[report.role]
+    needs_acknowledgement = not service.acknowledged(client_id)
+    with ui.dialog() as dialog, ui.card().classes("w-[34rem] max-w-full"):
+        ui.label("Bind this byte-identical open document").classes("runhead")
+        ui.label(
+            f"{record.files.get(report.role.value, label)} — {label}"
+            + (f" · folder {report.folder_label}" if report.folder_label else "")
+        ).classes("mono")
+        ui.label(
+            "Exactly one open document has saved bytes identical to this run's "
+            "input. This is not proof that it is the file you originally "
+            "uploaded, only that its saved bytes match."
+        ).classes("note")
+        if report.unsaved_changes:
+            ui.label(
+                "That document has unsaved changes. Its saved bytes still match, "
+                "but anything edited since the last save is not reflected here."
+            ).classes("notecard")
+        accepted = {"value": not needs_acknowledgement}
+        if needs_acknowledgement:
+            def on_ack(event: events.ValueChangeEventArguments) -> None:
+                accepted["value"] = bool(event.value)
+
+            ui.checkbox(
+                "I understand that changing selection can trigger Office "
+                "add-ins or event handlers in this document.",
+                on_change=on_ack,
+            )
+        with ui.row().classes("items-center gap-2"):
+
+            def confirm() -> None:
+                if not accepted["value"]:
+                    ui.notify(
+                        "Acknowledge the Office side-effect note first.",
+                        type="warning",
+                    )
+                    return
+                service.acknowledge(client_id)
+                outcome = service.confirm(client_id, record, report.role)
+                dialog.close()
+                if outcome is not BindOutcome.MATCHED:
+                    ui.notify("That candidate is no longer available.", type="warning")
+                repaint()
+
+            ui.button("Confirm binding", on_click=confirm).classes("primarybtn").props(
+                "no-caps flat dense"
+            )
+            ui.button("Cancel", on_click=dialog.close).classes("ghostbtn").props(
+                "no-caps flat dense"
+            )
+    dialog.open()
+
+
+def _render_completed_run(
+    container: ui.element,
+    work_dir: Path,
+    run_id: int,
+    *,
+    focus_service: "FocusService | None" = None,
+) -> None:
     history = RunHistory(work_dir / "history.sqlite3")
     try:
         record = history.get_run(run_id)
@@ -1502,6 +1679,7 @@ def _render_completed_run(container: ui.element, work_dir: Path, run_id: int) ->
             history=history,
             run_id=run_id,
             profiles_dir=work_dir / "profiles",
+            focus_actions=_focus_actions(focus_service, record),
         )
     # Results render below the upload/config sections; bring them into view.
     ui.run_javascript(
@@ -1515,12 +1693,18 @@ def create_pages(
     *,
     network_mode: NetworkMode = NetworkMode.LOCAL,
     expires_at: dt.datetime | None = None,
+    desktop_focus: bool = False,
 ) -> None:
     secure_managed_tree(work_dir)
     uploads_dir = work_dir / "uploads"
     profiles_dir = work_dir / "profiles"
     private_directory(uploads_dir)
     private_directory(profiles_dir)
+    # Windows-only, loopback-only, explicit opt-in; off unless all three hold.
+    focus_service = FocusService(
+        work_dir, enabled=desktop_focus, network_mode=network_mode
+    )
+    app.on_disconnect(lambda client: focus_service.forget_client(str(client.id)))
     # One process-global FIFO manager: refreshes reconnect, tabs never duplicate
     # work, and requests left over from a previous server run are orphaned.
     queue_manager = get_manager(work_dir)
@@ -2090,7 +2274,12 @@ def create_pages(
                     if record.status is RunStatus.SUCCEEDED and record.run_id:
                         ui.notify(f"Run #{record.run_id} complete")
                         if record.request_id in own_requests:
-                            _render_completed_run(results, work_dir, record.run_id)
+                            _render_completed_run(
+                                results,
+                                work_dir,
+                                record.run_id,
+                                focus_service=focus_service,
+                            )
                         else:
                             with completed_links:
                                 ui.link(
@@ -2449,6 +2638,8 @@ def create_pages(
                         removed = history.delete_runs(
                             targets, managed_root=work_dir / "runs"
                         )
+                        for run_id in targets:
+                            focus_service.forget_run(run_id)
                         selected.clear()
                         reload_rows()
                         dialog.close()
@@ -2569,6 +2760,7 @@ def create_pages(
                 history=history,
                 run_id=record.run_id,
                 profiles_dir=work_dir / "profiles",
+                focus_actions=_focus_actions(focus_service, record),
             )
 
 
@@ -2579,8 +2771,14 @@ def run_app(
     host: str = "127.0.0.1",
     network_mode: NetworkMode = NetworkMode.LOCAL,
     expires_at: dt.datetime | None = None,
+    desktop_focus: bool = False,
 ) -> None:
-    create_pages(work_dir, network_mode=network_mode, expires_at=expires_at)
+    create_pages(
+        work_dir,
+        network_mode=network_mode,
+        expires_at=expires_at,
+        desktop_focus=desktop_focus,
+    )
     if network_mode is NetworkMode.LAN:
         if expires_at is None:
             raise ValueError("LAN mode requires an expiry timestamp")
