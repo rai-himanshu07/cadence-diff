@@ -126,6 +126,17 @@ class WorkbookRisk:
 class NamedRange:
     name: str
     target: str
+    sheet: str | None = None
+    hidden: bool = False
+
+    @property
+    def scope_label(self) -> str:
+        return "workbook" if self.sheet is None else self.sheet
+
+    @property
+    def qualified_name(self) -> str:
+        """Identity that stays distinct when one name exists in several scopes."""
+        return self.name if self.sheet is None else f"{self.sheet}!{self.name}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +379,8 @@ class WorkbookSnapshot:
     chart_detail: str = ""
     interaction_rule_detail: str = ""
     conditional_format_style_detail: str = ""
+    defined_name_scope_available: bool = False
+    defined_name_scope_detail: str = ""
     sheets: list[SheetSnapshot] = field(default_factory=list)
     named_ranges: list[NamedRange] = field(default_factory=list)
     formula_ranges: list[FormulaRangeDescriptor] = field(default_factory=list)

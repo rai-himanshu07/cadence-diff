@@ -72,12 +72,16 @@ def _visibility_findings(
 def _named_range_findings(
     baseline: WorkbookSnapshot, current: WorkbookSnapshot
 ) -> list[Finding]:
-    base_names = {n.name: n.target for n in baseline.named_ranges}
-    curr_names = {n.name: n.target for n in current.named_ranges}
+    base_names = {(n.sheet, n.name): n.target for n in baseline.named_ranges}
+    curr_names = {(n.sheet, n.name): n.target for n in current.named_ranges}
     findings = []
-    for name in sorted(base_names.keys() | curr_names.keys()):
-        base_target = base_names.get(name)
-        curr_target = curr_names.get(name)
+    for scope, name in sorted(
+        base_names.keys() | curr_names.keys(),
+        key=lambda key: (key[0] or "", key[1]),
+    ):
+        key = (scope, name)
+        base_target = base_names.get(key)
+        curr_target = curr_names.get(key)
         if base_target == curr_target:
             continue
         expected = (
@@ -85,14 +89,15 @@ def _named_range_findings(
             and curr_target is not None
             and is_pure_range_extension(base_target, curr_target)
         )
+        label = name if scope is None else f"{scope}!{name}"
         if base_target is None:
-            message = f"named range {name!r} added -> {curr_target}"
+            message = f"named range {label!r} added -> {curr_target}"
         elif curr_target is None:
-            message = f"named range {name!r} removed (was {base_target})"
+            message = f"named range {label!r} removed (was {base_target})"
         elif expected:
-            message = f"named range {name!r} extended with new-cycle data"
+            message = f"named range {label!r} extended with new-cycle data"
         else:
-            message = f"named range {name!r} repointed"
+            message = f"named range {label!r} repointed"
         findings.append(
             Finding(
                 artifact="excel",
@@ -100,7 +105,8 @@ def _named_range_findings(
                 expected_reason=(
                     FindingExpectedReason.CADENCE_EXTENSION if expected else None
                 ),
-                element=name,
+                sheet=scope,
+                element=label,
                 baseline_value=base_target,
                 current_value=curr_target,
                 message=message,

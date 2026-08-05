@@ -52,6 +52,7 @@ from qc_tool.io.model import (
 )
 from qc_tool.io.ooxml_chart import ChartParseError, parse_ooxml_charts
 from qc_tool.io.ooxml_interaction import extract_worksheet_interactions
+from qc_tool.io.ooxml_names import scan_defined_names
 from qc_tool.io.ooxml_worksheet import (
     OOXMLMetadataError,
     WorkbookMetadata,
@@ -346,6 +347,7 @@ def _load_ooxml_oracle(
         if name.startswith("_xlnm"):
             continue
         snapshot.named_ranges.append(NamedRange(name=name, target=str(defined.attr_text)))
+    _apply_defined_name_scope(snapshot, data)
 
     for sheet_name in wb_formulas.sheetnames:
         check_cancelled(cancellation_token)
@@ -751,6 +753,7 @@ def _load_ooxml_streaming(
             if name.startswith("_xlnm"):
                 continue
             snapshot.named_ranges.append(NamedRange(name=name, target=str(defined.attr_text)))
+        _apply_defined_name_scope(snapshot, data)
 
         interaction_details: list[str] = []
         conditional_style_details: list[str] = []
@@ -839,6 +842,14 @@ def _relationship_targets(
             resolved = posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
         targets[relationship_id] = resolved
     return targets
+
+
+def _apply_defined_name_scope(snapshot: WorkbookSnapshot, data: bytes) -> None:
+    """Add sheet-scoped names from the package; workbook-scoped names are already set."""
+    scan = scan_defined_names(data)
+    snapshot.defined_name_scope_available = scan.available
+    snapshot.defined_name_scope_detail = scan.detail
+    snapshot.named_ranges.extend(scan.sheet_scoped)
 
 
 def _extract_ooxml_risks(data: bytes) -> list[WorkbookRisk]:
@@ -1028,6 +1039,11 @@ def _load_xlsb(
         chart_detail="XLSB chart metadata is unavailable",
         interaction_rule_detail="XLSB interaction-rule metadata is unavailable",
         conditional_format_style_detail=("XLSB conditional-format style metadata is unavailable"),
+        defined_name_scope_available=False,
+        defined_name_scope_detail=(
+            "XLSB stores the workbook part as binary, so defined names and their "
+            "scope cannot be read"
+        ),
         intrinsic_risks=_xlsb_risks(formula_scan),
     )
     with open_xlsb(io.BytesIO(data)) as wb:

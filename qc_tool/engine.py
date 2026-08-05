@@ -46,7 +46,7 @@ from qc_tool.excel.interaction import (
     conditional_style_coverage,
     interaction_rule_coverage,
 )
-from qc_tool.excel.preflight import preflight_workbook
+from qc_tool.excel.preflight import defined_name_scope_coverage, preflight_workbook
 from qc_tool.excel.workbook_risks import workbook_risk_findings
 from qc_tool.findings import Finding, FindingClass, Severity, limit_findings
 from qc_tool.io.loader import load_workbook_snapshot
@@ -674,6 +674,7 @@ def run_qc(
                 detail="Structural package risk inventory compared across the pair",
             )
         )
+        result.coverage.append(defined_name_scope_coverage(base_wb, curr_wb))
         if disclosure := _pair_formula_disclosure(base_wb, curr_wb):
             result.disclosures.append(disclosure)
         report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)

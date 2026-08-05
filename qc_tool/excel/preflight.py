@@ -38,6 +38,39 @@ from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot, display_cell_value
 from qc_tool.progress import CancellationToken, check_cancelled
 
 _FORMULA_RUN_MIN = 4
+
+
+def defined_name_scope_coverage(*workbooks: WorkbookSnapshot) -> CoverageItem:
+    """Report whether defined-name scope could be read for every supplied workbook."""
+    blocked = [book for book in workbooks if not book.defined_name_scope_available]
+    partial = [
+        book
+        for book in workbooks
+        if book.defined_name_scope_available and book.defined_name_scope_detail
+    ]
+    if blocked:
+        state = CoverageState.UNAVAILABLE
+        detail = "; ".join(
+            f"{book.source_name}: {book.defined_name_scope_detail}" for book in blocked
+        )
+    elif partial:
+        state = CoverageState.DEGRADED
+        detail = "; ".join(
+            f"{book.source_name}: {book.defined_name_scope_detail}" for book in partial
+        )
+    else:
+        state = CoverageState.CHECKED
+        detail = ""
+    return CoverageItem(
+        check_id="excel-defined-name-scope",
+        label="Defined-name scope (workbook and sheet)",
+        artifact="excel",
+        state=state,
+        findings=sum(
+            1 for book in workbooks for name in book.named_ranges if name.sheet is not None
+        ),
+        detail=detail,
+    )
 _FORMULA_SHARE = 0.60
 
 
@@ -276,7 +309,7 @@ def _structure_findings(
     findings: list[Finding] = []
     unsupported = 0
     for named in workbook.named_ranges:
-        resolution = resolve_reference(workbook, named.target, host_sheet="")
+        resolution = resolve_reference(workbook, named.target, host_sheet=named.sheet or "")
         if resolution.ranges and all(
             resolved.sheet in ignored_sheets for resolved in resolution.ranges
         ):
@@ -288,9 +321,12 @@ def _structure_findings(
                 Finding(
                     artifact="excel",
                     finding_class=FindingClass.NAMED_RANGE_INVALID,
-                    element=named.name,
+                    sheet=named.sheet,
+                    element=named.qualified_name,
                     current_value=named.target,
-                    message=f"named range {named.name!r} points to an invalid target",
+                    message=(
+                        f"named range {named.qualified_name!r} points to an invalid target"
+                    ),
                 )
             )
     for chart in workbook.charts:
@@ -400,6 +436,7 @@ def preflight_workbook(
             findings=len(result.findings),
         )
     )
+    result.coverage.append(defined_name_scope_coverage(workbook))
 
     formula_start = len(result.findings)
     if workbook.formula_presence_available:

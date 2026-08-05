@@ -282,6 +282,15 @@ def _verify_workbook_data(
                             )
     if workbook.defined_names and not embedded:
         report.add("defined-names", "workbook", "defined names remain")
+    if not embedded:
+        for sheet in workbook.worksheets:
+            if getattr(sheet, "defined_names", None):
+                report.add(
+                    "defined-names",
+                    "worksheet",
+                    "sheet-scoped defined names remain",
+                )
+                break
     for style in dynamic_workbook._named_styles:
         if style.name != "Normal" and not re.fullmatch(r"Style_\d+", style.name, re.I):
             report.add("named-style", style.name, "named style is not anonymized")

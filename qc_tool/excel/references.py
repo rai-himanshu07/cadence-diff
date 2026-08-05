@@ -68,6 +68,10 @@ def build_reference_index(workbook: WorkbookSnapshot) -> WorkbookReferenceIndex:
     for sheet in workbook.sheets:
         sheets[sheet.name.casefold()].append(sheet)
     for named_range in workbook.named_ranges:
+        # Scope-aware resolution is not modelled yet, so a sheet-local name must
+        # not silently answer a lookup that today resolves workbook-scoped.
+        if named_range.sheet is not None:
+            continue
         named_ranges[named_range.name.casefold()].append(named_range)
     for table in workbook.tables:
         aliases = {table.name.casefold(), table.display_name.casefold()}

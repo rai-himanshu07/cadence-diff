@@ -288,7 +288,19 @@ def sanitize_workbook(
     name_replacements = (
         {
             name: f"Name_{index:03d}"
-            for index, name in enumerate(workbook.defined_names, start=1)
+            for index, name in enumerate(
+                dict.fromkeys(
+                    [
+                        *workbook.defined_names,
+                        *(
+                            name
+                            for sheet in workbook.worksheets
+                            for name in getattr(sheet, "defined_names", ()) or ()
+                        ),
+                    ]
+                ),
+                start=1,
+            )
         }
         if redact_text
         else {}
@@ -379,6 +391,11 @@ def sanitize_workbook(
     if redact_text:
         stats.identifiers_redacted += len(workbook.defined_names)
         workbook.defined_names.clear()
+        for sheet in workbook.worksheets:
+            local_names = getattr(sheet, "defined_names", None)
+            if local_names:
+                stats.identifiers_redacted += len(local_names)
+                local_names.clear()
         for sheet in workbook.worksheets:
             old_title = sheet.title
             sheet.title = sheet_replacements[old_title]
