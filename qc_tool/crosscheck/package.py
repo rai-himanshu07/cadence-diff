@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from qc_tool.config.profile import CrosscheckProfile
 from qc_tool.coverage import CoverageItem, CoverageState, MappingCoverage
+from qc_tool.crosscheck.claims import claim_population
 from qc_tool.crosscheck.trace import (
     MappingSuggestion,
     SuggestedSource,
@@ -71,6 +72,7 @@ def reconcile_package(
 ) -> PackageQCResult:
     result = PackageQCResult()
     occurrences = extract_deck_figures(deck)
+    population = claim_population(deck, occurrences)
     mapped_identities = {mapping_identity(mapping) for mapping in profile.mappings}
     mapped_occurrences = [
         occurrence
@@ -100,6 +102,7 @@ def reconcile_package(
         mismatched=mismatched,
         unresolved=unresolved,
         unmapped=len(unmapped_occurrences),
+        unavailable=population.unreadable_shapes,
     )
     for occurrence in unmapped_occurrences:
         candidates = suggest_sources(
@@ -126,9 +129,9 @@ def reconcile_package(
                 label="Excel to PowerPoint figure mappings",
                 artifact="package",
                 state=(
-                    CoverageState.CHECKED
-                    if deck.charts_available
-                    else CoverageState.DEGRADED
+                    CoverageState.DEGRADED
+                    if not deck.charts_available or not population.complete
+                    else CoverageState.CHECKED
                 ),
                 findings=len(verified.findings),
                 detail=(
@@ -139,6 +142,18 @@ def reconcile_package(
                         ""
                         if deck.charts_available
                         else "; visible native chart labels unavailable"
+                    )
+                    + (
+                        ""
+                        if population.complete
+                        else (
+                            f"; {mapping.unavailable} rasterized or embedded "
+                            "surface(s) carry claims that cannot be read on "
+                            "slide(s) "
+                            + ", ".join(
+                                str(index) for index in population.unreadable_slides
+                            )
+                        )
                     )
                 ),
             ),

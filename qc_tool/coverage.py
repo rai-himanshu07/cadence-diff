@@ -33,6 +33,15 @@ class MappingCoverage(BaseModel):
     mismatched: int = 0
     unresolved: int = 0
     unmapped: int = 0
+    #: Material surfaces that carry claims nobody in this tool can read, such as
+    #: figures rendered into a picture. Additive; zero for runs recorded before
+    #: the population was made explicit.
+    unavailable: int = 0
+
+    @property
+    def reconciles(self) -> bool:
+        """Whether the mapped split accounts for exactly the eligible claims."""
+        return self.mapped + self.unmapped == self.eligible
 
 
 def capability_limited(coverage: list[CoverageItem]) -> bool:
