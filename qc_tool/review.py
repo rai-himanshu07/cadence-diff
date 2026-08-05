@@ -13,7 +13,16 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
 
 from qc_tool.excel.formula_tokens import tokenize_formula
-from qc_tool.findings import Finding, FindingClass, FindingSubtype, Severity
+from qc_tool.findings import (
+    Finding,
+    FindingClass,
+    FindingProvenance,
+    FindingSubtype,
+    FindingTemporalContext,
+    Materiality,
+    Severity,
+)
+from qc_tool.story import ChangeStory, StoryKind
 
 Coordinate: TypeAlias = tuple[int, int]
 Rectangle: TypeAlias = tuple[int, int, int, int]
@@ -634,3 +643,183 @@ def apply_group_review(
             )
         )
     return updates
+
+
+# --- guided review prioritization --------------------------------------------
+
+#: Every signal is derived from a field a producer already set, so a rationale
+#: can always be traced back to observed evidence rather than to a heuristic.
+_PRIORITY_WEIGHTS: dict[str, int] = {
+    "severity_critical": 1000,
+    "severity_warning": 400,
+    "severity_info": 50,
+    "material_delta": 300,
+    "historical_change": 250,
+    "new_defect": 200,
+    "downstream_impacts": 150,
+    "unexplained_residual": 120,
+    "wide_population": 80,
+    "inherited_only": -200,
+    "noise_only": -300,
+    "within_tolerance_only": -250,
+    "story_explained": -100,
+    "already_reviewed": 0,
+    "waived": 0,
+    "expected_growth": 0,
+}
+
+#: Signals that mean the analyst has no new decision to make. These defer a
+#: group behind every open one regardless of severity, because a waived
+#: critical is settled while an unreviewed style change is not.
+_DEFERRAL_TIERS: dict[str, int] = {
+    "already_reviewed": 1,
+    "waived": 2,
+    "expected_growth": 3,
+}
+
+_SIGNAL_PHRASES: dict[str, str] = {
+    "severity_critical": "critical severity",
+    "severity_warning": "warning severity",
+    "severity_info": "informational severity",
+    "material_delta": "{material} member(s) exceed the materiality threshold",
+    "historical_change": "{historical} member(s) change historical periods",
+    "new_defect": "{new} member(s) have no baseline counterpart",
+    "downstream_impacts": "{impacts} recorded downstream impact(s)",
+    "unexplained_residual": "no story explains this change",
+    "wide_population": "{members} atomic findings in one decision",
+    "inherited_only": "every member was already present in the baseline",
+    "noise_only": "every numeric delta is display noise",
+    "within_tolerance_only": "every numeric delta is within the accepted band",
+    "story_explained": "explained by story {story}",
+    "already_reviewed": "an analyst has already recorded a decision",
+    "waived": "covered by an active waiver",
+    "expected_growth": "expected new-cycle growth",
+}
+
+#: A decision holding at least this many atomics is worth surfacing early
+#: because one judgement retires a large share of the queue.
+_WIDE_POPULATION = 25
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewPriority:
+    """One review group placed in guided order, with its evidence cited."""
+
+    group: ReviewGroup
+    rank: int
+    score: int
+    signals: tuple[str, ...]
+    rationale: str
+
+
+def _priority_signals(
+    group: ReviewGroup, story_by_finding: dict[str, str]
+) -> tuple[list[str], dict[str, object]]:
+    members = group.members
+    counts: dict[str, object] = {
+        "members": len(members),
+        "material": sum(1 for item in members if item.materiality is Materiality.MATERIAL),
+        "historical": sum(
+            1
+            for item in members
+            if item.temporal_context is FindingTemporalContext.HISTORICAL
+        ),
+        "new": sum(1 for item in members if item.provenance is FindingProvenance.NEW),
+        "impacts": sum(len(item.impacts) for item in members),
+    }
+    signals: list[str] = []
+    if group.severity is Severity.CRITICAL:
+        signals.append("severity_critical")
+    elif group.severity is Severity.WARNING:
+        signals.append("severity_warning")
+    elif group.severity is Severity.INFO:
+        signals.append("severity_info")
+
+    if counts["material"]:
+        signals.append("material_delta")
+    if counts["historical"]:
+        signals.append("historical_change")
+    if counts["new"]:
+        signals.append("new_defect")
+    if counts["impacts"]:
+        signals.append("downstream_impacts")
+    if len(members) >= _WIDE_POPULATION:
+        signals.append("wide_population")
+
+    tiers = {item.materiality for item in members if item.materiality is not None}
+    if tiers == {Materiality.NOISE}:
+        signals.append("noise_only")
+    elif tiers == {Materiality.WITHIN_TOLERANCE}:
+        signals.append("within_tolerance_only")
+    if members and all(
+        item.provenance is FindingProvenance.INHERITED for item in members
+    ):
+        signals.append("inherited_only")
+
+    story = next(
+        (
+            story_by_finding[item.finding_id]
+            for item in members
+            if item.finding_id in story_by_finding
+        ),
+        None,
+    )
+    if story is None:
+        signals.append("unexplained_residual")
+    else:
+        signals.append("story_explained")
+        counts["story"] = story
+
+    if any(item.waiver_reason for item in members):
+        signals.append("waived")
+    if any(item.severity_overridden or item.analyst_comment for item in members):
+        signals.append("already_reviewed")
+    if group.expected_growth or group.severity is Severity.EXPECTED:
+        signals.append("expected_growth")
+    return signals, counts
+
+
+def _rationale(signals: list[str], counts: dict[str, object]) -> str:
+    return "; ".join(
+        _SIGNAL_PHRASES[signal].format(**counts) for signal in signals
+    ) or "no prioritization signal applies"
+
+
+def prioritize_review(
+    groups: list[ReviewGroup],
+    stories: list[ChangeStory] | None = None,
+) -> list[ReviewPriority]:
+    """Order review decisions by evidence, without dropping or hiding any.
+
+    The result is always a permutation of ``groups``: prioritization may order,
+    explain, and de-emphasize, but every atomic finding stays reachable.
+    """
+    story_by_finding: dict[str, str] = {}
+    for story in stories or ():
+        if story.kind is StoryKind.RESIDUAL:
+            continue
+        for finding_id in story.finding_ids:
+            story_by_finding.setdefault(finding_id, story.story_id)
+
+    scored: list[
+        tuple[int, int, tuple[object, ...], ReviewGroup, list[str], dict[str, object]]
+    ] = []
+    for group in groups:
+        signals, counts = _priority_signals(group, story_by_finding)
+        score = sum(_PRIORITY_WEIGHTS[signal] for signal in signals)
+        tier = max((_DEFERRAL_TIERS.get(signal, 0) for signal in signals), default=0)
+        scored.append((tier, score, _review_sort_key(group), group, signals, counts))
+
+    scored.sort(key=lambda entry: (entry[0], -entry[1], entry[2]))
+    return [
+        ReviewPriority(
+            group=group,
+            rank=index,
+            score=score,
+            signals=tuple(signals),
+            rationale=_rationale(signals, counts),
+        )
+        for index, (_tier, score, _order, group, signals, counts) in enumerate(
+            scored, start=1
+        )
+    ]

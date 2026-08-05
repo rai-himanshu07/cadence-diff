@@ -54,6 +54,7 @@ from qc_tool.review import (
     build_pattern_groups,
     count_pattern_groups,
     format_group_ranges,
+    prioritize_review,
 )
 from qc_tool.run_service import RunArtifacts, perform_run
 from qc_tool.runqueue import (
@@ -502,7 +503,11 @@ def _findings_rows(result: QCRunResult) -> list[dict[str, object]]:
     return [_finding_row(finding) for finding in result.findings]
 
 
-def _review_group_rows(groups: list[ReviewGroup]) -> list[dict[str, object]]:
+def _review_group_rows(
+    groups: list[ReviewGroup],
+    rationales: dict[str, str] | None = None,
+) -> list[dict[str, object]]:
+    reasons = rationales or {}
     return [
         {
             "id": group.group_id,
@@ -522,6 +527,7 @@ def _review_group_rows(groups: list[ReviewGroup]) -> list[dict[str, object]]:
                 )
             ),
             "element": group.element,
+            "why": reasons.get(group.group_id, ""),
             "sel": False,
             "cap_degraded": any(
                 member.finding_class is FindingClass.FINDINGS_CAPPED
@@ -1019,9 +1025,13 @@ def _render_result_view(
     def _visible_group_rows() -> list[dict[str, object]]:
         selected = set(severity_filter.value or [])
         needle = str(text_filter.value or "").strip().lower()
+        prioritized = prioritize_review(review_groups, stories)
         rows = [
             row
-            for row in _review_group_rows(review_groups)
+            for row in _review_group_rows(
+                [item.group for item in prioritized],
+                {item.group.group_id: item.rationale for item in prioritized},
+            )
             if row["severity"] in selected
             and (not story_scope or row["id"] in story_scope)
         ]
@@ -1082,6 +1092,16 @@ def _render_result_view(
             ui.label(
                 f"{group.sheet or group.slide or ''} · {format_group_ranges(group)}"
             ).classes("runmeta")
+            rationale = next(
+                (
+                    str(row.get("why") or "")
+                    for row in group_table.rows
+                    if row["id"] == group_id
+                ),
+                "",
+            )
+            if rationale:
+                ui.label(f"prioritized because: {rationale}").classes("note")
             _render_evidence_body(member)
             # A multi-member group must never focus an arbitrary representative;
             # its members are chosen explicitly in the affected-findings dialog.

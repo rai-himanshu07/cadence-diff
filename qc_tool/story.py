@@ -360,6 +360,20 @@ def build_stories(findings: list[Finding]) -> list[ChangeStory]:
     return sorted(stories, key=sort_key)
 
 
+def _missing_evidence(finding: Finding) -> tuple[str, ...]:
+    """Which explanation axes a residual finding carries no evidence on."""
+    absent: list[str] = []
+    if finding.provenance is None:
+        absent.append("provenance")
+    if finding.materiality is None:
+        absent.append("materiality")
+    if finding.temporal_context is None:
+        absent.append("temporal context")
+    if not finding.event_key:
+        absent.append("shared event")
+    return tuple(absent)
+
+
 def _materialize(
     kind: StoryKind,
     component: int,
@@ -493,6 +507,25 @@ def _materialize(
             "No systematic driver, recency, provenance, or noise evidence "
             "explains these findings. This is the primary review queue."
         )
+        classes = Counter(member.finding_class.value for member in members)
+        evidence.append(
+            "unexplained by class: "
+            + ", ".join(
+                f"{name}={count}"
+                for name, count in sorted(
+                    classes.items(), key=lambda item: (-item[1], item[0])
+                )[:_MAX_EVIDENCE_LINES]
+            )
+        )
+        missing = sorted(
+            {
+                reason
+                for member in members
+                for reason in _missing_evidence(member)
+            }
+        )
+        if missing:
+            evidence.append("no evidence recorded for: " + ", ".join(missing))
         anchor = "residual"
 
     return ChangeStory(
