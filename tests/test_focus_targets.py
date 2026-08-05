@@ -291,6 +291,28 @@ def test_matched_slide_findings_seed_both_decks() -> None:
     }
 
 
+def test_exact_shape_provenance_enters_only_the_private_sidecar() -> None:
+    finding = Finding(
+        artifact="ppt",
+        finding_class=FindingClass.TABLE_VALUE_CHANGED,
+        slide="3 Revenue",
+        slide_index=3,
+        baseline_slide_index=2,
+        focus_shape_id=31,
+        baseline_focus_shape_id=22,
+        message="table value changed",
+    )
+    public_payload = finding.model_dump(mode="json")
+    assert "focus_shape_id" not in public_payload
+    assert "baseline_focus_shape_id" not in public_payload
+
+    seeds = _targets([finding])["F0001"]
+    assert {(seed.role, seed.slide_index, seed.shape_id) for seed in seeds} == {
+        (FocusRole.CURRENT_PPT, 3, 31),
+        (FocusRole.BASELINE_PPT, 2, 22),
+    }
+
+
 def test_added_and_removed_slides_seed_only_the_existing_side() -> None:
     added = Finding(
         artifact="ppt",

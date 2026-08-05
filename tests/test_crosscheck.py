@@ -104,6 +104,8 @@ def test_deck_figures_extracted(occurrences: list[FigureOccurrence]) -> None:
     assert margin.figure.is_percent
     table = _occurrence(occurrences, "Revenue by Region", "table:North/Jan-26")
     assert table.figure.value == pytest.approx(100_000.0)
+    assert table.shape_id is not None and table.shape_id > 0
+    assert revenue.shape_id is None
 
 
 def test_auto_suggest_finds_kpi_source(

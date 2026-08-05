@@ -39,6 +39,18 @@ def _slide_is_hidden(slide: object) -> bool:
     return read_attribute(transition, "Hidden") == MSO_TRUE
 
 
+def _shape(slide: object, shape_id: int) -> object | None:
+    shapes = read_attribute(slide, "Shapes")
+    total = as_count(read_attribute(shapes, "Count"))
+    for index in range(1, total + 1):
+        candidate: object | None = None
+        with contextlib.suppress(Exception):
+            candidate = shapes.Item(index)  # type: ignore[attr-defined]
+        if candidate is not None and read_attribute(candidate, "Id") == shape_id:
+            return candidate
+    return None
+
+
 def navigate_powerpoint(
     window_object: object,
     *,
@@ -47,6 +59,7 @@ def navigate_powerpoint(
     salt: bytes,
     window_handle: int,
     set_foreground: Foreground,
+    shape_id: int | None = None,
 ) -> str:
     """Move one exact presentation's normal editing view to one exact slide."""
     presentation = read_attribute(window_object, "Presentation")
@@ -75,9 +88,14 @@ def navigate_powerpoint(
     if _slide_is_hidden(slide):
         # Normal-view behaviour for a hidden slide was never proved live.
         return FocusOutcome.TARGET_SLIDE_MISSING.value
+    shape = _shape(slide, shape_id) if shape_id is not None else None
+    if shape_id is not None and shape is None:
+        return FocusOutcome.TARGET_SHAPE_MISSING.value
     try:
         window_object.Activate()  # type: ignore[attr-defined]
         view.GotoSlide(slide_index)  # type: ignore[attr-defined]
+        if shape is not None:
+            shape.Select()  # type: ignore[attr-defined]
     except Exception:
         return FocusOutcome.HELPER_FAILED.value
     if (
@@ -100,6 +118,7 @@ def focus_document(document: OpenDocument, request: dict[str, object]) -> str:
     if len(handles) != 1:
         return FocusOutcome.TARGET_WINDOW_MISSING.value
     slide_index = request.get("slide_index")
+    raw_shape_id = request.get("shape_id")
     salt_hex = request.get("path_salt")
     expected = request.get("expected_path_digest")
     if (
@@ -108,6 +127,14 @@ def focus_document(document: OpenDocument, request: dict[str, object]) -> str:
         or slide_index < 1
         or not isinstance(salt_hex, str)
         or not isinstance(expected, str)
+        or (
+            raw_shape_id is not None
+            and (
+                not isinstance(raw_shape_id, int)
+                or isinstance(raw_shape_id, bool)
+                or raw_shape_id < 1
+            )
+        )
     ):
         return FocusOutcome.INVALID_REQUEST.value
     if not document.object_model_window_handle:
@@ -124,4 +151,5 @@ def focus_document(document: OpenDocument, request: dict[str, object]) -> str:
         salt=bytes.fromhex(salt_hex),
         window_handle=handles[0],
         set_foreground=win32_office.set_foreground_window,
+        shape_id=raw_shape_id if isinstance(raw_shape_id, int) else None,
     )

@@ -44,6 +44,8 @@ class FigureOccurrence:
     figure: ParsedFigure
     #: 1-based slide position in the deck this occurrence was extracted from.
     slide_index: int
+    #: Exact enclosing table/chart shape; flattened ordinary text has none.
+    shape_id: int | None = None
 
     @property
     def context(self) -> str:
@@ -147,6 +149,7 @@ def extract_deck_figures(deck: DeckSnapshot) -> list[FigureOccurrence]:
                             figure_index=0,
                             figure=figures[0],
                             slide_index=slide.index + 1,
+                            shape_id=table.shape_id or None,
                         )
                     )
         for chart in slide.charts:
@@ -183,6 +186,7 @@ def extract_deck_figures(deck: DeckSnapshot) -> list[FigureOccurrence]:
                                 figure_index=figure_index,
                                 figure=figure,
                                 slide_index=slide.index + 1,
+                                shape_id=chart.shape_id or None,
                             )
                         )
     return occurrences
@@ -349,6 +353,7 @@ def verify_mappings(
                     finding_class=FindingClass.CROSSCHECK_UNRESOLVED,
                     slide=mapping.slide,
                     slide_index=occurrence.slide_index,
+                    focus_shape_id=occurrence.shape_id,
                     element=display,
                     location=f"{mapping.source_sheet}!{mapping.source_cell}",
                     message=(
@@ -368,6 +373,7 @@ def verify_mappings(
                 finding_class=FindingClass.CROSSCHECK_MISMATCH,
                 slide=mapping.slide,
                 slide_index=occurrence.slide_index,
+                focus_shape_id=occurrence.shape_id,
                 element=display,
                 location=f"{mapping.source_sheet}!{mapping.source_cell}",
                 baseline_value=display_cell_value(value),

@@ -170,6 +170,7 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
                             slide=slide.display_name,
                             slide_index=slide.index + 1,
                             location=f"slide {slide.index + 1}",
+                            focus_shape_id=table.shape_id or None,
                             element=f"table {table_index}, row {row_index}, column {col_index + 1}",
                             message=(
                                 f"{slide.display_name}: blank cell inside a populated "
@@ -219,6 +220,7 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
                             slide=slide.display_name,
                             slide_index=slide.index + 1,
                             location=f"slide {slide.index + 1}",
+                            focus_shape_id=chart.shape_id or None,
                             element=series_element,
                             baseline_value=str(len(categories)),
                             current_value=str(len(values)),
@@ -236,6 +238,7 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
                             slide=slide.display_name,
                             slide_index=slide.index + 1,
                             location=f"slide {slide.index + 1}",
+                            focus_shape_id=chart.shape_id or None,
                             element=categories[index],
                             message=(
                                 f"{slide.display_name}: {series_element!r} has "

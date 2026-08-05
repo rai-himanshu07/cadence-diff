@@ -352,6 +352,7 @@ class FocusService:
                 "sheet": seed.sheet,
                 "address": seed.address,
                 "slide_index": seed.slide_index,
+                "shape_id": seed.shape_id,
             }
         )
 

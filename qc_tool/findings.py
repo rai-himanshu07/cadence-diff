@@ -243,6 +243,10 @@ class Finding(BaseModel):
     slide: str | None = None
     slide_index: int | None = Field(default=None, ge=1)
     baseline_slide_index: int | None = Field(default=None, ge=1)
+    #: Transient producer provenance copied into the private focus sidecar
+    #: before findings are serialized to reports, JSON, or history.
+    focus_shape_id: int | None = Field(default=None, ge=1, exclude=True)
+    baseline_focus_shape_id: int | None = Field(default=None, ge=1, exclude=True)
     baseline_value: str | None = None
     current_value: str | None = None
     message: str

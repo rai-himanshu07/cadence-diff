@@ -236,9 +236,13 @@ def test_side_effect_acknowledgement_is_per_client_and_sticky(tmp_path: Path) ->
 # --------------------------------------------------------------------------
 
 
-def _document(source: Path) -> OpenDocument:
+def _document(
+    source: Path,
+    *,
+    application: FocusApplication = FocusApplication.EXCEL,
+) -> OpenDocument:
     return OpenDocument(
-        application=FocusApplication.EXCEL,
+        application=application,
         process_id=42,
         process_created=1.0,
         windows_session_id=1,
@@ -257,7 +261,7 @@ def _payload(document: OpenDocument) -> dict[str, object]:
     item = asdict(document)
     item["application"] = document.application.value
     return {
-        "application": FocusApplication.EXCEL.value,
+        "application": document.application.value,
         "documents": [item],
         "reasons": [],
     }
@@ -390,10 +394,60 @@ async def test_focus_sends_only_fixed_identity_and_never_a_path(
     assert request["schema_version"] == SCHEMA_VERSION
     assert request["sheet"] == "Summary"
     assert request["address"] == "B5"
+    assert request["shape_id"] is None
     assert request["process_id"] == 42
     assert request["window_handle"] == 101
     assert str(source) not in repr(request)
     assert source.name not in repr(request)
+
+
+async def test_powerpoint_shape_id_reaches_only_the_private_helper_request(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import zipfile
+
+    source = tmp_path / "current.pptx"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("ppt/presentation.xml", "<presentation/>")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    document = _document(source, application=FocusApplication.POWERPOINT)
+    discovery = HelperRun(
+        payload={
+            "outcome": FocusOutcome.DISCOVERED.value,
+            "discovery": _payload(document),
+        }
+    )
+    navigator, seen = _navigator([discovery, discovery, discovery])
+    service = _service(tmp_path / "data", navigator=navigator)
+    service.acknowledge(CLIENT)
+    seed = FocusTargetSeed(
+        artifact=FocusArtifact.PPT,
+        role=FocusRole.CURRENT_PPT,
+        slide_index=2,
+        shape_id=77,
+    )
+    record = _record(
+        hashes={"current_ppt": digest},
+        seeds={"F0001": (seed,)},
+    )
+    await service.bind(CLIENT, record, FocusRole.CURRENT_PPT)
+    assert service.confirm(CLIENT, record, FocusRole.CURRENT_PPT) is BindOutcome.MATCHED
+    claim = ActionClaim(
+        run_id=7,
+        finding_id="F0001",
+        role=FocusRole.CURRENT_PPT,
+        revision=0,
+        issued_at=dt.datetime.now(dt.UTC),
+    )
+    await service.focus(CLIENT, record, claim)
+    request = next(
+        item for item in seen if item.get("action") == FocusAction.FOCUS.value
+    )
+    assert request["slide_index"] == 2
+    assert request["shape_id"] == 77
+    assert str(source) not in repr(request)
 
 
 async def test_focus_refuses_when_the_feature_is_off(tmp_path: Path) -> None:

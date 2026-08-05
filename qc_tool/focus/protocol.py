@@ -49,6 +49,7 @@ class FocusOutcome(StrEnum):
     TARGET_SHEET_MISSING = "target_sheet_missing"
     TARGET_SHEET_HIDDEN = "target_sheet_hidden"
     TARGET_SLIDE_MISSING = "target_slide_missing"
+    TARGET_SHAPE_MISSING = "target_shape_missing"
     TARGET_ADDRESS_INVALID = "target_address_invalid"
     TARGET_WINDOW_MISSING = "target_window_missing"
     SIDE_EFFECT_DETECTED = "side_effect_detected"

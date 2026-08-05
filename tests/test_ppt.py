@@ -110,6 +110,10 @@ def test_text_changes_split_wording_from_figures(
 
 def test_table_diff(findings: list[Finding], manifest: FixtureManifest) -> None:
     tables = _by_class(findings, FindingClass.TABLE_VALUE_CHANGED)
+    assert tables and all(
+        finding.focus_shape_id and finding.baseline_focus_shape_id
+        for finding in tables
+    )
     p04 = manifest.defect("P04")
     unexpected = [f for f in tables if not f.expected_growth]
     assert [(f.slide, f.element, f.baseline_value, f.current_value) for f in unexpected] == [
@@ -127,6 +131,10 @@ def test_chart_diff_full_history(findings: list[Finding], manifest: FixtureManif
         for f in _by_class(findings, FindingClass.CHART_VALUE_CHANGED)
         if f.slide == "Revenue Trend"
     ]
+    assert charts and all(
+        finding.focus_shape_id and finding.baseline_focus_shape_id
+        for finding in charts
+    )
     p05 = manifest.defect("P05")
     unexpected = [f for f in charts if not f.expected_growth]
     assert len(unexpected) == 1

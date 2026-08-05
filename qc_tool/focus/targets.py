@@ -153,11 +153,18 @@ def _excel_seed(role: FocusRole, sheet: str | None, address: str | None) -> Focu
     )
 
 
-def _ppt_seed(role: FocusRole, slide_index: int | None) -> FocusTargetSeed | None:
+def _ppt_seed(
+    role: FocusRole,
+    slide_index: int | None,
+    shape_id: int | None = None,
+) -> FocusTargetSeed | None:
     if slide_index is None:
         return None
     return FocusTargetSeed(
-        artifact=FocusArtifact.PPT, role=role, slide_index=slide_index
+        artifact=FocusArtifact.PPT,
+        role=role,
+        slide_index=slide_index,
+        shape_id=shape_id,
     )
 
 
@@ -182,10 +189,28 @@ def _seeds_for(finding: Finding, rule: TargetRule) -> list[FocusTargetSeed]:
         case TargetRule.EXCEL_SHEET_BASELINE:
             seeds.append(_excel_seed(FocusRole.BASELINE_EXCEL, finding.sheet, None))
         case TargetRule.PPT_MATCHED_SLIDE:
-            seeds.append(_ppt_seed(FocusRole.CURRENT_PPT, finding.slide_index))
-            seeds.append(_ppt_seed(FocusRole.BASELINE_PPT, finding.baseline_slide_index))
+            seeds.append(
+                _ppt_seed(
+                    FocusRole.CURRENT_PPT,
+                    finding.slide_index,
+                    finding.focus_shape_id,
+                )
+            )
+            seeds.append(
+                _ppt_seed(
+                    FocusRole.BASELINE_PPT,
+                    finding.baseline_slide_index,
+                    finding.baseline_focus_shape_id,
+                )
+            )
         case TargetRule.PPT_CURRENT_SLIDE:
-            seeds.append(_ppt_seed(FocusRole.CURRENT_PPT, finding.slide_index))
+            seeds.append(
+                _ppt_seed(
+                    FocusRole.CURRENT_PPT,
+                    finding.slide_index,
+                    finding.focus_shape_id,
+                )
+            )
         case TargetRule.PPT_SLIDE_ADDED:
             if finding.baseline_slide_index is not None:
                 raise FocusTargetContractError(
@@ -203,7 +228,13 @@ def _seeds_for(finding: Finding, rule: TargetRule) -> list[FocusTargetSeed]:
             if qualified is not None:
                 sheet, address = qualified
                 seeds.append(_excel_seed(FocusRole.CURRENT_EXCEL, sheet, address))
-            seeds.append(_ppt_seed(FocusRole.CURRENT_PPT, finding.slide_index))
+            seeds.append(
+                _ppt_seed(
+                    FocusRole.CURRENT_PPT,
+                    finding.slide_index,
+                    finding.focus_shape_id,
+                )
+            )
     return [seed for seed in seeds if seed is not None]
 
 

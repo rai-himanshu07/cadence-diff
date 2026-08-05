@@ -52,6 +52,14 @@ def test_a_real_run_records_a_versioned_sidecar(cycle_run) -> None:
     assert record.focus_targets.usable
     identifiers = {finding.finding_id for finding in record.findings}
     assert set(record.focus_targets.targets) <= identifiers
+    ppt_shape_targets = [
+        seed
+        for seeds in record.focus_targets.targets.values()
+        for seed in seeds
+        if seed.artifact.value == "ppt" and seed.shape_id is not None
+    ]
+    assert ppt_shape_targets
+    assert all(seed.shape_id and seed.shape_id > 0 for seed in ppt_shape_targets)
 
 
 def test_targets_never_reference_an_omitted_finding(cycle_run) -> None:

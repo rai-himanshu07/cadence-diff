@@ -804,6 +804,28 @@ def _chart_findings(
     return findings
 
 
+def _shape_findings(
+    findings: list[Finding],
+    *,
+    baseline_shape_id: int | None = None,
+    current_shape_id: int | None = None,
+) -> list[Finding]:
+    baseline_shape_id = (
+        baseline_shape_id
+        if baseline_shape_id is not None and baseline_shape_id > 0
+        else None
+    )
+    current_shape_id = (
+        current_shape_id
+        if current_shape_id is not None and current_shape_id > 0
+        else None
+    )
+    for finding in findings:
+        finding.baseline_focus_shape_id = baseline_shape_id
+        finding.focus_shape_id = current_shape_id
+    return findings
+
+
 def diff_slide_elements(
     baseline: SlideContent,
     current: SlideContent,
@@ -820,6 +842,7 @@ def diff_slide_elements(
                 finding_class=FindingClass.PPT_TABLE_STRUCTURE_CHANGED,
                 slide=display,
                 element=_table_label(table),
+                baseline_focus_shape_id=table.shape_id or None,
                 message=f"{display}: table {_table_label(table)!r} removed",
             )
         )
@@ -830,25 +853,32 @@ def diff_slide_elements(
                 finding_class=FindingClass.PPT_TABLE_STRUCTURE_CHANGED,
                 slide=display,
                 element=_table_label(table),
+                focus_shape_id=table.shape_id or None,
                 message=f"{display}: table {_table_label(table)!r} added",
             )
         )
     for baseline_table, current_table in matching.table_pairs:
         findings.extend(
-            _table_findings(
-                current,
-                baseline_table,
-                current_table,
-                profile,
+            _shape_findings(
+                _table_findings(
+                    current,
+                    baseline_table,
+                    current_table,
+                    profile,
+                ),
+                baseline_shape_id=baseline_table.shape_id,
+                current_shape_id=current_table.shape_id,
             )
         )
-    for _baseline_table, current_table in matching.reordered_tables:
+    for baseline_table, current_table in matching.reordered_tables:
         findings.append(
             Finding(
                 artifact="ppt",
                 finding_class=FindingClass.PPT_TABLE_STRUCTURE_CHANGED,
                 slide=display,
                 element=_table_label(current_table),
+                focus_shape_id=current_table.shape_id or None,
+                baseline_focus_shape_id=baseline_table.shape_id or None,
                 message=f"{display}: table {_table_label(current_table)!r} reordered",
             )
         )
@@ -860,6 +890,7 @@ def diff_slide_elements(
                 finding_class=FindingClass.PPT_CHART_STRUCTURE_CHANGED,
                 slide=display,
                 element=_chart_label(chart),
+                baseline_focus_shape_id=chart.shape_id or None,
                 message=f"{display}: chart {_chart_label(chart)!r} removed",
             )
         )
@@ -870,18 +901,27 @@ def diff_slide_elements(
                 finding_class=FindingClass.PPT_CHART_STRUCTURE_CHANGED,
                 slide=display,
                 element=_chart_label(chart),
+                focus_shape_id=chart.shape_id or None,
                 message=f"{display}: chart {_chart_label(chart)!r} added",
             )
         )
     for baseline_chart, current_chart in matching.chart_pairs:
-        findings.extend(_chart_findings(current, baseline_chart, current_chart, profile))
-    for _baseline_chart, current_chart in matching.reordered_charts:
+        findings.extend(
+            _shape_findings(
+                _chart_findings(current, baseline_chart, current_chart, profile),
+                baseline_shape_id=baseline_chart.shape_id,
+                current_shape_id=current_chart.shape_id,
+            )
+        )
+    for baseline_chart, current_chart in matching.reordered_charts:
         findings.append(
             Finding(
                 artifact="ppt",
                 finding_class=FindingClass.PPT_CHART_STRUCTURE_CHANGED,
                 slide=display,
                 element=_chart_label(current_chart),
+                focus_shape_id=current_chart.shape_id or None,
+                baseline_focus_shape_id=baseline_chart.shape_id or None,
                 message=f"{display}: chart {_chart_label(current_chart)!r} reordered",
             )
         )

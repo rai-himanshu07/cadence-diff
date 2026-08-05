@@ -21,9 +21,24 @@ class FakeTransition:
         self.Hidden = hidden
 
 
+class FakeShape:
+    def __init__(self, shape_id: int) -> None:
+        self.Id = shape_id
+        self.selected = False
+
+    def Select(self) -> None:
+        self.selected = True
+
+
 class FakeSlide:
-    def __init__(self, *, hidden: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        hidden: bool = False,
+        shapes: list[FakeShape] | None = None,
+    ) -> None:
         self.SlideShowTransition = FakeTransition(MSO_TRUE if hidden else 0)
+        self.Shapes = FakeCollection(list(shapes or []))
 
 
 class FakeCollection:
@@ -94,7 +109,13 @@ def _window(
     return FakeDocumentWindow(presentation, app, view_type=view_type), presentation
 
 
-def _navigate(window: FakeDocumentWindow, *, slide_index: int = 2, foreground=lambda _h: True):
+def _navigate(
+    window: FakeDocumentWindow,
+    *,
+    slide_index: int = 2,
+    shape_id: int | None = None,
+    foreground=lambda _h: True,
+):
     return navigate_powerpoint(
         window,
         slide_index=slide_index,
@@ -102,6 +123,7 @@ def _navigate(window: FakeDocumentWindow, *, slide_index: int = 2, foreground=la
         salt=SALT,
         window_handle=201,
         set_foreground=foreground,
+        shape_id=shape_id,
     )
 
 
@@ -110,6 +132,26 @@ def test_focus_activates_the_window_and_moves_the_normal_view() -> None:
     assert _navigate(window) == FocusOutcome.FOCUSED.value
     assert window.activated
     assert window.View.visited == [2]
+
+
+def test_shape_focus_enumerates_by_id_then_selects_exact_shape() -> None:
+    first = FakeShape(41)
+    target = FakeShape(77)
+    window, _presentation = _window(
+        slides=[FakeSlide(), FakeSlide(shapes=[first, target]), FakeSlide()]
+    )
+    assert _navigate(window, shape_id=77) == FocusOutcome.FOCUSED.value
+    assert window.View.visited == [2]
+    assert not first.selected
+    assert target.selected
+
+
+def test_missing_shape_refuses_before_navigation() -> None:
+    window, _presentation = _window(
+        slides=[FakeSlide(), FakeSlide(shapes=[FakeShape(41)]), FakeSlide()]
+    )
+    assert _navigate(window, shape_id=77) == FocusOutcome.TARGET_SHAPE_MISSING.value
+    assert window.View.visited == []
 
 
 def test_wrong_presentation_is_refused_even_with_the_right_window() -> None:

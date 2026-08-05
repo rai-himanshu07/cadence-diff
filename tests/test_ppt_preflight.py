@@ -43,12 +43,18 @@ def test_ppt_preflight_detects_intrinsic_defects() -> None:
                 index=0,
                 title="Executive Summary",
                 texts=["Reporting cycle Jun-26", "DRAFT — replace before issue"],
-                tables=[TableContent(rows=[["Region", "Jun-26"], ["North", ""]])],
+                tables=[
+                    TableContent(
+                        rows=[["Region", "Jun-26"], ["North", ""]],
+                        shape_id=101,
+                    )
+                ],
                 charts=[
                     ChartContent(
                         chart_type="LINE",
                         categories=["May-26", "Jun-26"],
                         series=[("Revenue", [100.0])],
+                        shape_id=102,
                     )
                 ],
                 shape_count=4,
@@ -76,3 +82,15 @@ def test_ppt_preflight_detects_intrinsic_defects() -> None:
         FindingClass.PPT_TABLE_BLANK,
         FindingClass.PPT_CHART_LENGTH_MISMATCH,
     } <= classes
+    table = next(
+        finding
+        for finding in result.findings
+        if finding.finding_class is FindingClass.PPT_TABLE_BLANK
+    )
+    chart = next(
+        finding
+        for finding in result.findings
+        if finding.finding_class is FindingClass.PPT_CHART_LENGTH_MISMATCH
+    )
+    assert table.focus_shape_id == 101
+    assert chart.focus_shape_id == 102
