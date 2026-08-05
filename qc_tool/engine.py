@@ -41,6 +41,7 @@ from qc_tool.excel.dependency import (
 )
 from qc_tool.excel.diff_structure import diff_workbook_structure
 from qc_tool.excel.diff_values import diff_workbook_values
+from qc_tool.excel.diff_vba import diff_workbook_vba, vba_coverage
 from qc_tool.excel.formulas import diff_workbook_formulas, formula_text_compatible
 from qc_tool.excel.interaction import (
     conditional_style_coverage,
@@ -675,6 +676,9 @@ def run_qc(
             )
         )
         result.coverage.append(defined_name_scope_coverage(base_wb, curr_wb))
+        vba_findings = diff_workbook_vba(base_wb, curr_wb)
+        findings.extend(vba_findings)
+        result.coverage.append(vba_coverage(base_wb, curr_wb))
         if disclosure := _pair_formula_disclosure(base_wb, curr_wb):
             result.disclosures.append(disclosure)
         report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)

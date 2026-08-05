@@ -24,6 +24,7 @@ from qc_tool.excel.dependency import (
     build_dependency_graph,
     limit_impacts,
 )
+from qc_tool.excel.diff_vba import vba_coverage
 from qc_tool.excel.formulas import diff_workbook_formulas
 from qc_tool.excel.interaction import (
     conditional_style_coverage,
@@ -437,6 +438,7 @@ def preflight_workbook(
         )
     )
     result.coverage.append(defined_name_scope_coverage(workbook))
+    result.coverage.append(vba_coverage(workbook))
 
     formula_start = len(result.findings)
     if workbook.formula_presence_available:

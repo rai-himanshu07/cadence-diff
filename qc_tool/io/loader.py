@@ -59,6 +59,7 @@ from qc_tool.io.ooxml_worksheet import (
     WorksheetMetadata,
     parse_ooxml_worksheet_metadata,
 )
+from qc_tool.io.vba import VbaProjectScan, VbaReadError, scan_vba_project
 from qc_tool.io.xlsb_formula import (
     XlsbFormulaScan,
     XlsbFormulaScanError,
@@ -348,6 +349,7 @@ def _load_ooxml_oracle(
             continue
         snapshot.named_ranges.append(NamedRange(name=name, target=str(defined.attr_text)))
     _apply_defined_name_scope(snapshot, data)
+    _apply_vba(snapshot, data)
 
     for sheet_name in wb_formulas.sheetnames:
         check_cancelled(cancellation_token)
@@ -754,6 +756,7 @@ def _load_ooxml_streaming(
                 continue
             snapshot.named_ranges.append(NamedRange(name=name, target=str(defined.attr_text)))
         _apply_defined_name_scope(snapshot, data)
+        _apply_vba(snapshot, data)
 
         interaction_details: list[str] = []
         conditional_style_details: list[str] = []
@@ -850,6 +853,13 @@ def _apply_defined_name_scope(snapshot: WorkbookSnapshot, data: bytes) -> None:
     snapshot.defined_name_scope_available = scan.available
     snapshot.defined_name_scope_detail = scan.detail
     snapshot.named_ranges.extend(scan.sheet_scoped)
+
+
+def _apply_vba(snapshot: WorkbookSnapshot, data: bytes) -> None:
+    try:
+        snapshot.vba = scan_vba_project(data)
+    except VbaReadError as exc:  # defensive: the scan already fails closed
+        snapshot.vba = VbaProjectScan(present=True, available=False, detail=str(exc))
 
 
 def _extract_ooxml_risks(data: bytes) -> list[WorkbookRisk]:
@@ -1046,6 +1056,7 @@ def _load_xlsb(
         ),
         intrinsic_risks=_xlsb_risks(formula_scan),
     )
+    _apply_vba(snapshot, data)
     with open_xlsb(io.BytesIO(data)) as wb:
         for sheet_name in wb.sheets:
             check_cancelled(cancellation_token)

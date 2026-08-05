@@ -39,6 +39,7 @@ class FindingClass(StrEnum):
     SHEET_REMOVED = "sheet_removed"
     HIDDEN_CHANGED = "hidden_changed"
     NAMED_RANGE_CHANGED = "named_range_changed"
+    VBA_MODULE_CHANGED = "vba_module_changed"
     TABLE_STRUCTURE_CHANGED = "table_structure_changed"
     DATA_VALIDATION_CHANGED = "data_validation_changed"
     CONDITIONAL_FORMAT_CHANGED = "conditional_format_changed"

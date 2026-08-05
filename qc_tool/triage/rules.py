@@ -39,6 +39,8 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.FORMULA_MISSING: Severity.CRITICAL,
     FindingClass.EXTERNAL_LINK: Severity.CRITICAL,
     FindingClass.ACTIVE_CONTENT: Severity.CRITICAL,
+    #: Macro logic can rewrite any figure in the deliverable.
+    FindingClass.VBA_MODULE_CHANGED: Severity.CRITICAL,
     FindingClass.NAMED_RANGE_INVALID: Severity.CRITICAL,
     FindingClass.CHART_REFERENCE_INVALID: Severity.CRITICAL,
     FindingClass.PIVOT_SOURCE_INVALID: Severity.CRITICAL,

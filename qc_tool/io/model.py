@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TypeGuard
 
+from qc_tool.io.vba import VbaProjectScan
+
 CellValue = str | float | int | bool | dt.date | dt.datetime | None
 SerializedCellValue = str | float | int | bool | None
 
@@ -381,6 +383,7 @@ class WorkbookSnapshot:
     conditional_format_style_detail: str = ""
     defined_name_scope_available: bool = False
     defined_name_scope_detail: str = ""
+    vba: VbaProjectScan = field(default_factory=VbaProjectScan)
     sheets: list[SheetSnapshot] = field(default_factory=list)
     named_ranges: list[NamedRange] = field(default_factory=list)
     formula_ranges: list[FormulaRangeDescriptor] = field(default_factory=list)

@@ -107,6 +107,8 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
     FindingClass.CALCULATION_MODE: TargetRule.NONE,
     FindingClass.EXTERNAL_LINK: TargetRule.NONE,
     FindingClass.ACTIVE_CONTENT: TargetRule.NONE,
+    #: A VBA module has no cell or slide the analyst could be taken to.
+    FindingClass.VBA_MODULE_CHANGED: TargetRule.NONE,
     FindingClass.NAMED_RANGE_INVALID: TargetRule.NONE,
     FindingClass.CHART_REFERENCE_INVALID: TargetRule.NONE,
     FindingClass.CHART_LENGTH_MISMATCH: TargetRule.NONE,
