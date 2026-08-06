@@ -1321,6 +1321,8 @@ def _render_result_view(
                 else None,
                 comment=value,
             )
+        # A comment does not regroup, but it does change the reviewed marker.
+        refilter()
         ui.notify(f"{finding_id}: comment saved")
 
     findings_table.on("sev", on_severity)
