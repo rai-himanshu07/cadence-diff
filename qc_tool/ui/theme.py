@@ -426,6 +426,9 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 .annotcomment { flex: 1; }
 .overridden { font-size: var(--fs-meta); letter-spacing: 0.06em; color: var(--info);
   text-transform: uppercase; margin-left: 0.4rem; }
+/* An analyst note without a severity change still counts as a decision. */
+.reviewed { font-size: var(--fs-meta); letter-spacing: 0.06em; color: var(--ink-soft);
+  text-transform: uppercase; margin-left: 0.4rem; white-space: nowrap; }
 .rerunbanner { border-left: 3px solid var(--info); background: var(--panel);
   border-top: 1px solid var(--line); border-right: 1px solid var(--line);
   border-bottom: 1px solid var(--line); border-radius: 0 4px 4px 0;
@@ -664,6 +667,9 @@ REVIEW_GROUPS_BODY_SLOT = """
     ><span class="mono">{{ props.row.location }}</span></q-td>
   <q-td key="members" :props="props" class="groupcount">{{ props.row.members }}</q-td>
   <q-td key="message" :props="props">{{ props.row.message }}
+    <span v-if="props.row.reviewed" class="reviewed"
+      :title="props.row.reviewed + ' of ' + props.row.members + ' reviewed'"
+      >reviewed {{ props.row.reviewed }}/{{ props.row.members }}</span>
     <span v-if="props.row.cap_degraded" class="capbadge">
       retained details; coverage degraded
     </span>
@@ -678,7 +684,8 @@ REVIEW_MEMBER_ROWS_SLOT = """
   <q-td key="severity" :props="props">
     <span :class="'sevdot sev-' + props.row.severity"></span
     ><span class="sevtext">{{ props.row.severity }}</span
-    ><span v-if="props.row.overridden" class="overridden">analyst</span>
+    ><span v-if="props.row.overridden" class="overridden">analyst</span
+    ><span v-else-if="props.row.comment" class="reviewed">note</span>
   </q-td>
   <q-td key="class" :props="props" class="mono c-class">{{
     props.row.class.replace(/_/g, ' ') }}</q-td>
@@ -699,7 +706,8 @@ FINDINGS_BODY_SLOT = """
   <q-td key="severity" :props="props">
     <span :class="'sevdot sev-' + props.row.severity"></span
     ><span class="sevtext">{{ props.row.severity }}</span
-    ><span v-if="props.row.overridden" class="overridden">analyst</span>
+    ><span v-if="props.row.overridden" class="overridden">analyst</span
+    ><span v-else-if="props.row.comment" class="reviewed">note</span>
   </q-td>
   <q-td key="class" :props="props" class="mono">{{ props.row.class }}</q-td>
   <q-td key="where" :props="props">{{ props.row.where }}</q-td>

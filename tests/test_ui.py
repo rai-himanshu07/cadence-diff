@@ -16,6 +16,7 @@ import qc_tool.ui.app as app_module
 from qc_tool.config.profile import DeliverableProfile, save_profile
 from qc_tool.coverage import QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
+from qc_tool.engine import QCRunResult
 from qc_tool.findings import (
     Finding,
     FindingClass,
@@ -30,7 +31,7 @@ from qc_tool.findings import (
 from qc_tool.history.run_state import RunStateRecord, RunStateStore, RunStatus
 from qc_tool.history.store import RunHistory
 from qc_tool.progress import CancellationToken, ProgressEvent, RunCancelled, RunPhase
-from qc_tool.review import build_review_groups
+from qc_tool.review import build_pattern_groups, build_review_groups
 from qc_tool.security import secure_managed_tree
 from qc_tool.server_config import NetworkMode
 from qc_tool.ui.app import (
@@ -875,3 +876,34 @@ async def test_group_review_survives_the_panel_refresh_it_triggers(
         user.find("Apply review").click()
 
     assert not caplog.records, [record.getMessage() for record in caplog.records]
+
+
+def test_comment_only_review_is_visible_in_the_queue(qc_result: QCRunResult) -> None:
+    """Choosing "keep" records a decision without setting severity_overridden.
+
+    Nothing in the queue used to indicate that, so the decision looked lost.
+    """
+    findings = [finding.model_copy(deep=True) for finding in qc_result.findings]
+    findings[0].analyst_comment = "checked against the source pack"
+
+    rows = _review_group_rows(build_pattern_groups(findings))
+    reviewed = {str(row["id"]): int(str(row["reviewed"])) for row in rows}
+    members = {str(row["id"]): int(str(row["members"])) for row in rows}
+
+    assert any(reviewed.values()), "a comment-only decision must mark its group reviewed"
+    assert all(reviewed[key] <= members[key] for key in reviewed)
+    assert sum(reviewed.values()) == 1
+
+
+def test_untouched_findings_are_not_marked_reviewed(qc_result: QCRunResult) -> None:
+    findings = [finding.model_copy(deep=True) for finding in qc_result.findings]
+
+    rows = _review_group_rows(build_pattern_groups(findings))
+
+    assert all(row["reviewed"] == 0 for row in rows)
+
+
+def test_row_slots_show_a_note_without_a_severity_override() -> None:
+    for slot in (app_module.REVIEW_MEMBER_ROWS_SLOT, app_module.FINDINGS_BODY_SLOT):
+        assert 'v-else-if="props.row.comment"' in slot
+    assert 'v-if="props.row.reviewed"' in app_module.REVIEW_GROUPS_BODY_SLOT

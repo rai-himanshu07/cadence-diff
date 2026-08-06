@@ -528,6 +528,11 @@ def _review_group_rows(
             ),
             "element": group.element,
             "why": reasons.get(group.group_id, ""),
+            "reviewed": sum(
+                1
+                for member in group.members
+                if member.severity_overridden or member.analyst_comment
+            ),
             "sel": False,
             "cap_degraded": any(
                 member.finding_class is FindingClass.FINDINGS_CAPPED
