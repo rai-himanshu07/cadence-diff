@@ -55,6 +55,30 @@ separate speaker notes, and visible chart-label anchors for Excel reconciliation
 Unsupported representations degrade the relevant check instead of becoming a
 false pass.
 
+Workbook state outside the grid is compared too, each behind its own coverage
+row. **Defined names** are compared with explicit scope, so the same name in two
+sheets stays two identities and neither shadows the other. **VBA modules** are
+inventoried and their source text diffed for XLSM, XLSB, and any XLSX carrying a
+project; findings report module name, line counts, changed line ranges, and a
+digest, never the macro source, and no macro is ever executed. **Cell comments**,
+**Power Query definitions**, and **data connections** are compared as content,
+separately from the existing presence/risk detection. Connections are modelled
+as a fixed classification plus a target digest — the connection string, URL, and
+command text are never read into a finding, report, or log — and nothing is
+fetched and no query is run.
+
+The review queue is ordered by deterministic guided priority, scored from
+severity, materiality, temporal position, provenance, downstream impacts,
+population size, and story membership, with the cited counts shown for each
+decision. Ordering is a permutation: it may de-emphasize, never hide. Decisions
+already made — waived, reviewed, expected — defer below everything still open.
+
+Excel-to-PowerPoint coverage states its population explicitly: claims that were
+read, and surfaces that could not be. A figure rendered into a picture or an
+embedded object is counted as unavailable and its slides are named, rather than
+being dropped from the denominator. Rendered-visual comparison and OCR remain
+deliberately unavailable.
+
 Modern Excel spill references (`B2#` / `ANCHORARRAY`) use only declared
 array-formula extents from the OOXML anchor. Implicit intersection (`@`) is
 resolved only when the host cell makes one result unambiguous. Missing or

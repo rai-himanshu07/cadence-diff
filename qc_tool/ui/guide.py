@@ -546,6 +546,51 @@ def render_guide() -> None:
                     "including XLSB extents, degrade reference coverage. Unsupported formulas, chart parts, "
                     "rule families, or theme styles are disclosed separately."
                 )
+                _paragraph(
+                    "Workbook metadata beyond the grid is compared too, each with its own "
+                    "coverage row so a limitation is never silent."
+                )
+                _table(
+                    ["Check", "What it compares"],
+                    [
+                        [
+                            "excel-defined-name-scope",
+                            "Workbook-scoped and sheet-scoped defined names. The same name "
+                            "in two sheets stays two separate identities, shown as "
+                            "Sheet!Name. XLSB reports unavailable because its workbook part "
+                            "is binary.",
+                        ],
+                        [
+                            "excel-vba",
+                            "VBA module inventory and module source text, for XLSM, XLSB, "
+                            "and any XLSX carrying a project. Findings carry the module "
+                            "name, line counts, changed line ranges, and a digest \u2014 never "
+                            "the macro source. No macro is ever executed.",
+                        ],
+                        [
+                            "excel-comments",
+                            "Cell comments and threaded notes, by sheet and cell.",
+                        ],
+                        [
+                            "excel-power-query",
+                            "Power Query definitions per named query. If the mashup cannot "
+                            "be opened, coverage degrades and comparison falls back to a "
+                            "definition digest, so a changed query is still detected.",
+                        ],
+                        [
+                            "excel-connections",
+                            "Data connections by name, kind, and target digest. The "
+                            "connection string, URL, and command text are never read into a "
+                            "finding, report, or log. Nothing is fetched and no query runs.",
+                        ],
+                    ],
+                )
+                _callout(
+                    "A locked VBA project is still compared",
+                    "Project protection restricts the Excel editor; it does not encrypt the "
+                    "module streams. The run reports the project as protected and still "
+                    "compares its text.",
+                )
 
             with _guide_section("review", "Review findings in one place"):
                 _paragraph(
@@ -557,6 +602,9 @@ def render_guide() -> None:
                 _list(
                     [
                         "Filter by severity or free text, and read the capability status before concluding a run is clean.",
+                        "The queue is ordered by evidence, not by sheet position. The detail panel says <em>prioritized because</em> and names the counts it scored on: severity, materiality, historical position, provenance, downstream impacts, population size, and whether a story explains it.",
+                        "Ordering only reorders. Every review item and every atomic finding stays reachable; nothing is hidden.",
+                        "Waived, already-reviewed, and expected-growth decisions sink below everything still open, because they need no new judgement.",
                         "Pattern review-item counts are analyst decisions; atomic-finding counts are the underlying evidence. Spatial review counts remain a compatibility metric.",
                         "Select a review item to see its evidence axes, baseline/current values, impacts, and nearby cells in the detail panel.",
                         "Open a group for paged atomic members, or use the Atomic evidence view for every individual finding.",
@@ -572,6 +620,31 @@ def render_guide() -> None:
                     "Expected findings are hidden by default",
                     "Enable Expected in the severity filter when auditing cadence growth or waiver application.",
                 )
+                _table(
+                    ["Group severity", "What is recorded"],
+                    [
+                        [
+                            "keep",
+                            "Severity is left exactly as the engine set it. With a comment "
+                            "this is a note, not a re-classification: counts and exported "
+                            "severities do not move.",
+                        ],
+                        [
+                            "any severity",
+                            "An explicit analyst disposition. Re-picking the value it "
+                            "already has is still recorded, as a confirmation.",
+                        ],
+                    ],
+                )
+                _list(
+                    [
+                        "A reviewed group row shows <strong>reviewed N/M</strong>: how many members carry an override or a note. Member and atomic rows show <strong>analyst</strong> for a severity override and <strong>note</strong> for a comment alone.",
+                        "The toast reports how many members actually changed. Under Unreviewed only a smaller number means members you had already decided were skipped.",
+                        "Neither mode erases anything: keep never clears an override, and a blank comment never clears a comment. Clear a note from the row editor in Atomic evidence.",
+                        "Severity is part of what groups findings, so changing it regroups them. Under Unreviewed only a group can split, leaving members you already decided in their own group.",
+                        "Annotations belong to the run. A Re-QC starts a new run with no annotations; the delta reports resolved, new, and persisting.",
+                    ]
+                )
 
             with _guide_section("mappings", "Excel to PowerPoint mappings"):
                 _paragraph(
@@ -585,9 +658,17 @@ def render_guide() -> None:
                         "Confirm only when the workbook cell is the intended source, not merely the same number.",
                         "A <strong>near match</strong> is useful for locating drift but is not a successful reconciliation.",
                         "Coverage distinguishes eligible, mapped, verified, mismatched, unresolved, and unmapped figures.",
+                        "Coverage also counts <strong>unavailable</strong> surfaces: a figure rendered into a picture or an embedded object is a real claim nobody here can read, so it is counted and named rather than dropped from the denominator.",
                         "Visible native chart labels use chart, series, and category anchors and can be confirmed like text or table figures.",
                         "Re-run Final-package QC after confirmations to verify persisted mappings independently.",
                     ]
+                )
+                _callout(
+                    "A clean mapping result still has a population",
+                    "If any slide carries a rasterized or embedded surface, crosscheck coverage "
+                    "degrades and names the affected slides. Read that before treating the deck "
+                    "as fully reconciled.",
+                    warning=True,
                 )
 
             with _guide_section("reqc", "History and Re-QC"):
