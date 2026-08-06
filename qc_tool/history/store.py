@@ -15,6 +15,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from qc_tool.config.profile import (
+    DeliverableProfile,
+    canonical_profile_json,
+    profile_sha256,
+)
 from qc_tool.coverage import CoverageItem, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion
 from qc_tool.engine import QCRunResult
@@ -25,6 +30,12 @@ from qc_tool.focus.model import (
     FocusTargetSidecar,
     decode_focus_targets,
     encode_focus_targets,
+)
+from qc_tool.history.review_state import (
+    AnnotationLineage,
+    CarryForwardCandidate,
+    RunFinalizedError,
+    RunSignoff,
 )
 from qc_tool.review import build_pattern_groups, build_review_groups
 from qc_tool.review import count_pattern_groups as count_pattern_review_groups
@@ -58,6 +69,8 @@ CREATE TABLE IF NOT EXISTS runs (
     story_counts TEXT NOT NULL DEFAULT '{}',
     comparison_scope TEXT NOT NULL DEFAULT '{}',
     focus_targets TEXT NOT NULL DEFAULT '{}'
+    ,profile_snapshot TEXT NOT NULL DEFAULT 'null'
+    ,profile_sha256 TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS annotations (
     run_id INTEGER NOT NULL,
@@ -66,6 +79,33 @@ CREATE TABLE IF NOT EXISTS annotations (
     comment TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL,
     PRIMARY KEY (run_id, finding_id)
+);
+CREATE TABLE IF NOT EXISTS run_signoffs (
+    run_id INTEGER PRIMARY KEY,
+    finalized_at TEXT NOT NULL,
+    acknowledgements TEXT NOT NULL DEFAULT '[]',
+    review_state_digest TEXT NOT NULL,
+    profile_sha256 TEXT NOT NULL,
+    attestation_path TEXT NOT NULL,
+    attestation_sha256 TEXT NOT NULL,
+    report_paths TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS annotation_lineage (
+    run_id INTEGER NOT NULL,
+    finding_id TEXT NOT NULL,
+    source_run_id INTEGER NOT NULL,
+    source_finding_id TEXT NOT NULL,
+    evidence_version INTEGER NOT NULL,
+    evidence_digest TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, finding_id)
+);
+CREATE TABLE IF NOT EXISTS review_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    active_seconds REAL
 );
 """
 
@@ -99,6 +139,12 @@ _MIGRATIONS = {
     "focus_targets": (
         "ALTER TABLE runs ADD COLUMN focus_targets TEXT NOT NULL DEFAULT '{}'"
     ),
+    "profile_snapshot": (
+        "ALTER TABLE runs ADD COLUMN profile_snapshot TEXT NOT NULL DEFAULT 'null'"
+    ),
+    "profile_sha256": (
+        "ALTER TABLE runs ADD COLUMN profile_sha256 TEXT NOT NULL DEFAULT ''"
+    ),
 }
 
 
@@ -130,6 +176,9 @@ class RunRecord:
     findings: list[Finding] = field(default_factory=list)
     #: Private desktop-focus locators; never exported, reported, or attested.
     focus_targets: FocusTargetSidecar = field(default_factory=FocusTargetSidecar)
+    profile_snapshot: DeliverableProfile | None = None
+    profile_sha256: str = ""
+    signoff: RunSignoff | None = None
 
 
 def sha256_file(path: Path) -> str:
@@ -185,6 +234,7 @@ class RunHistory:
         file_paths: dict[str, str] | None = None,
         rerun_of: int | None = None,
         focus_targets: dict[str, tuple[FocusTargetSeed, ...]] | None = None,
+        profile_snapshot: DeliverableProfile | None = None,
     ) -> int:
         started_at = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         counts = {sev.value: count for sev, count in result.counts.items()}
@@ -208,6 +258,16 @@ class RunHistory:
         findings_payload = json.dumps(
             [finding.model_dump(mode="json") for finding in result.findings]
         )
+        profile_payload = (
+            canonical_profile_json(profile_snapshot)
+            if profile_snapshot is not None
+            else "null"
+        )
+        profile_digest = (
+            profile_sha256(profile_snapshot)
+            if profile_snapshot is not None
+            else ""
+        )
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -216,8 +276,9 @@ class RunHistory:
                     disclosures, verified_crosschecks, findings, report_paths,
                     file_paths, rerun_of, mode, coverage, mapping_coverage,
                     mapping_suggestions, review_counts, pattern_review_counts,
-                    story_counts, comparison_scope, focus_targets
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    story_counts, comparison_scope, focus_targets,
+                    profile_snapshot, profile_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     started_at,
@@ -250,6 +311,8 @@ class RunHistory:
                         if focus_targets
                         else EMPTY_SIDECAR_JSON
                     ),
+                    profile_payload,
+                    profile_digest,
                 ),
             )
             run_id = cursor.lastrowid
@@ -296,6 +359,12 @@ class RunHistory:
             ],
             findings=findings,
             focus_targets=decode_focus_targets(row["focus_targets"]),
+            profile_snapshot=(
+                DeliverableProfile.model_validate(json.loads(row["profile_snapshot"]))
+                if json.loads(row["profile_snapshot"]) is not None
+                else None
+            ),
+            profile_sha256=row["profile_sha256"],
         )
 
     def list_runs(self, limit: int = 50, *, include_archived: bool = True) -> list[RunRecord]:
@@ -304,7 +373,11 @@ class RunHistory:
             rows = conn.execute(
                 f"SELECT * FROM runs{clause} ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
-        return [self._record_from_row(row, with_findings=False) for row in rows]
+        records = [self._record_from_row(row, with_findings=False) for row in rows]
+        signoffs = self._signoffs_by_run(record.run_id for record in records)
+        for record in records:
+            record.signoff = signoffs.get(record.run_id)
+        return records
 
     def set_archived(self, run_ids: Iterable[int], archived: bool) -> int:
         """Retire or restore runs without touching their recorded evidence."""
@@ -335,15 +408,38 @@ class RunHistory:
             rows = conn.execute(
                 f"SELECT report_paths FROM runs WHERE id IN ({placeholders})", ids
             ).fetchall()
+            signoff_rows = conn.execute(
+                f"""
+                SELECT report_paths, attestation_path
+                FROM run_signoffs WHERE run_id IN ({placeholders})
+                """,
+                ids,
+            ).fetchall()
             cursor = conn.execute(
                 f"DELETE FROM runs WHERE id IN ({placeholders})", ids
             )
             conn.execute(
                 f"DELETE FROM annotations WHERE run_id IN ({placeholders})", ids
             )
+            conn.execute(
+                f"DELETE FROM annotation_lineage WHERE run_id IN ({placeholders})",
+                ids,
+            )
+            conn.execute(
+                f"DELETE FROM run_signoffs WHERE run_id IN ({placeholders})", ids
+            )
+            conn.execute(
+                f"DELETE FROM review_sessions WHERE run_id IN ({placeholders})", ids
+            )
             deleted = cursor.rowcount
         for row in rows:
             for raw in json.loads(row["report_paths"]).values():
+                _remove_managed_report(Path(raw), root)
+        for row in signoff_rows:
+            for raw in (
+                *json.loads(row["report_paths"]).values(),
+                row["attestation_path"],
+            ):
                 _remove_managed_report(Path(raw), root)
         return deleted
 
@@ -353,6 +449,7 @@ class RunHistory:
         if row is None:
             raise KeyError(f"no QC run with id {run_id}")
         record = self._record_from_row(row, with_findings=True)
+        record.signoff = self.get_signoff(run_id)
         annotations = self.get_annotations(run_id)
         for finding in record.findings:
             annotation = annotations.get(finding.finding_id)
@@ -363,6 +460,16 @@ class RunHistory:
             if severity is not None:
                 finding.severity = Severity(severity)
                 finding.severity_overridden = True
+        return record
+
+    def get_raw_run(self, run_id: int) -> RunRecord:
+        """Rehydrate immutable engine findings without analyst annotations."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"no QC run with id {run_id}")
+        record = self._record_from_row(row, with_findings=True)
+        record.signoff = self.get_signoff(run_id)
         return record
 
     def set_annotation(
@@ -382,6 +489,7 @@ class RunHistory:
         """Upsert one group decision atomically across its finding members."""
         if not updates:
             return
+        self.assert_mutable(run_id)
         updated_at = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         with self._connect() as conn:
             conn.executemany(
@@ -416,6 +524,7 @@ class RunHistory:
         check_coverage: list[CoverageItem],
     ) -> None:
         """Persist mapping confirmations made while reviewing a stored run."""
+        self.assert_mutable(run_id)
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -439,6 +548,244 @@ class RunHistory:
         if cursor.rowcount == 0:
             raise KeyError(f"no QC run with id {run_id}")
 
+    def _signoffs_by_run(self, run_ids: Iterable[int]) -> dict[int, RunSignoff]:
+        ids = sorted({int(run_id) for run_id in run_ids})
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM run_signoffs WHERE run_id IN ({placeholders})", ids
+            ).fetchall()
+        return {row["run_id"]: self._signoff_from_row(row) for row in rows}
+
+    @staticmethod
+    def _signoff_from_row(row: sqlite3.Row) -> RunSignoff:
+        return RunSignoff(
+            run_id=row["run_id"],
+            finalized_at=row["finalized_at"],
+            acknowledgements=tuple(json.loads(row["acknowledgements"])),
+            review_state_digest=row["review_state_digest"],
+            profile_sha256=row["profile_sha256"],
+            attestation_path=row["attestation_path"],
+            attestation_sha256=row["attestation_sha256"],
+            report_paths=json.loads(row["report_paths"]),
+        )
+
+    def get_signoff(self, run_id: int) -> RunSignoff | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM run_signoffs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return None if row is None else self._signoff_from_row(row)
+
+    def assert_mutable(self, run_id: int) -> None:
+        if self.get_signoff(run_id) is not None:
+            raise RunFinalizedError(
+                f"run #{run_id} is finalized; submit a Re-QC run to make corrections"
+            )
+
+    def record_signoff(self, signoff: RunSignoff) -> None:
+        with self._connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO run_signoffs (
+                        run_id, finalized_at, acknowledgements,
+                        review_state_digest, profile_sha256, attestation_path,
+                        attestation_sha256, report_paths
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        signoff.run_id,
+                        signoff.finalized_at,
+                        json.dumps(list(signoff.acknowledgements)),
+                        signoff.review_state_digest,
+                        signoff.profile_sha256,
+                        signoff.attestation_path,
+                        signoff.attestation_sha256,
+                        json.dumps(signoff.report_paths),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RunFinalizedError(
+                    f"run #{signoff.run_id} is already finalized"
+                ) from exc
+
+    def get_annotation_lineage(self, run_id: int) -> dict[str, AnnotationLineage]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM annotation_lineage WHERE run_id = ?", (run_id,)
+            ).fetchall()
+        return {
+            row["finding_id"]: AnnotationLineage(
+                finding_id=row["finding_id"],
+                source_run_id=row["source_run_id"],
+                source_finding_id=row["source_finding_id"],
+                evidence_version=row["evidence_version"],
+                evidence_digest=row["evidence_digest"],
+                applied_at=row["applied_at"],
+            )
+            for row in rows
+        }
+
+    def apply_carried_annotations(
+        self,
+        run_id: int,
+        source_run_id: int,
+        candidates: list[CarryForwardCandidate],
+    ) -> int:
+        if not candidates:
+            return 0
+        applied_at = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM run_signoffs WHERE run_id = ?", (run_id,)
+            ).fetchone():
+                raise RunFinalizedError(
+                    f"run #{run_id} is finalized; submit a Re-QC run to make corrections"
+                )
+            rerun = conn.execute(
+                "SELECT rerun_of FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if rerun is None:
+                raise KeyError(f"no QC run with id {run_id}")
+            if rerun["rerun_of"] != source_run_id:
+                raise ValueError("carry-forward source is not this run's direct predecessor")
+            conn.executemany(
+                """
+                INSERT INTO annotations (run_id, finding_id, severity, comment, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, finding_id) DO UPDATE SET
+                    severity = excluded.severity,
+                    comment = excluded.comment,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        run_id,
+                        candidate.finding_id,
+                        candidate.severity,
+                        candidate.comment,
+                        applied_at,
+                    )
+                    for candidate in candidates
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO annotation_lineage (
+                    run_id, finding_id, source_run_id, source_finding_id,
+                    evidence_version, evidence_digest, applied_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, finding_id) DO UPDATE SET
+                    source_run_id = excluded.source_run_id,
+                    source_finding_id = excluded.source_finding_id,
+                    evidence_version = excluded.evidence_version,
+                    evidence_digest = excluded.evidence_digest,
+                    applied_at = excluded.applied_at
+                """,
+                [
+                    (
+                        run_id,
+                        candidate.finding_id,
+                        source_run_id,
+                        candidate.source_finding_id,
+                        candidate.evidence_version,
+                        candidate.evidence_digest,
+                        applied_at,
+                    )
+                    for candidate in candidates
+                ],
+            )
+        return len(candidates)
+
+    @staticmethod
+    def _bounded_session_end(started_at: dt.datetime, observed: dt.datetime) -> dt.datetime:
+        return min(observed, started_at + dt.timedelta(hours=4))
+
+    def pause_review_sessions(self, *, now: dt.datetime | None = None) -> int:
+        observed = now or dt.datetime.now(dt.UTC)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, started_at FROM review_sessions WHERE ended_at IS NULL"
+            ).fetchall()
+            for row in rows:
+                started = dt.datetime.fromisoformat(row["started_at"])
+                ended = self._bounded_session_end(started, observed)
+                seconds = max(0.0, (ended - started).total_seconds())
+                conn.execute(
+                    """
+                    UPDATE review_sessions
+                    SET ended_at = ?, active_seconds = ? WHERE id = ?
+                    """,
+                    (ended.isoformat(timespec="seconds"), seconds, row["id"]),
+                )
+        return len(rows)
+
+    def start_review_session(
+        self,
+        run_id: int,
+        *,
+        now: dt.datetime | None = None,
+    ) -> int:
+        observed = now or dt.datetime.now(dt.UTC)
+        self.pause_review_sessions(now=observed)
+        with self._connect() as conn:
+            if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is None:
+                raise KeyError(f"no QC run with id {run_id}")
+            cursor = conn.execute(
+                "INSERT INTO review_sessions (run_id, started_at) VALUES (?, ?)",
+                (run_id, observed.isoformat(timespec="seconds")),
+            )
+        if cursor.lastrowid is None:
+            raise RuntimeError("sqlite did not return a review-session id")
+        return int(cursor.lastrowid)
+
+    def active_review_run(self) -> int | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT run_id FROM review_sessions
+                WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1
+                """
+            ).fetchone()
+        return None if row is None else int(row["run_id"])
+
+    def review_seconds(
+        self,
+        run_id: int,
+        *,
+        now: dt.datetime | None = None,
+    ) -> float | None:
+        observed = now or dt.datetime.now(dt.UTC)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT started_at, ended_at, active_seconds
+                FROM review_sessions WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchall()
+        if not rows:
+            return None
+        total = 0.0
+        for row in rows:
+            if row["ended_at"] is not None:
+                total += float(row["active_seconds"] or 0.0)
+                continue
+            started = dt.datetime.fromisoformat(row["started_at"])
+            ended = self._bounded_session_end(started, observed)
+            total += max(0.0, (ended - started).total_seconds())
+        return total
+
+    def carried_annotation_count(self, run_id: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM annotation_lineage WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
 
 def export_runs_archive(
     records: list[RunRecord], destination: Path, *, managed_root: Path
@@ -456,7 +803,17 @@ def export_runs_archive(
     with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as bundle:
         for record in records:
             included: list[str] = []
-            for kind, raw in sorted(record.report_paths.items()):
+            artifact_paths = (
+                record.signoff.report_paths
+                if record.signoff is not None
+                else record.report_paths
+            )
+            if record.signoff is not None:
+                artifact_paths = {
+                    **artifact_paths,
+                    "attestation": record.signoff.attestation_path,
+                }
+            for kind, raw in sorted(artifact_paths.items()):
                 source = Path(raw)
                 try:
                     resolved = source.resolve()
@@ -479,6 +836,11 @@ def export_runs_archive(
                     "counts": record.counts,
                     "pattern_review_counts": record.pattern_review_counts,
                     "archived": record.archived,
+                    "finalized_at": (
+                        record.signoff.finalized_at
+                        if record.signoff is not None
+                        else None
+                    ),
                     "reports": included,
                 }
             )

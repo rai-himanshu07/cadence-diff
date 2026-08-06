@@ -60,10 +60,11 @@ from qc_tool.findings import Finding, FindingClass, Severity, limit_findings
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.model import WorkbookSnapshot
 from qc_tool.ppt.diff import diff_decks
+from qc_tool.ppt.element_match import match_slide_elements
 from qc_tool.ppt.extract import load_deck_snapshot
 from qc_tool.ppt.match import match_slides
 from qc_tool.ppt.model import DeckSnapshot
-from qc_tool.ppt.preflight import preflight_deck
+from qc_tool.ppt.preflight import media_structural_coverage, preflight_deck
 from qc_tool.progress import (
     CancellationToken,
     ProgressCallback,
@@ -454,14 +455,24 @@ def run_qc(
             findings.extend(ppt_preflight.findings)
             result.coverage.extend(ppt_preflight.coverage)
         else:
-            result.coverage.append(
-                CoverageItem(
-                    check_id="ppt-intrinsic",
-                    label="Current PowerPoint intrinsic checks",
-                    artifact="ppt",
-                    state=CoverageState.UNAVAILABLE,
-                    detail="No current deck supplied",
-                )
+            result.coverage.extend(
+                [
+                    CoverageItem(
+                        check_id="ppt-intrinsic",
+                        label="Current PowerPoint intrinsic checks",
+                        artifact="ppt",
+                        state=CoverageState.UNAVAILABLE,
+                        detail="No current deck supplied",
+                    ),
+                    media_structural_coverage(),
+                    CoverageItem(
+                        check_id="ppt-media-visual",
+                        label="Rendered media and visual layout",
+                        artifact="ppt",
+                        state=CoverageState.UNAVAILABLE,
+                        detail="No current deck supplied",
+                    ),
+                ]
             )
         result.coverage.extend(
             [
@@ -977,7 +988,8 @@ def run_qc(
         matching = match_slides(base_deck, current_deck, profile.ppt)
         check_cancelled(cancellation_token)
         ppt_start = len(findings)
-        findings += diff_decks(matching, profile.ppt)
+        ppt_findings = diff_decks(matching, profile.ppt)
+        findings += ppt_findings
         check_cancelled(cancellation_token)
         result.coverage.append(
             CoverageItem(
@@ -995,6 +1007,36 @@ def run_qc(
                     if not base_deck.charts_available
                     or not current_deck.charts_available
                     else "Complete semantic slide-element comparison"
+                ),
+            )
+        )
+        result.coverage.append(
+            media_structural_coverage(
+                base_deck,
+                current_deck,
+                findings=sum(
+                    finding.finding_class is FindingClass.PPT_MEDIA_CHANGED
+                    for finding in ppt_findings
+                ),
+                ambiguous_shapes=sum(
+                    len(
+                        match_slide_elements(
+                            baseline_slide, current_slide
+                        ).ambiguous_current_media
+                    )
+                    for baseline_slide, current_slide in matching.pairs
+                ),
+            )
+        )
+        result.coverage.append(
+            CoverageItem(
+                check_id="ppt-media-visual",
+                label="Rendered media and visual layout",
+                artifact="ppt",
+                state=CoverageState.UNAVAILABLE,
+                detail=(
+                    "Embedded bytes are checked structurally; pixels, OCR text, "
+                    "and rendered layout are not inspected"
                 ),
             )
         )
@@ -1086,6 +1128,14 @@ def run_qc(
                 CoverageItem(
                     check_id="ppt-availability",
                     label="Availability boundaries",
+                    artifact="ppt",
+                    state=CoverageState.UNAVAILABLE,
+                    detail="PowerPoint pair not supplied",
+                ),
+                media_structural_coverage(),
+                CoverageItem(
+                    check_id="ppt-media-visual",
+                    label="Rendered media and visual layout",
                     artifact="ppt",
                     state=CoverageState.UNAVAILABLE,
                     detail="PowerPoint pair not supplied",

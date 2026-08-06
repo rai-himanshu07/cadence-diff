@@ -17,7 +17,10 @@ Every run reports explicit coverage — checked / degraded / unavailable —
 so a check that could not run is never silently treated as passed.
 Findings support analyst severity overrides and comments; exports
 (annotated Excel workbook, self-contained HTML) regenerate from the
-reviewed state.
+reviewed state. A reviewed run can be finalized into immutable reports and a
+verified signed attestation. Re-QC presents unchanged prior decisions for
+explicit evidence-fingerprint-gated carry-forward; nothing is accepted
+automatically.
 
 Analyst-facing views partition findings into deterministic **semantic pattern
 groups**, the primary analyst decisions. Spatial groups remain a separate
@@ -76,8 +79,17 @@ already made — waived, reviewed, expected — defer below everything still ope
 Excel-to-PowerPoint coverage states its population explicitly: claims that were
 read, and surfaces that could not be. A figure rendered into a picture or an
 embedded object is counted as unavailable and its slides are named, rather than
-being dropped from the denominator. Rendered-visual comparison and OCR remain
-deliberately unavailable.
+being dropped from the denominator. Embedded image bytes are also hashed without
+decoding, so additions, removals, and byte changes are reported structurally.
+Rendered-visual comparison and OCR remain deliberately unavailable: byte
+identity does not prove pixel, crop, layout, or text equivalence.
+
+Named reporting contracts have typed Core and Advanced Excel/PowerPoint editors
+for every profile field, including repeatable controls, mappings, waivers, and
+availability rules. Canonical YAML remains available as an advanced view over
+the same lossless draft. Saves are statically linted, atomic, and protected by
+an exact source-byte concurrency check; optional selected-file validation uses
+the same bounded local loaders as QC.
 
 Modern Excel spill references (`B2#` / `ANCHORARRAY`) use only declared
 array-formula extents from the OOXML anchor. Implicit intersection (`@`) is
@@ -97,7 +109,7 @@ truncating or guessing.
 
 ```bash
 # Current 0.2 alpha (pre-releases require an explicit version)
-pip install --pre 'cadence-diff==0.2.0a1'
+pip install --pre 'cadence-diff==0.2.0a2'
 
 # Latest stable release
 pip install cadence-diff

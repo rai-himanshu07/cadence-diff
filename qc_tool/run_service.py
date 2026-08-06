@@ -149,6 +149,7 @@ def perform_run(
             file_paths={role: str(path) for role, path in files.items()},
             rerun_of=rerun_of,
             focus_targets=_focus_targets(result, file_hashes),
+            profile_snapshot=profile,
         )
         recorded = True
         report_progress(

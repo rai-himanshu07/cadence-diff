@@ -313,6 +313,26 @@ def test_exact_shape_provenance_enters_only_the_private_sidecar() -> None:
     }
 
 
+def test_media_change_focuses_the_exact_shape_in_both_decks() -> None:
+    finding = Finding(
+        artifact="ppt",
+        finding_class=FindingClass.PPT_MEDIA_CHANGED,
+        slide="3 Revenue",
+        slide_index=3,
+        baseline_slide_index=2,
+        focus_shape_id=41,
+        baseline_focus_shape_id=32,
+        message="embedded media bytes changed",
+    )
+
+    seeds = _targets([finding])["F0001"]
+
+    assert {(seed.role, seed.slide_index, seed.shape_id) for seed in seeds} == {
+        (FocusRole.CURRENT_PPT, 3, 41),
+        (FocusRole.BASELINE_PPT, 2, 32),
+    }
+
+
 def test_added_and_removed_slides_seed_only_the_existing_side() -> None:
     added = Finding(
         artifact="ppt",

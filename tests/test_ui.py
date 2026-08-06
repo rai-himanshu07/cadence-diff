@@ -14,7 +14,7 @@ from nicegui.testing import User
 import qc_tool.run_service as run_service
 import qc_tool.ui.app as app_module
 from qc_tool.config.profile import DeliverableProfile, save_profile
-from qc_tool.coverage import QCRunMode
+from qc_tool.coverage import MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import (
@@ -34,13 +34,16 @@ from qc_tool.progress import CancellationToken, ProgressEvent, RunCancelled, Run
 from qc_tool.review import build_pattern_groups, build_review_groups
 from qc_tool.security import secure_managed_tree
 from qc_tool.server_config import NetworkMode
+from qc_tool.signoff import finalize_run, required_acknowledgements
 from qc_tool.ui.app import (
     _acceptance_summary,
     _context_grid_html,
     _evidence_axes,
     _files_for_mode,
     _history_row,
+    _history_trend_row,
     _input_cautions,
+    _mapping_stats,
     _outcome_summary,
     _profile_path,
     _queue_status_line,
@@ -57,7 +60,7 @@ from qc_tool.ui.app import (
     perform_run,
     persist_confirmed_mapping,
 )
-from qc_tool.ui.guide import PROFILE_CONTROLS_EXAMPLE
+from qc_tool.ui.guide import GUIDE_SCRIPT, PROFILE_CONTROLS_EXAMPLE
 from qc_tool.ui.theme import CSS
 from tests.conftest import fixture_profile
 
@@ -136,6 +139,12 @@ def test_profile_controls_guide_example_is_valid_yaml() -> None:
         "add",
         "subtract",
     ]
+
+
+def test_guide_search_matches_all_tokens_and_bounded_aliases() -> None:
+    assert "tokens.every" in GUIDE_SCRIPT
+    assert "aliases[s.id]" in GUIDE_SCRIPT
+    assert "mapping unavailable opaque" in GUIDE_SCRIPT
 
 
 def test_review_group_rows_do_not_embed_atomic_member_payloads(qc_result) -> None:
@@ -544,6 +553,31 @@ def test_run_blockers_report_every_missing_role() -> None:
     assert _run_blockers(QCRunMode.CYCLE_COMPARISON, ready) == []
 
 
+def test_run_blockers_wait_for_hashes_and_reject_identical_pairs() -> None:
+    files = {
+        "baseline_excel": Path("baseline.xlsx"),
+        "current_excel": Path("current.xlsx"),
+    }
+
+    assert _run_blockers(
+        QCRunMode.CYCLE_COMPARISON,
+        files,
+        file_hashes={"baseline_excel": "a"},
+    ) == ["Verifying selected file bytes: Current — Excel workbook"]
+    assert _run_blockers(
+        QCRunMode.CYCLE_COMPARISON,
+        files,
+        file_hashes={"baseline_excel": "same", "current_excel": "same"},
+    ) == [
+        "Baseline and current Excel are byte-identical; a comparison would prove nothing"
+    ]
+    assert _run_blockers(
+        QCRunMode.CYCLE_COMPARISON,
+        files,
+        file_hashes={"baseline_excel": "a", "current_excel": "b"},
+    ) == []
+
+
 def test_run_blockers_name_the_files_a_rerun_still_needs() -> None:
     blockers = _run_blockers(
         QCRunMode.CYCLE_COMPARISON,
@@ -589,6 +623,24 @@ def test_outcome_summary_leads_with_the_decision() -> None:
     )
     assert _outcome_summary({Severity.WARNING: 2})[:2] == ("limited", "Review required")
     assert _outcome_summary({Severity.INFO: 9})[:2] == ("ok", "No blocking findings")
+
+
+def test_mapping_stats_reconcile_readable_and_unavailable_surfaces() -> None:
+    stats = dict(
+        _mapping_stats(
+            MappingCoverage(
+                eligible=26,
+                unavailable=1,
+                mapped=1,
+                verified=1,
+                unmapped=25,
+            )
+        )
+    )
+
+    assert stats["readable"] == 26
+    assert stats["unavailable"] == 1
+    assert stats["total surfaces"] == 27
 
 
 def test_context_grid_html_escapes_source_values() -> None:
@@ -643,6 +695,39 @@ def test_history_row_exposes_mode_profile_capability_and_decisions(
     assert "baseline.xlsx" in str(row["files"])
 
 
+def test_history_trend_row_contains_only_fixed_aggregate_fields(
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {"current_excel": fixture_dir / "current.xlsx"},
+        {},
+        DeliverableProfile(name="trend"),
+        mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+    )
+    history = RunHistory(work_dir / "history.sqlite3")
+
+    row = _history_trend_row(history.get_run(artifacts.run_id), history)
+
+    assert set(row) == {
+        "run",
+        "profile",
+        "atomics",
+        "decisions",
+        "limited",
+        "mapped",
+        "verified",
+        "exact_reusable",
+        "carried",
+        "finalized",
+        "review_minutes",
+    }
+    assert row["review_minutes"] == "unknown"
+    assert not ({"files", "file_paths", "report_paths", "findings"} & row.keys())
+
+
 @pytest.mark.asyncio
 async def test_colophon_is_scoped_to_the_guide(user: User, tmp_path: Path) -> None:
     create_pages(tmp_path / "work")
@@ -662,6 +747,7 @@ def test_input_cautions_flag_a_baseline_current_mix_up() -> None:
         "current_excel": Path("/tmp/b/pack.xlsx"),
     }
     state.file_sizes = {"baseline_excel": 4096, "current_excel": 4096}
+    state.file_hashes = {"baseline_excel": "a", "current_excel": "b"}
 
     cautions = _input_cautions(state)
 
@@ -691,6 +777,47 @@ async def test_inputs_render_as_baseline_and_current_panels(
     await user.should_see("the previous cycle you compare against")
     await user.should_see("Current")
     await user.should_see("the cycle you are signing off")
+
+
+@pytest.mark.asyncio
+async def test_manage_profiles_uses_complete_typed_editor_and_dirty_close(
+    user: User,
+    tmp_path: Path,
+) -> None:
+    create_pages(tmp_path / "work")
+    await user.open("/")
+
+    user.find("Manage profiles").click()
+
+    await user.should_see("Core contract")
+    await user.should_see("Advanced Excel/PPT")
+    await user.should_see("Advanced YAML")
+    await user.should_see("The built-in default profile is immutable")
+    await user.should_not_see("Waivers (YAML list)")
+    save_button = user.find("Save profile").elements.pop()
+    assert isinstance(save_button, ui.button)
+    assert not save_button.enabled
+
+    new_name = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "New profile name"
+    )
+    new_name.value = "typed-contract"
+    user.find("Create").click()
+
+    save_button = user.find("Save profile").elements.pop()
+    assert isinstance(save_button, ui.button)
+    assert save_button.enabled
+    user.find("Add Waivers item").click()
+    await user.should_see("Finding Class")
+    await user.should_see("Unsaved profile changes")
+
+    user.find("Close").click()
+    await user.should_see("Discard profile changes?")
+    user.find("Discard and close").click()
+    dialogs = user.find(kind=ui.dialog).elements
+    assert dialogs and all(not dialog.value for dialog in dialogs)
 
 
 @pytest.mark.asyncio
@@ -774,6 +901,7 @@ async def test_run_detail_page(user: User, fixture_dir: Path, tmp_path: Path) ->
     await user.should_see("Review queue")
     await user.should_see("Atomic evidence")
     await user.should_see("atomic findings")
+    await user.should_see("Start review timer")
     # Review queue is the default view; evidence tabs are opt-in.
     panels = user.find(kind=ui.tab_panels).elements.pop()
     assert panels.value == "review"
@@ -784,6 +912,115 @@ async def test_run_detail_page_not_found(user: User, tmp_path: Path) -> None:
     create_pages(tmp_path / "work")
     await user.open("/runs/999")
     await user.should_see("Run not found")
+
+
+@pytest.mark.asyncio
+async def test_signoff_dialog_reports_unreviewed_blockers(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {"current_excel": fixture_dir / "current.xlsx"},
+        {},
+        DeliverableProfile(name="default"),
+        mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+
+    user.find("Finalize review").click()
+
+    await user.should_see("Finalize reviewed run")
+    await user.should_see("findings still need an analyst decision")
+
+
+@pytest.mark.asyncio
+async def test_finalized_run_renders_frozen_evidence_state(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {"current_excel": fixture_dir / "current.xlsx"},
+        {},
+        DeliverableProfile(name="default"),
+        mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+    )
+    history = RunHistory(work_dir / "history.sqlite3")
+    record = history.get_run(artifacts.run_id)
+    history.set_annotations_bulk(
+        artifacts.run_id,
+        [
+            (
+                finding.finding_id,
+                finding.severity.value if finding.severity else None,
+                "reviewed",
+            )
+            for finding in record.findings
+            if finding.severity in {Severity.CRITICAL, Severity.WARNING}
+        ],
+    )
+    record = history.get_run(artifacts.run_id)
+    finalize_run(
+        work_dir,
+        artifacts.run_id,
+        set(required_acknowledgements(record)),
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+
+    await user.should_see("Finalized")
+    await user.should_see("Download attestation")
+    await user.should_not_see("Finalize review")
+    assert _history_row(history.get_run(artifacts.run_id))["finalized"] is True
+
+
+@pytest.mark.asyncio
+async def test_reqc_offers_explicit_prior_decision_preview(
+    user: User,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    finding = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        sheet="Data",
+        location="B2",
+        baseline_value="1",
+        current_value="2",
+        message="changed",
+    )
+    previous = history.record_run(
+        QCRunResult(profile_name="fixture", findings=[finding]),
+        file_hashes={},
+        report_paths={},
+    )
+    history.set_annotation(previous, "F1", severity="info", comment="reviewed")
+    current = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding.model_copy(update={"finding_id": "N1"})],
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous,
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{current}")
+
+    user.find("Review prior decisions").click()
+
+    await user.should_see("1 exact reusable")
+    await user.should_see("source run was not finalized")
+    await user.should_see("N1 · info")
 
 
 @pytest.mark.asyncio
@@ -811,7 +1048,50 @@ async def test_final_package_detail_shows_mapping_review(
     await user.should_see("Final-package QC")
     await user.should_see("Check coverage")
     await user.should_see("Mapping review")
-    await user.should_see("eligible")
+    await user.should_see("readable")
+    await user.should_see("unavailable")
+    await user.should_see("total surfaces")
+
+
+@pytest.mark.asyncio
+async def test_mapping_confirmation_survives_the_repaint_it_triggers(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    work_dir = tmp_path / "work"
+    profiles_dir = work_dir / "profiles"
+    profiles_dir.mkdir(parents=True)
+    profile = DeliverableProfile(name="mapping-review")
+    save_profile(profile, profiles_dir / "mapping-review.yaml")
+    artifacts = perform_run(
+        work_dir,
+        {
+            "current_excel": fixture_dir / "current.xlsx",
+            "current_ppt": fixture_dir / "current.pptx",
+        },
+        {},
+        profile,
+        mode=QCRunMode.FINAL_PACKAGE,
+    )
+    before = RunHistory(work_dir / "history.sqlite3").get_run(artifacts.run_id)
+    assert before.mapping_coverage is not None and before.mapping_suggestions
+
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    buttons = user.find("Confirm").elements
+    assert buttons
+
+    nicegui_warnings.reset()
+    with caplog.at_level(logging.WARNING, logger="nicegui"):
+        _emit(next(iter(buttons)), "click", {})
+
+    assert not caplog.records, [record.getMessage() for record in caplog.records]
+    after = RunHistory(work_dir / "history.sqlite3").get_run(artifacts.run_id)
+    assert after.mapping_coverage is not None
+    assert after.mapping_coverage.mapped == 1
+    assert len(after.mapping_suggestions) == len(before.mapping_suggestions) - 1
 
 
 def _emit(element: ui.element, event_type: str, args: object) -> None:
@@ -907,3 +1187,19 @@ def test_row_slots_show_a_note_without_a_severity_override() -> None:
     for slot in (app_module.REVIEW_MEMBER_ROWS_SLOT, app_module.FINDINGS_BODY_SLOT):
         assert 'v-else-if="props.row.comment"' in slot
     assert 'v-if="props.row.reviewed"' in app_module.REVIEW_GROUPS_BODY_SLOT
+
+
+def test_review_rows_have_keyboard_and_focus_contracts() -> None:
+    assert 'role="button" tabindex="0"' in app_module.REVIEW_GROUPS_BODY_SLOT
+    assert "@keydown.enter.prevent" in app_module.REVIEW_GROUPS_BODY_SLOT
+    assert "@keydown.space.prevent" in app_module.REVIEW_GROUPS_BODY_SLOT
+    assert ':data-review-id="props.row.id"' in app_module.REVIEW_GROUPS_BODY_SLOT
+    assert 'role="button" tabindex="0"' in app_module.REVIEW_MEMBER_ROWS_SLOT
+    assert ':data-member-id="props.row.id"' in app_module.REVIEW_MEMBER_ROWS_SLOT
+    assert "@media (max-width: 1350px)" in CSS
+    assert ".reviewclass-inline { display: inline; }" in CSS
+
+
+def test_atomic_slot_can_confirm_the_current_severity() -> None:
+    assert 'label="Confirm severity"' in app_module.FINDINGS_BODY_SLOT
+    assert "value: props.row.severity" in app_module.FINDINGS_BODY_SLOT

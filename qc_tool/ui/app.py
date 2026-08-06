@@ -12,25 +12,33 @@ import asyncio
 import datetime as dt
 import html
 import logging
-import re
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
 from nicegui import app, events, ui
 
+from qc_tool.config.lint import lint_profile
 from qc_tool.config.profile import (
     CrosscheckMapping,
     DeliverableProfile,
     default_profile,
     load_profile,
+    profile_path,
+    profile_sha256,
     save_profile,
+)
+from qc_tool.config.promotion import (
+    PromotionKind,
+    PromotionRequest,
+    available_promotions,
+    promote_finding,
 )
 from qc_tool.coverage import (
     CoverageItem,
     CoverageState,
+    MappingCoverage,
     QCRunMode,
     capability_limited,
 )
@@ -42,9 +50,12 @@ from qc_tool.focus.model import FocusTargetSeed
 from qc_tool.focus.protocol import FocusOutcome
 from qc_tool.focus.service import ROLE_LABELS as FOCUS_ROLE_LABELS
 from qc_tool.focus.service import BindReport, FocusService, TokenRejection
+from qc_tool.history.carry_forward import apply_carry_forward, preview_carry_forward
 from qc_tool.history.run_state import RunStateRecord, RunStatus
 from qc_tool.history.store import RunHistory, RunRecord, export_runs_archive, sha256_file
+from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.peek import peek_sheet_names, peek_slide_titles
+from qc_tool.ppt.extract import load_deck_snapshot
 from qc_tool.progress import RunPhase
 from qc_tool.report.excel_report import write_excel_report
 from qc_tool.report.html_report import write_html_report
@@ -71,8 +82,10 @@ from qc_tool.server_config import (
     local_config,
     save_server_config,
 )
+from qc_tool.signoff import assess_signoff, finalize_run
 from qc_tool.story import build_stories
 from qc_tool.ui.guide import render_guide
+from qc_tool.ui.profile_editor import ProfileEditorController, open_profile_editor
 from qc_tool.ui.theme import (
     FINDINGS_BODY_SLOT,
     HISTORY_BODY_SLOT,
@@ -96,7 +109,6 @@ __all__ = [
 ]
 
 MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # accept large workbooks locally
-_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$")
 
 ROLES = ("baseline_excel", "current_excel", "baseline_ppt", "current_ppt")
 ROLE_LABELS = {
@@ -202,6 +214,8 @@ if (!document.querySelector('.stopped-page')) {
 class SessionState:
     files: dict[str, Path] = field(default_factory=dict)
     file_sizes: dict[str, int] = field(default_factory=dict)
+    file_hashes: dict[str, str] = field(default_factory=dict)
+    upload_generations: dict[str, int] = field(default_factory=dict)
     passwords: dict[str, str] = field(default_factory=dict)  # role -> password
     profile_name: str = "default"
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON
@@ -229,12 +243,7 @@ def _safe_upload_name(raw_name: str) -> str:
 
 def _profile_path(profiles_dir: Path, name: str) -> Path:
     """Resolve a validated profile name inside the managed profile directory."""
-    if not _PROFILE_NAME_RE.fullmatch(name) or name in {".", ".."}:
-        raise ValueError(
-            "profile name must start with a letter or number and contain only "
-            "letters, numbers, spaces, dots, dashes, or underscores"
-        )
-    return profiles_dir / f"{name}.yaml"
+    return profile_path(profiles_dir, name)
 
 
 def _storage_secret(work_dir: Path) -> str:
@@ -306,6 +315,7 @@ def _run_blockers(
     mode: QCRunMode,
     files: dict[str, Path],
     *,
+    file_hashes: Mapping[str, str] | None = None,
     rerun_of: int | None = None,
     rerun_required: frozenset[str] = frozenset(),
 ) -> list[str]:
@@ -319,9 +329,29 @@ def _run_blockers(
             f"selected again: {names}"
         )
     try:
-        _files_for_mode(mode, files)
+        selected = _files_for_mode(mode, files)
     except ValueError as exc:
         blockers.append(str(exc))
+        selected = {}
+    if file_hashes is not None:
+        verifying = sorted(set(selected) - file_hashes.keys())
+        if verifying:
+            names = ", ".join(ROLE_LABELS[role] for role in verifying)
+            blockers.append(f"Verifying selected file bytes: {names}")
+        for baseline, current, artifact in (
+            ("baseline_excel", "current_excel", "Excel"),
+            ("baseline_ppt", "current_ppt", "PowerPoint"),
+        ):
+            if (
+                baseline in selected
+                and current in selected
+                and file_hashes.get(baseline)
+                and file_hashes[baseline] == file_hashes.get(current)
+            ):
+                blockers.append(
+                    f"Baseline and current {artifact} are byte-identical; "
+                    "a comparison would prove nothing"
+                )
     return blockers
 
 
@@ -360,6 +390,8 @@ def _input_cautions(state: SessionState) -> list[str]:
         if (
             state.files[baseline].name == state.files[current].name
             and state.file_sizes.get(baseline) == state.file_sizes.get(current)
+            and state.file_hashes.get(baseline)
+            and state.file_hashes.get(baseline) != state.file_hashes.get(current)
         ):
             cautions.append(
                 f"baseline and current {artifact} look like the same file "
@@ -450,10 +482,39 @@ def _capability_summary(coverage: list[CoverageItem]) -> tuple[str, str, str]:
     return ("ok", "All checks ran", "")
 
 
+def _mapping_stats(mapping: MappingCoverage) -> tuple[tuple[str, int], ...]:
+    """The complete readable/unavailable claim population shown in review."""
+    return (
+        ("readable", mapping.eligible),
+        ("unavailable", mapping.unavailable),
+        ("total surfaces", mapping.eligible + mapping.unavailable),
+        ("mapped", mapping.mapped),
+        ("verified", mapping.verified),
+        ("mismatched", mapping.mismatched),
+        ("unresolved", mapping.unresolved),
+        ("unmapped", mapping.unmapped),
+    )
+
+
+def _lint_profile_for_record(
+    profile: DeliverableProfile,
+    record: RunRecord,
+) -> list:
+    workbook = None
+    deck = None
+    excel_path = record.file_paths.get("current_excel")
+    ppt_path = record.file_paths.get("current_ppt")
+    if excel_path:
+        workbook = load_workbook_snapshot(Path(excel_path))
+    if ppt_path:
+        deck = load_deck_snapshot(Path(ppt_path))
+    return lint_profile(profile, workbook=workbook, deck=deck)
+
+
 # --- pages -------------------------------------------------------------------
 
 
-def _finding_row(finding: Finding) -> dict[str, object]:
+def _finding_row(finding: Finding, *, mutable: bool = True) -> dict[str, object]:
     return {
         "id": finding.finding_id,
         "severity": (finding.severity or Severity.WARNING).value,
@@ -468,6 +529,7 @@ def _finding_row(finding: Finding) -> dict[str, object]:
         "artifact": finding.artifact,
         "comment": finding.analyst_comment,
         "overridden": finding.severity_overridden,
+        "mutable": mutable,
         "root": finding.root_cause_key,
         "provenance": (
             finding.provenance.value if finding.provenance is not None else ""
@@ -499,8 +561,10 @@ def _finding_row(finding: Finding) -> dict[str, object]:
     }
 
 
-def _findings_rows(result: QCRunResult) -> list[dict[str, object]]:
-    return [_finding_row(finding) for finding in result.findings]
+def _findings_rows(
+    result: QCRunResult, *, mutable: bool = True
+) -> list[dict[str, object]]:
+    return [_finding_row(finding, mutable=mutable) for finding in result.findings]
 
 
 def _review_group_rows(
@@ -631,6 +695,7 @@ def _history_row(record: RunRecord) -> dict[str, object]:
         "id": record.run_id,
         "sel": False,
         "archived": record.archived,
+        "finalized": record.signoff is not None,
         "started": record.started_at.isoformat(timespec="seconds"),
         "when": _relative_time(record.started_at),
         "mode": MODE_LABELS[record.mode],
@@ -644,9 +709,43 @@ def _history_row(record: RunRecord) -> dict[str, object]:
         "files": " · ".join(record.files.values()),
         "exports": [
             kind
-            for kind, path in record.report_paths.items()
+            for kind, path in (
+                record.signoff.report_paths
+                if record.signoff is not None
+                else record.report_paths
+            ).items()
             if Path(path).exists()
         ],
+    }
+
+
+def _history_trend_row(record: RunRecord, history: RunHistory) -> dict[str, object]:
+    exact_reusable = 0
+    if record.rerun_of is not None:
+        try:
+            exact_reusable = len(preview_carry_forward(history, record.run_id).exact)
+        except (KeyError, ValueError):
+            exact_reusable = 0
+    review_seconds = history.review_seconds(record.run_id)
+    mapping = record.mapping_coverage
+    return {
+        "run": record.run_id,
+        "profile": record.profile,
+        "atomics": sum(record.counts.values()),
+        "decisions": sum(
+            (record.pattern_review_counts or record.review_counts or record.counts).values()
+        ),
+        "limited": sum(
+            item.state is not CoverageState.CHECKED for item in record.coverage
+        ),
+        "mapped": mapping.mapped if mapping is not None else 0,
+        "verified": mapping.verified if mapping is not None else 0,
+        "exact_reusable": exact_reusable,
+        "carried": history.carried_annotation_count(record.run_id),
+        "finalized": "yes" if record.signoff is not None else "no",
+        "review_minutes": (
+            "unknown" if review_seconds is None else f"{review_seconds / 60:.1f}"
+        ),
     }
 
 
@@ -766,6 +865,16 @@ def _render_result_view(
     Stories, Coverage, Atomic evidence, and Mapping review. Only the active
     view is mounted, so a high-volume run does not pay for hidden tables."""
     findings_by_id = {f.finding_id: f for f in result.findings}
+    signoff = (
+        history.get_signoff(run_id)
+        if history is not None and run_id is not None
+        else None
+    )
+    mutable = signoff is None
+    if signoff is not None:
+        report_paths = {
+            kind: Path(path) for kind, path in signoff.report_paths.items()
+        }
     review_groups = build_pattern_groups(result.findings)
     stories = build_stories(result.findings)
     all_rows: list[dict[str, object]] = []  # atomic rows are built on demand
@@ -844,6 +953,203 @@ def _render_result_view(
                 ui.button(
                     "Re-QC this run",
                     on_click=lambda: ui.navigate.to(f"/?rerun={run_id}"),
+                ).classes("ghostbtn").props("no-caps flat dense")
+            if history is not None and run_id is not None:
+                if history.active_review_run() == run_id:
+
+                    def pause_review() -> None:
+                        history.pause_review_sessions()
+                        ui.notify("Review timer paused")
+                        ui.navigate.reload()
+
+                    ui.button("Pause review timer", on_click=pause_review).classes(
+                        "ghostbtn"
+                    ).props("no-caps flat dense")
+                else:
+
+                    def start_review() -> None:
+                        history.start_review_session(run_id)
+                        ui.notify("Review timer started")
+                        ui.navigate.reload()
+
+                    ui.button("Start review timer", on_click=start_review).classes(
+                        "ghostbtn"
+                    ).props("no-caps flat dense")
+            if (
+                mutable
+                and history is not None
+                and run_id is not None
+                and rerun_of is not None
+            ):
+
+                def open_carry_forward() -> None:
+                    preview = preview_carry_forward(history, run_id)
+                    selected: set[str] = set()
+                    with ui.dialog() as dialog, ui.card().classes(
+                        "w-[46rem] max-w-full"
+                    ):
+                        ui.label("Review prior decisions").classes("runhead")
+                        ui.label(
+                            f"{len(preview.exact)} exact reusable · "
+                            f"{len(preview.changed_evidence)} changed evidence · "
+                            f"{len(preview.resolved)} resolved · "
+                            f"{len(preview.ambiguous)} ambiguous"
+                        ).classes("note")
+                        checkboxes: list[ui.checkbox] = []
+                        if not preview.source_finalized:
+                            ui.label(
+                                "The source run was not finalized. Select each exact "
+                                "decision explicitly before applying it."
+                            ).classes("notecard")
+                        elif preview.exact:
+
+                            def select_all() -> None:
+                                selected.update(
+                                    candidate.finding_id for candidate in preview.exact
+                                )
+                                for checkbox in checkboxes:
+                                    checkbox.value = True
+                                    checkbox.update()
+
+                            ui.button(
+                                "Select all exact", on_click=select_all
+                            ).classes("ghostbtn").props("flat no-caps dense")
+                        for candidate in preview.exact:
+
+                            def select_candidate(
+                                event: events.ValueChangeEventArguments,
+                                finding_id: str = candidate.finding_id,
+                            ) -> None:
+                                if event.value:
+                                    selected.add(finding_id)
+                                else:
+                                    selected.discard(finding_id)
+
+                            checkbox = ui.checkbox(
+                                f"{candidate.finding_id} · "
+                                f"{candidate.severity or 'note only'}",
+                                on_change=select_candidate,
+                            )
+                            checkboxes.append(checkbox)
+                        if not preview.exact:
+                            ui.label("No prior decisions have identical evidence.").classes(
+                                "lede"
+                            )
+
+                        def apply_selected() -> None:
+                            if not selected:
+                                ui.notify("Select at least one exact decision", type="warning")
+                                return
+                            try:
+                                count = apply_carry_forward(history, run_id, selected)
+                            except Exception as exc:
+                                ui.notify(str(exc), type="negative")
+                                return
+                            dialog.close()
+                            ui.notify(f"Applied {count} prior decisions")
+                            ui.navigate.reload()
+
+                        with ui.row().classes("items-center gap-2"):
+                            ui.button(
+                                "Apply selected", on_click=apply_selected
+                            ).classes("runbtn").props("no-caps")
+                            ui.button("Cancel", on_click=dialog.close).props(
+                                "flat no-caps"
+                            )
+                    dialog.open()
+
+                ui.button(
+                    "Review prior decisions", on_click=open_carry_forward
+                ).classes("ghostbtn").props("no-caps flat dense")
+            if signoff is not None:
+                ui.label(
+                    f"Finalized {signoff.finalized_at}"
+                ).classes("reviewed")
+                if Path(signoff.attestation_path).is_file():
+                    ui.button(
+                        "Download attestation",
+                        on_click=lambda: ui.download(signoff.attestation_path),
+                    ).classes("ghostbtn").props("no-caps flat dense")
+            elif history is not None and run_id is not None and profiles_dir is not None:
+
+                def open_signoff_dialog() -> None:
+                    record = history.get_run(run_id)
+                    initial = assess_signoff(record)
+                    accepted: set[str] = set()
+                    with ui.dialog() as dialog, ui.card().classes(
+                        "w-[42rem] max-w-full"
+                    ):
+                        ui.label("Finalize reviewed run").classes("runhead")
+                        ui.label(
+                            "Finalization locks this run's review state, regenerates "
+                            "reports, and creates a signed private attestation. Use "
+                            "Re-QC for later corrections."
+                        ).classes("note")
+                        if record.profile_snapshot is None:
+                            ui.label(
+                                "This legacy run has no exact profile snapshot. "
+                                "Submit a Re-QC run before sign-off."
+                            ).classes("notecard")
+                        if initial.undecided_finding_ids:
+                            ui.label(
+                                f"{len(initial.undecided_finding_ids)} Critical/Warning "
+                                "findings still need an analyst decision."
+                            ).classes("notecard")
+                        for code in initial.required_acknowledgements:
+
+                            def acknowledge(
+                                event: events.ValueChangeEventArguments,
+                                code: str = code,
+                            ) -> None:
+                                if event.value:
+                                    accepted.add(code)
+                                else:
+                                    accepted.discard(code)
+
+                            ui.checkbox(
+                                f"Acknowledge {code.replace(':', ': ')}",
+                                on_change=acknowledge,
+                            )
+
+                        async def finalize() -> None:
+                            current = history.get_run(run_id)
+                            assessment = assess_signoff(current, accepted)
+                            if not assessment.ready:
+                                ui.notify(
+                                    "Resolve remaining decisions and acknowledgements first",
+                                    type="warning",
+                                )
+                                return
+                            try:
+                                await asyncio.to_thread(
+                                    finalize_run,
+                                    profiles_dir.parent,
+                                    run_id,
+                                    accepted,
+                                )
+                            except Exception as exc:
+                                ui.notify(str(exc), type="negative")
+                                return
+                            dialog.close()
+                            ui.notify("Run finalized and attestation verified")
+                            ui.navigate.reload()
+
+                        with ui.row().classes("items-center gap-2"):
+                            finalize_button = ui.button(
+                                "Finalize and attest", on_click=finalize
+                            ).classes("runbtn").props("no-caps")
+                            if (
+                                record.profile_snapshot is None
+                                or initial.undecided_finding_ids
+                            ):
+                                finalize_button.disable()
+                            ui.button("Cancel", on_click=dialog.close).props(
+                                "flat no-caps"
+                            )
+                    dialog.open()
+
+                ui.button(
+                    "Finalize review", on_click=open_signoff_dialog
                 ).classes("ghostbtn").props("no-caps flat dense")
             ui.label(
                 "exports are for sharing — every finding stays viewable here"
@@ -1025,6 +1331,7 @@ def _render_result_view(
                     history=history,
                     run_id=run_id,
                     profiles_dir=profiles_dir,
+                    mutable=mutable,
                 )
 
     def _visible_group_rows() -> list[dict[str, object]]:
@@ -1074,7 +1381,7 @@ def _render_result_view(
     def on_view_change(e: events.ValueChangeEventArguments) -> None:
         # Atomic rows cost real DOM, so they are built the first time they matter.
         if e.value == "atomic" and not all_rows:
-            all_rows[:] = _findings_rows(result)
+            all_rows[:] = _findings_rows(result, mutable=mutable)
             refilter()
 
     panels.on_value_change(on_view_change)
@@ -1112,15 +1419,24 @@ def _render_result_view(
             # its members are chosen explicitly in the affected-findings dialog.
             if focus_actions is not None and group.member_count == 1:
                 focus_actions(member)
+            if (
+                group.member_count == 1
+                and history is not None
+                and run_id is not None
+                and profiles_dir is not None
+                and result.profile_name != "default"
+            ):
+                render_promotion_action(member)
             with ui.row().classes("items-center gap-2 mt-2"):
                 ui.button(
                     "View affected findings",
                     on_click=lambda: open_members(group_id),
                 ).classes("ghostbtn").props("no-caps flat dense")
-                ui.button(
-                    "Review group",
-                    on_click=lambda: open_group_review(group_id),
-                ).classes("ghostbtn").props("no-caps flat dense")
+                if mutable:
+                    ui.button(
+                        "Review group",
+                        on_click=lambda: open_group_review(group_id),
+                    ).classes("ghostbtn").props("no-caps flat dense")
 
     def on_select(e: events.GenericEventArguments) -> None:
         group_id = str(e.args.get("id", ""))
@@ -1174,6 +1490,13 @@ def _render_result_view(
                     _render_evidence_body(member)
                     if focus_actions is not None:
                         focus_actions(member)
+                    if (
+                        history is not None
+                        and run_id is not None
+                        and profiles_dir is not None
+                        and result.profile_name != "default"
+                    ):
+                        render_promotion_action(member)
 
             def on_member_select(e: events.GenericEventArguments) -> None:
                 show_member(str(e.args.get("id", "")))
@@ -1184,7 +1507,8 @@ def _render_result_view(
                 start = page["index"] * page_size
                 end = min(start + page_size, group.member_count)
                 member_table.rows = [
-                    _finding_row(member) for member in group.members[start:end]
+                    _finding_row(member, mutable=mutable)
+                    for member in group.members[start:end]
                 ]
                 page_label.set_text(
                     f"Showing {start + 1:,}-{end:,} of {group.member_count:,}"
@@ -1213,7 +1537,113 @@ def _render_result_view(
                     "flat no-caps"
                 )
             refresh_page()
+            dialog.on(
+                "hide",
+                lambda: ui.run_javascript(
+                    f'document.querySelector(\'[data-review-id="{group_id}"]\')?.focus()'
+                ),
+            )
         dialog.open()
+
+    def render_promotion_action(finding: Finding) -> None:
+        def open_promotion() -> None:
+            if history is None or run_id is None or profiles_dir is None:
+                return
+            active_history = history
+            active_run_id = run_id
+            path = _profile_path(profiles_dir, result.profile_name)
+            profile = load_profile(path)
+            opened_hash = profile_sha256(profile)
+            kinds = available_promotions(finding)
+            with ui.dialog() as dialog, ui.card().classes("w-[42rem] max-w-full"):
+                ui.label("Promote finding to contract").classes("runhead")
+                ui.label(
+                    "This updates the named profile for future runs. The current "
+                    "run and any finalized evidence remain unchanged."
+                ).classes("note")
+                kind = ui.select(
+                    {item.value: item.value.replace("_", " ") for item in kinds},
+                    value=kinds[0].value,
+                    label="Rule type",
+                ).classes("w-full").props("outlined dense")
+                name = ui.input("Control name").classes("w-full").props(
+                    "outlined dense"
+                )
+                reason = ui.input("Waiver reason").classes("w-full").props(
+                    "outlined dense"
+                )
+                expires = ui.input("Waiver expiry (YYYY-MM-DD)").classes(
+                    "w-full"
+                ).props("outlined dense")
+                with ui.row().classes("gap-2 w-full"):
+                    minimum = ui.number("Minimum").classes("flex-1").props(
+                        "outlined dense"
+                    )
+                    maximum = ui.number("Maximum").classes("flex-1").props(
+                        "outlined dense"
+                    )
+                    absolute = ui.number(
+                        "Absolute tolerance", value=0, min=0
+                    ).classes("flex-1").props("outlined dense")
+                    relative = ui.number(
+                        "Relative tolerance", value=0, min=0
+                    ).classes("flex-1").props("outlined dense")
+
+                async def apply_promotion() -> None:
+                    try:
+                        expiry = (
+                            dt.date.fromisoformat(str(expires.value))
+                            if expires.value
+                            else None
+                        )
+                        request = PromotionRequest(
+                            kind=PromotionKind(str(kind.value)),
+                            name=str(name.value or ""),
+                            reason=str(reason.value or ""),
+                            expires=expiry,
+                            minimum=(
+                                float(minimum.value)
+                                if minimum.value is not None
+                                else None
+                            ),
+                            maximum=(
+                                float(maximum.value)
+                                if maximum.value is not None
+                                else None
+                            ),
+                            absolute=float(absolute.value or 0),
+                            relative=float(relative.value or 0),
+                        )
+                        draft = promote_finding(profile, finding, request)
+                        current = load_profile(path)
+                        if profile_sha256(current) != opened_hash:
+                            raise ValueError(
+                                "profile changed while this dialog was open; reopen it"
+                            )
+                        record = active_history.get_run(active_run_id)
+                        issues = await asyncio.to_thread(
+                            _lint_profile_for_record, draft, record
+                        )
+                        errors = [issue for issue in issues if issue.level == "error"]
+                        if errors:
+                            raise ValueError(errors[0].message)
+                        save_profile(draft, path)
+                    except Exception as exc:
+                        ui.notify(str(exc), type="negative")
+                        return
+                    dialog.close()
+                    ui.notify("Profile updated; run Re-QC to apply the new contract")
+
+                with ui.row().classes("items-center gap-2"):
+                    ui.button(
+                        "Preview and save", on_click=apply_promotion
+                    ).classes("runbtn").props("no-caps")
+                    ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+            dialog.open()
+
+        ui.button(
+            "Promote to contract", on_click=open_promotion
+        ).classes("ghostbtn").props("flat no-caps dense")
 
     def open_group_review(group_id: str) -> None:
         group = next(
@@ -1266,7 +1696,7 @@ def _render_result_view(
                         ],
                     )
                 if all_rows:
-                    all_rows[:] = _findings_rows(result)
+                    all_rows[:] = _findings_rows(result, mutable=mutable)
                 # Refreshing the detail panel deregisters this dialog, so close
                 # and report before anything is torn down.
                 dialog.close()
@@ -1280,6 +1710,12 @@ def _render_result_view(
                     "runbtn"
                 ).props("no-caps")
                 ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+            dialog.on(
+                "hide",
+                lambda: ui.run_javascript(
+                    f'document.querySelector(\'[data-review-id="{group_id}"]\')?.focus()'
+                ),
+            )
         dialog.open()
 
     group_table.on("select", on_select)
@@ -1348,6 +1784,7 @@ def _render_mapping_review(
     history: RunHistory | None,
     run_id: int | None,
     profiles_dir: Path | None,
+    mutable: bool = True,
 ) -> None:
     """Excel-to-PowerPoint figure reconciliation and analyst confirmation."""
     section("Mapping review")
@@ -1360,19 +1797,24 @@ def _render_mapping_review(
         if mapping is None:
             return
         with mapping_stats:
-            for label, value in (
-                ("eligible", mapping.eligible),
-                ("mapped", mapping.mapped),
-                ("verified", mapping.verified),
-                ("mismatched", mapping.mismatched),
-                ("unresolved", mapping.unresolved),
-                ("unmapped", mapping.unmapped),
-            ):
+            for label, value in _mapping_stats(mapping):
                 with ui.column().classes("mappingstat"):
                     ui.label(str(value)).classes("n")
                     ui.label(label).classes("l")
 
     render_mapping_stats()
+    mapping_limitation = next(
+        (
+            item.detail
+            for item in result.coverage
+            if item.check_id == "excel-ppt-crosscheck"
+            and item.state is not CoverageState.CHECKED
+            and item.detail
+        ),
+        "",
+    )
+    if mapping_limitation:
+        ui.label(mapping_limitation).classes("notecard")
     if result.profile_name == "default":
         ui.label("Named profile required to save confirmed mappings.").classes(
             "notecard"
@@ -1442,6 +1884,8 @@ def _render_mapping_review(
                                         )
                                         return
                                     try:
+                                        if history is not None and run_id is not None:
+                                            history.assert_mutable(run_id)
                                         persist_confirmed_mapping(
                                             profiles_dir,
                                             result.profile_name,
@@ -1485,11 +1929,11 @@ def _render_mapping_review(
                                             )
                                     render_stats()
                                     render_mapping_stats()
-                                    render_suggestions()
                                     ui.notify(
                                         f"Mapped {suggestion.figure_raw} to "
                                         f"{candidate.sheet}!{candidate.cell}"
                                     )
+                                    render_suggestions()
 
                                 return confirm
 
@@ -1497,6 +1941,8 @@ def _render_mapping_review(
                                 "Confirm", on_click=confirm_handler()
                             ).classes("ghostbtn").props("no-caps flat dense")
                             if result.profile_name == "default":
+                                button.disable()
+                            if not mutable:
                                 button.disable()
 
     render_suggestions()
@@ -1733,7 +2179,11 @@ def create_pages(
     focus_service = FocusService(
         work_dir, enabled=desktop_focus, network_mode=network_mode
     )
-    app.on_disconnect(lambda client: focus_service.forget_client(str(client.id)))
+    def on_disconnect(client) -> None:
+        focus_service.forget_client(str(client.id))
+        RunHistory(work_dir / "history.sqlite3").pause_review_sessions()
+
+    app.on_disconnect(on_disconnect)
     # One process-global FIFO manager: refreshes reconnect, tabs never duplicate
     # work, and requests left over from a previous server run are orphaned.
     queue_manager = get_manager(work_dir)
@@ -1744,6 +2194,7 @@ def create_pages(
     def request_shutdown() -> None:
         """Confirm, then stop the local server exactly as Ctrl+C would."""
         pending = queue_manager.store.pending()
+        RunHistory(work_dir / "history.sqlite3").pause_review_sessions()
         with ui.dialog() as dialog, ui.card().classes("w-[32rem] max-w-full"):
             ui.label("Stop the QC Tool server?").classes("runhead")
             ui.label(
@@ -1889,22 +2340,41 @@ def create_pages(
                                         return
                                     target = uploads_dir / role / filename
                                     private_directory(target.parent)
+                                    generation = state.upload_generations.get(role, 0) + 1
+                                    state.upload_generations[role] = generation
                                     await e.file.save(target)
                                     private_file(target)
                                     state.files[role] = target
                                     size = e.file.size()
                                     state.file_sizes[role] = size
+                                    state.file_hashes.pop(role, None)
                                     file_states[role].text = (
-                                        f"{e.file.name} · {max(1, size // 1024):,} KB"
+                                        f"{e.file.name} · {max(1, size // 1024):,} KB · "
+                                        "verifying bytes"
                                     )
                                     file_states[role].classes(add="ok", remove="err")
                                     update_mode_surface()
                                     refresh_scope()
                                     refresh_readiness()
+                                    digest = await asyncio.to_thread(sha256_file, target)
+                                    if (
+                                        state.upload_generations.get(role) != generation
+                                        or state.files.get(role) != target
+                                    ):
+                                        return
+                                    state.file_hashes[role] = digest
+                                    file_states[role].text = (
+                                        f"{e.file.name} · {max(1, size // 1024):,} KB"
+                                    )
+                                    refresh_readiness()
 
                                 def clear_role(role: str = role) -> None:
+                                    state.upload_generations[role] = (
+                                        state.upload_generations.get(role, 0) + 1
+                                    )
                                     state.files.pop(role, None)
                                     state.file_sizes.pop(role, None)
+                                    state.file_hashes.pop(role, None)
                                     uploaders[role].reset()
                                     file_states[role].text = "no file selected"
                                     file_states[role].classes(remove="ok err")
@@ -1957,6 +2427,8 @@ def create_pages(
                         file_states[role].classes(add="err")
                         continue
                     state.files[role] = stored_path
+                    if expected_hash:
+                        state.file_hashes[role] = expected_hash
                     file_states[role].text = (
                         f"{stored_path.name} · verified, reused from run "
                         f"#{rerun_record.run_id}"
@@ -1975,12 +2447,15 @@ def create_pages(
 
             def manage_profiles() -> None:
                 """Profile authoring lives here so routine setup stays a selector."""
-                with ui.dialog() as dialog, ui.card().classes("w-[42rem] max-w-full"):
+                with ui.dialog() as dialog, ui.card().classes(
+                    "w-[72rem] max-w-[96vw] max-h-[92vh] overflow-y-auto"
+                ) as card:
                     ui.label("Manage profiles").classes("runhead")
                     ui.label(
                         "Profiles hold controls, waivers, mappings, and cadence "
                         "rules. The built-in default profile cannot be edited."
                     ).classes("note")
+                    editor_controller: ProfileEditorController | None = None
                     with ui.row().classes("items-end gap-2 w-full no-wrap"):
                         new_profile_name = (
                             ui.input("New profile name")
@@ -2001,14 +2476,23 @@ def create_pages(
                             except ValueError as exc:
                                 ui.notify(str(exc), type="warning")
                                 return
+                            if path.exists():
+                                ui.notify(
+                                    f"Profile {name!r} already exists",
+                                    type="warning",
+                                )
+                                return
                             save_profile(DeliverableProfile(name=name), path)
                             options = list_profiles(profiles_dir)
                             profile_select.options = options
                             profile_select.value = name
                             profile_select.update()
+                            state.profile_name = name
                             editing.options = options
-                            editing.value = name
                             editing.update()
+                            if editor_controller is not None:
+                                editor_controller.request_load(name)
+                            refresh_readiness()
                             ui.notify(f"Profile {name!r} created")
 
                         ui.button("Create", on_click=create_profile).classes(
@@ -2023,53 +2507,31 @@ def create_pages(
                         .classes("w-full")
                         .props("outlined dense")
                     )
-                    editor = (
-                        ui.textarea()
-                        .classes("w-full")
-                        .style("font-family: var(--font-mono); font-size: 0.8rem")
-                        .props("rows=16 outlined")
+
+                    def profile_saved(old_name: str, new_name: str) -> None:
+                        options = list_profiles(profiles_dir)
+                        editing.options = options
+                        editing.update()
+                        profile_select.options = options
+                        if state.profile_name == old_name:
+                            state.profile_name = new_name
+                            profile_select.value = new_name
+                        profile_select.update()
+                        refresh_readiness()
+
+                    def close_profile_dialog() -> None:
+                        dialog.close()
+
+                    editor_controller = open_profile_editor(
+                        card,
+                        profiles_dir,
+                        editing,
+                        on_close=close_profile_dialog,
+                        selected_files=lambda: dict(state.files),
+                        selected_passwords=lambda: dict(state.passwords),
+                        on_saved=profile_saved,
                     )
-
-                    def load_selected() -> None:
-                        name = str(editing.value or "default")
-                        if name == "default":
-                            editor.value = ""
-                            editor.disable()
-                            return
-                        editor.enable()
-                        path = _profile_path(profiles_dir, name)
-                        editor.value = (
-                            path.read_text(encoding="utf-8") if path.exists() else ""
-                        )
-
-                    editing.on_value_change(load_selected)
-                    load_selected()
-
-                    def save() -> None:
-                        name = str(editing.value or "default")
-                        if name == "default":
-                            ui.notify(
-                                "Create a named profile before editing",
-                                type="warning",
-                            )
-                            return
-                        try:
-                            profile = DeliverableProfile.model_validate(
-                                yaml.safe_load(editor.value or "") or {}
-                            )
-                        except Exception as exc:  # surfaced to the analyst
-                            ui.notify(f"Invalid profile: {exc}", type="negative")
-                            return
-                        save_profile(profile, _profile_path(profiles_dir, name))
-                        ui.notify("Profile saved")
-
-                    with ui.row().classes("items-center gap-2"):
-                        ui.button("Save", on_click=save).classes("runbtn").props(
-                            "no-caps"
-                        )
-                        ui.button("Close", on_click=dialog.close).props(
-                            "flat no-caps"
-                        )
+                    dialog.on("hide", editor_controller.dispose)
                 dialog.open()
 
             def on_profile_change(e: events.ValueChangeEventArguments) -> None:
@@ -2257,6 +2719,7 @@ def create_pages(
                     blockers = _run_blockers(
                         state.mode,
                         state.files,
+                        file_hashes=state.file_hashes,
                         rerun_of=state.rerun_of,
                         rerun_required=state.rerun_required,
                     )
@@ -2370,12 +2833,14 @@ def create_pages(
                     blockers = _run_blockers(
                         state.mode,
                         state.files,
+                        file_hashes=state.file_hashes,
                         rerun_of=state.rerun_of,
                         rerun_required=state.rerun_required,
                     )
                     if blockers:
                         ui.notify("; ".join(blockers), type="warning")
                         return
+                    RunHistory(work_dir / "history.sqlite3").pause_review_sessions()
                     files = _files_for_mode(state.mode, state.files)
                     try:
                         profile = load_profile_by_name(profiles_dir, state.profile_name)
@@ -2565,6 +3030,33 @@ def create_pages(
             table.add_slot("body", HISTORY_BODY_SLOT)
             empty_note = ui.label("No run matches these filters.").classes("note")
             empty_note.visible = False
+            with ui.expansion("Assurance trends").classes("w-full mt-4"):
+                ui.label(
+                    "Fixed local counts only. Review minutes come only from the "
+                    "explicit Start/Pause timer; unknown means no timer evidence."
+                ).classes("note")
+                trend_table = ui.table(
+                    columns=[
+                        {"name": "run", "label": "Run", "field": "run"},
+                        {"name": "profile", "label": "Profile", "field": "profile"},
+                        {"name": "atomics", "label": "Atomics", "field": "atomics"},
+                        {"name": "decisions", "label": "Decisions", "field": "decisions"},
+                        {"name": "limited", "label": "Limits", "field": "limited"},
+                        {"name": "mapped", "label": "Mapped", "field": "mapped"},
+                        {"name": "verified", "label": "Verified", "field": "verified"},
+                        {"name": "exact_reusable", "label": "Reusable", "field": "exact_reusable"},
+                        {"name": "carried", "label": "Carried", "field": "carried"},
+                        {"name": "finalized", "label": "Finalized", "field": "finalized"},
+                        {
+                            "name": "review_minutes",
+                            "label": "Review min",
+                            "field": "review_minutes",
+                        },
+                    ],
+                    rows=[],
+                    row_key="run",
+                    pagination=20,
+                ).classes("findings-table").props("flat dense")
 
             def refresh_bulk_bar() -> None:
                 bulk_bar.visible = bool(selected)
@@ -2607,6 +3099,11 @@ def create_pages(
                 for row in rows:
                     row["sel"] = row["id"] in selected
                 table.rows = visible
+                trend_table.rows = [
+                    _history_trend_row(records[int(str(row["id"]))], history)
+                    for row in visible
+                    if int(str(row["id"])) in records
+                ]
                 empty_note.visible = not visible
 
             for control in (
@@ -2733,10 +3230,15 @@ def create_pages(
 
             def on_export(e: events.GenericEventArguments) -> None:
                 record = records.get(int(e.args["id"]))
-                path = (
-                    record.report_paths.get(str(e.args["kind"]))
+                paths = (
+                    record.signoff.report_paths
+                    if record is not None and record.signoff is not None
+                    else record.report_paths
                     if record is not None
-                    else None
+                    else {}
+                )
+                path = (
+                    paths.get(str(e.args["kind"]))
                 )
                 if path and Path(path).exists():
                     ui.download(str(path))

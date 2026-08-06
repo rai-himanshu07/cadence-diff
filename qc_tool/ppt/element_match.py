@@ -10,6 +10,7 @@ from qc_tool.ppt.model import (
     ChartContent,
     PptChartPlot,
     PptChartSeries,
+    ShapeContent,
     SlideContent,
     TableContent,
 )
@@ -51,6 +52,11 @@ class SlideElementMatching:
     removed_charts: list[ChartContent] = field(default_factory=list)
     added_charts: list[ChartContent] = field(default_factory=list)
     reordered_charts: list[tuple[ChartContent, ChartContent]] = field(default_factory=list)
+    media_pairs: list[tuple[ShapeContent, ShapeContent]] = field(default_factory=list)
+    removed_media: list[ShapeContent] = field(default_factory=list)
+    added_media: list[ShapeContent] = field(default_factory=list)
+    ambiguous_baseline_media: list[ShapeContent] = field(default_factory=list)
+    ambiguous_current_media: list[ShapeContent] = field(default_factory=list)
 
 
 def _consume_unique_matches(
@@ -177,6 +183,27 @@ def _chart_geometry(chart: ChartContent) -> tuple[int, int, int, int]:
     return chart.left, chart.top, chart.width, chart.height
 
 
+def _media_name(shape: ShapeContent) -> str | None:
+    return shape.name.strip().casefold() or None
+
+
+def _media_geometry(shape: ShapeContent) -> tuple[int, int, int, int]:
+    return shape.left, shape.top, shape.width, shape.height
+
+
+def _media_may_match(baseline: ShapeContent, current: ShapeContent) -> bool:
+    baseline_name = _media_name(baseline)
+    current_name = _media_name(current)
+    return bool(
+        _media_geometry(baseline) == _media_geometry(current)
+        or (
+            baseline_name is not None
+            and current_name is not None
+            and baseline_name == current_name
+        )
+    )
+
+
 def match_slide_elements(
     baseline: SlideContent,
     current: SlideContent,
@@ -253,6 +280,48 @@ def match_slide_elements(
         lambda chart: chart.z_order,
         lambda chart: chart.z_order,
     )
+
+    baseline_media = [
+        shape for shape in baseline.shapes if shape.media_kind is not None
+    ]
+    current_media = [
+        shape for shape in current.shapes if shape.media_kind is not None
+    ]
+    matching.media_pairs.extend(
+        _consume_unique_matches(
+            baseline_media,
+            current_media,
+            lambda shape: (_media_name(shape), _media_geometry(shape)),
+        )
+    )
+    matching.media_pairs.extend(
+        _consume_unique_matches(baseline_media, current_media, _media_geometry)
+    )
+    matching.media_pairs.extend(
+        _consume_unique_matches(baseline_media, current_media, _media_name)
+    )
+    matching.ambiguous_baseline_media = [
+        baseline_shape
+        for baseline_shape in baseline_media
+        if any(
+            _media_may_match(baseline_shape, current_shape)
+            for current_shape in current_media
+        )
+    ]
+    matching.ambiguous_current_media = [
+        current_shape
+        for current_shape in current_media
+        if any(
+            _media_may_match(baseline_shape, current_shape)
+            for baseline_shape in baseline_media
+        )
+    ]
+    for shape in matching.ambiguous_baseline_media:
+        baseline_media.remove(shape)
+    for shape in matching.ambiguous_current_media:
+        current_media.remove(shape)
+    matching.removed_media = baseline_media
+    matching.added_media = current_media
     return matching
 
 

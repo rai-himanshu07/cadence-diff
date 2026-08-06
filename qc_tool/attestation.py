@@ -12,7 +12,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from qc_tool import __version__
-from qc_tool.config.profile import DeliverableProfile
+from qc_tool.config.profile import DeliverableProfile, canonical_profile_bytes
 from qc_tool.engine import QCRunResult
 from qc_tool.report.json_report import result_payload
 from qc_tool.security import private_directory, private_file
@@ -33,6 +33,13 @@ class AttestationVerification(BaseModel):
     def add(self, code: str, message: str) -> None:
         self.valid = False
         self.issues.append(AttestationIssue(code=code, message=message))
+
+
+class AttestationSignoff(BaseModel):
+    finalized_at: str
+    acknowledgements: tuple[str, ...] = ()
+    review_state_digest: str
+    annotation_lineage: list[dict[str, object]] = Field(default_factory=list)
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -80,11 +87,10 @@ def create_attestation(
     input_files: dict[str, Path],
     report_paths: dict[str, Path],
     key: bytes,
+    signoff: AttestationSignoff | None = None,
 ) -> Path:
     """Create a private signed bundle containing evidence and report members."""
-    profile_bytes = json.dumps(
-        profile.model_dump(mode="json", by_alias=True), indent=2
-    ).encode("utf-8")
+    profile_bytes = canonical_profile_bytes(profile)
     findings_bytes = json.dumps(
         result_payload(result, include_context=True), indent=2
     ).encode("utf-8")
@@ -120,7 +126,7 @@ def create_attestation(
         if finding.severity_overridden or finding.analyst_comment or finding.waiver_reason
     ]
     unsigned = {
-        "schema_version": 1,
+        "schema_version": 2 if signoff is not None else 1,
         "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "tool": {"distribution": "cadence-diff", "version": __version__},
         "run": {
@@ -141,6 +147,8 @@ def create_attestation(
         "waivers": [item.model_dump(mode="json") for item in profile.waivers],
         "analyst_decisions": analyst_decisions,
     }
+    if signoff is not None:
+        unsigned["signoff"] = signoff.model_dump(mode="json")
     signature = hmac.new(key, _canonical(unsigned), hashlib.sha256).hexdigest()
     manifest = {
         **unsigned,
@@ -176,6 +184,13 @@ def verify_attestation(path: Path, *, key: bytes) -> AttestationVerification:
         except (json.JSONDecodeError, UnicodeDecodeError):
             result.add("invalid-manifest", "manifest.json is not valid JSON")
             return result
+        schema_version = manifest.get("schema_version")
+        if schema_version not in {1, 2}:
+            result.add(
+                "schema-version", f"unsupported attestation schema {schema_version!r}"
+            )
+        if schema_version == 2 and not isinstance(manifest.get("signoff"), dict):
+            result.add("missing-signoff", "schema v2 sign-off evidence is missing")
         signature = manifest.pop("signature", None)
         if not isinstance(signature, dict):
             result.add("missing-signature", "manifest signature is missing")

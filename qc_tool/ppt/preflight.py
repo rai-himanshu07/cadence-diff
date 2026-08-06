@@ -37,6 +37,43 @@ class PptPreflightResult:
     coverage: list[CoverageItem] = field(default_factory=list)
 
 
+def media_structural_coverage(
+    *decks: DeckSnapshot,
+    findings: int = 0,
+    ambiguous_shapes: int = 0,
+) -> CoverageItem:
+    if not decks:
+        return CoverageItem(
+            check_id="ppt-media-structural",
+            label="Embedded media byte structure",
+            artifact="ppt",
+            state=CoverageState.UNAVAILABLE,
+            detail="PowerPoint deck not supplied",
+        )
+    available = all(deck.media_available for deck in decks)
+    complete = available and ambiguous_shapes == 0
+    details = [
+        deck.media_detail for deck in decks if not deck.media_available
+    ]
+    if ambiguous_shapes:
+        details.append(
+            f"{ambiguous_shapes} media shape(s) had ambiguous name/geometry "
+            "keys and were not compared"
+        )
+    return CoverageItem(
+        check_id="ppt-media-structural",
+        label="Embedded media byte structure",
+        artifact="ppt",
+        state=CoverageState.CHECKED if complete else CoverageState.DEGRADED,
+        findings=findings,
+        detail=(
+            "Embedded media bytes hashed without decoding"
+            if complete
+            else "; ".join(details)
+        ),
+    )
+
+
 def _periods_in_text(text: str) -> list[tuple[str, Period]]:
     periods: list[tuple[str, Period]] = []
     for pattern in _PERIOD_PATTERNS:
@@ -304,12 +341,18 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
         )
     )
     result.coverage.append(
+        media_structural_coverage(deck)
+    )
+    result.coverage.append(
         CoverageItem(
             check_id="ppt-media-visual",
-            label="Media integrity and rendered visual layout",
+            label="Rendered media and visual layout",
             artifact="ppt",
             state=CoverageState.UNAVAILABLE,
-            detail="Requires a trusted rendering comparison",
+            detail=(
+                "Embedded bytes are checked structurally; pixels, OCR text, and "
+                "rendered layout are not inspected"
+            ),
         )
     )
     return result

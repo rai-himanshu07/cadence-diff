@@ -7,6 +7,11 @@ and reuse them each cycle.
 """
 
 import datetime as dt
+import hashlib
+import json
+import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -19,6 +24,7 @@ from qc_tool.security import private_directory, private_file
 Orientation = Literal["long", "wide", "block"]
 CadenceKind = Literal["month", "week", "quarter", "date"]
 SeriesRole = Literal["actual", "forecast", "target"]
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$")
 
 
 class NumericTolerance(BaseModel):
@@ -233,6 +239,31 @@ def default_profile(name: str = "default") -> DeliverableProfile:
     return DeliverableProfile(name=name)
 
 
+def canonical_profile_json(profile: DeliverableProfile) -> str:
+    return json.dumps(
+        profile.model_dump(mode="json", by_alias=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def canonical_profile_bytes(profile: DeliverableProfile) -> bytes:
+    return canonical_profile_json(profile).encode("utf-8")
+
+
+def profile_sha256(profile: DeliverableProfile) -> str:
+    return hashlib.sha256(canonical_profile_bytes(profile)).hexdigest()
+
+
+def profile_path(profiles_dir: Path, name: str) -> Path:
+    if not _PROFILE_NAME_RE.fullmatch(name) or name in {".", ".."}:
+        raise ValueError(
+            "profile name must start with a letter or number and contain only "
+            "letters, numbers, spaces, dots, dashes, or underscores"
+        )
+    return profiles_dir / f"{name}.yaml"
+
+
 def load_profile(path: Path) -> DeliverableProfile:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
@@ -242,7 +273,27 @@ def load_profile(path: Path) -> DeliverableProfile:
 
 def save_profile(profile: DeliverableProfile, path: Path) -> None:
     private_directory(path.parent)
-    payload = profile.model_dump(by_alias=True, exclude_defaults=True)
+    payload = profile.model_dump(mode="json", by_alias=True, exclude_defaults=True)
     payload["name"] = profile.name
-    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-    private_file(path)
+    content = yaml.safe_dump(payload, sort_keys=False)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            temporary = Path(handle.name)
+        private_file(temporary)
+        if load_profile(temporary) != profile:
+            raise ValueError("saved profile does not round-trip through YAML")
+        os.replace(temporary, path)
+        temporary = None
+        private_file(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

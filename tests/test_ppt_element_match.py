@@ -14,6 +14,7 @@ from qc_tool.ppt.model import (
     PptChartLabel,
     PptChartPlot,
     PptChartSeries,
+    ShapeContent,
     SlideContent,
     TableContent,
 )
@@ -113,6 +114,7 @@ def _slide(
     *,
     tables: list[TableContent] | None = None,
     charts: list[ChartContent] | None = None,
+    shapes: list[ShapeContent] | None = None,
 ) -> SlideContent:
     return SlideContent(
         index=0,
@@ -120,6 +122,33 @@ def _slide(
         texts=[],
         tables=tables or [],
         charts=charts or [],
+        shapes=shapes or [],
+    )
+
+
+def _media(
+    name: str,
+    geometry: tuple[int, int, int, int],
+    digest: str,
+    *,
+    source_index: int,
+    z_order: int,
+    shape_id: int,
+) -> ShapeContent:
+    left, top, width, height = geometry
+    return ShapeContent(
+        source_id=f"media-{source_index}",
+        source_index=source_index,
+        shape_id=shape_id,
+        shape_type="PICTURE",
+        name=name,
+        left=left,
+        top=top,
+        width=width,
+        height=height,
+        z_order=z_order,
+        media_kind="image/png",
+        media_digest=digest,
     )
 
 
@@ -192,6 +221,129 @@ def test_element_matcher_survives_insertions_reorders_and_duplicate_panels() -> 
     } == {("Revenue", "Revenue"), ("Margin", "Margin")}
     assert [chart.all_series[0].name for chart in matching.added_charts] == ["Cost"]
     assert len(matching.reordered_charts) == 1
+
+
+def test_media_digest_never_controls_pairing_and_reorder_is_silent() -> None:
+    left = (0, 0, 100, 100)
+    right = (200, 0, 100, 100)
+    baseline = _slide(
+        shapes=[
+            _media("Picture", left, "a" * 64, source_index=0, z_order=1, shape_id=11),
+            _media("Picture", right, "b" * 64, source_index=1, z_order=2, shape_id=12),
+        ]
+    )
+    current = _slide(
+        shapes=[
+            _media("Picture", right, "a" * 64, source_index=0, z_order=1, shape_id=22),
+            _media("Picture", left, "b" * 64, source_index=1, z_order=2, shape_id=21),
+        ]
+    )
+
+    findings = _findings(baseline, current)
+    media = [
+        finding
+        for finding in findings
+        if finding.finding_class is FindingClass.PPT_MEDIA_CHANGED
+    ]
+
+    assert {
+        (finding.baseline_focus_shape_id, finding.focus_shape_id)
+        for finding in media
+    } == {(11, 21), (12, 22)}
+    assert all("a" * 64 not in finding.model_dump_json() for finding in media)
+    assert all("b" * 64 not in finding.model_dump_json() for finding in media)
+
+    reordered = _slide(
+        shapes=[
+            _media("Picture", right, "b" * 64, source_index=0, z_order=1, shape_id=22),
+            _media("Picture", left, "a" * 64, source_index=1, z_order=2, shape_id=21),
+        ]
+    )
+    assert not [
+        finding
+        for finding in _findings(baseline, reordered)
+        if finding.finding_class is FindingClass.PPT_MEDIA_CHANGED
+    ]
+
+
+def test_media_add_remove_and_ambiguous_structural_keys_are_not_guessed() -> None:
+    geometry = (0, 0, 100, 100)
+    removed = _media(
+        "Old picture", geometry, "a" * 64, source_index=0, z_order=1, shape_id=11
+    )
+    added = _media(
+        "New picture",
+        (300, 0, 100, 100),
+        "b" * 64,
+        source_index=0,
+        z_order=1,
+        shape_id=21,
+    )
+
+    findings = _findings(_slide(shapes=[removed]), _slide(shapes=[added]))
+    media = [
+        finding
+        for finding in findings
+        if finding.finding_class is FindingClass.PPT_MEDIA_CHANGED
+    ]
+    assert len(media) == 2
+    assert {finding.message.rsplit(" ", 1)[-1] for finding in media} == {
+        "added",
+        "removed",
+    }
+    assert {finding.baseline_focus_shape_id for finding in media} == {None, 11}
+    assert {finding.focus_shape_id for finding in media} == {None, 21}
+
+    duplicate_baseline = _slide(
+        shapes=[
+            _media("Same", geometry, "a" * 64, source_index=0, z_order=1, shape_id=1),
+            _media("Same", geometry, "b" * 64, source_index=1, z_order=2, shape_id=2),
+        ]
+    )
+    duplicate_current = _slide(
+        shapes=[
+            _media("Same", geometry, "a" * 64, source_index=0, z_order=2, shape_id=3),
+            _media("Same", geometry, "b" * 64, source_index=1, z_order=1, shape_id=4),
+        ]
+    )
+    matching = match_slide_elements(duplicate_baseline, duplicate_current)
+    assert matching.media_pairs == []
+    assert matching.removed_media == []
+    assert matching.added_media == []
+    assert len(matching.ambiguous_baseline_media) == 2
+    assert len(matching.ambiguous_current_media) == 2
+    assert not [
+        finding
+        for finding in _findings(duplicate_baseline, duplicate_current)
+        if finding.finding_class is FindingClass.PPT_MEDIA_CHANGED
+    ]
+
+
+def test_media_duplicate_names_or_geometry_use_the_unique_combined_key() -> None:
+    first = (0, 0, 100, 100)
+    second = (200, 0, 100, 100)
+    baseline = _slide(
+        shapes=[
+            _media("Same", first, "a" * 64, source_index=0, z_order=1, shape_id=1),
+            _media("Same", second, "b" * 64, source_index=1, z_order=2, shape_id=2),
+            _media("Left", first, "c" * 64, source_index=2, z_order=3, shape_id=3),
+            _media("Right", first, "d" * 64, source_index=3, z_order=4, shape_id=4),
+        ]
+    )
+    current = _slide(
+        shapes=[
+            _media("Same", second, "b" * 64, source_index=0, z_order=1, shape_id=12),
+            _media("Same", first, "a" * 64, source_index=1, z_order=2, shape_id=11),
+            _media("Right", first, "d" * 64, source_index=2, z_order=3, shape_id=14),
+            _media("Left", first, "c" * 64, source_index=3, z_order=4, shape_id=13),
+        ]
+    )
+
+    matching = match_slide_elements(baseline, current)
+
+    assert len(matching.media_pairs) == 4
+    assert matching.removed_media == []
+    assert matching.added_media == []
 
 
 def test_diff_emits_explicit_table_chart_plot_and_series_inventory_changes() -> None:

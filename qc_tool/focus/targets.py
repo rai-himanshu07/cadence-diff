@@ -136,6 +136,7 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
     FindingClass.PPT_CHART_LEGEND_CHANGED: TargetRule.PPT_MATCHED_SLIDE,
     FindingClass.PPT_CHART_LABELS_CHANGED: TargetRule.PPT_MATCHED_SLIDE,
     FindingClass.PPT_SHAPE_GEOMETRY_CHANGED: TargetRule.PPT_MATCHED_SLIDE,
+    FindingClass.PPT_MEDIA_CHANGED: TargetRule.PPT_MATCHED_SLIDE,
     FindingClass.PPT_DRAFT_TOKEN: TargetRule.PPT_CURRENT_SLIDE,
     FindingClass.PPT_EMPTY_SLIDE: TargetRule.PPT_CURRENT_SLIDE,
     FindingClass.PPT_TABLE_BLANK: TargetRule.PPT_CURRENT_SLIDE,

@@ -227,6 +227,18 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .q-uploader__list { min-height: 1.4rem; padding: 0.35rem 0.6rem; }
 .q-expansion-item { background: var(--panel); border: 1px solid var(--line);
   border-radius: 6px; }
+.profile-section { margin-bottom: 0.4rem; }
+.profile-section .profile-section { border-color: var(--line-soft);
+  margin: 0.25rem 0; }
+.profile-section .q-item { min-height: 2.35rem; }
+.profile-section .q-expansion-item__content { padding: 0.35rem 0.55rem 0.55rem; }
+.profile-icon-button { width: 2rem; height: 2rem; flex: 0 0 2rem; }
+.profile-yaml textarea { font-family: var(--font-mono); font-size: var(--fs-meta);
+  line-height: 1.45; }
+.profile-editor-actions { position: sticky; bottom: -1px; z-index: 2;
+  background: var(--panel); border-top: 1px solid var(--line);
+  padding: 0.65rem 0 0.2rem; width: 100%; }
+.preline { white-space: pre-line; overflow-wrap: anywhere; }
 
 /* inputs: one panel per cycle so baseline and current can never be scanned
    as a single left-to-right list of four look-alike slots */
@@ -363,6 +375,9 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 .findings-table thead th { white-space: normal; }
 .findings-table .mono { font-family: var(--font-mono); font-size: var(--fs-meta); }
 .review-groups-table tbody tr { cursor: pointer; }
+.review-groups-table tbody tr:focus-visible,
+.members-table tbody tr:focus-visible { outline: 2px solid var(--ink);
+  outline-offset: -2px; }
 .review-groups-table tbody tr.selrow td { background: var(--surface1); }
 .review-groups-table tbody tr.selrow td:first-child {
   box-shadow: inset 3px 0 0 var(--ink); }
@@ -546,6 +561,20 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 .caplimited { color: var(--warning); font-weight: 650; }
 .capfull { color: var(--ink-soft); }
 
+.reviewclass-inline { display: none; color: var(--ink-soft);
+  font-family: var(--font-mono); font-size: var(--fs-meta); margin-right: 0.45rem; }
+
+@media (max-width: 1350px) {
+  .review-groups-table th:nth-child(2),
+  .review-groups-table td:nth-child(2) { display: none; }
+  .review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 11%; }
+  .review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 20%; }
+  .review-groups-table th:nth-child(4), .review-groups-table td:nth-child(4) { width: 5%; }
+  .review-groups-table th:nth-child(5), .review-groups-table td:nth-child(5) { width: 64%; }
+  .reviewclass-inline { display: inline; }
+  .review-groups-table .sevtext { white-space: nowrap; }
+}
+
 @media (max-width: 640px) {
   .appheader .inner { align-items: center; flex-wrap: wrap; gap: 0.45rem 0.7rem;
     padding: 0.55rem 0.75rem; }
@@ -613,6 +642,7 @@ HISTORY_BODY_SLOT = """
   </q-td>
   <q-td key="id" :props="props" class="mono">#{{ props.row.id }}
     <span v-if="props.row.archived" class="archivedtag">archived</span>
+    <span v-if="props.row.finalized" class="reviewed">finalized</span>
   </q-td>
   <q-td key="when" :props="props">
     <span :title="props.row.started">{{ props.row.when }}</span>
@@ -654,7 +684,12 @@ HISTORY_BODY_SLOT = """
 
 REVIEW_GROUPS_BODY_SLOT = """
 <q-tr :props="props" :class="{selrow: props.row.sel}"
-  @click="$parent.$emit('select', {id: props.row.id})">
+  role="button" tabindex="0" :data-review-id="props.row.id"
+  :aria-label="'Review ' + props.row.class.replace(/_/g, ' ') +
+    ' at ' + props.row.where + ' ' + props.row.location"
+  @click="$parent.$emit('select', {id: props.row.id})"
+  @keydown.enter.prevent="$parent.$emit('select', {id: props.row.id})"
+  @keydown.space.prevent="$parent.$emit('select', {id: props.row.id})">
   <q-td key="severity" :props="props">
     <span :class="'sevdot sev-' + props.row.severity"></span
     ><span class="sevtext">{{ props.row.severity }}</span>
@@ -666,7 +701,8 @@ REVIEW_GROUPS_BODY_SLOT = """
     props.row.where }}<span v-if="props.row.where && props.row.location"> · </span
     ><span class="mono">{{ props.row.location }}</span></q-td>
   <q-td key="members" :props="props" class="groupcount">{{ props.row.members }}</q-td>
-  <q-td key="message" :props="props">{{ props.row.message }}
+  <q-td key="message" :props="props"><span class="reviewclass-inline">{{
+    props.row.class.replace(/_/g, ' ') }}</span>{{ props.row.message }}
     <span v-if="props.row.reviewed" class="reviewed"
       :title="props.row.reviewed + ' of ' + props.row.members + ' reviewed'"
       >reviewed {{ props.row.reviewed }}/{{ props.row.members }}</span>
@@ -679,7 +715,11 @@ REVIEW_GROUPS_BODY_SLOT = """
 
 REVIEW_MEMBER_ROWS_SLOT = """
 <q-tr :props="props" :class="{selrow: props.row.sel}"
-  @click="$parent.$emit('select', {id: props.row.id})">
+  role="button" tabindex="0" :data-member-id="props.row.id"
+  :aria-label="'Review finding ' + props.row.id + ' at ' + props.row.location"
+  @click="$parent.$emit('select', {id: props.row.id})"
+  @keydown.enter.prevent="$parent.$emit('select', {id: props.row.id})"
+  @keydown.space.prevent="$parent.$emit('select', {id: props.row.id})">
   <q-td key="id" :props="props" class="mono">{{ props.row.id }}</q-td>
   <q-td key="severity" :props="props">
     <span :class="'sevdot sev-' + props.row.severity"></span
@@ -758,17 +798,22 @@ FINDINGS_BODY_SLOT = """
       <div class="dk">artifact</div><div class="dv">{{ props.row.artifact }}</div>
       <div class="dk">review</div>
       <div class="dv">
-        <div class="annotrow">
+        <div v-if="props.row.mutable" class="annotrow">
           <q-select dense outlined options-dense class="annotsev" label="severity"
             :model-value="props.row.severity"
             :options="['critical','warning','info','expected']"
             @update:model-value="v => { props.row.severity = v; props.row.overridden = true;
               $parent.$emit('sev', {id: props.row.id, value: v}) }" />
+          <q-btn dense flat no-caps class="confirmsev" label="Confirm severity"
+            :aria-label="'Confirm current severity for ' + props.row.id"
+            @click="props.row.overridden = true;
+              $parent.$emit('sev', {id: props.row.id, value: props.row.severity})" />
           <q-input dense outlined class="annotcomment" label="analyst comment"
             :model-value="props.row.comment"
             @update:model-value="v => props.row.comment = v"
             @blur="() => $parent.$emit('note', {id: props.row.id, value: props.row.comment})" />
         </div>
+        <span v-else class="reviewed">finalized — review state locked</span>
       </div>
       <template v-if="props.row.bx || props.row.cx">
         <div class="dk">context</div>

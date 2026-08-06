@@ -22,6 +22,8 @@ class ShapeContent:
     texts: list[str] = field(default_factory=list)
     is_placeholder: bool = False
     placeholder_type: str | None = None
+    media_kind: str | None = None
+    media_digest: str | None = None
 
 
 @dataclass(slots=True)
@@ -130,3 +132,5 @@ class DeckSnapshot:
     chart_detail: str = "Charts parsed from raw PowerPoint chart parts"
     notes_available: bool = True
     notes_detail: str = "Speaker notes read separately from visible slide text"
+    media_available: bool = True
+    media_detail: str = "Embedded media bytes hashed without decoding"

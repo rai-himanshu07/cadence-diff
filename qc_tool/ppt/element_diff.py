@@ -15,6 +15,7 @@ from qc_tool.ppt.model import (
     ChartContent,
     PptChartPlot,
     PptChartSeries,
+    ShapeContent,
     SlideContent,
     TableContent,
 )
@@ -826,6 +827,10 @@ def _shape_findings(
     return findings
 
 
+def _media_label(shape: ShapeContent) -> str:
+    return f"media shape {shape.source_index + 1}"
+
+
 def diff_slide_elements(
     baseline: SlideContent,
     current: SlideContent,
@@ -923,6 +928,49 @@ def diff_slide_elements(
                 focus_shape_id=current_chart.shape_id or None,
                 baseline_focus_shape_id=baseline_chart.shape_id or None,
                 message=f"{display}: chart {_chart_label(current_chart)!r} reordered",
+            )
+        )
+    for shape in matching.removed_media:
+        findings.append(
+            Finding(
+                artifact="ppt",
+                finding_class=FindingClass.PPT_MEDIA_CHANGED,
+                slide=display,
+                element=_media_label(shape),
+                baseline_focus_shape_id=shape.shape_id or None,
+                message=f"{display}: embedded media removed",
+            )
+        )
+    for shape in matching.added_media:
+        findings.append(
+            Finding(
+                artifact="ppt",
+                finding_class=FindingClass.PPT_MEDIA_CHANGED,
+                slide=display,
+                element=_media_label(shape),
+                focus_shape_id=shape.shape_id or None,
+                message=f"{display}: embedded media added",
+            )
+        )
+    for baseline_shape, current_shape in matching.media_pairs:
+        if (
+            baseline_shape.media_digest is None
+            or current_shape.media_digest is None
+            or (
+                baseline_shape.media_kind == current_shape.media_kind
+                and baseline_shape.media_digest == current_shape.media_digest
+            )
+        ):
+            continue
+        findings.append(
+            Finding(
+                artifact="ppt",
+                finding_class=FindingClass.PPT_MEDIA_CHANGED,
+                slide=display,
+                element=_media_label(current_shape),
+                focus_shape_id=current_shape.shape_id or None,
+                baseline_focus_shape_id=baseline_shape.shape_id or None,
+                message=f"{display}: embedded media bytes changed",
             )
         )
     for finding in findings:

@@ -72,6 +72,21 @@ def test_default_severities(result: QCRunResult) -> None:
     assert _one(result, FindingClass.SLIDE_REORDERED).severity is Severity.EXPECTED
 
 
+def test_ppt_media_change_defaults_to_warning() -> None:
+    findings = triage(
+        [
+            Finding(
+                artifact="ppt",
+                finding_class=FindingClass.PPT_MEDIA_CHANGED,
+                slide="Executive Summary",
+                message="embedded media bytes changed",
+            )
+        ]
+    )
+
+    assert findings[0].severity is Severity.WARNING
+
+
 def test_expected_growth_always_expected(result: QCRunResult) -> None:
     growth = [f for f in result.findings if f.expected_growth]
     assert growth

@@ -13,7 +13,7 @@ from qc_tool.ppt.extract import (
     SlideContent,
     TableContent,
 )
-from qc_tool.ppt.preflight import preflight_deck
+from qc_tool.ppt.preflight import media_structural_coverage, preflight_deck
 
 
 def test_current_ppt_preflight_runs_without_baseline(fixture_dir: Path) -> None:
@@ -32,7 +32,29 @@ def test_current_ppt_preflight_runs_without_baseline(fixture_dir: Path) -> None:
         item for item in result.coverage if item.check_id == "ppt-cycle-comparison"
     )
     assert comparison.state is CoverageState.UNAVAILABLE
+    structural_media = next(
+        item
+        for item in result.coverage
+        if item.check_id == "ppt-media-structural"
+    )
+    visual_media = next(
+        item for item in result.coverage if item.check_id == "ppt-media-visual"
+    )
+    assert structural_media.state is CoverageState.CHECKED
+    assert visual_media.state is CoverageState.UNAVAILABLE
     assert sha256_file(source) == before
+
+
+def test_media_structural_coverage_refuses_ambiguous_shape_pairing() -> None:
+    coverage = media_structural_coverage(
+        DeckSnapshot(source_name="baseline.pptx"),
+        DeckSnapshot(source_name="current.pptx"),
+        ambiguous_shapes=2,
+    )
+
+    assert coverage.state is CoverageState.DEGRADED
+    assert "2 media shape(s)" in coverage.detail
+    assert "were not compared" in coverage.detail
 
 
 def test_ppt_preflight_detects_intrinsic_defects() -> None:

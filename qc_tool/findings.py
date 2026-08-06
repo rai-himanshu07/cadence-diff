@@ -90,6 +90,7 @@ class FindingClass(StrEnum):
     PPT_CHART_LEGEND_CHANGED = "ppt_chart_legend_changed"
     PPT_CHART_LABELS_CHANGED = "ppt_chart_labels_changed"
     PPT_SHAPE_GEOMETRY_CHANGED = "ppt_shape_geometry_changed"
+    PPT_MEDIA_CHANGED = "ppt_media_changed"
     PPT_DRAFT_TOKEN = "ppt_draft_token"
     PPT_EMPTY_SLIDE = "ppt_empty_slide"
     PPT_DUPLICATE_TITLE = "ppt_duplicate_title"

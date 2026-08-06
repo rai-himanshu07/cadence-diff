@@ -1,14 +1,30 @@
 """PPT extraction, fuzzy matching, and diff tests (criteria 7, 8)."""
 
+import json
+import struct
+import xml.etree.ElementTree as ET
+import zipfile
+import zlib
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from pptx import Presentation
+from pptx.util import Inches
 
-from qc_tool.config.profile import PptProfile
-from qc_tool.findings import Finding, FindingClass
+from qc_tool.attestation import create_attestation, verify_attestation
+from qc_tool.config.profile import DeliverableProfile, PptProfile
+from qc_tool.coverage import CoverageState
+from qc_tool.engine import run_qc
+from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.history.store import RunHistory
 from qc_tool.ppt.diff import diff_decks
 from qc_tool.ppt.extract import DeckSnapshot, load_deck_snapshot
 from qc_tool.ppt.match import SlideMatching, match_slides
+from qc_tool.ppt.preflight import preflight_deck
+from qc_tool.report.excel_report import write_excel_report
+from qc_tool.report.html_report import write_html_report
+from qc_tool.report.json_report import result_payload
 from tests.fixtures.manifest_schema import FixtureManifest
 
 
@@ -34,6 +50,237 @@ def findings(matching: SlideMatching) -> list[Finding]:
 
 def _by_class(findings: list[Finding], cls: FindingClass) -> list[Finding]:
     return [f for f in findings if f.finding_class is cls]
+
+
+def _png(red: int, green: int, blue: int) -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes((0, red, green, blue))))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _picture_deck(path: Path, image: bytes) -> None:
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    slide.shapes.add_picture(
+        BytesIO(image),
+        Inches(1),
+        Inches(1),
+        width=Inches(2),
+        height=Inches(1),
+    )
+    presentation.save(str(path))
+
+
+def _duplicate_picture_deck(path: Path) -> None:
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    for image in (_png(255, 0, 0), _png(0, 0, 255)):
+        shape = slide.shapes.add_picture(
+            BytesIO(image),
+            Inches(1),
+            Inches(1),
+            width=Inches(2),
+            height=Inches(1),
+        )
+        shape.name = "Duplicate picture"
+    presentation.save(str(path))
+
+
+def _rewrite_picture_relationship(
+    source: Path,
+    destination: Path,
+    *,
+    external: bool,
+) -> None:
+    drawing_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    office_rel_ns = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    )
+    package_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    slide_member = "ppt/slides/slide1.xml"
+    rels_member = "ppt/slides/_rels/slide1.xml.rels"
+    relationship_id = ""
+    with zipfile.ZipFile(source) as archive, zipfile.ZipFile(
+        destination, "w", zipfile.ZIP_DEFLATED
+    ) as output:
+        for info in archive.infolist():
+            data = archive.read(info.filename)
+            if info.filename == slide_member:
+                root = ET.fromstring(data)
+                blip = root.find(f".//{{{drawing_ns}}}blip")
+                if blip is None:
+                    raise ValueError("picture fixture has no drawing blip")
+                embed = f"{{{office_rel_ns}}}embed"
+                relationship_id = str(blip.attrib[embed])
+                if external:
+                    del blip.attrib[embed]
+                    blip.set(f"{{{office_rel_ns}}}link", relationship_id)
+                else:
+                    blip.set(embed, "rId999")
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            elif info.filename == rels_member and external:
+                root = ET.fromstring(data)
+                relationship = next(
+                    item
+                    for item in root.findall(f"{{{package_rel_ns}}}Relationship")
+                    if item.attrib.get("Id") == relationship_id
+                )
+                relationship.set("Target", "https://private.invalid/client-image.png")
+                relationship.set("TargetMode", "External")
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            output.writestr(info, data)
+
+
+def test_embedded_picture_bytes_are_hashed_without_decoding(tmp_path: Path) -> None:
+    first_path = tmp_path / "first.pptx"
+    same_path = tmp_path / "same.pptx"
+    changed_path = tmp_path / "changed.pptx"
+    _picture_deck(first_path, _png(255, 0, 0))
+    _picture_deck(same_path, _png(255, 0, 0))
+    _picture_deck(changed_path, _png(0, 0, 255))
+
+    first = load_deck_snapshot(first_path)
+    same = load_deck_snapshot(same_path)
+    changed = load_deck_snapshot(changed_path)
+
+    first_shape = first.slides[0].shapes[0]
+    assert first_shape.media_kind == "image/png"
+    assert len(first_shape.media_digest or "") == 64
+    assert first_shape.media_digest == same.slides[0].shapes[0].media_digest
+    assert first_shape.media_digest != changed.slides[0].shapes[0].media_digest
+    assert first.media_available and changed.media_available
+
+
+def test_linked_and_malformed_picture_relationships_degrade_without_leakage(
+    tmp_path: Path,
+) -> None:
+    embedded_path = tmp_path / "embedded.pptx"
+    linked_path = tmp_path / "linked.pptx"
+    malformed_path = tmp_path / "malformed.pptx"
+    _picture_deck(embedded_path, _png(1, 2, 3))
+    _rewrite_picture_relationship(embedded_path, linked_path, external=True)
+    _rewrite_picture_relationship(embedded_path, malformed_path, external=False)
+
+    linked = load_deck_snapshot(linked_path)
+    malformed = load_deck_snapshot(malformed_path)
+
+    linked_shape = linked.slides[0].shapes[0]
+    malformed_shape = malformed.slides[0].shapes[0]
+    assert linked_shape.media_kind == "linked-image"
+    assert linked_shape.media_digest is None
+    assert not linked.media_available
+    assert "linked-image" in linked.media_detail
+    assert "private.invalid" not in linked.media_detail
+    assert malformed_shape.media_kind == "unavailable-image"
+    assert malformed_shape.media_digest is None
+    assert not malformed.media_available
+    assert "unreadable-image-relationship" in malformed.media_detail
+    linked_coverage = next(
+        item
+        for item in preflight_deck(linked, PptProfile()).coverage
+        if item.check_id == "ppt-media-structural"
+    )
+    assert linked_coverage.state is CoverageState.DEGRADED
+    assert "private.invalid" not in linked_coverage.detail
+
+
+def test_media_change_roundtrips_without_digest_or_content_leakage(
+    tmp_path: Path,
+) -> None:
+    baseline_path = tmp_path / "baseline.pptx"
+    current_path = tmp_path / "current.pptx"
+    _picture_deck(baseline_path, _png(255, 0, 0))
+    _picture_deck(current_path, _png(0, 0, 255))
+    baseline_digest = load_deck_snapshot(baseline_path).slides[0].shapes[0].media_digest
+    current_digest = load_deck_snapshot(current_path).slides[0].shapes[0].media_digest
+    assert baseline_digest is not None and current_digest is not None
+
+    result = run_qc(baseline_ppt=baseline_path, current_ppt=current_path)
+
+    media = [
+        finding
+        for finding in result.findings
+        if finding.finding_class is FindingClass.PPT_MEDIA_CHANGED
+    ]
+    assert len(media) == 1
+    finding = media[0]
+    assert finding.severity is Severity.WARNING
+    assert finding.slide_index == 1 and finding.baseline_slide_index == 1
+    assert finding.focus_shape_id and finding.baseline_focus_shape_id
+    structural = next(
+        item
+        for item in result.coverage
+        if item.check_id == "ppt-media-structural"
+    )
+    visual = next(
+        item for item in result.coverage if item.check_id == "ppt-media-visual"
+    )
+    assert structural.state is CoverageState.CHECKED and structural.findings == 1
+    assert visual.state is CoverageState.UNAVAILABLE
+
+    serialized = json.dumps(result_payload(result, include_context=True))
+    assert FindingClass.PPT_MEDIA_CHANGED.value in serialized
+    assert baseline_digest not in serialized
+    assert current_digest not in serialized
+    assert "255, 0, 0" not in serialized and "0, 0, 255" not in serialized
+
+    html_path = tmp_path / "report.html"
+    excel_path = tmp_path / "report.xlsx"
+    write_html_report(result, html_path)
+    write_excel_report(result, excel_path)
+    history = RunHistory(tmp_path / "history.sqlite3")
+    run_id = history.record_run(result, file_hashes={}, report_paths={})
+    restored = history.get_run(run_id)
+    assert any(
+        item.finding_class is FindingClass.PPT_MEDIA_CHANGED
+        for item in restored.findings
+    )
+
+    key = b"m" * 32
+    attestation = create_attestation(
+        tmp_path / "media.qca",
+        result=result,
+        profile=DeliverableProfile(name="default"),
+        input_files={"baseline_ppt": baseline_path, "current_ppt": current_path},
+        report_paths={"html": html_path, "excel": excel_path},
+        key=key,
+    )
+    assert verify_attestation(attestation, key=key).valid
+
+
+def test_duplicate_media_keys_degrade_cycle_coverage_without_guessing(
+    tmp_path: Path,
+) -> None:
+    baseline_path = tmp_path / "baseline-duplicates.pptx"
+    current_path = tmp_path / "current-duplicates.pptx"
+    _duplicate_picture_deck(baseline_path)
+    _duplicate_picture_deck(current_path)
+
+    result = run_qc(baseline_ppt=baseline_path, current_ppt=current_path)
+
+    assert not [
+        finding
+        for finding in result.findings
+        if finding.finding_class is FindingClass.PPT_MEDIA_CHANGED
+    ]
+    structural = next(
+        item
+        for item in result.coverage
+        if item.check_id == "ppt-media-structural"
+    )
+    assert structural.state is CoverageState.DEGRADED
+    assert "2 media shape(s)" in structural.detail
 
 
 def test_extraction_shapes(base_deck: DeckSnapshot, curr_deck: DeckSnapshot) -> None:

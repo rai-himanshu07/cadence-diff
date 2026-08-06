@@ -109,6 +109,7 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.PPT_CHART_AXIS_CHANGED: Severity.WARNING,
     FindingClass.PPT_CHART_LEGEND_CHANGED: Severity.WARNING,
     FindingClass.PPT_CHART_LABELS_CHANGED: Severity.WARNING,
+    FindingClass.PPT_MEDIA_CHANGED: Severity.WARNING,
     # Presentation-only and additive events: info.
     FindingClass.CELL_COMMENT_CHANGED: Severity.INFO,
     FindingClass.STYLE_CHANGED: Severity.INFO,

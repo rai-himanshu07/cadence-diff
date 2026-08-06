@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, cast
 
 from pptx import Presentation
+from pptx.oxml.ns import qn
 
 from qc_tool.io.decrypt import open_decrypted
 from qc_tool.ppt.chart_xml import PptChartParseError, parse_ppt_chart
@@ -79,6 +81,31 @@ def _placeholder_type(shape: Any) -> str | None:
     return str(getattr(placeholder_type, "name", placeholder_type))
 
 
+def _embedded_media(shape: Any) -> tuple[str | None, str | None, str | None]:
+    """Return media kind, SHA-256, and a fixed degradation code for one shape."""
+    blips = list(shape._element.xpath(".//a:blip"))
+    if not blips:
+        return None, None, None
+    if len(blips) != 1:
+        return "unavailable-image", None, "multiple-image-relationships"
+    blip = blips[0]
+    embed_id = blip.get(qn("r:embed"))
+    link_id = blip.get(qn("r:link"))
+    if not embed_id:
+        return (
+            "linked-image" if link_id else "unavailable-image",
+            None,
+            "linked-image" if link_id else "missing-image-relationship",
+        )
+    try:
+        part = shape.part.related_part(embed_id)
+        blob = bytes(part.blob)
+        kind = str(part.content_type)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return "unavailable-image", None, "unreadable-image-relationship"
+    return kind, hashlib.sha256(blob).hexdigest(), None
+
+
 def _notes(slide: Any) -> list[str]:
     if not slide.has_notes_slide:
         return []
@@ -103,6 +130,7 @@ def load_deck_snapshot(
     presentation = Presentation(stream)
     snapshot = DeckSnapshot(source_name=path.name)
     chart_errors: list[str] = []
+    media_errors: list[str] = []
     for index, slide in enumerate(presentation.slides):
         check_cancelled(cancellation_token)
         title_shape = slide.shapes.title
@@ -136,6 +164,11 @@ def load_deck_snapshot(
             shape_type = _shape_type(shape)
             source_id = _shape_source_id(index, shape_index, shape_type, geometry)
             texts = _shape_texts(shape)
+            media_kind, media_digest, media_error = _embedded_media(shape)
+            if media_error is not None:
+                media_errors.append(
+                    f"slide {index + 1} shape {shape_index + 1}: {media_error}"
+                )
             content.shapes.append(
                 ShapeContent(
                     source_id=source_id,
@@ -151,6 +184,8 @@ def load_deck_snapshot(
                     texts=texts,
                     is_placeholder=bool(shape.is_placeholder),
                     placeholder_type=_placeholder_type(shape),
+                    media_kind=media_kind,
+                    media_digest=media_digest,
                 )
             )
             if base_shape.has_text_frame and base_shape is not title_shape:
@@ -209,4 +244,7 @@ def load_deck_snapshot(
     if chart_errors:
         snapshot.charts_available = False
         snapshot.chart_detail = "; ".join(chart_errors)
+    if media_errors:
+        snapshot.media_available = False
+        snapshot.media_detail = "; ".join(media_errors)
     return snapshot

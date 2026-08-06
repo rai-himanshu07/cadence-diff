@@ -1,8 +1,24 @@
 """Declarative workbook controls, root-cause grouping, and expiring waivers."""
 
-from qc_tool.config.profile import DeliverableProfile
+import datetime as dt
+from pathlib import Path
+
+import yaml
+
+from qc_tool.config.profile import (
+    DeliverableProfile,
+    FindingWaiver,
+    load_profile,
+    save_profile,
+)
 from qc_tool.excel.preflight import preflight_workbook
-from qc_tool.findings import Finding, FindingClass, FindingExpectedReason, Severity
+from qc_tool.findings import (
+    Finding,
+    FindingClass,
+    FindingExpectedReason,
+    Materiality,
+    Severity,
+)
 from qc_tool.io.model import (
     CellRecord,
     NamedRange,
@@ -11,6 +27,32 @@ from qc_tool.io.model import (
     WorkbookSnapshot,
 )
 from qc_tool.triage.rules import triage
+
+
+def test_enum_bearing_profile_saves_as_plain_yaml_and_roundtrips(
+    tmp_path: Path,
+) -> None:
+    profile = DeliverableProfile(
+        name="reviewed-pack",
+        waivers=[
+            FindingWaiver(
+                finding_class=FindingClass.STYLE_CHANGED,
+                reason="approved branding",
+                expires=dt.date(2026, 12, 31),
+            )
+        ],
+        severity={FindingClass.VALUE_CHANGED: Severity.WARNING},
+        materiality_severity={Materiality.MATERIAL: Severity.CRITICAL},
+    )
+    path = tmp_path / "reviewed-pack.yaml"
+
+    save_profile(profile, path)
+
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert payload["waivers"][0]["finding_class"] == "style_changed"
+    assert payload["severity"] == {"value_changed": "warning"}
+    assert payload["materiality_severity"] == {"material": "critical"}
+    assert load_profile(path) == profile
 
 
 def test_profile_controls_cover_required_unique_bounds_and_tie_out() -> None:

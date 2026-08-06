@@ -110,7 +110,7 @@ GLOSSARY = (
 )
 
 #: Client-side only: no network, no external assets. Runs after NiceGUI mounts.
-GUIDE_SCRIPT = """
+GUIDE_SCRIPT = r"""
 (function () {
   const box = document.getElementById('guide-q');
   if (!box || box.dataset.wired) return;
@@ -118,6 +118,13 @@ GUIDE_SCRIPT = """
   const count = document.getElementById('guide-q-count');
   const sections = Array.from(document.querySelectorAll('.guide-section'));
   const links = Array.from(document.querySelectorAll('.guide-toc-link'));
+    const aliases = {
+        coverage: 'capability limited unavailable degraded not checked',
+        mappings: 'mapping unavailable opaque screenshot raster image claim',
+        review: 'unreviewed only replace all confirm severity reviewed note',
+        reqc: 'rerun repeat carry forward history',
+        files: 'xlsb formula encrypted password same file',
+    };
   const mobile = () => window.matchMedia('(max-width: 640px)').matches;
 
   sections.forEach(function (s) {
@@ -152,9 +159,13 @@ GUIDE_SCRIPT = """
 
   box.addEventListener('input', function () {
     const q = box.value.trim().toLowerCase();
+        const tokens = q.split(/\s+/).filter(Boolean);
     let hits = 0;
     sections.forEach(function (s) {
-      const match = !q || s.innerText.toLowerCase().indexOf(q) !== -1;
+            const searchable = (s.innerText + ' ' + (aliases[s.id] || '')).toLowerCase();
+            const match = !tokens.length || tokens.every(function (token) {
+                return searchable.indexOf(token) !== -1;
+            });
       s.hidden = !match;
       if (q && match) { hits += 1; s.classList.remove('collapsed'); }
     });
@@ -414,7 +425,10 @@ def render_guide() -> None:
                 _paragraph(
                     "The default profile runs general checks. Create a named profile when a "
                     "deliverable needs stable mappings, tolerances, region overrides, controls, "
-                    "required slides, severity rules, or waivers. The in-app editor validates YAML."
+                    "required slides, severity rules, or waivers. Manage profiles exposes typed "
+                    "Core and Advanced Excel/PPT views over the complete contract. Lists and "
+                    "mappings can be added, edited, removed, and reordered without dropping "
+                    "fields that are not currently expanded."
                 )
                 _table(
                     ["Profile feature", "Typical use"],
@@ -434,6 +448,23 @@ def render_guide() -> None:
                 )
                 _code(PROFILE_CONTROLS_EXAMPLE)
                 _callout(
+                    "Form and YAML are one draft",
+                    "Advanced YAML shows the complete canonical profile. Apply parses and "
+                    "previews YAML in the typed form; Reset discards unapplied YAML text. "
+                    "Save runs static lint, refuses a changed source file by its exact byte "
+                    "hash, and atomically replaces only a valid named profile. The built-in "
+                    "default remains read-only.",
+                )
+                _callout(
+                    "Optional file-backed validation",
+                    "Select files on Compare, then validate from Manage profiles to check "
+                    "sheet, range, slide, and mapping references with the same local read-only "
+                    "loaders and passwords. Current files take precedence over baseline files. "
+                    "Large-workbook refusal and cancellation remain active. XLSB reference "
+                    "lint stays bounded; formula-text adapter availability and degradation are "
+                    "reported by the subsequent QC run.",
+                )
+                _callout(
                     "Availability controls blankness only",
                     "Ignore ranges win first. Availability decides whether a blank is "
                     "required or allowed after the declared period. Refresh ranges decide "
@@ -452,6 +483,16 @@ def render_guide() -> None:
                 _paragraph(
                     "Read coverage before interpreting a low finding count. Coverage describes "
                     "whether each check actually ran for the supplied files and format capabilities."
+                )
+                _callout(
+                    "PowerPoint media has two separate claims",
+                    "ppt-media-structural hashes embedded media bytes without decoding them. "
+                    "A Warning means an embedded image was added, removed, or its bytes changed; "
+                    "the digest, pixels, source path, and image text are never reported. Linked "
+                    "or malformed image relationships degrade that check instead of guessing. "
+                    "ppt-media-visual remains unavailable because byte identity cannot prove "
+                    "rendered appearance, crop/layout equivalence, or OCR text.",
+                    warning=True,
                 )
                 _table(
                     ["Coverage state", "Meaning"],
@@ -631,8 +672,8 @@ def render_guide() -> None:
                         ],
                         [
                             "any severity",
-                            "An explicit analyst disposition. Re-picking the value it "
-                            "already has is still recorded, as a confirmation.",
+                            "An explicit analyst disposition. Use Confirm severity to "
+                            "record the current severity as reviewed without changing it.",
                         ],
                     ],
                 )

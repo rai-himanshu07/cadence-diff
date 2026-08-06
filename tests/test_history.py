@@ -171,6 +171,27 @@ def test_history_survives_reopen(qc_result: QCRunResult, tmp_path: Path) -> None
     assert runs[0].started_at <= dt.datetime.now(dt.UTC)
 
 
+def test_review_sessions_are_explicit_nonoverlapping_and_capped(
+    qc_result: QCRunResult,
+    tmp_path: Path,
+) -> None:
+    history = RunHistory(tmp_path / "history.sqlite3")
+    first = history.record_run(qc_result, file_hashes={}, report_paths={})
+    second = history.record_run(qc_result, file_hashes={}, report_paths={})
+    started = dt.datetime(2026, 8, 6, 9, 0, tzinfo=dt.UTC)
+
+    history.start_review_session(first, now=started)
+    history.start_review_session(second, now=started + dt.timedelta(minutes=30))
+
+    assert history.review_seconds(first, now=started + dt.timedelta(hours=1)) == 1800
+    assert history.active_review_run() == second
+    # A missing pause cannot accrue beyond four hours.
+    assert history.review_seconds(second, now=started + dt.timedelta(days=1)) == 14400
+    assert history.pause_review_sessions(now=started + dt.timedelta(days=1)) == 1
+    assert history.active_review_run() is None
+    assert history.review_seconds(second) == 14400
+
+
 def test_legacy_run_rehydrates_after_optional_contract_expansion(tmp_path: Path) -> None:
     database = tmp_path / "legacy.sqlite3"
     with sqlite3.connect(database) as connection:
