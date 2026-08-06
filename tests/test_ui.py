@@ -1,12 +1,14 @@
 """UI smoke tests (criterion 12): pages render; perform_run produces artifacts."""
 
 import datetime as dt
+import logging
 import os
 from pathlib import Path
 
 import pytest
 import yaml
-from nicegui import ui
+from nicegui import app, events, ui
+from nicegui.helpers import warnings as nicegui_warnings
 from nicegui.testing import User
 
 import qc_tool.run_service as run_service
@@ -62,8 +64,11 @@ pytest_plugins = ["nicegui.testing.user_plugin"]
 
 
 def test_mode_toggle_pins_content_color_against_quasar() -> None:
-    assert '.mode-select .q-btn .q-btn__content' in CSS
-    assert '.mode-select .q-btn[aria-pressed="true"] .q-btn__content' in CSS
+    # Quasar paints the pressed button bg-primary + text-white, and --q-primary
+    # is light in dark mode, so every toggle needs its own pinned colours.
+    assert ".q-btn-toggle .q-btn .q-btn__content" in CSS
+    assert '.q-btn-toggle .q-btn[aria-pressed="true"] .q-btn__content' in CSS
+    assert '.q-btn-toggle .q-btn[aria-pressed="true"] { background: var(--btn-bg)' in CSS
     for field in (
         "provenance",
         "subtype",
@@ -736,7 +741,6 @@ async def test_lan_mode_shows_exposure_warning(user: User, tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_dark_mode_toggle_persists(user: User, tmp_path: Path) -> None:
-    from nicegui import app
 
     app.storage.general.pop("dark_mode", None)
     create_pages(tmp_path / "work")
@@ -807,3 +811,67 @@ async def test_final_package_detail_shows_mapping_review(
     await user.should_see("Check coverage")
     await user.should_see("Mapping review")
     await user.should_see("eligible")
+
+
+def _emit(element: ui.element, event_type: str, args: object) -> None:
+    """Drive a slot-emitted table event the way the browser would."""
+    for listener in element._event_listeners.values():
+        if listener.type == event_type and listener.handler is not None:
+            listener.handler(
+                events.GenericEventArguments(
+                    sender=element, client=element.client, args=args
+                )
+            )
+            return
+    raise AssertionError(f"no {event_type!r} listener on {element}")
+
+
+@pytest.mark.asyncio
+async def test_group_review_survives_the_panel_refresh_it_triggers(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Applying a group review refreshes the panel that owns the dialog.
+
+    Reporting or closing after that refresh touches deleted elements, which
+    NiceGUI surfaces as a use-after-free warning and a RuntimeError.
+    """
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+
+    group_table = next(
+        element
+        for element in user.find(kind=ui.table).elements
+        if "review-groups-table" in element.classes
+    )
+    _emit(group_table, "select", {"id": str(group_table.rows[0]["id"])})
+    await user.should_see("Review group")
+
+    user.find("Review group").click()
+    await user.should_see("Apply review")
+    severity_select = next(
+        element
+        for element in user.find(kind=ui.select).elements
+        if element.props.get("label") == "Group severity"
+    )
+    severity_select.value = Severity.INFO.value
+
+    # Closing or reporting after the refresh touches deregistered elements,
+    # which NiceGUI reports by logging rather than by raising to the caller.
+    nicegui_warnings.reset()  # the use-after-free warning is otherwise once-only
+    with caplog.at_level(logging.WARNING, logger="nicegui"):
+        user.find("Apply review").click()
+
+    assert not caplog.records, [record.getMessage() for record in caplog.records]

@@ -1262,11 +1262,13 @@ def _render_result_view(
                     )
                 if all_rows:
                     all_rows[:] = _findings_rows(result)
+                # Refreshing the detail panel deregisters this dialog, so close
+                # and report before anything is torn down.
+                dialog.close()
+                ui.notify(f"Updated {len(updates):,} affected findings")
                 refresh_review_groups()
                 render_stats()
                 detail_box.clear()
-                dialog.close()
-                ui.notify(f"Updated {len(updates):,} affected findings")
 
             with ui.row().classes("items-center gap-2"):
                 ui.button("Apply review", on_click=apply_review).classes(

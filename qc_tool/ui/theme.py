@@ -137,12 +137,7 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .lede { color: var(--ink-soft); font-size: var(--fs-body); max-width: 56rem; }
 .mode-select { width: 100%; max-width: 52rem; border: 1px solid var(--line);
   border-radius: 5px; overflow: hidden; }
-.mode-select .q-btn { min-height: 2.5rem; background: var(--panel); color: var(--ink); }
-.mode-select .q-btn .q-btn__content { color: var(--ink) !important; }
-.mode-select .q-btn[aria-pressed="true"] { background: var(--btn-bg) !important;
-  color: var(--btn-fg) !important; }
-.mode-select .q-btn[aria-pressed="true"] .q-btn__content {
-  color: var(--btn-fg) !important; }
+.mode-select .q-btn { min-height: 2.5rem; background: var(--panel); }
 .modecopy { color: var(--ink-soft); font-size: 0.8125rem; margin-bottom: 0.55rem; }
 .guide-jump { color: var(--info) !important; font-size: var(--fs-meta);
   text-decoration: none; margin: -0.35rem 0 0.55rem; }
@@ -308,6 +303,15 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .runbtn:hover { background: var(--btn-bg-hover) !important; }
 .ghostbtn { border: 1px solid var(--line); background: transparent; }
 .ghostbtn, .ghostbtn .q-btn__content { color: var(--ink) !important; }
+
+/* Quasar paints the pressed toggle button bg-primary + text-white, and
+   --q-primary is light in dark mode, so white on light would be unreadable. */
+.q-btn-toggle .q-btn, .q-btn-toggle .q-btn .q-btn__content {
+  color: var(--ink) !important; }
+.q-btn-toggle .q-btn[aria-pressed="true"] { background: var(--btn-bg) !important; }
+.q-btn-toggle .q-btn[aria-pressed="true"],
+.q-btn-toggle .q-btn[aria-pressed="true"] .q-btn__content {
+  color: var(--btn-fg) !important; }
 
 /* quasar form surfaces in dark mode */
 body.body--dark .q-field--outlined .q-field__control { background: var(--panel); }
