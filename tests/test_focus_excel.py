@@ -176,7 +176,12 @@ def test_dirty_before_navigation_is_not_reported_as_a_side_effect() -> None:
     assert _navigate(window) == FocusOutcome.FOCUSED.value
 
 
-def test_focus_document_refuses_off_windows() -> None:
+def test_focus_document_refuses_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_tool.focus import excel_focus
+
+    monkeypatch.setattr(excel_focus.sys, "platform", "linux")
     document = OpenDocument(
         application=FocusApplication.EXCEL,
         process_id=1,

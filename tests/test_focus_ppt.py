@@ -231,7 +231,12 @@ def test_baseline_and_current_slide_indices_are_independent() -> None:
     assert window.View.visited == [1, 3]
 
 
-def test_focus_document_refuses_off_windows() -> None:
+def test_focus_document_refuses_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_tool.focus import ppt_focus
+
+    monkeypatch.setattr(ppt_focus.sys, "platform", "linux")
     document = OpenDocument(
         application=FocusApplication.POWERPOINT,
         process_id=1,

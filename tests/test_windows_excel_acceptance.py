@@ -15,7 +15,11 @@ def _scan() -> XlsbFormulaScan:
     return XlsbFormulaScan(formula_cells={"Data": frozenset({(1, 1)})})
 
 
-def test_acceptance_probe_refuses_non_windows_without_reading_source(tmp_path: Path) -> None:
+def test_acceptance_probe_refuses_non_windows_without_reading_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(acceptance.os, "name", "posix")
     args = argparse.Namespace(
         xlsb=tmp_path / "missing.xlsb",
         output=tmp_path / "result.json",

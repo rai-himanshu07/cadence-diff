@@ -119,7 +119,12 @@ def test_worker_refuses_an_unknown_schema_or_action() -> None:
     )["outcome"] == FocusOutcome.INVALID_REQUEST.value
 
 
-def test_worker_discovery_refuses_off_windows() -> None:
+def test_worker_discovery_refuses_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from qc_tool.focus import discovery
+
+    monkeypatch.setattr(discovery.sys, "platform", "linux")
     reply = handle_request(
         {
             "schema_version": SCHEMA_VERSION,
