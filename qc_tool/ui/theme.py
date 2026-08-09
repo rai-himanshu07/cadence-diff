@@ -30,7 +30,7 @@ CSS = """
   --btn-fg: #f4f2ed;
   --btn-bg-hover: #30353c;
   --critical: #b42318;
-  --warning: #b54708;
+  --warning: #9a6700;
   --info: #175cd3;
   --expected: #067647;
   --font-sans: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -60,7 +60,7 @@ body.body--dark {
   --btn-fg: #15171b;
   --btn-bg-hover: #cfccc4;
   --critical: #e0604d;
-  --warning: #dd9a4a;
+  --warning: #e2b54b;
   --info: #6fa5ef;
   --expected: #56b184;
   /* Quasar tints flat buttons, dropdown highlights, chips etc. with primary;
@@ -77,7 +77,8 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .appheader .inner { width: 100%; display: flex; align-items: baseline;
   gap: 1rem; padding: 0.65rem var(--gutter); }
 .wordmark { color: #f4f2ed; font-weight: 650; font-size: 1.02rem;
-  letter-spacing: 0.01em; }
+  letter-spacing: 0.01em; text-decoration: none; }
+.wordmark:focus-visible { outline: 2px solid #f4f2ed; outline-offset: 3px; }
 .wordtag { font-family: var(--font-mono); font-size: var(--fs-meta); color: #b6bdc5;
   border: 1px solid #3a4048; border-radius: 3px; padding: 0.1rem 0.4rem; }
 .headnav { margin-left: auto; display: flex; gap: 1.25rem; align-items: baseline; }
@@ -240,6 +241,24 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
   padding: 0.65rem 0 0.2rem; width: 100%; }
 .preline { white-space: pre-line; overflow-wrap: anywhere; }
 
+/* formula token diff */
+.formula-diff {
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 14rem;
+  overflow: auto;
+  padding: 0.35rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: transparent;
+}
+.formula-diff .fdiff-equal { color: var(--ink); }
+.formula-diff .fdiff-removed { color: var(--critical);
+  text-decoration: line-through; background-color: rgba(180,36,24,0.06); }
+.formula-diff .fdiff-added { color: var(--expected);
+  text-decoration: underline; background-color: rgba(6,118,71,0.06); }
+
 /* inputs: one panel per cycle so baseline and current can never be scanned
    as a single left-to-right list of four look-alike slots */
 .rolegroups { display: grid; grid-template-columns: repeat(auto-fit, minmax(30rem, 1fr));
@@ -253,6 +272,9 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
   border-bottom: 1px solid var(--line-soft); }
 .rolegrouptitle { font-size: var(--fs-section); font-weight: 680; }
 .rolegroupnote { font-size: var(--fs-meta); color: var(--ink-soft); }
+.additional-workbooks { display: grid; gap: 0.6rem; margin-top: 0.65rem; }
+.additional-workbook { border-top: 1px solid var(--line-soft);
+  padding-top: 0.55rem; width: 100%; }
 
 .upgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr));
   gap: 1rem 1.5rem; width: 100%; }
@@ -347,6 +369,15 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 .stat-warning { border-top-color: var(--warning); }
 .stat-info { border-top-color: var(--info); }
 .stat-expected { border-top-color: var(--expected); }
+/* review-time KPI pinned to the header's top right, same box language */
+.runheader { position: relative; }
+.timerkpi { position: absolute; top: 0; right: 0; display: flex;
+  flex-direction: column; align-items: flex-end; border-top-color: var(--ink-soft); }
+.timerkpi .n { font-family: var(--font-mono); }
+.timerkpi .timerbtn { padding: 0 0.4rem; min-height: 1.4rem;
+  font-size: var(--fs-meta); letter-spacing: 0.07em; text-transform: uppercase;
+  color: var(--info); }
+@media (max-width: 900px) { .timerkpi { position: static; align-items: flex-start; } }
 
 /* findings table */
 .findings-table { border: 1px solid var(--line); border-radius: 6px;
@@ -360,17 +391,22 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
   overflow-wrap: break-word; }
 .findings-table td:first-child { white-space: nowrap; }
 /* let the message column absorb the slack instead of wrapping every word */
-.findings-table:not(.history-table) th:last-child,
-.findings-table:not(.history-table) td:last-child { width: 60%; min-width: 15rem; }
+.findings-table:not(.history-table):not(.review-groups-table) th:last-child,
+.findings-table:not(.history-table):not(.review-groups-table) td:last-child {
+  width: 60%; min-width: 15rem; }
 /* auto layout treats a cell width as a hint, so the review item column only
-   holds its share under fixed layout; metadata keeps a title tooltip */
-.review-groups-table .q-table { table-layout: fixed; }
-.review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 8%; }
-.review-groups-table th:nth-child(2), .review-groups-table td:nth-child(2) { width: 12%; }
-.review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 16%; }
+   holds its share under fixed layout; metadata keeps a title tooltip.
+   Fixed layout also needs an explicit table width or it shrinks to the sum
+   of resolved column widths and strands the pane's right edge. */
+.review-groups-table .q-table { table-layout: fixed; width: 100%; }
+.review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 16%; }
+.review-groups-table th:nth-child(2), .review-groups-table td:nth-child(2) { width: 16%; }
+.review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 25%; }
 .review-groups-table th:nth-child(4), .review-groups-table td:nth-child(4) { width: 4%; }
+/* the # header is one glyph plus a sort icon; wrapping puts them on two lines */
+.review-groups-table th:nth-child(4) { white-space: nowrap; }
 .review-groups-table th:nth-child(5), .review-groups-table td:nth-child(5) {
-  width: 60%; min-width: 0; }
+  width: 39%; min-width: 0; }
 /* fixed layout leaves no slack, so headers must wrap instead of colliding */
 .findings-table thead th { white-space: normal; }
 .findings-table .mono { font-family: var(--font-mono); font-size: var(--fs-meta); }
@@ -383,7 +419,11 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
   box-shadow: inset 3px 0 0 var(--ink); }
 .review-toggle { border: 1px solid var(--line); border-radius: 4px; }
 .review-groups-table .groupcount { font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums; text-align: right; }
+  font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
+/* light column boundaries; the theme variable keeps both modes quiet */
+.review-groups-table th:not(:last-child),
+.review-groups-table td:not(:last-child) { border-right: 1px solid var(--line-soft); }
+.review-groups-table table.col-resizing { cursor: col-resize; user-select: none; }
 .capbadge { color: var(--warning); font-size: var(--fs-meta); display: block;
   margin-top: 0.15rem; }
 .coverage-table { width: 100%; border: 1px solid var(--line); border-radius: 6px;
@@ -431,6 +471,43 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
   white-space: nowrap; }
 .ctxgrid td.hit { outline: 2px solid var(--warning); outline-offset: -2px;
   background: var(--hit-bg); font-weight: 650; }
+/* severity outlines for related finding cells: style + colour, never colour
+   alone; the open finding keeps the stronger `hit` treatment above */
+.ctxgrid td.sev-critical { outline: 2px solid var(--critical); outline-offset: -3px; }
+.ctxgrid td.sev-warning { outline: 2px dashed var(--warning); outline-offset: -3px; }
+.ctxgrid td.sev-info { outline: 2px dotted var(--info); outline-offset: -3px; }
+.ctxgrid td.sev-expected { outline: 1px solid var(--expected); outline-offset: -2px; }
+.ctxlegend { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
+  font-size: var(--fs-meta); color: var(--ink-soft); margin-top: 0.35rem; }
+.ctxlegend .key { display: inline-flex; align-items: center; gap: 0.3rem; }
+.ctxlegend .swatch { width: 0.75rem; height: 0.75rem; display: inline-block;
+  border: 2px solid var(--line); }
+.ctxlegend .swatch.sev-critical { border-color: var(--critical); }
+.ctxlegend .swatch.sev-warning { border-color: var(--warning); border-style: dashed; }
+.ctxlegend .swatch.sev-info { border-color: var(--info); border-style: dotted; }
+.ctxlegend .swatch.sev-expected { border-color: var(--expected); border-width: 1px; }
+/* related-series lens rows */
+.review-groups-table tr.clusterrow > td { background: var(--surface2); font-weight: 500; }
+.review-groups-table tr.clusterrow > td:first-child { white-space: normal; }
+.review-groups-table tr.childrow > td:first-child { padding-left: 1.6rem; }
+.review-groups-table tr.childrow > td { background: var(--panel); }
+.clustercaret { display: inline-block; width: 1rem; color: var(--ink-soft); }
+/* quiet dot-count pairs; they wrap instead of clipping in a narrow cell */
+.mixchip { display: inline-flex; align-items: center; gap: 0.2rem;
+  font-size: var(--fs-meta); font-weight: 650; margin-right: 0.45rem;
+  white-space: nowrap; }
+.mixchip::before { content: ""; width: 7px; height: 7px; border-radius: 50%;
+  display: inline-block; }
+.mixchip.mix-critical::before { background: var(--critical); }
+.mixchip.mix-warning::before { background: var(--warning); }
+.mixchip.mix-info::before { background: var(--info); }
+.mixchip.mix-expected::before { background: var(--expected); }
+.childpager { margin-left: 0.5rem; font-size: var(--fs-meta); color: var(--ink-soft); }
+.childpager .pagebtn { border: 1px solid var(--line-soft); background: var(--panel);
+  color: var(--ink-soft); cursor: pointer; padding: 0 0.35rem; margin: 0 0.25rem;
+  border-radius: 3px; }
+/* shared context pager sits between the current and baseline grids */
+.ctxpagerrow { justify-content: center; width: 100%; margin: 0.15rem 0; }
 .deltaline { font-family: var(--font-mono); font-size: 0.8125rem;
   color: var(--ink-soft); margin-top: 0.5rem; }
 .deltaline .good { color: var(--expected); font-weight: 650; }
@@ -489,17 +566,58 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 .resulttabs .q-tab__label { font-size: var(--fs-body); font-weight: 600; }
 .resultpanels { width: 100%; background: transparent !important; }
 .resultpanels .q-tab-panel { padding: 0.9rem 0 0; }
-.reviewtoolbar { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap;
-  width: 100%; margin-bottom: 0.7rem; }
+.reviewtoolbar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+  width: 100%; margin-bottom: 0.7rem; position: sticky; top: 0; z-index: 6;
+  background: var(--paper); padding: 0.5rem 0 0.55rem;
+  border-bottom: 1px solid var(--line-soft); }
+.sevpills { display: inline-flex; gap: 0.3rem; flex-wrap: nowrap; }
+.sevpill { border: 1px solid var(--line); border-radius: 999px;
+  background: var(--panel); color: var(--ink-soft); min-height: 1.9rem;
+  padding: 0 0.7rem; position: relative; }
+.sevpill .q-btn__content { font-size: var(--fs-meta); letter-spacing: 0.03em;
+  color: inherit; }
+.sevpill::before { content: ""; width: 8px; height: 8px; border-radius: 50%;
+  display: inline-block; margin-right: 0.4rem; background: var(--line); }
+.sevpill.active { color: var(--ink); border-color: var(--ink-soft);
+  background: var(--surface2); }
+.sevpill.active.sevpill-critical::before { background: var(--critical); }
+.sevpill.active.sevpill-warning::before { background: var(--warning); }
+.sevpill.active.sevpill-info::before { background: var(--info); }
+.sevpill.active.sevpill-expected::before { background: var(--expected); }
+.classbtn { border: 1px solid var(--line); border-radius: 4px;
+  background: var(--panel); color: var(--ink); min-height: 1.9rem; }
+.classbtn .q-btn__content { font-size: var(--fs-meta); color: inherit; }
+.classmenu { min-width: 17rem; max-height: 24rem; background: var(--panel);
+  padding: 0.5rem 0.6rem; }
+.classmenu .classsearch { width: 100%; }
+.classmenu .classquick { gap: 0.25rem; margin: 0.25rem 0 0.1rem; }
+.classmenu .classlist { max-height: 16rem; overflow-y: auto; gap: 0;
+  flex-wrap: nowrap; }
+.classmenu .q-checkbox__label { font-size: var(--fs-meta); }
+.queuepager { gap: 0.15rem; justify-content: center; padding-top: 0.15rem; }
+.queuepager .hint { white-space: nowrap; }
+.queuepager .pagesize { margin-left: 0.6rem; }
+.queuepager .pagesize .q-field__native { font-size: var(--fs-meta);
+  color: var(--ink-soft); }
 .reviewsplit { display: grid;
   grid-template-columns: minmax(0, 1fr) clamp(24rem, 38%, 48rem);
   gap: 1rem; align-items: start; width: 100%; }
+/* the queue scrolls inside itself with a pinned header; the page stays put */
+.review-groups-table .q-table__middle { max-height: calc(100vh - 15rem);
+  overflow-y: auto; }
+.review-groups-table thead tr th { position: sticky; top: 0; z-index: 2; }
 .detailpanel { border: 1px solid var(--line); border-radius: 6px;
-  background: var(--panel); padding: 0.75rem 0.85rem; min-height: 6rem;
-  position: sticky; top: 0.75rem; max-height: calc(100vh - 6rem);
-  overflow-y: auto; overflow-x: hidden; }
+  background: var(--panel); padding: 0; min-height: 6rem;
+  position: sticky; top: 3.6rem; max-height: calc(100vh - 5rem);
+  overflow: hidden; display: flex; flex-direction: column; }
+.detailpanel:empty { padding: 0.75rem 0.85rem; }
 .detailpanel:empty::before { content: "Select a review item to see its evidence.";
   font-size: var(--fs-meta); color: var(--ink-soft); }
+.detailhead { flex: 0 0 auto; padding: 0.7rem 0.85rem 0.55rem;
+  border-bottom: 1px solid var(--line-soft); background: var(--panel); }
+.detailactions { gap: 0.5rem; margin-top: 0.45rem; align-items: center; }
+.detailbody { flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  overflow-x: hidden; padding: 0.6rem 0.85rem 0.85rem; }
 .detail-id { font-family: var(--font-mono); font-size: var(--fs-meta);
   color: var(--ink-soft); }
 .detail-msg { font-size: var(--fs-body); font-weight: 650; line-height: 1.35;
@@ -567,13 +685,15 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 @media (max-width: 1350px) {
   .review-groups-table th:nth-child(2),
   .review-groups-table td:nth-child(2) { display: none; }
-  .review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 11%; }
-  .review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 20%; }
-  .review-groups-table th:nth-child(4), .review-groups-table td:nth-child(4) { width: 5%; }
-  .review-groups-table th:nth-child(5), .review-groups-table td:nth-child(5) { width: 64%; }
+  /* room for three 3-digit severity chips on one line */
+  .review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 21%; }
+  .review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 28%; }
+  .review-groups-table th:nth-child(4), .review-groups-table td:nth-child(4) { width: 6%; }
+  .review-groups-table th:nth-child(5), .review-groups-table td:nth-child(5) { width: 45%; }
   .reviewclass-inline { display: inline; }
   .review-groups-table .sevtext { white-space: nowrap; }
 }
+.triage-key-action { display: none; }
 
 @media (max-width: 640px) {
   .appheader .inner { align-items: center; flex-wrap: wrap; gap: 0.45rem 0.7rem;
@@ -660,6 +780,7 @@ HISTORY_BODY_SLOT = """
     </span>
     <span class="atomicnote">{{ props.row.atomic }} atomic</span>
   </q-td>
+  <q-td key="size" :props="props" class="mono">{{ props.row.size_label }}</q-td>
   <q-td key="files" :props="props" class="c-files">{{ props.row.files }}</q-td>
   <q-td auto-width>
     <q-btn dense flat no-caps class="linkbtn" label="Open"
@@ -682,9 +803,130 @@ HISTORY_BODY_SLOT = """
 </q-tr>
 """
 
+#: Drag the boundary between two queue headers to trade width between them;
+#: double-click a boundary to restore the stylesheet defaults.
+COL_RESIZE_JS = """
+<script>
+(() => {
+  if (window.__qcColResize) return;
+  window.__qcColResize = true;
+  const EDGE = 8, MIN = 48;
+  const SEL = '.review-groups-table thead th';
+  const visibleNext = (th) => {
+    let n = th.nextElementSibling;
+    while (n && getComputedStyle(n).display === 'none') n = n.nextElementSibling;
+    return n;
+  };
+  const gripAt = (e) => {
+    const th = e.target.closest(SEL);
+    if (!th) return null;
+    if (th.getBoundingClientRect().right - e.clientX > EDGE) return null;
+    return visibleNext(th) ? th : null;
+  };
+  document.addEventListener('pointermove', (e) => {
+    if (window.__qcColDrag) return;
+    const th = e.target.closest(SEL);
+    if (th) th.style.cursor = gripAt(e) ? 'col-resize' : '';
+  });
+  // a grab at the boundary must never toggle the column sort
+  document.addEventListener('click', (e) => {
+    if (gripAt(e)) { e.stopPropagation(); e.preventDefault(); }
+  }, true);
+  document.addEventListener('pointerdown', (e) => {
+    const th = gripAt(e);
+    if (!th) return;
+    const next = visibleNext(th);
+    const row = [...th.closest('tr').children]
+      .filter(t => getComputedStyle(t).display !== 'none');
+    for (const t of row) t.style.width = t.getBoundingClientRect().width + 'px';
+    const startX = e.clientX;
+    const w0 = th.getBoundingClientRect().width;
+    const n0 = next.getBoundingClientRect().width;
+    const table = th.closest('table');
+    table.classList.add('col-resizing');
+    window.__qcColDrag = true;
+    const move = (ev) => {
+      // bounds never cross zero, so a column already under MIN only grows
+      const lo = Math.min(0, MIN - w0);
+      const hi = Math.max(0, n0 - MIN);
+      const d = Math.max(lo, Math.min(ev.clientX - startX, hi));
+      th.style.width = (w0 + d) + 'px';
+      next.style.width = (n0 - d) + 'px';
+    };
+    const up = () => {
+      table.classList.remove('col-resizing');
+      window.__qcColDrag = false;
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+    };
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+  document.addEventListener('dblclick', (e) => {
+    const th = e.target.closest(SEL);
+    if (!th) return;
+    if (th.getBoundingClientRect().right - e.clientX > EDGE) return;
+    for (const t of th.closest('tr').children) t.style.width = '';
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
+})();
+</script>
+"""
+
 REVIEW_GROUPS_BODY_SLOT = """
-<q-tr :props="props" :class="{selrow: props.row.sel}"
+<q-tr v-if="props.row.kind === 'cluster'" :props="props"
+  :class="{selrow: props.row.sel, clusterrow: true}"
   role="button" tabindex="0" :data-review-id="props.row.id"
+  data-review-kind="cluster"
+  :data-review-state="props.row.review_state" :data-severity="props.row.severity"
+  :aria-expanded="props.row.expanded ? 'true' : 'false'"
+  :aria-label="'Related series ' + props.row.location + ', ' +
+    props.row.children + ' of ' + props.row.children_total +
+    ' decisions shown, ' + props.row.members + ' findings'"
+  @click="$parent.$emit('toggle', {id: props.row.id})"
+  @keydown.enter.prevent="$parent.$emit('toggle', {id: props.row.id})"
+  @keydown.space.prevent="$parent.$emit('toggle', {id: props.row.id})">
+  <q-td key="severity" :props="props">
+    <span class="clustercaret" aria-hidden="true">{{
+      props.row.expanded ? '▾' : '▸' }}</span
+    ><span v-for="d in props.row.mix" :key="d.k"
+      :class="'mixchip mix-' + d.k" :title="d.n + ' ' + d.k">{{ d.n }}</span>
+  </q-td>
+  <q-td key="class" :props="props" class="mono c-class">related series</q-td>
+  <q-td key="where" :props="props" class="c-loc"
+    :title="props.row.where + ' ' + props.row.location">{{
+    props.row.where }}<span v-if="props.row.where"> · </span
+    ><span class="mono">{{ props.row.location }}</span></q-td>
+  <q-td key="members" :props="props" class="groupcount">{{ props.row.members }}</q-td>
+  <q-td key="message" :props="props">{{ props.row.message }}
+    <span v-if="props.row.reviewed" class="reviewed"
+      :title="props.row.reviewed + ' of ' + props.row.reviewable_members + ' reviewed'"
+      >reviewed {{ props.row.reviewed }}/{{ props.row.reviewable_members }}</span>
+    <span v-if="props.row.hidden_children" class="capbadge">
+      {{ props.row.hidden_children }} hidden by filters
+    </span>
+    <span v-if="props.row.cap_degraded" class="capbadge">
+      retained details; coverage degraded
+    </span>
+    <span v-if="props.row.child_page" class="childpager">
+      <button type="button" class="pagebtn" aria-label="Previous child segments"
+        @click.stop="$parent.$emit('childpage', {id: props.row.id, delta: -1})"
+        >&lsaquo;</button>{{ props.row.child_page }}<button type="button" class="pagebtn"
+        aria-label="Next child segments"
+        @click.stop="$parent.$emit('childpage', {id: props.row.id, delta: 1})"
+        >&rsaquo;</button>
+    </span>
+  </q-td>
+</q-tr>
+<q-tr v-else :props="props"
+  :class="{selrow: props.row.sel, childrow: props.row.kind === 'child'}"
+  role="button" tabindex="0" :data-review-id="props.row.id"
+  :data-review-kind="props.row.kind"
+  :data-review-parent="props.row.parent"
+  :data-review-state="props.row.review_state" :data-severity="props.row.severity"
   :aria-label="'Review ' + props.row.class.replace(/_/g, ' ') +
     ' at ' + props.row.where + ' ' + props.row.location"
   @click="$parent.$emit('select', {id: props.row.id})"
@@ -704,11 +946,15 @@ REVIEW_GROUPS_BODY_SLOT = """
   <q-td key="message" :props="props"><span class="reviewclass-inline">{{
     props.row.class.replace(/_/g, ' ') }}</span>{{ props.row.message }}
     <span v-if="props.row.reviewed" class="reviewed"
-      :title="props.row.reviewed + ' of ' + props.row.members + ' reviewed'"
-      >reviewed {{ props.row.reviewed }}/{{ props.row.members }}</span>
+      :title="props.row.reviewed + ' of ' + props.row.reviewable_members + ' reviewed'"
+      >reviewed {{ props.row.reviewed }}/{{ props.row.reviewable_members }}</span>
     <span v-if="props.row.cap_degraded" class="capbadge">
       retained details; coverage degraded
     </span>
+    <button v-for="action in ['critical','warning','info','expected','confirm']"
+      :key="action" type="button" tabindex="-1" aria-hidden="true"
+      class="triage-key-action" :data-triage-action="action"
+      @click.stop="$parent.$emit('triage', {id: props.row.id, action: action})"></button>
   </q-td>
 </q-tr>
 """
@@ -889,7 +1135,7 @@ def page_frame(
     ui.add_head_html(f"<style>{CSS}</style>")
     dark = ui.dark_mode(value=bool(app.storage.general.get("dark_mode", False)))
     with ui.header(elevated=False).classes("appheader"), ui.element("div").classes("inner"):
-        ui.label("QC Tool").classes("wordmark")
+        ui.link("QC Tool", "/").classes("wordmark")
         ui.label(f"cadence-diff v{__version__}").classes("wordtag")
         with ui.element("nav").classes("headnav"):
             ui.html(

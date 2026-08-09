@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from qc_tool.config.lint import lint_profile
+from qc_tool.config.lint import lint_package_profile, lint_profile
 from qc_tool.config.profile import DeliverableProfile
 from qc_tool.io.loader import load_workbook_snapshot
+from qc_tool.package import PackageManifest
 from qc_tool.ppt.extract import load_deck_snapshot
 
 
@@ -242,3 +243,63 @@ def test_inverted_numeric_bounds_are_rejected() -> None:
     )
     issues = lint_profile(profile)
     assert any(issue.level == "error" and "exceeds maximum" in issue.message for issue in issues)
+
+
+def test_package_lint_refuses_ambiguous_unscoped_excel_rules() -> None:
+    manifest = PackageManifest.from_role_files(
+        {
+            "current_excel:core": Path("core.xlsx"),
+            "current_excel:ops": Path("ops.xlsx"),
+        }
+    )
+    profile = DeliverableProfile.model_validate(
+        {
+            "name": "ambiguous",
+            "excel": {"sheets": {"Data": {"ignore": True}}},
+        }
+    )
+
+    issues = lint_package_profile(profile, manifest)
+
+    assert any(
+        issue.level == "error"
+        and "legacy unscoped Excel rules are ambiguous" in issue.message
+        for issue in issues
+    )
+
+
+def test_package_lint_rejects_unknown_member_rules_mappings_and_waivers() -> None:
+    manifest = PackageManifest.from_role_files(
+        {"current_excel:core": Path("core.xlsx")}
+    )
+    profile = DeliverableProfile.model_validate(
+        {
+            "name": "unknown-members",
+            "excel": {"members": {"missing": {}}},
+            "crosscheck": {
+                "mappings": [
+                    {
+                        "slide": "Executive",
+                        "line_skeleton": "Revenue #",
+                        "source_member": "missing",
+                        "source_sheet": "Data",
+                        "source_cell": "A1",
+                    }
+                ]
+            },
+            "waivers": [
+                {
+                    "finding_class": "value_changed",
+                    "reason": "temporary",
+                    "expires": "2099-01-01",
+                    "member": "missing",
+                }
+            ],
+        }
+    )
+
+    messages = [issue.message for issue in lint_package_profile(profile, manifest)]
+
+    assert "unknown current Excel member 'missing'" in messages
+    assert "mapping references unknown current Excel member 'missing'" in messages
+    assert "waiver references unknown current Excel member 'missing'" in messages

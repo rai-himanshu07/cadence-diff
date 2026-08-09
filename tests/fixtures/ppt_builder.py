@@ -60,6 +60,50 @@ def _add_bullets(slide: Slide, lines: Iterable[str]) -> None:
         paragraph.font.size = Pt(18)
 
 
+def build_grouped_text_deck(
+    path: Path,
+    *,
+    grouped_lines: tuple[str, ...] = (),
+    nested_lines: tuple[str, ...] = (),
+    top_before: tuple[str, ...] = (),
+    top_after: tuple[str, ...] = (),
+    title: str = "Grouped KPIs",
+) -> Path:
+    """Write a synthetic nested-group deck for extraction contracts."""
+    presentation = Presentation()
+    slide = _add_slide(presentation, title)
+
+    def add_line(shapes, text: str, offset: int) -> None:
+        box = shapes.add_textbox(
+            Inches(0.6 + offset * 0.1),
+            Inches(1.4 + offset * 0.45),
+            Inches(6.0),
+            Inches(0.4),
+        )
+        box.text = text
+
+    offset = 0
+    for text in top_before:
+        add_line(slide.shapes, text, offset)
+        offset += 1
+    group = slide.shapes.add_group_shape()
+    for text in grouped_lines:
+        add_line(group.shapes, text, offset)
+        offset += 1
+    if nested_lines:
+        nested = group.shapes.add_group_shape()
+        for text in nested_lines:
+            add_line(nested.shapes, text, offset)
+            offset += 1
+    for text in top_after:
+        add_line(slide.shapes, text, offset)
+        offset += 1
+    presentation.core_properties.created = FIXED_DOC_TIME
+    presentation.core_properties.modified = FIXED_DOC_TIME
+    presentation.save(str(path))
+    return path
+
+
 def _trend_values(*, current: bool) -> list[float]:
     months = domain.CURRENT_MONTHS if current else domain.BASELINE_MONTHS
     values = [domain.month_total_revenue(m, current=False) for m in range(months)]

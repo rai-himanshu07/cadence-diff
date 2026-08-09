@@ -21,6 +21,9 @@ import re
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 from qc_tool.config.profile import DeliverableProfile
 from qc_tool.excel.periods import Period, is_period_after, is_period_label, parse_period
@@ -50,7 +53,7 @@ class AxisAlignment:
     deleted: list[int] = field(default_factory=list)  # baseline indices
     inserted: list[int] = field(default_factory=list)  # current indices, unexpected
     growth: list[int] = field(default_factory=list)  # current indices, expected
-    method: str = "keys"  # "keys" | "positional"
+    method: Literal["keys", "positional"] = "keys"
     low_confidence_fallback: bool = False
 
 
@@ -92,6 +95,134 @@ class WorkbookAlignment:
     unpaired_baseline_regions: list[TableRegion] = field(default_factory=list)
     unpaired_current_regions: list[TableRegion] = field(default_factory=list)
     low_confidence_regions: list[str] = field(default_factory=list)
+
+
+# --- alignment trust manifest ---------------------------------------------
+
+
+class AlignmentAxisTrust(BaseModel):
+    method: Literal["keys", "positional"]
+    low_confidence_fallback: bool
+    paired: int = Field(ge=0)
+    deleted: int = Field(ge=0)
+    inserted: int = Field(ge=0)
+    growth: int = Field(ge=0)
+
+    model_config = {"frozen": True}
+
+
+class AlignmentRegionTrust(BaseModel):
+    version: Literal[1] = 1
+    artifact_member: str = Field(default="primary", min_length=1)
+    sheet: str = Field(min_length=1)
+    region_id: str = Field(min_length=1)
+    baseline_range: str = Field(min_length=1)
+    current_range: str = Field(min_length=1)
+    row: AlignmentAxisTrust
+    column: AlignmentAxisTrust
+    comparable_cell_pairs: int = Field(ge=0)
+    skipped_low_confidence_cells: int = Field(ge=0)
+    low_confidence: bool
+
+    model_config = {"frozen": True}
+
+
+class AlignmentUnpairedRegion(BaseModel):
+    version: Literal[1] = 1
+    artifact_member: str = Field(default="primary", min_length=1)
+    side: Literal["baseline", "current"]
+    sheet: str = Field(min_length=1)
+    region_id: str = Field(min_length=1)
+    cell_range: str = Field(min_length=1)
+    orientation: Literal["long", "wide", "block"]
+
+    model_config = {"frozen": True}
+
+
+class AlignmentTrustManifest(BaseModel):
+    version: Literal[1] = 1
+    regions: tuple[AlignmentRegionTrust, ...] = ()
+    unpaired: tuple[AlignmentUnpairedRegion, ...] = ()
+
+    model_config = {"frozen": True}
+
+
+def build_alignment_trust_manifest(
+    alignment: WorkbookAlignment,
+    artifact_member: str = "primary",
+) -> AlignmentTrustManifest:
+    """Build factual, deterministic region correspondence metadata."""
+    regions: list[AlignmentRegionTrust] = []
+    for sheet_name in sorted(alignment.regions.keys()):
+        region_list = alignment.regions[sheet_name]
+        for region in region_list:
+            # counts for rows/columns
+            row_pairs = len(region.rows.pairs)
+            col_pairs = len(region.columns.pairs)
+            row_trust = AlignmentAxisTrust(
+                method=region.rows.method,
+                low_confidence_fallback=bool(region.rows.low_confidence_fallback),
+                paired=row_pairs,
+                deleted=len(region.rows.deleted),
+                inserted=len(region.rows.inserted),
+                growth=len(region.rows.growth),
+            )
+            col_trust = AlignmentAxisTrust(
+                method=region.columns.method,
+                low_confidence_fallback=bool(region.columns.low_confidence_fallback),
+                paired=col_pairs,
+                deleted=len(region.columns.deleted),
+                inserted=len(region.columns.inserted),
+                growth=len(region.columns.growth),
+            )
+            comparable_cell_pairs = row_pairs * col_pairs
+            skipped = comparable_cell_pairs if region.low_confidence else 0
+            regions.append(
+                AlignmentRegionTrust(
+                    version=1,
+                    artifact_member=artifact_member,
+                    sheet=sheet_name,
+                    region_id=region.current.region_id,
+                    baseline_range=region.baseline.cell_range,
+                    current_range=region.current.cell_range,
+                    row=row_trust,
+                    column=col_trust,
+                    comparable_cell_pairs=comparable_cell_pairs,
+                    skipped_low_confidence_cells=skipped,
+                    low_confidence=bool(region.low_confidence),
+                )
+            )
+
+    unpaired: list[AlignmentUnpairedRegion] = []
+    def unpaired_key(region: TableRegion) -> tuple[str, str, str]:
+        return region.sheet, region.region_id, region.cell_range
+    for reg in sorted(alignment.unpaired_baseline_regions, key=unpaired_key):
+        unpaired.append(
+            AlignmentUnpairedRegion(
+                version=1,
+                artifact_member=artifact_member,
+                side="baseline",
+                sheet=reg.sheet,
+                region_id=reg.region_id,
+                cell_range=reg.cell_range,
+                orientation=reg.orientation,
+            )
+        )
+    for reg in sorted(alignment.unpaired_current_regions, key=unpaired_key):
+        unpaired.append(
+            AlignmentUnpairedRegion(
+                version=1,
+                artifact_member=artifact_member,
+                side="current",
+                sheet=reg.sheet,
+                region_id=reg.region_id,
+                cell_range=reg.cell_range,
+                orientation=reg.orientation,
+            )
+        )
+
+    return AlignmentTrustManifest(regions=tuple(regions), unpaired=tuple(unpaired))
+
 
 
 # --- axis key extraction --------------------------------------------------
@@ -214,7 +345,10 @@ def _is_growth(entry: AxisEntry, max_periods: dict[tuple[int, str], Period]) -> 
 
 
 def _align_axis(
-    baseline: list[AxisEntry], current: list[AxisEntry], *, method: str = "keys"
+    baseline: list[AxisEntry],
+    current: list[AxisEntry],
+    *,
+    method: Literal["keys", "positional"] = "keys",
 ) -> AxisAlignment:
     current_by_key = {entry.key: entry for entry in current}
     matched_current: set[int] = set()

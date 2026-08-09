@@ -10,6 +10,10 @@ from qc_tool.ppt.match import SlideMatching
 from qc_tool.ppt.model import SlideContent
 
 
+def _comparison_text(text: str) -> str:
+    return " ".join(text.split())
+
+
 def _text_findings(baseline: SlideContent, current: SlideContent) -> list[Finding]:
     findings: list[Finding] = []
     slide = current.display_name
@@ -30,6 +34,8 @@ def _text_findings(baseline: SlideContent, current: SlideContent) -> list[Findin
             current_lines,
             strict=False,
         ):
+            if _comparison_text(baseline_line) == _comparison_text(current_line):
+                continue
             expected = _numeric_skeleton(baseline_line) == _numeric_skeleton(
                 current_line
             )
@@ -107,6 +113,18 @@ def diff_decks(
             )
         )
     for baseline_slide, current_slide in matching.reordered:
+        baseline_position = baseline_slide.index + 1
+        current_position = current_slide.index + 1
+        if baseline_position == current_position:
+            # LIS flags relative displacement; equal absolute positions mean
+            # the slides AROUND this one moved.
+            move_text = (
+                f"kept position {current_position} while surrounding slides moved"
+            )
+        else:
+            move_text = (
+                f"moved from position {baseline_position} to {current_position}"
+            )
         findings.append(
             Finding(
                 artifact="ppt",
@@ -115,11 +133,10 @@ def diff_decks(
                 slide=current_slide.display_name,
                 slide_index=current_slide.index + 1,
                 baseline_slide_index=baseline_slide.index + 1,
-                baseline_value=f"position {baseline_slide.index + 1}",
-                current_value=f"position {current_slide.index + 1}",
+                baseline_value=f"position {baseline_position}",
+                current_value=f"position {current_position}",
                 message=(
-                    f"slide {current_slide.display_name!r} moved from position "
-                    f"{baseline_slide.index + 1} to {current_slide.index + 1}"
+                    f"slide {current_slide.display_name!r} {move_text}"
                 ),
             )
         )

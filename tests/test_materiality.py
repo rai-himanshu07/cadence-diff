@@ -40,6 +40,7 @@ from qc_tool.findings import (
     Severity,
 )
 from qc_tool.io.model import CellRecord, SheetSnapshot
+from qc_tool.review_series import anchor_matches_finding, anchor_segment
 
 
 class TestFormatParser:
@@ -862,3 +863,306 @@ class TestLintAcceptanceBands:
         messages = [issue.message for issue in issues]
         assert any("accepts nothing" in message for message in messages)
         assert any("not a valid A1 range" in message for message in messages)
+
+
+def _wide_period_region(
+    cols: int, *, baseline_values: dict[int, float], current_values: dict[int, float]
+) -> list[Finding]:
+    """Columns 2..cols keyed by monthly labels in row 1, constants in row 2."""
+
+    def cells(values: dict[int, float]) -> dict[tuple[int, int], CellRecord]:
+        result = {
+            (1, 1): CellRecord(1, 1, "Metric"),
+            (2, 1): CellRecord(2, 1, "Actual"),
+        }
+        for col in range(2, cols + 1):
+            result[(1, col)] = CellRecord(1, col, f"2026-{col - 1:02d}")
+            if col in values:
+                result[(2, col)] = CellRecord(2, col, values[col], number_format="0.0")
+        return result
+
+    baseline = SheetSnapshot("S", "visible", 2, cols, cells(baseline_values))
+    current = SheetSnapshot("S", "visible", 2, cols, cells(current_values))
+    region = TableRegion("S", 1, 1, 2, cols, "wide", 1, 1, "columns")
+    alignment = RegionAlignment(
+        region,
+        region,
+        AxisAlignment(pairs=[(1, 1), (2, 2)]),
+        AxisAlignment(pairs=[(col, col) for col in range(1, cols + 1)]),
+    )
+    return diff_region_values(
+        baseline,
+        current,
+        alignment,
+        NumericTolerance(),
+        ignore=_RangeSet([]),
+        refresh=_RangeSet([]),
+        sheet_profile=None,
+    )
+
+
+def _two_column_period_region(
+    rows: int,
+    *,
+    baseline_values: dict[tuple[int, int], float],
+    current_values: dict[tuple[int, int], float],
+) -> list[Finding]:
+    """Rows 2..rows keyed by monthly labels in column A, constants in B and C."""
+
+    def cells(
+        values: dict[tuple[int, int], float],
+    ) -> dict[tuple[int, int], CellRecord]:
+        result = {
+            (1, 1): CellRecord(1, 1, "Month"),
+            (1, 2): CellRecord(1, 2, "Actual"),
+            (1, 3): CellRecord(1, 3, "Target"),
+        }
+        for row in range(2, rows + 1):
+            result[(row, 1)] = CellRecord(row, 1, f"2026-{row - 1:02d}")
+            for col in (2, 3):
+                if (row, col) in values:
+                    result[(row, col)] = CellRecord(
+                        row, col, values[(row, col)], number_format="0.0"
+                    )
+        return result
+
+    baseline = SheetSnapshot("S", "visible", rows, 3, cells(baseline_values))
+    current = SheetSnapshot("S", "visible", rows, 3, cells(current_values))
+    region = TableRegion("S", 1, 1, rows, 3, "long", 1, 1, "rows")
+    alignment = RegionAlignment(
+        region,
+        region,
+        AxisAlignment(pairs=[(row, row) for row in range(1, rows + 1)]),
+        AxisAlignment(pairs=[(1, 1), (2, 2), (3, 3)]),
+    )
+    return diff_region_values(
+        baseline,
+        current,
+        alignment,
+        NumericTolerance(),
+        ignore=_RangeSet([]),
+        refresh=_RangeSet([]),
+        sheet_profile=None,
+    )
+
+
+class TestSeriesAnchorProducer:
+    def test_rows_period_region_anchors_measure_column_and_period_row(self) -> None:
+        rows = 8
+        baseline = {row: 100.0 + row for row in range(2, 9)}
+        current = dict(baseline)
+        current[2] = 205.0
+        current[8] = 300.0
+
+        findings = _long_period_region(
+            rows, baseline_values=baseline, current_values=current
+        )
+        anchored = {
+            finding.location or "": finding.series_anchor
+            for finding in findings
+            if finding.series_anchor is not None
+        }
+
+        assert set(anchored) == {"B2", "B8"}
+        for location, anchor in anchored.items():
+            assert anchor is not None
+            assert anchor.version == 2
+            assert anchor_segment(anchor) == "restatement"
+            assert anchor.sheet == "S"
+            assert anchor.current_region_id == "S!A1:B8"
+            assert anchor.period_axis == "rows"
+            assert anchor.series_index == 2
+            assert anchor.period_index == int(location[1:])
+
+        for finding in findings:
+            if finding.series_anchor is None:
+                continue
+            assert anchor_matches_finding(finding, finding.series_anchor)
+
+    def test_columns_period_region_anchors_measure_row_and_period_column(self) -> None:
+        cols = 8
+        baseline = {col: 100.0 + col for col in range(2, 9)}
+        current = dict(baseline)
+        current[2] = 205.0
+        current[8] = 300.0
+
+        findings = _wide_period_region(
+            cols, baseline_values=baseline, current_values=current
+        )
+        anchored = {
+            finding.location or "": finding.series_anchor
+            for finding in findings
+            if finding.series_anchor is not None
+        }
+
+        assert set(anchored) == {"B2", "H2"}
+        for anchor in anchored.values():
+            assert anchor is not None
+            assert anchor.current_region_id == "S!A1:H2"
+            assert anchor.period_axis == "columns"
+            assert anchor.series_index == 2
+        assert anchored["B2"] is not None and anchored["B2"].period_index == 2
+        assert anchored["H2"] is not None and anchored["H2"].period_index == 8
+
+        for finding in findings:
+            if finding.series_anchor is None:
+                continue
+            assert anchor_matches_finding(finding, finding.series_anchor)
+
+    def test_block_region_text_and_population_edits_never_anchor(self) -> None:
+        findings = _region_findings(
+            {
+                (1, 1): CellRecord(1, 1, 1806.0, number_format="#,##0.0"),
+                (2, 1): CellRecord(2, 1, "label"),
+                (4, 1): CellRecord(4, 1, 7.0),
+            },
+            {
+                (1, 1): CellRecord(1, 1, 1814.0, number_format="#,##0.0"),
+                (2, 1): CellRecord(2, 1, "renamed"),
+                (3, 1): CellRecord(3, 1, 9.0),
+            },
+            4,
+        )
+
+        assert findings
+        assert all(finding.series_anchor is None for finding in findings)
+
+    def test_added_period_anchors_as_a_new_period_and_lone_clear_never_does(self) -> None:
+        rows = 8
+        baseline = {row: 100.0 + row for row in range(2, 9)}
+        baseline.pop(3)  # blank baseline -> added population
+        current = dict(baseline)
+        current[3] = 42.0
+        current.pop(4)  # cleared population; the ONLY measure column, so the
+        # period position dies with it and no anchor may exist
+
+        findings = _long_period_region(
+            rows, baseline_values=baseline, current_values=current
+        )
+        by_location = {finding.location: finding for finding in findings}
+
+        added = by_location["B3"]
+        assert added.subtype is FindingSubtype.VALUE_ADDED_POPULATION
+        assert added.series_anchor is not None
+        assert anchor_segment(added.series_anchor) == "new_period"
+        assert added.series_anchor.series_index == 2
+        assert added.series_anchor.period_index == 3
+        assert anchor_matches_finding(added, added.series_anchor)
+        # the public finding is untouched, so its canonical decision cannot move
+        assert added.materiality is None
+        assert added.temporal_context is None
+
+        cleared = by_location["B4"]
+        assert cleared.subtype is FindingSubtype.VALUE_CLEARED_POPULATION
+        assert cleared.series_anchor is None
+
+    def test_single_cell_clear_anchors_when_a_sibling_keeps_the_period_alive(
+        self,
+    ) -> None:
+        rows = 8
+        baseline = {
+            (row, col): 100.0 * col + row for row in range(2, 9) for col in (2, 3)
+        }
+        current = dict(baseline)
+        current.pop((4, 2))  # clear Actual for 2026-03; Target C4 keeps row 4 alive
+
+        findings = _two_column_period_region(
+            rows, baseline_values=baseline, current_values=current
+        )
+        cleared = next(f for f in findings if f.location == "B4")
+
+        assert cleared.subtype is FindingSubtype.VALUE_CLEARED_POPULATION
+        assert cleared.series_anchor is not None
+        assert anchor_segment(cleared.series_anchor) == "cleared_period"
+        assert cleared.series_anchor.series_index == 2
+        assert cleared.series_anchor.period_index == 4
+        assert anchor_matches_finding(cleared, cleared.series_anchor)
+        # nothing public moved: no materiality, no temporal context
+        assert cleared.materiality is None
+        assert cleared.temporal_context is None
+        assert "series_anchor" not in cleared.model_dump(mode="json")
+
+    def test_whole_row_wipe_earns_no_anchor_for_any_cleared_cell(self) -> None:
+        rows = 8
+        baseline = {
+            (row, col): 100.0 * col + row for row in range(2, 9) for col in (2, 3)
+        }
+        current = dict(baseline)
+        current.pop((4, 2))
+        current.pop((4, 3))  # the whole 2026-03 row is gone: one event
+
+        findings = _two_column_period_region(
+            rows, baseline_values=baseline, current_values=current
+        )
+        wiped = [f for f in findings if f.location in {"B4", "C4"}]
+
+        assert len(wiped) == 2
+        assert all(
+            f.subtype is FindingSubtype.VALUE_CLEARED_POPULATION for f in wiped
+        )
+        assert all(f.series_anchor is None for f in wiped)
+
+    def test_cleared_text_baseline_never_anchors(self) -> None:
+        rows = 8
+        baseline: dict[tuple[int, int], object] = {
+            (row, col): 100.0 * col + row for row in range(2, 9) for col in (2, 3)
+        }
+        baseline[(4, 2)] = "n/a"  # text baseline
+        current = dict(baseline)
+        current.pop((4, 2))  # cleared, but C4 keeps the period alive
+
+        findings = _two_column_period_region(
+            rows,
+            baseline_values=baseline,  # type: ignore[arg-type]
+            current_values=current,  # type: ignore[arg-type]
+        )
+        cleared = next(f for f in findings if f.location == "B4")
+
+        assert cleared.subtype is FindingSubtype.VALUE_CLEARED_POPULATION
+        assert cleared.series_anchor is None
+
+    def test_added_period_needs_a_dated_position_and_a_numeric_value(self) -> None:
+        rows = 8
+        baseline: dict[int, object] = {row: 100.0 + row for row in range(2, 9)}
+        baseline.pop(3)
+        current = dict(baseline)
+        current[3] = "n/a"  # text addition
+
+        findings = _long_period_region(
+            rows,
+            baseline_values=baseline,  # type: ignore[arg-type]
+            current_values=current,  # type: ignore[arg-type]
+        )
+        added = next(f for f in findings if f.location == "B3")
+
+        assert added.subtype is FindingSubtype.VALUE_ADDED_POPULATION
+        assert added.series_anchor is None
+
+    def test_added_period_outside_a_period_region_never_anchors(self) -> None:
+        findings = _region_findings(
+            {(1, 1): CellRecord(1, 1, 1806.0, number_format="#,##0.0")},
+            {
+                (1, 1): CellRecord(1, 1, 1814.0, number_format="#,##0.0"),
+                (3, 1): CellRecord(3, 1, 9.0),
+            },
+            4,
+        )
+        added = next(f for f in findings if f.location == "A3")
+
+        assert added.subtype is FindingSubtype.VALUE_ADDED_POPULATION
+        assert added.series_anchor is None
+
+    def test_anchors_never_reach_public_serialization(self) -> None:
+        rows = 8
+        baseline = {row: 100.0 + row for row in range(2, 9)}
+        current = dict(baseline)
+        current[8] = 300.0
+
+        findings = _long_period_region(
+            rows, baseline_values=baseline, current_values=current
+        )
+        anchored = [f for f in findings if f.series_anchor is not None]
+
+        assert anchored
+        for finding in anchored:
+            assert "series_anchor" not in finding.model_dump(mode="json")

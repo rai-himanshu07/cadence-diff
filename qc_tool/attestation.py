@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from qc_tool import __version__
 from qc_tool.config.profile import DeliverableProfile, canonical_profile_bytes
 from qc_tool.engine import QCRunResult
+from qc_tool.package import PackageManifest
 from qc_tool.report.json_report import result_payload
 from qc_tool.security import private_directory, private_file
 
@@ -125,8 +126,16 @@ def create_attestation(
         for finding in result.findings
         if finding.severity_overridden or finding.analyst_comment or finding.waiver_reason
     ]
+    package_manifest = (
+        result.package_manifest
+        if result.package_manifest is not None
+        and not result.package_manifest.is_legacy_projection
+        else None
+    )
     unsigned = {
-        "schema_version": 2 if signoff is not None else 1,
+        "schema_version": (
+            3 if package_manifest is not None else (2 if signoff is not None else 1)
+        ),
         "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "tool": {"distribution": "cadence-diff", "version": __version__},
         "run": {
@@ -147,6 +156,8 @@ def create_attestation(
         "waivers": [item.model_dump(mode="json") for item in profile.waivers],
         "analyst_decisions": analyst_decisions,
     }
+    if package_manifest is not None:
+        unsigned["package_manifest"] = package_manifest.model_dump(mode="json")
     if signoff is not None:
         unsigned["signoff"] = signoff.model_dump(mode="json")
     signature = hmac.new(key, _canonical(unsigned), hashlib.sha256).hexdigest()
@@ -185,12 +196,23 @@ def verify_attestation(path: Path, *, key: bytes) -> AttestationVerification:
             result.add("invalid-manifest", "manifest.json is not valid JSON")
             return result
         schema_version = manifest.get("schema_version")
-        if schema_version not in {1, 2}:
+        if schema_version not in {1, 2, 3}:
             result.add(
                 "schema-version", f"unsupported attestation schema {schema_version!r}"
             )
         if schema_version == 2 and not isinstance(manifest.get("signoff"), dict):
             result.add("missing-signoff", "schema v2 sign-off evidence is missing")
+        package_manifest = None
+        if schema_version == 3:
+            try:
+                package_manifest = PackageManifest.model_validate(
+                    manifest.get("package_manifest")
+                )
+            except (TypeError, ValueError):
+                result.add(
+                    "package-manifest",
+                    "schema v3 package manifest is missing or invalid",
+                )
         signature = manifest.pop("signature", None)
         if not isinstance(signature, dict):
             result.add("missing-signature", "manifest signature is missing")
@@ -206,6 +228,17 @@ def verify_attestation(path: Path, *, key: bytes) -> AttestationVerification:
         if not isinstance(members, dict):
             result.add("member-manifest", "member hash manifest is invalid")
             return result
+        inputs = manifest.get("inputs")
+        if package_manifest is not None:
+            expected_roles = {
+                member.role_key for member in package_manifest.members
+            }
+            actual_roles = set(inputs) if isinstance(inputs, dict) else set()
+            if actual_roles != expected_roles:
+                result.add(
+                    "package-inputs",
+                    "attested input roles do not match the package manifest",
+                )
         expected_names = {"manifest.json", *members}
         unexpected = names - expected_names
         missing = expected_names - names

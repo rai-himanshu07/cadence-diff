@@ -9,7 +9,7 @@ import pytest
 from openpyxl import Workbook
 
 from qc_tool.coverage import CoverageState
-from qc_tool.engine import run_qc
+from qc_tool.engine import _workload_coverage, run_qc
 from qc_tool.excel import complexity as complexity_module
 from qc_tool.excel.complexity import (
     WorkbookComplexityError,
@@ -20,6 +20,7 @@ from qc_tool.io.model import (
     ConditionalFormatDescriptor,
     SheetSnapshot,
     WorkbookSnapshot,
+    WorkbookWorkload,
 )
 from qc_tool.progress import PhaseTelemetry, ProgressEvent, RunPhase
 
@@ -218,3 +219,40 @@ def test_dependency_workload_coverage_is_reported_for_a_cycle_run(
 
     assert item.state is CoverageState.CHECKED
     assert "projected cell dependencies" in item.detail
+
+
+def test_xlsb_physical_workload_coverage_is_reported_when_scanned() -> None:
+    workbook = WorkbookSnapshot(
+        source_name="synthetic.xlsb",
+        file_format="xlsb",
+        formulas_available=False,
+        styles_available=False,
+        workload=WorkbookWorkload(
+            format="xlsb",
+            cell_count=10,
+            formula_count=3,
+            worksheet_binary_bytes=1_024,
+            sheet_count=1,
+            largest_sheet_area=20,
+        ),
+    )
+
+    item = _workload_coverage(workbook)
+
+    assert item.state is CoverageState.CHECKED
+    assert "BIFF12 worksheets" in item.detail
+
+
+def test_unavailable_xlsb_metrics_remain_explicit() -> None:
+    workbook = WorkbookSnapshot(
+        source_name="synthetic.xlsb",
+        file_format="xlsb",
+        formulas_available=False,
+        styles_available=False,
+        workload=WorkbookWorkload(format="xlsb", metrics_available=False),
+    )
+
+    item = _workload_coverage(workbook)
+
+    assert item.state is CoverageState.UNAVAILABLE
+    assert item.detail == "Workbook workload metrics are unavailable"

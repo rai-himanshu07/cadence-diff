@@ -76,6 +76,9 @@ class RunRequest:
     compare_sheets: tuple[str, ...] = ()
     compare_slides: tuple[int, ...] = ()
     rerun_of: int | None = None
+    # New fields for multi-workbook intake (primitive-only payloads)
+    package_manifest: dict[str, Any] = field(default_factory=dict)
+    compare_member_sheets: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

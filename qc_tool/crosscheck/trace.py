@@ -11,6 +11,7 @@ skeleton, so refreshed numbers do not break the anchor.
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Literal
 
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
@@ -28,6 +29,7 @@ from qc_tool.crosscheck.numbers import (
 from qc_tool.excel.dependency import DependencyGraph, Node, dependent_nodes_of
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot, display_cell_value
+from qc_tool.package import MEMBER_ID_PATTERN
 from qc_tool.ppt.extract import DeckSnapshot
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,11 @@ class FigureOccurrence:
     slide_index: int
     #: Exact enclosing table/chart shape; flattened ordinary text has none.
     shape_id: int | None = None
+    #: The kind of surface the figure was read from.
+    surface_kind: Literal["text", "table", "chart"] = "text"
+    #: Anchor identifying the exact surface within the slide (numeric skeleton,
+    #: table:<row>/<header>, or chart:<title>/<series>/<category>). May be empty.
+    surface_anchor: str = ""
 
     @property
     def context(self) -> str:
@@ -62,6 +69,7 @@ class SourceCandidate:
     rel_diff: float
     row_label: str = ""
     column_label: str = ""
+    source_member: str = "primary"
 
 
 class SuggestedSource(BaseModel):
@@ -73,6 +81,11 @@ class SuggestedSource(BaseModel):
     rel_diff: float
     row_label: str = ""
     column_label: str = ""
+    source_member: str = Field(
+        default="primary",
+        pattern=MEMBER_ID_PATTERN,
+        exclude_if=lambda value: value == "primary",
+    )
 
     @classmethod
     def from_candidate(cls, candidate: SourceCandidate) -> "SuggestedSource":
@@ -85,6 +98,7 @@ class SuggestedSource(BaseModel):
             rel_diff=candidate.rel_diff,
             row_label=candidate.row_label,
             column_label=candidate.column_label,
+            source_member=candidate.source_member,
         )
 
 
@@ -94,6 +108,11 @@ class MappingSuggestion(BaseModel):
     line_skeleton: str
     figure_index: int
     figure_raw: str
+    source_member: str = Field(
+        default="primary",
+        pattern=MEMBER_ID_PATTERN,
+        exclude_if=lambda value: value == "primary",
+    )
     candidates: list[SuggestedSource] = Field(default_factory=list)
 
 
@@ -124,6 +143,8 @@ def extract_deck_figures(deck: DeckSnapshot) -> list[FigureOccurrence]:
                         slide=slide.display_name,
                         line=line,
                         line_skeleton=numeric_skeleton(line),
+                        surface_kind="text",
+                        surface_anchor=numeric_skeleton(line),
                         figure_index=index,
                         figure=figure,
                         slide_index=slide.index + 1,
@@ -146,6 +167,8 @@ def extract_deck_figures(deck: DeckSnapshot) -> list[FigureOccurrence]:
                             slide=slide.display_name,
                             line=cell_text,
                             line_skeleton=f"table:{row_label}/{header}",
+                            surface_kind="table",
+                            surface_anchor=f"table:{row_label}/{header}",
                             figure_index=0,
                             figure=figures[0],
                             slide_index=slide.index + 1,
@@ -179,10 +202,15 @@ def extract_deck_figures(deck: DeckSnapshot) -> list[FigureOccurrence]:
                             FigureOccurrence(
                                 slide=slide.display_name,
                                 line=label.text,
-                                line_skeleton=(
-                                    f"chart:{chart_anchor}/{series_anchor}/"
-                                    f"{category_anchor}"
-                                ),
+                                    line_skeleton=(
+                                        f"chart:{chart_anchor}/{series_anchor}/"
+                                        f"{category_anchor}"
+                                    ),
+                                    surface_kind="chart",
+                                    surface_anchor=(
+                                        f"chart:{chart_anchor}/{series_anchor}/"
+                                        f"{category_anchor}"
+                                    ),
                                 figure_index=figure_index,
                                 figure=figure,
                                 slide_index=slide.index + 1,
@@ -209,7 +237,11 @@ def _nearest_above_label(sheet: SheetSnapshot, row: int, col: int) -> str:
 
 
 def suggest_sources(
-    occurrence: FigureOccurrence, workbook: WorkbookSnapshot, *, limit: int = 5
+    occurrence: FigureOccurrence,
+    workbook: WorkbookSnapshot,
+    *,
+    limit: int = 5,
+    source_member: str = "primary",
 ) -> list[SourceCandidate]:
     """Ranked candidate source cells: display matches first, then near misses."""
     candidates: list[SourceCandidate] = []
@@ -238,6 +270,7 @@ def suggest_sources(
                     rel_diff=rel_diff,
                     row_label=row_label,
                     column_label=column_label,
+                    source_member=source_member,
                 )
             )
     candidates.sort(
@@ -257,6 +290,7 @@ def build_mapping(
         label=label or f"{candidate.row_label} {candidate.column_label}".strip(),
         source_sheet=candidate.sheet,
         source_cell=candidate.cell,
+        source_member=candidate.source_member,
     )
 
 
@@ -330,6 +364,7 @@ def verify_mappings(
             result.findings.append(
                 Finding(
                     artifact="crosscheck",
+                    artifact_member=mapping.source_member,
                     finding_class=FindingClass.CROSSCHECK_UNRESOLVED,
                     slide=mapping.slide,
                     element=display,
@@ -350,6 +385,7 @@ def verify_mappings(
             result.findings.append(
                 Finding(
                     artifact="crosscheck",
+                    artifact_member=mapping.source_member,
                     finding_class=FindingClass.CROSSCHECK_UNRESOLVED,
                     slide=mapping.slide,
                     slide_index=occurrence.slide_index,
@@ -370,6 +406,7 @@ def verify_mappings(
         result.findings.append(
             Finding(
                 artifact="crosscheck",
+                artifact_member=mapping.source_member,
                 finding_class=FindingClass.CROSSCHECK_MISMATCH,
                 slide=mapping.slide,
                 slide_index=occurrence.slide_index,

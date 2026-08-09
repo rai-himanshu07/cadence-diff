@@ -52,7 +52,8 @@ def peek_slide_titles(path: Path) -> list[tuple[int, str]]:
             title = ""
             shape = getattr(slide.shapes, "title", None)
             if shape is not None and getattr(shape, "has_text_frame", False):
-                title = shape.text_frame.text.strip()
+                # collapse soft line breaks (\v) and newlines into a one-line label
+                title = " ".join(shape.text_frame.text.split())
             titles.append((index, title or f"Slide {index}"))
         return titles
     except Exception as exc:

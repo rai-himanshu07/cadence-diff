@@ -1,14 +1,42 @@
 """Report generation tests (criterion 11)."""
 
+import json
 from pathlib import Path
 
 from openpyxl import load_workbook
 
 from qc_tool.engine import QCRunResult, run_qc
-from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.findings import Finding, FindingClass, SeriesAnchorV1, Severity
+from qc_tool.history.review_state import finding_evidence_digest
+from qc_tool.package import (
+    PackageArtifact,
+    PackageManifest,
+    PackageMember,
+    PackageSide,
+)
 from qc_tool.report.excel_report import write_excel_report
 from qc_tool.report.html_report import render_html_report, write_html_report
 from qc_tool.report.json_report import result_payload
+from qc_tool.review import build_pattern_groups
+
+
+def test_report_cells_never_carry_xml_illegal_characters(tmp_path: Path) -> None:
+    from openpyxl import Workbook
+
+    from qc_tool.report.excel_report import _dynamic_cell, _safe_report_text
+
+    assert _safe_report_text("line one\vline two") == "line one\nline two"
+    assert _safe_report_text("page\fbreak") == "page\nbreak"
+    assert _safe_report_text("bell\x07null\x00escape\x1b") == "bellnullescape"
+    assert _safe_report_text("kept\ttab\nnewline\rreturn") == "kept\ttab\nnewline\rreturn"
+
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    cell = _dynamic_cell(sheet, row=1, column=1, value="soft\vbreak\x08")
+    assert cell.value == "soft\nbreak"
+    path = tmp_path / "sanitized.xlsx"
+    workbook.save(path)  # raised IllegalCharacterError before fix
 
 
 def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
@@ -20,6 +48,7 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
         "Summary",
         "Stories",
         "Coverage",
+        "Alignment Trust",
         "Review Groups",
         "Findings",
     ]
@@ -55,6 +84,12 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
     assert summary["D3"].hyperlink.location == "'Stories'!A1"
     assert summary["D4"].hyperlink is not None
     assert summary["D4"].hyperlink.location == "'Review Groups'!A1"
+    assert summary["D7"].hyperlink is not None
+    assert summary["D7"].hyperlink.location == "'Alignment Trust'!A1"
+
+    alignment_trust = workbook["Alignment Trust"]
+    assert alignment_trust["A1"].value == "Member"
+    assert alignment_trust.max_row > 1
 
     stories_sheet = workbook["Stories"]
     assert stories_sheet["A1"].value == "Story"
@@ -162,3 +197,299 @@ def test_json_context_is_private_and_opt_in(qc_result: QCRunResult) -> None:
         finding.get("baseline_excerpt") or finding.get("current_excerpt")
         for finding in diagnostic_payload["findings"]
     )
+
+
+def _package_result() -> QCRunResult:
+    manifest = PackageManifest(
+        members=(
+            PackageMember(
+                member_id="core",
+                side=PackageSide.CURRENT,
+                artifact=PackageArtifact.EXCEL,
+                display_name="core.xlsx",
+            ),
+            PackageMember(
+                member_id="ops",
+                side=PackageSide.CURRENT,
+                artifact=PackageArtifact.EXCEL,
+                display_name="ops.xlsx",
+            ),
+            PackageMember(
+                member_id="primary",
+                side=PackageSide.CURRENT,
+                artifact=PackageArtifact.PPT,
+                display_name="deck.pptx",
+            ),
+        )
+    )
+    findings = [
+        Finding(
+            finding_id="F0001",
+            artifact="excel",
+            artifact_member="core",
+            finding_class=FindingClass.VALUE_CHANGED,
+            severity=Severity.CRITICAL,
+            sheet="Data",
+            location="B2",
+            baseline_value="1",
+            current_value="2",
+            message="core changed",
+        ),
+        Finding(
+            finding_id="F0002",
+            artifact="excel",
+            artifact_member="ops",
+            finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+            severity=Severity.WARNING,
+            sheet="Data",
+            baseline_location="C2",
+            location="C2",
+            baseline_value="=A1+B1",
+            current_value="=A1+C1",
+            message="ops formula changed",
+        ),
+    ]
+    return QCRunResult(
+        profile_name="package",
+        files={member.role_key: member.display_name for member in manifest.members},
+        findings=findings,
+        package_manifest=manifest,
+    )
+
+
+def test_true_package_json_uses_v2_and_matches_shipped_schema_keys() -> None:
+    payload = result_payload(_package_result(), include_review_summary=True)
+    schema_path = Path(__file__).parents[1] / "qc_tool/report/findings-v2.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 2
+    assert payload["schema"].endswith("findings-v2.json")
+    assert payload["package_manifest"]["version"] == 1
+    assert payload["review_summary"]["summary_version"] == 4
+    assert set(payload) <= set(schema["properties"])
+    assert set(schema["required"]) <= set(payload)
+
+
+def test_scalar_json_v1_matches_shipped_schema_keys(qc_result: QCRunResult) -> None:
+    payload = result_payload(qc_result)
+    schema_path = Path(__file__).parents[1] / "qc_tool/report/findings.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 1
+    assert "package_manifest" not in payload
+    assert "review_summary" not in payload
+    assert set(payload) <= set(schema["properties"])
+    assert set(schema["required"]) <= set(payload)
+
+
+def test_multi_member_excel_report_has_package_and_member_columns(
+    tmp_path: Path,
+) -> None:
+    result = _package_result()
+    path = tmp_path / "package.xlsx"
+
+    write_excel_report(result, path)
+    workbook = load_workbook(path)
+
+    assert "Package" in workbook.sheetnames
+    assert workbook["Findings"]["D1"].value == "Member"
+    assert workbook["Findings"]["D2"].value == "core"
+    assert workbook["Findings"]["D3"].value == "ops"
+    assert workbook["Review Groups"]["C1"].value == "Member"
+    assert workbook["Review Groups"]["K2"].hyperlink is not None
+    package = workbook["Package"]
+    assert [package.cell(row=row, column=3).value for row in range(2, 5)] == [
+        "core",
+        "ops",
+        "primary",
+    ]
+    assert workbook["Summary"]["D8"].hyperlink is not None
+    assert workbook["Summary"]["D8"].hyperlink.location == "'Package'!A1"
+
+
+def test_multi_member_html_is_autoescaped_and_renders_formula_diff() -> None:
+    result = _package_result()
+    assert result.package_manifest is not None
+    hostile = result.package_manifest.members[0].model_copy(
+        update={"display_name": "<script>alert(1)</script>.xlsx"}
+    )
+    result.package_manifest = PackageManifest(
+        members=(hostile, *result.package_manifest.members[1:])
+    )
+
+    html = render_html_report(result)
+
+    assert "Package members" in html
+    assert "<script>alert(1)</script>.xlsx" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;.xlsx" in html
+    assert "artifact_member" in html
+    assert "Formula token diff" in html
+    assert "fdiff-removed" in html
+    assert "fdiff-added" in html
+
+
+def test_series_anchors_leave_every_public_surface_byte_identical(
+    qc_result: QCRunResult, tmp_path: Path
+) -> None:
+    before_json = json.dumps(result_payload(qc_result), sort_keys=True)
+    before_html = render_html_report(qc_result)
+    before_groups = [group.group_id for group in build_pattern_groups(qc_result.findings)]
+    before_digests = [
+        finding_evidence_digest(finding) for finding in qc_result.findings
+    ]
+
+    anchored = 0
+    for finding in qc_result.findings:
+        if finding.sheet is None or finding.location is None:
+            continue
+        anchored += 1
+        finding.series_anchor = SeriesAnchorV1(
+            sheet=finding.sheet,
+            current_region_id=f"{finding.sheet}!A1:Z99",
+            period_axis="rows",
+            series_index=1,
+            period_index=1,
+        )
+    assert anchored > 0
+
+    assert json.dumps(result_payload(qc_result), sort_keys=True) == before_json
+    assert render_html_report(qc_result) == before_html
+    assert [
+        group.group_id for group in build_pattern_groups(qc_result.findings)
+    ] == before_groups
+    assert [
+        finding_evidence_digest(finding) for finding in qc_result.findings
+    ] == before_digests
+
+    path = tmp_path / "anchored.xlsx"
+    write_excel_report(qc_result, path)
+    workbook = load_workbook(path)
+    text = " ".join(
+        str(cell.value)
+        for sheet in workbook.worksheets
+        for row in sheet.iter_rows()
+        for cell in row
+        if cell.value is not None
+    )
+    assert "series_anchor" not in text
+    assert "current_region_id" not in text
+
+
+def test_findings_continue_onto_follow_on_sheets_past_the_row_cap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Step 6: the Excel report never truncates; it continues onto new sheets."""
+    import qc_tool.report.excel_report as excel_report
+
+    monkeypatch.setattr(excel_report, "MAX_FINDINGS_DATA_ROWS", 2)
+    findings = [
+        Finding(
+            finding_id=f"F{index:04d}",
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            severity=Severity.CRITICAL,
+            sheet="Data",
+            location=f"B{index}",
+            baseline_value="1",
+            current_value="2",
+            message=f"value changed {index}",
+        )
+        for index in range(1, 6)
+    ]
+    result = QCRunResult(profile_name="cap", findings=findings)
+    path = tmp_path / "capped.xlsx"
+
+    write_excel_report(result, path)
+
+    workbook = load_workbook(path)
+    assert [name for name in workbook.sheetnames if name.startswith("Findings")] == [
+        "Findings",
+        "Findings (2)",
+        "Findings (3)",
+    ]
+    assert workbook["Findings"]["A2"].value == "F0001"
+    assert workbook["Findings"]["A3"].value == "F0002"
+    assert workbook["Findings (2)"]["A2"].value == "F0003"
+    assert workbook["Findings (3)"]["A2"].value == "F0005"
+    assert workbook["Findings (3)"].max_row == 2
+    # Each continuation sheet keeps headers and its own filter range.
+    assert workbook["Findings (2)"]["A1"].value == "ID"
+    assert workbook["Findings (2)"].auto_filter.ref == "A1:T3"
+    # Review-group links resolve into the continuation sheet that holds the row.
+    review = workbook["Review Groups"]
+    locations: set[str] = set()
+    for row in range(2, review.max_row + 1):
+        hyperlink = review.cell(row=row, column=10).hyperlink
+        if hyperlink is not None and hyperlink.location is not None:
+            locations.add(hyperlink.location)
+    assert any(location.startswith("'Findings") for location in locations)
+
+
+def test_streamed_json_report_equals_materialized_payload(
+    qc_result: QCRunResult, tmp_path: Path, monkeypatch
+) -> None:
+    import qc_tool.report.json_report as json_report
+
+    class _FrozenDatetime(json_report.dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 1, 1, tzinfo=json_report.dt.UTC)
+
+    monkeypatch.setattr(json_report.dt, "datetime", _FrozenDatetime)
+    from qc_tool.report.json_report import write_json_report
+
+    path = tmp_path / "streamed.json"
+    write_json_report(qc_result, path, include_review_summary=True)
+    streamed = json.loads(path.read_text(encoding="utf-8"))
+    materialized = result_payload(qc_result, include_review_summary=True)
+    assert streamed == materialized
+    # Byte-exact framing too, not just structural equality.
+    assert path.read_text(encoding="utf-8") == json.dumps(materialized, indent=2)
+
+
+def test_html_report_past_threshold_keeps_decisions_and_discloses(
+    monkeypatch,
+) -> None:
+    import qc_tool.report.html_report as html_report
+
+    monkeypatch.setattr(html_report, "ATOMICS_INLINE_THRESHOLD", 1)
+    findings = [
+        Finding(
+            finding_id=f"F{index:04d}",
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            severity=Severity.CRITICAL,
+            sheet="Data",
+            location=f"B{index}",
+            baseline_value="1",
+            current_value="2",
+            message=f"value changed {index}",
+        )
+        for index in range(1, 4)
+    ]
+    result = QCRunResult(profile_name="cap", findings=findings)
+
+    html = render_html_report(result)
+
+    assert "above the 1-row inline limit" in html
+    assert "Excel and JSON exports" in html
+    assert "data-member-body" not in html  # no embedded atomic payloads
+    assert "value changed 1" not in html  # member text is not inlined
+    assert 'class="review-group"' in html or "review-item" in html  # decisions stay
+
+
+def test_streamed_html_write_matches_monolithic_render(
+    qc_result: QCRunResult, tmp_path: Path
+) -> None:
+    """Step 8: the chunked template write is byte-identical to render()."""
+    import re
+
+    path = tmp_path / "streamed.html"
+    write_html_report(qc_result, path)
+    streamed = path.read_text(encoding="utf-8")
+    rendered = render_html_report(qc_result)
+
+    strip_stamp = lambda text: re.sub(  # noqa: E731
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00", "STAMP", text
+    )
+    assert strip_stamp(streamed) == strip_stamp(rendered)

@@ -45,16 +45,20 @@ def cycle_run(fixture_dir: Path, tmp_path_factory: pytest.TempPathFactory):
     return work_dir, artifacts
 
 
-def test_a_real_run_records_a_versioned_sidecar(cycle_run) -> None:
+def test_a_real_run_records_block_focus_seeds(cycle_run) -> None:
     work_dir, artifacts = cycle_run
     record = RunHistory(work_dir / "history.sqlite3").get_run(artifacts.run_id)
-    assert record.focus_targets.version == FOCUS_SIDECAR_VERSION
-    assert record.focus_targets.usable
-    identifiers = {finding.finding_id for finding in record.findings}
-    assert set(record.focus_targets.targets) <= identifiers
+    assert record.focus_blocks is not None
+    assert not record.focus_degraded()
+    seeded = {
+        finding.finding_id: seeds
+        for finding in record.findings
+        if (seeds := record.focus_seeds(finding.finding_id))
+    }
+    assert seeded
     ppt_shape_targets = [
         seed
-        for seeds in record.focus_targets.targets.values()
+        for seeds in seeded.values()
         for seed in seeds
         if seed.artifact.value == "ppt" and seed.shape_id is not None
     ]
@@ -62,11 +66,27 @@ def test_a_real_run_records_a_versioned_sidecar(cycle_run) -> None:
     assert all(seed.shape_id and seed.shape_id > 0 for seed in ppt_shape_targets)
 
 
-def test_targets_never_reference_an_omitted_finding(cycle_run) -> None:
+def test_block_seeds_match_the_reference_generator(cycle_run) -> None:
+    """Block seeds equal what the dict generator produced at record time.
+
+    The reference runs over the LIVE result findings: private transient
+    fields (focus_shape_id) exist only there, and block storage must
+    preserve them exactly as the old whole-run sidecar did.
+    """
+    from qc_tool.focus.targets import build_focus_targets
+
     work_dir, artifacts = cycle_run
     record = RunHistory(work_dir / "history.sqlite3").get_run(artifacts.run_id)
-    for finding_id in record.focus_targets.targets:
-        assert any(f.finding_id == finding_id for f in record.findings)
+    reference = build_focus_targets(
+        list(artifacts.result.findings),
+        mode=record.mode,
+        file_hashes=record.file_hashes,
+    )
+    assert reference  # the fixture pair produces seeds
+    for finding in record.findings:
+        assert record.focus_seeds(finding.finding_id) == reference.get(
+            finding.finding_id, ()
+        )
 
 
 def test_default_json_is_unchanged_by_focus(cycle_run) -> None:
@@ -144,7 +164,7 @@ def test_annotations_survive_a_recorded_sidecar(cycle_run) -> None:
     annotated = next(f for f in reloaded.findings if f.finding_id == target)
     assert annotated.analyst_comment == "reviewed"
     assert annotated.severity_overridden
-    assert reloaded.focus_targets.usable
+    assert reloaded.focus_blocks is not None  # decisions never drop the seeds
 
 
 def test_exported_history_carries_no_focus_target(cycle_run, tmp_path: Path) -> None:
@@ -158,50 +178,64 @@ def test_exported_history_carries_no_focus_target(cycle_run, tmp_path: Path) -> 
     assert b"expected_path_digest" not in payload
 
 
-def test_a_legacy_run_row_still_loads(cycle_run) -> None:
+def test_a_legacy_run_row_still_loads(cycle_run, tmp_path: Path) -> None:
+    """A pre-block run (column-only sidecar) keeps loading and serving seeds."""
+    import shutil
     import sqlite3
 
     work_dir, artifacts = cycle_run
-    db_path = work_dir / "history.sqlite3"
+    reference_record = RunHistory(work_dir / "history.sqlite3").get_run(
+        artifacts.run_id
+    )
+    reference = {
+        finding.finding_id: reference_record.focus_seeds(finding.finding_id)
+        for finding in reference_record.findings
+    }
+    db_path = tmp_path / "legacy.sqlite3"
+    shutil.copy(work_dir / "history.sqlite3", db_path)
+    legacy_payload = json.dumps(
+        {
+            "version": FOCUS_SIDECAR_VERSION,
+            "targets": {
+                finding_id: [seed.model_dump(mode="json") for seed in seeds]
+                for finding_id, seeds in reference.items()
+                if seeds
+            },
+        }
+    )
     with sqlite3.connect(db_path) as conn:
         conn.execute(
-            "UPDATE runs SET focus_targets = '{}' WHERE id = ?", (artifacts.run_id,)
+            "DELETE FROM run_focus_blocks WHERE run_id = ?", (artifacts.run_id,)
         )
-    record = RunHistory(db_path).get_run(artifacts.run_id)
-    assert record.focus_targets == FocusTargetSidecar()
-    assert record.findings
-    # Restore the sidecar so module-scoped siblings keep their fixture.
-    with sqlite3.connect(db_path) as conn:
         conn.execute(
             "UPDATE runs SET focus_targets = ? WHERE id = ?",
-            (
-                json.dumps(
-                    {
-                        "version": FOCUS_SIDECAR_VERSION,
-                        "targets": {
-                            finding_id: [seed.model_dump(mode="json") for seed in seeds]
-                            for finding_id, seeds in (
-                                RunHistory(db_path)
-                                .get_run(artifacts.run_id)
-                                .focus_targets.targets.items()
-                            )
-                        },
-                    }
-                ),
-                artifacts.run_id,
-            ),
+            (legacy_payload, artifacts.run_id),
         )
+    record = RunHistory(db_path).get_run(artifacts.run_id)
+    assert record.focus_blocks is None
+    for finding_id, seeds in reference.items():
+        assert record.focus_seeds(finding_id) == seeds
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE runs SET focus_targets = '{}' WHERE id = ?",
+            (artifacts.run_id,),
+        )
+    emptied = RunHistory(db_path).get_run(artifacts.run_id)
+    assert emptied.focus_sidecar() == FocusTargetSidecar()
+    assert not emptied.focus_degraded()  # absent is not the capped state
+    assert emptied.findings
 
 
 def test_generation_failure_leaves_the_run_successful(
     fixture_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import qc_tool.run_service as run_service
+    import qc_tool.history.store as history_store
 
     def explode(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise RuntimeError("target generation failed")
 
-    monkeypatch.setattr(run_service, "build_focus_targets", explode)
+    monkeypatch.setattr(history_store, "focus_seeds_for_finding", explode)
     work_dir = tmp_path / "work"
     artifacts = perform_run(
         work_dir,
@@ -214,8 +248,11 @@ def test_generation_failure_leaves_the_run_successful(
     )
     record = RunHistory(work_dir / "history.sqlite3").get_run(artifacts.run_id)
     assert record.findings
-    assert not record.focus_targets.usable
-    assert artifacts.report_paths["html"].exists()
+    assert record.focus_blocks is None
+    assert not record.focus_sidecar().usable
+    assert not record.focus_seeds(record.findings[0].finding_id)
+    # reports are on-demand by default; the run itself succeeded
+    assert artifacts.run_id > 0
 
 
 # --------------------------------------------------------------------------

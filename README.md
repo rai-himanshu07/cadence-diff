@@ -9,9 +9,9 @@ or external services.
 
 | Mode | Inputs | What it answers |
 |---|---|---|
-| **Current-file preflight** | latest Excel and/or PPT | Is this file internally sound? (error literals, cleared/inconsistent formulas, period sequence, draft tokens, blanks, broken links…) |
-| **Cycle comparison** | baseline + current | What changed vs last cycle — with expected cadence growth isolated from real errors (shift-aware formula compare, growth-aware alignment). |
-| **Final-package QC** | current Excel + current PPT | Do the deck's figures reconcile to the workbook? (suggest → confirm → persist source mappings; coverage reporting.) |
+| **Current-file preflight** | latest Excel workbook member(s) and/or PPT | Is this package internally sound? (error literals, cleared/inconsistent formulas, period sequence, draft tokens, blanks, broken links…) |
+| **Cycle comparison** | baseline + current workbook members and/or PPT pair | What changed vs last cycle — with members paired by stable ID and expected cadence growth isolated from real errors. |
+| **Final-package QC** | one to eight current Excel members + current PPT | Do the deck's figures reconcile to the nominated workbook members? (suggest → confirm → persist source mappings; coverage reporting.) |
 
 Every run reports explicit coverage — checked / degraded / unavailable —
 so a check that could not run is never silently treated as passed.
@@ -28,6 +28,11 @@ backward-compatible layout metric. Pattern review-item counts answer how many
 decisions remain; atomic-finding counts preserve the complete cell-level
 evidence. Results open on the review queue with a selected-decision evidence
 panel; stories, coverage, and every atomic finding are one click away.
+A finding-class multi-select composes with severity and text filtering, while
+the disjoint All / Needs review / Reviewed selector keeps partially reviewed
+groups in the action queue. While that queue owns focus, `j`/`k` or Arrow keys
+navigate visible decisions, `1`–`4` set severity for unreviewed members, and
+`c` confirms the current severity before advancing.
 JSON, attestations, Re-QC identity, coverage counts, and CI failure thresholds
 remain atomic and backward-compatible.
 
@@ -76,6 +81,28 @@ population size, and story membership, with the cited counts shown for each
 decision. Ordering is a permutation: it may de-emphasize, never hide. Decisions
 already made — waived, reviewed, expected — defer below everything still open.
 
+Named contracts accumulate a longitudinal decision dossier across direct Re-QC
+lineage. Missing historical observations are labelled rather than inferred, and
+recurrence nudges require three finalized occurrences plus at least two fresh
+manual decisions; no policy is applied automatically. A read-only what-if
+preview reuses typed numeric evidence to show how temporary acceptance bounds
+or a materiality review floor would move atomics and decisions while keeping
+accepted findings visible as Info.
+
+Formula-logic findings include a bounded token-level R1C1 diff in the UI and
+HTML report. Cycle comparisons persist a factual alignment trust manifest for
+every workbook member and region, including paired/skipped/unpaired counts.
+A separate compact formula graph detects circular references without expanding
+large ranges, and PowerPoint preflight checks semantically identical claims
+repeated across slides while treating ambiguous identity as unavailable.
+
+Multi-workbook packages use a versioned, path-free manifest with stable member
+IDs and a cap of eight Excel workbooks per side. Duplicate sheet names remain
+member-qualified through findings, review groups, mappings, history, reports,
+signed evidence, desktop focus, strict sanitization, and structural
+fingerprinting. Cross-workbook formulas are inventoried but never followed,
+refreshed, or evaluated.
+
 Excel-to-PowerPoint coverage states its population explicitly: claims that were
 read, and surfaces that could not be. A figure rendered into a picture or an
 embedded object is counted as unavailable and its slides are named, rather than
@@ -83,6 +110,22 @@ being dropped from the denominator. Embedded image bytes are also hashed without
 decoding, so additions, removals, and byte changes are reported structurally.
 Rendered-visual comparison and OCR remain deliberately unavailable: byte
 identity does not prove pixel, crop, layout, or text equivalence.
+
+The review queue can also collapse one logical time series that the engine
+correctly split across several decisions. A related-series row is a navigation
+lens, never a new decision: canonical decisions, group identities, counts,
+reports, JSON, carry-forward, and signed evidence are unchanged, and promoting a
+series can only increase the number of top-level rows. Parent labels are
+structural only — sheet, measure column letter or row number, and how many
+periods changed — and `Confirm visible` records each visible, unreviewed finding
+at its own current severity while stating exactly what a filter is hiding.
+A period populated for the first time this cycle joins its column as a new-period
+segment, and a historical cell cleared to blank joins as a cleared-period segment
+while sibling measures still prove that period exists; both sort at their period
+position so a parent reads in time order. A wiped period row stays together as
+one decision rather than being scattered across column parents. Continuity comes
+from producer-authored, digest-bound private evidence, so runs recorded before
+this feature keep their existing grouping until a verified Re-QC.
 
 Named reporting contracts have typed Core and Advanced Excel/PowerPoint editors
 for every profile field, including repeatable controls, mappings, waivers, and
@@ -99,19 +142,19 @@ guessing; XLSB spill extents remain degraded even when formula text is enriched.
 
 OOXML loading streams worksheet content, verifies physical cells independently
 of declared dimensions, and reports workload evidence from uncompressed XML,
-shared strings, styles, cell counts, and sheet bounds. Pathological packages
-are refused before expensive parsing unless the operator deliberately enables
-the per-run override. Findings budgets and low-confidence alignment are always
-disclosed through summary findings and degraded coverage rather than silently
-truncating or guessing.
+shared strings, styles, cell counts, and sheet bounds. XLSB structural scanning
+reports retained cells, formulas, binary worksheet bytes, shared strings,
+styles, and sheet extents before cached values are materialized. Pathological
+packages are refused before expensive parsing unless the operator deliberately
+enables the per-run override. Every finding is stored and reported in full; run
+history tracks the storage each run occupies and prompts for cleanup when the
+total grows large. Low-confidence alignment is always disclosed through
+summary findings and degraded coverage rather than silently guessing.
 
 ## Install & run
 
 ```bash
-# Current 0.2 alpha (pre-releases require an explicit version)
-pip install --pre 'cadence-diff==0.2.0a2'
-
-# Latest stable release
+# Stable release
 pip install cadence-diff
 cadence-diff                    # web UI → http://127.0.0.1:8080
 cadence-diff --port 9000 --data-dir ~/qc-data
@@ -119,9 +162,8 @@ qc-tool                         # compatibility alias
 python -m qc_tool               # equivalent
 ```
 
-The `0.2` line is published as an Alpha for representative analyst testing.
-PyPI does not select pre-releases by default, so an unqualified install remains
-on the latest stable `0.1.x` release.
+`1.0.0` is the first stable release. Existing `0.1.x` and `0.2.0a1` artifacts
+remain immutable; an unqualified install selects the latest stable version.
 
 The web UI includes a packaged **Guide** page at `/guide`. It covers mode
 selection, files, profiles and controls, coverage/severity, finding review,
@@ -137,9 +179,13 @@ cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \
                  --profile monthly --json findings.json --progress
 cadence-diff run --current-excel this.xlsx            # preflight (inferred)
 cadence-diff run --current-excel x.xlsx --current-ppt d.pptx   # package QC
+cadence-diff run --current-excel core.xlsx \
+  --current-workbook ops=ops.xlsx --current-ppt deck.pptx
 cadence-diff run --current-excel this.xlsx --individual-findings # raw CLI rows
+cadence-diff run --current-excel this.xlsx --json findings.json \
+  --json-review-summary  # v2: pattern groups, stories, alignment trust
 
-# Only after reviewing workload refusal and confirming sufficient local memory
+# Only after reviewing every workload refusal and confirming sufficient memory
 cadence-diff run --current-excel unusually-large.xlsx \
   --allow-large-workbooks
 
@@ -162,10 +208,15 @@ cadence-diff verify-sanitized client_pack.sanitized.xlsx \
 
 # Structural-only evidence: no values, text, formulas, paths, or identifiers
 cadence-diff fingerprint client_pack.xlsx --output client_pack.fingerprint.json
+cadence-diff fingerprint --current-excel core.xlsx \
+  --current-workbook ops=ops.xlsx --current-ppt deck.pptx \
+  --output package.fingerprint.json
 
-# Sanitize an Excel/PPT package together and reverify confirmed mappings
+# Sanitize Excel member(s)/PPT together and reverify confirmed mappings
 cadence-diff sanitize-package --excel current.xlsx --ppt current.pptx \
   --profile monthly --output-dir sanitized-package --forbid "Client Name"
+cadence-diff sanitize-package --excel core.xlsx --workbook ops=ops.xlsx \
+  --ppt deck.pptx --profile monthly --output-dir sanitized-package
 
 # Signed evidence bundle; verify every member and manifest signature
 cadence-diff run --current-excel this.xlsx --fail-on never \
@@ -229,7 +280,8 @@ and `.pptx`, including password-protected files.
 
 The original XLSB remains read-only and `pyxlsb` remains authoritative for its
 saved values. Formula text is enriched through a platform spreadsheet engine
-only after an independent BIFF12 scan identifies every formula coordinate:
+only after an independent structural scan of the binary file identifies every
+formula coordinate:
 
 - **Windows:** a licensed desktop Excel installation in an interactive user
   session. The conditional `pywin32` dependency is installed with the package.
@@ -248,10 +300,12 @@ Temporary decrypted/conversion files are private and removed after each load.
 The Windows worker is implemented and protocol-tested, but must still pass the
 restricted corporate Windows/Excel pilot before production sign-off.
 
-Strict sanitization supports `.xlsx` and `.pptx`. Macro-enabled `.xlsm` is
-refused because VBA can retain credentials and client identifiers; create and
-review a macro-free `.xlsx` copy first. The redaction manifest and privacy
-verifier report what was removed, transformed, skipped, or unverifiable.
+Strict sanitization supports bounded current `.xlsx` workbook members plus one
+`.pptx`. Macro-enabled `.xlsm` is refused because VBA can retain credentials
+and client identifiers; create and review a macro-free `.xlsx` copy first.
+Multi-member outputs use structural aliases rather than source filenames or
+analyst member IDs. The redaction manifest and privacy verifier report what was
+removed, transformed, skipped, or unverifiable.
 
 ## Development
 
@@ -260,7 +314,7 @@ The development environment is Conda/Miniforge:
 ```bash
 conda env create -f environment.yml
 conda run -n cadence-diff-dev python main.py        # dev server, repo-local ./data
-conda run -n cadence-diff-dev pytest -x -q          # 400+ tests, fixture-driven
+conda run -n cadence-diff-dev pytest -x -q          # fixture-driven contract suite
 conda run -n cadence-diff-dev ruff check .
 conda run -n cadence-diff-dev pyright
 ```
@@ -282,7 +336,9 @@ qc_tool/
   report/      annotated Excel + standalone HTML exports
   history/     SQLite run history, annotations, re-QC lineage
   privacy.py   fail-closed OOXML privacy verification
-  fingerprint.py structural-only evidence export
+  fingerprint.py structural-only artifact/package evidence export
+  package.py   stable bounded package/member identity
+  package_sanitize.py strict member-aware package redaction
   attestation.py signed QC evidence bundles
   progress.py  progress events and cooperative cancellation
   server_config.py fail-safe local/temporary-LAN configuration

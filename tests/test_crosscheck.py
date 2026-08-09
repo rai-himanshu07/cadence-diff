@@ -4,12 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from qc_tool.config.profile import CrosscheckProfile
+from qc_tool.config.profile import CrosscheckMapping, CrosscheckProfile
 from qc_tool.crosscheck.numbers import (
     display_matches,
     extract_figures,
     parse_figure,
 )
+from qc_tool.crosscheck.package import reconcile_multi_package
 from qc_tool.crosscheck.trace import (
     FigureOccurrence,
     build_mapping,
@@ -171,8 +172,6 @@ def test_verify_mappings_end_to_end(
 def test_verify_unresolved_when_wording_changes(
     deck: DeckSnapshot, workbook: WorkbookSnapshot
 ) -> None:
-    from qc_tool.config.profile import CrosscheckMapping
-
     profile = CrosscheckProfile(
         mappings=[
             CrosscheckMapping(
@@ -199,3 +198,92 @@ def test_verify_unresolved_when_wording_changes(
         FindingClass.CROSSCHECK_UNRESOLVED,
     ]
     assert result.verified == []
+
+
+def test_multi_package_verifies_mapping_against_nominated_member_only(
+    occurrences: list[FigureOccurrence],
+    deck: DeckSnapshot,
+    workbook: WorkbookSnapshot,
+) -> None:
+    revenue = _occurrence(occurrences, "Executive Summary", "Total revenue")
+    candidate = suggest_sources(
+        revenue,
+        workbook,
+        source_member="core",
+    )[0]
+    mapping = build_mapping(revenue, candidate, label="Total revenue")
+
+    result = reconcile_multi_package(
+        {"core": workbook, "ops": workbook},
+        deck,
+        CrosscheckProfile(mappings=[mapping], max_candidates=3),
+    )
+
+    assert mapping.source_member == "core"
+    assert result.mapping_coverage.mapped == 1
+    assert result.mapping_coverage.verified == 1
+    assert not any(
+        finding.artifact_member == "ops"
+        for finding in result.findings
+        if finding.finding_class
+        in {
+            FindingClass.CROSSCHECK_MISMATCH,
+            FindingClass.CROSSCHECK_UNRESOLVED,
+        }
+    )
+    coverage = next(
+        item for item in result.coverage if item.check_id == "excel-ppt-crosscheck"
+    )
+    assert "across 2 workbook members" in coverage.detail
+
+
+def test_multi_package_missing_nominated_member_is_explicitly_unresolved(
+    occurrences: list[FigureOccurrence],
+    deck: DeckSnapshot,
+    workbook: WorkbookSnapshot,
+) -> None:
+    revenue = _occurrence(occurrences, "Executive Summary", "Total revenue")
+    mapping = CrosscheckMapping(
+        slide=revenue.slide,
+        line_skeleton=revenue.line_skeleton,
+        figure_index=revenue.figure_index,
+        label="Missing source",
+        source_member="missing",
+        source_sheet="Dashboard",
+        source_cell="B2",
+    )
+
+    result = reconcile_multi_package(
+        {"core": workbook},
+        deck,
+        CrosscheckProfile(mappings=[mapping]),
+    )
+
+    unresolved = [
+        finding
+        for finding in result.findings
+        if finding.finding_class is FindingClass.CROSSCHECK_UNRESOLVED
+    ]
+    assert len(unresolved) == 1
+    assert unresolved[0].artifact_member == "missing"
+    assert "unavailable in the current package" in unresolved[0].message
+    assert result.mapping_coverage.unresolved == 1
+
+
+def test_multi_package_suggestions_are_member_qualified_and_globally_capped(
+    deck: DeckSnapshot,
+    workbook: WorkbookSnapshot,
+) -> None:
+    result = reconcile_multi_package(
+        {"core": workbook, "ops": workbook},
+        deck,
+        CrosscheckProfile(max_candidates=2),
+    )
+
+    assert result.suggestions
+    assert all(len(suggestion.candidates) <= 2 for suggestion in result.suggestions)
+    assert all(
+        candidate.source_member in {"core", "ops"}
+        for suggestion in result.suggestions
+        for candidate in suggestion.candidates
+    )

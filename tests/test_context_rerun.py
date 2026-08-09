@@ -2,6 +2,7 @@
 
 import shutil
 import sqlite3
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -129,6 +130,16 @@ def test_rerun_delta_after_fixing_files(fixture_dir: Path, tmp_path: Path) -> No
     # The analyst "fixes" the workbook and saves it under a new name (suffix).
     fixed = tmp_path / "current_v2_fixed.xlsx"
     shutil.copyfile(fixture_dir / "baseline.xlsx", fixed)
+    with zipfile.ZipFile(fixed) as source:
+        parts = [(info, source.read(info.filename)) for info in source.infolist()]
+    with zipfile.ZipFile(fixed, "w") as target:
+        for info, content in parts:
+            if info.filename == "docProps/core.xml":
+                content = content.replace(
+                    b"</cp:coreProperties>",
+                    b" \n</cp:coreProperties>",
+                )
+            target.writestr(info, content)
 
     second = perform_run(
         work_dir,

@@ -2,21 +2,80 @@
 
 import datetime as dt
 import json
+import textwrap
 from pathlib import Path
 
 from qc_tool.coverage import capability_limited
 from qc_tool.engine import QCRunResult
-from qc_tool.review import build_pattern_groups, count_pattern_groups
+from qc_tool.findings_store import finding_by_id
+from qc_tool.review_stream import (
+    counts_from_summaries,
+    stream_stories,
+    summarize_pattern_groups,
+)
 from qc_tool.security import private_directory, private_file
-from qc_tool.story import build_stories
 
 
-def review_summary(result: QCRunResult) -> dict:
+def review_summary(
+    result: QCRunResult,
+    *,
+    include_alignment_trust: bool = False,
+) -> dict:
     """Versioned, additive semantic review summary; findings stay atomic."""
-    groups = build_pattern_groups(result.findings)
-    counts = count_pattern_groups(groups)
-    stories = build_stories(result.findings)
-    return {
+    summaries = summarize_pattern_groups(result.findings)
+    counts = counts_from_summaries(summaries)
+    stories = stream_stories(
+        [iter(result.findings), iter(result.findings), iter(result.findings)]
+    )
+    groups_payload = []
+    for summary in summaries:
+        first = finding_by_id(result.findings, summary.member_finding_ids[0])
+        groups_payload.append(
+            {
+                "group_id": summary.group_id,
+                "finding_class": summary.finding_class.value,
+                "severity": summary.severity.value,
+                "artifact": summary.artifact,
+                "sheet": summary.sheet,
+                "slide": summary.slide,
+                "element": summary.element,
+                "expected_growth": summary.expected_growth,
+                "expected_reason": (
+                    first.expected_reason.value
+                    if first is not None and first.expected_reason is not None
+                    else None
+                ),
+                "provenance": (
+                    first.provenance.value
+                    if first is not None and first.provenance is not None
+                    else None
+                ),
+                "subtype": (
+                    first.subtype.value
+                    if first is not None and first.subtype is not None
+                    else None
+                ),
+                "materiality": (
+                    first.materiality.value
+                    if first is not None and first.materiality is not None
+                    else None
+                ),
+                "temporal_context": (
+                    first.temporal_context.value
+                    if first is not None and first.temporal_context is not None
+                    else None
+                ),
+                "evidence_tags": sorted(
+                    tag.value
+                    for tag in (first.evidence_tags if first is not None else set())
+                ),
+                "ranges": list(summary.ranges),
+                "bounding_range": summary.bounding_range,
+                "member_count": summary.member_count,
+                "finding_ids": list(summary.member_finding_ids),
+            }
+        )
+    payload = {
         "summary_version": 3,
         "capability_limited": capability_limited(result.coverage),
         "pattern_review_counts": {
@@ -38,74 +97,46 @@ def review_summary(result: QCRunResult) -> dict:
             }
             for story in stories
         ],
-        "groups": [
-            {
-                "group_id": group.group_id,
-                "finding_class": group.finding_class.value,
-                "severity": group.severity.value,
-                "artifact": group.artifact,
-                "sheet": group.sheet,
-                "slide": group.slide,
-                "element": group.element,
-                "expected_growth": group.expected_growth,
-                "expected_reason": (
-                    group.members[0].expected_reason.value
-                    if group.members[0].expected_reason is not None
-                    else None
-                ),
-                "provenance": (
-                    group.members[0].provenance.value
-                    if group.members[0].provenance is not None
-                    else None
-                ),
-                "subtype": (
-                    group.members[0].subtype.value
-                    if group.members[0].subtype is not None
-                    else None
-                ),
-                "materiality": (
-                    group.members[0].materiality.value
-                    if group.members[0].materiality is not None
-                    else None
-                ),
-                "temporal_context": (
-                    group.members[0].temporal_context.value
-                    if group.members[0].temporal_context is not None
-                    else None
-                ),
-                "evidence_tags": sorted(
-                    tag.value for tag in group.members[0].evidence_tags
-                ),
-                "ranges": list(group.ranges),
-                "bounding_range": group.bounding_range,
-                "member_count": group.member_count,
-                "finding_ids": [member.finding_id for member in group.members],
-            }
-            for group in groups
-        ],
+        "groups": groups_payload,
     }
+    if include_alignment_trust:
+        payload["summary_version"] = 4
+        payload["alignment_trust"] = (
+            result.alignment_trust.model_dump(mode="json")
+            if result.alignment_trust is not None
+            else None
+        )
+    return payload
 
 
-def result_payload(
+def _payload_scaffold(
     result: QCRunResult,
     *,
     include_context: bool = False,
     include_review_summary: bool = False,
 ) -> dict:
-    """A stable, versioned JSON payload for downstream tooling."""
-    finding_excludes = (
-        set()
-        if include_context
-        else {"baseline_excerpt", "current_excerpt"}
+    """Everything but the findings array, with ``findings`` in position."""
+    package_manifest = (
+        result.package_manifest
+        if result.package_manifest is not None
+        and not result.package_manifest.is_legacy_projection
+        else None
     )
+    extended_schema = include_review_summary or package_manifest is not None
+    schema_version = 2 if extended_schema else 1
     payload = {
-        "schema_version": 1,
-        "schema": "https://cadence-diff.local/schema/findings-v1.json",
+        "schema_version": schema_version,
+        "schema": (
+            f"https://cadence-diff.local/schema/findings-v{schema_version}.json"
+        ),
         "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "context_included": include_context,
         "mode": result.mode.value,
         "profile": result.profile_name,
-        "comparison_scope": result.comparison_scope.model_dump(mode="json"),
+        "comparison_scope": result.comparison_scope.model_dump(
+            mode="json",
+            exclude_none=True,
+        ),
         "files": result.files,
         "counts": {sev.value: count for sev, count in result.counts.items()},
         "disclosures": result.disclosures,
@@ -121,13 +152,39 @@ def result_payload(
             if include_context
             else []
         ),
-        "findings": [
-            finding.model_dump(mode="json", exclude=finding_excludes)
-            for finding in result.findings
-        ],
+        "findings": [],
     }
+    if package_manifest is not None:
+        payload["package_manifest"] = package_manifest.model_dump(mode="json")
     if include_review_summary:
-        payload["review_summary"] = review_summary(result)
+        payload["review_summary"] = review_summary(
+            result,
+            include_alignment_trust=True,
+        )
+    return payload
+
+
+def _finding_excludes(include_context: bool) -> set[str]:
+    return set() if include_context else {"baseline_excerpt", "current_excerpt"}
+
+
+def result_payload(
+    result: QCRunResult,
+    *,
+    include_context: bool = False,
+    include_review_summary: bool = False,
+) -> dict:
+    """A stable, versioned JSON payload for downstream tooling."""
+    payload = _payload_scaffold(
+        result,
+        include_context=include_context,
+        include_review_summary=include_review_summary,
+    )
+    excludes = _finding_excludes(include_context)
+    payload["findings"] = [
+        finding.model_dump(mode="json", exclude=excludes)
+        for finding in result.findings
+    ]
     return payload
 
 
@@ -138,16 +195,31 @@ def write_json_report(
     include_context: bool = False,
     include_review_summary: bool = False,
 ) -> None:
-    private_directory(path.parent)
-    path.write_text(
-        json.dumps(
-            result_payload(
-                result,
-                include_context=include_context,
-                include_review_summary=include_review_summary,
-            ),
-            indent=2,
-        ),
-        encoding="utf-8",
+    """Stream the payload so the findings array never materializes at once."""
+    scaffold = _payload_scaffold(
+        result,
+        include_context=include_context,
+        include_review_summary=include_review_summary,
     )
+    marker = "__qc_findings_stream_marker__"
+    scaffold["findings"] = marker
+    text = json.dumps(scaffold, indent=2)
+    head, _, tail = text.partition(f'"{marker}"')
+    excludes = _finding_excludes(include_context)
+    private_directory(path.parent)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(head)
+        handle.write("[")
+        first = True
+        for finding in result.findings:
+            handle.write("\n" if first else ",\n")
+            first = False
+            item = json.dumps(
+                finding.model_dump(mode="json", exclude=excludes), indent=2
+            )
+            handle.write(textwrap.indent(item, "    "))
+        if not first:
+            handle.write("\n  ")
+        handle.write("]")
+        handle.write(tail)
     private_file(path)

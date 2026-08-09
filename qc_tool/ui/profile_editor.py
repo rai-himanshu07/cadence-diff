@@ -33,6 +33,7 @@ _yaml_to_profile = yaml_to_profile
 EDITOR_SECTIONS: dict[str, tuple[tuple[str, ...], ...]] = {
     "core": (
         ("name",),
+        ("contract_id",),
         ("description",),
         ("tolerance",),
         ("restatement_windows",),
@@ -45,6 +46,7 @@ EDITOR_SECTIONS: dict[str, tuple[tuple[str, ...], ...]] = {
     "advanced": (
         ("excel", "ignore_sheets"),
         ("excel", "sheets"),
+        ("excel", "members"),
         ("ppt",),
     ),
 }
@@ -255,7 +257,7 @@ class ProfileEditorController:
                     ui.label(
                         "Validation is local and read-only. It uses the selected "
                         "current file when available, otherwise the baseline, and "
-                        "keeps the large-workbook refusal active."
+                        "keeps workbook workload safeguards active."
                     ).classes("note")
                     ui.label(
                         "XLSB profile-reference validation remains bounded. Formula "
@@ -406,6 +408,13 @@ class ProfileEditorController:
         if self.immutable:
             control.disable()
 
+    def _draft_value(self, path: DraftPath, schema: Schema) -> object:
+        """Read a field, projecting schema defaults omitted by serialization."""
+        try:
+            return self.session.draft.get(path)
+        except KeyError:
+            return default_for_schema(schema)
+
     def _render_scalar(
         self,
         schema: Schema,
@@ -415,7 +424,7 @@ class ProfileEditorController:
         classes: str = "w-full",
     ) -> None:
         resolved, nullable = resolve_schema(schema)
-        value = self.session.draft.get(path)
+        value = self._draft_value(path, schema)
         enum_values = [str(item) for item in resolved.get("enum", [])]
         if enum_values:
             options = {item: item.replace("_", " ") for item in enum_values}
@@ -463,6 +472,8 @@ class ProfileEditorController:
             ).classes(classes).props("outlined dense")
             if resolved.get("format") == "date":
                 control.props("type=date")
+            if name == "contract_id":
+                control.props("readonly")
         self._lock(control)
 
     def _icon_button(
@@ -531,7 +542,7 @@ class ProfileEditorController:
         name: str,
         depth: int,
     ) -> None:
-        values = self.session.draft.get(path)
+        values = self._draft_value(path, schema)
         if not isinstance(values, list):
             return
         item_schema = schema.get("items", {"type": "string"})
@@ -661,7 +672,7 @@ class ProfileEditorController:
         name: str,
         depth: int,
     ) -> None:
-        mapping = self.session.draft.get(path)
+        mapping = self._draft_value(path, schema)
         if not isinstance(mapping, dict):
             return
         value_schema = schema.get("additionalProperties", {"type": "string"})

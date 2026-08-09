@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cadence-diff.local/schema/findings-v2.json",
+  "title": "cadence-diff extended findings export v2",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "mode",
+    "profile",
+    "files",
+    "counts",
+    "coverage",
+    "findings"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "schema": {"const": "https://cadence-diff.local/schema/findings-v2.json"},
+    "generated_at": {"type": "string"},
+    "context_included": {"type": "boolean"},
+    "mode": {"type": "string"},
+    "profile": {"type": "string"},
+    "comparison_scope": {"type": "object"},
+    "files": {"type": "object", "additionalProperties": {"type": "string"}},
+    "counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+    "disclosures": {"type": "array", "items": {"type": "string"}},
+    "coverage": {"type": "array", "items": {"type": "object"}},
+    "mapping_coverage": {"type": ["object", "null"]},
+    "mapping_suggestions": {"type": "array", "items": {"type": "object"}},
+    "verified_crosschecks": {"type": "integer"},
+    "review_summary": {"type": "object"},
+    "package_manifest": {"type": "object"},
+    "findings": {"type": "array", "items": {"type": "object"}}
+  },
+  "additionalProperties": false
+}

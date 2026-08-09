@@ -111,7 +111,13 @@ def review_state_digest(
         "file_hashes": dict(sorted(record.file_hashes.items())),
         "acknowledgements": sorted(acknowledgements),
         "decisions": sorted(decisions, key=lambda item: str(item["finding_id"])),
+        "counterfactual_digest": getattr(record, "counterfactual_digest", ""),
     }
+    if (
+        record.package_manifest is not None
+        and not record.package_manifest.is_legacy_projection
+    ):
+        payload["package_manifest"] = record.package_manifest.model_dump(mode="json")
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -128,6 +134,8 @@ def _result_from_record(record: RunRecord) -> QCRunResult:
         mapping_suggestions=record.mapping_suggestions,
         verified_crosschecks=record.verified_crosschecks,
         comparison_scope=record.comparison_scope,
+        package_manifest=record.package_manifest,
+        alignment_trust=record.alignment_trust,
     )
 
 
@@ -235,6 +243,8 @@ def finalize_run(
             report_paths={kind: str(path) for kind, path in final_paths.items()},
         )
         history.record_signoff(signoff)
+        # a finalized review is over; the recorded time must stop with it
+        history.pause_review_sessions(run_id=run_id)
         return signoff
     except BaseException:
         for path in (*temporary_paths.values(), *published):

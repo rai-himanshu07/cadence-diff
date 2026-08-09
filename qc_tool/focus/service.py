@@ -24,7 +24,11 @@ from qc_tool.focus.binding import (
     revalidate_binding,
 )
 from qc_tool.focus.discovery import DiscoveryResult, FocusApplication, OpenDocument
-from qc_tool.focus.model import FocusRole, FocusTargetSeed, FocusTargetSidecar
+from qc_tool.focus.model import (
+    FocusRole,
+    FocusTargetSeed,
+    focus_role_key,
+)
 from qc_tool.focus.navigator import FocusNavigator, FocusReply
 from qc_tool.focus.protocol import SCHEMA_VERSION, FocusAction, FocusOutcome
 from qc_tool.history.store import RunRecord
@@ -78,6 +82,7 @@ class ActionClaim:
     role: FocusRole
     revision: int
     issued_at: dt.datetime
+    member_id: str = "primary"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,10 +91,15 @@ class BindReport:
     role: FocusRole
     folder_label: str = ""
     unsaved_changes: bool = False
+    member_id: str = "primary"
 
     @property
     def offered(self) -> bool:
         return self.outcome is BindOutcome.MATCHED
+
+    @property
+    def role_key(self) -> str:
+        return focus_role_key(self.role, self.member_id)
 
 
 @dataclass(slots=True)
@@ -97,9 +107,9 @@ class _ClientState:
     revision: int = 0
     acknowledged: bool = False
     tokens: dict[str, ActionClaim] = field(default_factory=dict)
-    pending: dict[tuple[int, FocusRole], tuple[OpenDocument, FileIdentity]] = field(
-        default_factory=dict
-    )
+    pending: dict[
+        tuple[int, FocusRole, str], tuple[OpenDocument, FileIdentity]
+    ] = field(default_factory=dict)
 
 
 class FocusService:
@@ -180,6 +190,7 @@ class FocusService:
         finding_id: str,
         role: FocusRole,
         *,
+        member_id: str = "primary",
         now: dt.datetime | None = None,
     ) -> str:
         state = self._state(client_id)
@@ -190,6 +201,7 @@ class FocusService:
             role=role,
             revision=state.revision,
             issued_at=now or dt.datetime.now(dt.UTC),
+            member_id=member_id,
         )
         return token
 
@@ -211,33 +223,65 @@ class FocusService:
 
     def seeds(self, record: RunRecord, finding_id: str) -> tuple[FocusTargetSeed, ...]:
         """Role seeds that this run can actually act on, ambiguity suppressed."""
-        sidecar: FocusTargetSidecar = record.focus_targets
         usable: list[FocusTargetSeed] = []
-        for seed in sidecar.seeds(finding_id):
-            if not record.file_hashes.get(seed.role.value):
+        for seed in record.focus_seeds(finding_id):
+            if not record.file_hashes.get(seed.role_key):
                 continue
             usable.append(seed)
-        return tuple(seed for seed in usable if seed.role not in self._ambiguous(record))
+        ambiguous = self._ambiguous(record)
+        return tuple(
+            seed
+            for seed in usable
+            if (seed.role, seed.member_id) not in ambiguous
+        )
 
     @staticmethod
-    def _ambiguous(record: RunRecord) -> set[FocusRole]:
+    def _ambiguous(record: RunRecord) -> set[tuple[FocusRole, str]]:
         """A role pair whose two inputs hash identically cannot be told apart."""
-        ambiguous: set[FocusRole] = set()
+        ambiguous: set[tuple[FocusRole, str]] = set()
         for baseline, current in _PAIRED_ROLES:
-            first = record.file_hashes.get(baseline.value)
-            second = record.file_hashes.get(current.value)
-            if first and second and first == second:
-                ambiguous.update({baseline, current})
+            prefixes = (baseline.value, current.value)
+            member_ids = {
+                key.partition(":")[2] or "primary"
+                for key in record.file_hashes
+                if any(key == prefix or key.startswith(f"{prefix}:") for prefix in prefixes)
+            }
+            for member_id in member_ids:
+                first = record.file_hashes.get(focus_role_key(baseline, member_id))
+                second = record.file_hashes.get(focus_role_key(current, member_id))
+                if first and second and first == second:
+                    ambiguous.update(
+                        {(baseline, member_id), (current, member_id)}
+                    )
         return ambiguous
 
     def seed(
-        self, record: RunRecord, finding_id: str, role: FocusRole
+        self,
+        record: RunRecord,
+        finding_id: str,
+        role: FocusRole,
+        member_id: str = "primary",
     ) -> FocusTargetSeed | None:
-        matches = [seed for seed in self.seeds(record, finding_id) if seed.role is role]
+        matches = [
+            seed
+            for seed in self.seeds(record, finding_id)
+            if seed.role is role and seed.member_id == member_id
+        ]
         return matches[0] if len(matches) == 1 else None
 
-    def binding(self, client_id: str, run_id: int, role: FocusRole):
-        return self._registry.get(client_id, run_id, role)
+    def binding(
+        self,
+        client_id: str,
+        run_id: int,
+        role: FocusRole,
+        member_id: str = "primary",
+    ):
+        return self._registry.get(
+            client_id,
+            run_id,
+            role,
+            member_id=member_id,
+        )
 
     # -- dispatch ----------------------------------------------------------
 
@@ -254,46 +298,65 @@ class FocusService:
         return DiscoveryResult.from_payload(reply.discovery)
 
     async def bind(
-        self, client_id: str, record: RunRecord, role: FocusRole
+        self,
+        client_id: str,
+        record: RunRecord,
+        role: FocusRole,
+        member_id: str = "primary",
     ) -> BindReport:
         """Discover, match exact saved bytes, and offer one document to confirm."""
         if not self.available:
-            return BindReport(BindOutcome.ENUMERATION_INCOMPLETE, role)
-        expected = record.file_hashes.get(role.value)
-        if not expected or role in self._ambiguous(record):
-            return BindReport(BindOutcome.NO_EXACT_MATCH, role)
+            return BindReport(
+                BindOutcome.ENUMERATION_INCOMPLETE,
+                role,
+                member_id=member_id,
+            )
+        role_key = focus_role_key(role, member_id)
+        expected = record.file_hashes.get(role_key)
+        if not expected or (role, member_id) in self._ambiguous(record):
+            return BindReport(BindOutcome.NO_EXACT_MATCH, role, member_id=member_id)
         discovery = await self._discover(_APPLICATIONS[role])
         if discovery is None:
-            return BindReport(BindOutcome.ENUMERATION_INCOMPLETE, role)
-        managed = record.file_paths.get(role.value)
+            return BindReport(
+                BindOutcome.ENUMERATION_INCOMPLETE,
+                role,
+                member_id=member_id,
+            )
+        managed = record.file_paths.get(role_key)
         request = BindingRequest(
             run_id=record.run_id,
             role=role,
             expected_sha256=expected,
             managed_root=self._work_dir,
             managed_path=Path(managed) if managed else None,
+            member_id=member_id,
         )
         outcome, document, identity = resolve_binding(request, discovery)
         if outcome is not BindOutcome.MATCHED or document is None or identity is None:
-            return BindReport(outcome, role)
+            return BindReport(outcome, role, member_id=member_id)
         state = self._state(client_id)
-        state.pending[(record.run_id, role)] = (document, identity)
+        state.pending[(record.run_id, role, member_id)] = (document, identity)
         return BindReport(
             outcome,
             role,
             folder_label=_folder_label(document.full_name),
             unsaved_changes=document.saved is False,
+            member_id=member_id,
         )
 
     def confirm(
-        self, client_id: str, record: RunRecord, role: FocusRole
+        self,
+        client_id: str,
+        record: RunRecord,
+        role: FocusRole,
+        member_id: str = "primary",
     ) -> BindOutcome:
         """Promote an offered candidate into a live binding after confirmation."""
         state = self._state(client_id)
-        offered = state.pending.pop((record.run_id, role), None)
+        offered = state.pending.pop((record.run_id, role, member_id), None)
         if offered is None:
             return BindOutcome.NO_EXACT_MATCH
-        expected = record.file_hashes.get(role.value)
+        expected = record.file_hashes.get(focus_role_key(role, member_id))
         if not expected:
             return BindOutcome.NO_EXACT_MATCH
         document, identity = offered
@@ -304,6 +367,7 @@ class FocusService:
                 role=role,
                 expected_sha256=expected,
                 managed_root=self._work_dir,
+                member_id=member_id,
             ),
             document,
             identity,
@@ -318,10 +382,20 @@ class FocusService:
             return FocusReply(FocusOutcome.UNSUPPORTED_PLATFORM)
         if not self.acknowledged(client_id):
             return FocusReply(FocusOutcome.ACTION_UNAVAILABLE)
-        seed = self.seed(record, claim.finding_id, claim.role)
+        seed = self.seed(
+            record,
+            claim.finding_id,
+            claim.role,
+            claim.member_id,
+        )
         if seed is None:
             return FocusReply(FocusOutcome.ACTION_UNAVAILABLE)
-        binding = self._registry.get(client_id, record.run_id, claim.role)
+        binding = self._registry.get(
+            client_id,
+            record.run_id,
+            claim.role,
+            member_id=claim.member_id,
+        )
         if binding is None:
             return FocusReply(BindOutcome.BINDING_EXPIRED.value)
         discovery = await self._discover(_APPLICATIONS[claim.role])
@@ -332,7 +406,11 @@ class FocusService:
             return FocusReply(revalidated.outcome.value)
         salt = secrets.token_bytes(16)
         digest = self._registry.path_digest(
-            client_id, record.run_id, claim.role, salt
+            client_id,
+            record.run_id,
+            claim.role,
+            salt,
+            member_id=claim.member_id,
         )
         if digest is None:
             return FocusReply(BindOutcome.BINDING_IDENTITY_CHANGED.value)

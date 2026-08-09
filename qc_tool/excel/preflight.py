@@ -22,6 +22,7 @@ from qc_tool.excel.dependency import (
     DependencyGraph,
     annotate_impacts,
     build_dependency_graph,
+    detect_circular_references,
     limit_impacts,
 )
 from qc_tool.excel.diff_metadata import (
@@ -528,9 +529,22 @@ def preflight_workbook(
             annotate_impacts(result.findings, dependency_graph)
         dependency_state = dependency_graph.coverage_state
         dependency_detail = dependency_graph.coverage_detail
+        circular = detect_circular_references(
+            dependency_graph,
+            cancellation_token=cancellation_token,
+        )
+        result.findings.extend(circular.findings)
+        circular_coverage = circular.coverage
     else:
         dependency_state = CoverageState.UNAVAILABLE
         dependency_detail = "Formula text is unavailable for dependency extraction"
+        circular_coverage = CoverageItem(
+            check_id="excel-circular-references",
+            label="Circular formula references",
+            artifact="excel",
+            state=CoverageState.UNAVAILABLE,
+            detail="Formula text is unavailable for circular-reference detection",
+        )
     result.coverage.append(
         CoverageItem(
             check_id="excel-dependencies",
@@ -540,6 +554,7 @@ def preflight_workbook(
             detail=dependency_detail,
         )
     )
+    result.coverage.append(circular_coverage)
 
     period_start = len(result.findings)
     for sheet in workbook.sheets:

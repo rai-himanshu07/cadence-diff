@@ -1,15 +1,19 @@
 """UI smoke tests (criterion 12): pages render; perform_run produces artifacts."""
 
 import datetime as dt
+import inspect
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import yaml
 from nicegui import app, events, ui
 from nicegui.helpers import warnings as nicegui_warnings
 from nicegui.testing import User
+from openpyxl.utils import get_column_letter
 
 import qc_tool.run_service as run_service
 import qc_tool.ui.app as app_module
@@ -31,18 +35,31 @@ from qc_tool.findings import (
 from qc_tool.history.run_state import RunStateRecord, RunStateStore, RunStatus
 from qc_tool.history.store import RunHistory
 from qc_tool.progress import CancellationToken, ProgressEvent, RunCancelled, RunPhase
-from qc_tool.review import build_pattern_groups, build_review_groups
+from qc_tool.review import (
+    ReviewGroup,
+    apply_group_review,
+    build_pattern_groups,
+    build_review_groups,
+)
+from qc_tool.review_series import SeriesReviewLens, build_series_review_lens
 from qc_tool.security import secure_managed_tree
 from qc_tool.server_config import NetworkMode
 from qc_tool.signoff import finalize_run, required_acknowledgements
 from qc_tool.ui.app import (
+    LensEntry,
     _acceptance_summary,
+    _class_filter_label,
+    _cluster_context_html,
     _context_grid_html,
     _evidence_axes,
     _files_for_mode,
+    _filter_review_rows,
+    _flatten_lens_rows,
+    _format_bytes,
     _history_row,
     _history_trend_row,
     _input_cautions,
+    _lens_entries,
     _mapping_stats,
     _outcome_summary,
     _profile_path,
@@ -53,7 +70,9 @@ from qc_tool.ui.app import (
     _run_blockers,
     _safe_upload_name,
     _scope_summary,
+    _storage_prompt_due,
     _storage_secret,
+    build_cluster_context,
     create_pages,
     list_profiles,
     load_profile_by_name,
@@ -61,8 +80,9 @@ from qc_tool.ui.app import (
     persist_confirmed_mapping,
 )
 from qc_tool.ui.guide import GUIDE_SCRIPT, PROFILE_CONTROLS_EXAMPLE
-from qc_tool.ui.theme import CSS
+from qc_tool.ui.theme import CSS, page_frame
 from tests.conftest import fixture_profile
+from tests.test_review_series import series_oracle
 
 pytest_plugins = ["nicegui.testing.user_plugin"]
 
@@ -155,6 +175,180 @@ def test_review_group_rows_do_not_embed_atomic_member_payloads(qc_result) -> Non
     assert rows
     assert sum(group.member_count for group in groups) == len(qc_result.findings)
     assert all("member_ids" not in row and "excerpts" not in row for row in rows)
+
+
+def _review_group(
+    *members: Finding,
+    finding_class: FindingClass = FindingClass.VALUE_CHANGED,
+) -> ReviewGroup:
+    return ReviewGroup(
+        group_id="G001",
+        finding_class=finding_class,
+        severity=Severity.CRITICAL,
+        artifact="excel",
+        sheet="Data",
+        slide=None,
+        element="cell",
+        expected_growth=False,
+        ranges=("A1",),
+        bounding_range="A1",
+        baseline_ranges=(),
+        baseline_bounding_range="",
+        baseline_mixed=False,
+        members=tuple(members),
+        spatial=False,
+    )
+
+
+def _filter_row(
+    row_id: str,
+    *,
+    severity: str = "critical",
+    finding_class: str = "value_changed",
+    review_state: str = "needs_review",
+) -> dict[str, object]:
+    return {
+        "id": row_id,
+        "severity": severity,
+        "class": finding_class,
+        "review_state": review_state,
+        "where": "Data",
+        "location": "A1",
+        "message": "changed",
+    }
+
+
+def test_review_filters_compose_class_state_text_and_story_with_and_semantics() -> None:
+    rows = [
+        _filter_row("G1", review_state="reviewed"),
+        _filter_row("G2"),
+        _filter_row("G3", finding_class="formula_error"),
+        {
+            **_filter_row("G4"),
+            "where": "Other",
+            "message": "different",
+        },
+    ]
+
+    filtered = _filter_review_rows(
+        rows,
+        severities={"critical"},
+        finding_classes={"value_changed"},
+        review_state="needs_review",
+        needle="A1 changed",
+        story_scope={"G2", "G4"},
+    )
+
+    assert [row["id"] for row in filtered] == ["G2"]
+
+
+def test_empty_class_filter_hides_all_review_rows() -> None:
+    assert _filter_review_rows(
+        [_filter_row("G1")],
+        severities={"critical"},
+        finding_classes=set(),
+        review_state="all",
+    ) == []
+
+
+def test_cap_only_group_is_visible_only_in_all_review_state() -> None:
+    cap = Finding(
+        finding_id="F1",
+        artifact="run",
+        finding_class=FindingClass.FINDINGS_CAPPED,
+        message="additional findings omitted",
+    )
+    row = _review_group_rows(
+        [_review_group(cap, finding_class=FindingClass.FINDINGS_CAPPED)]
+    )[0]
+
+    assert row["reviewable_members"] == 0
+    assert row["reviewed"] == 0
+    assert row["review_state"] == "all"
+    assert _filter_review_rows(
+        [row],
+        severities={"critical"},
+        finding_classes={FindingClass.FINDINGS_CAPPED.value},
+        review_state="all",
+    ) == [row]
+    assert _filter_review_rows(
+        [row],
+        severities={"critical"},
+        finding_classes={FindingClass.FINDINGS_CAPPED.value},
+        review_state="needs_review",
+    ) == []
+    assert _filter_review_rows(
+        [row],
+        severities={"critical"},
+        finding_classes={FindingClass.FINDINGS_CAPPED.value},
+        review_state="reviewed",
+    ) == []
+
+
+def test_partial_group_remains_needs_review_and_cap_members_do_not_count() -> None:
+    reviewed = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        severity_overridden=True,
+        message="reviewed",
+    )
+    pending = Finding(
+        finding_id="F2",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        message="pending",
+    )
+    cap = Finding(
+        finding_id="F3",
+        artifact="run",
+        finding_class=FindingClass.FINDINGS_CAPPED,
+        message="omitted",
+    )
+
+    partial = _review_group_rows([_review_group(reviewed, pending, cap)])[0]
+    complete = _review_group_rows([_review_group(reviewed, cap)])[0]
+
+    assert partial["reviewable_members"] == 2
+    assert partial["reviewed"] == 1
+    assert partial["review_state"] == "needs_review"
+    assert complete["reviewable_members"] == 1
+    assert complete["reviewed"] == 1
+    assert complete["review_state"] == "reviewed"
+
+
+def test_unreviewed_only_group_action_preserves_existing_decisions() -> None:
+    reviewed = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.INFO,
+        severity_overridden=True,
+        analyst_comment="already checked",
+        message="reviewed",
+    )
+    pending = Finding(
+        finding_id="F2",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        message="pending",
+    )
+
+    updates = apply_group_review(
+        _review_group(reviewed, pending),
+        severity=Severity.WARNING,
+        comment="",
+        replace_existing=False,
+    )
+
+    assert [update.finding_id for update in updates] == ["F2"]
+    assert reviewed.severity is Severity.INFO
+    assert reviewed.analyst_comment == "already checked"
+    assert pending.severity is Severity.WARNING
+    assert pending.severity_overridden is True
 
 
 def test_managed_names_cannot_escape_storage(tmp_path: Path) -> None:
@@ -258,6 +452,41 @@ def test_confirmed_mapping_persists_to_named_profile(tmp_path: Path) -> None:
         persist_confirmed_mapping(profiles_dir, "default", suggestion, candidate)
 
 
+def test_confirmed_mapping_persists_source_member(tmp_path: Path) -> None:
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    save_profile(DeliverableProfile(name="monthly"), profiles_dir / "monthly.yaml")
+    suggestion = MappingSuggestion(
+        slide="Summary",
+        line="Revenue $1.2M",
+        line_skeleton="Revenue $#M",
+        figure_index=0,
+        figure_raw="$1.2M",
+    )
+    candidate = SuggestedSource(
+        sheet="Dashboard",
+        cell="B2",
+        value=1_200_000,
+        display_match=True,
+        label_score=100,
+        rel_diff=0,
+        source_member="ops",
+    )
+
+    mapping = persist_confirmed_mapping(
+        profiles_dir,
+        "monthly",
+        suggestion,
+        candidate,
+    )
+
+    assert mapping.source_member == "ops"
+    assert load_profile_by_name(
+        profiles_dir,
+        "monthly",
+    ).crosscheck.mappings[0].source_member == "ops"
+
+
 def test_perform_run_produces_artifacts(fixture_dir: Path, tmp_path: Path) -> None:
     work_dir = tmp_path / "work"
     files = {
@@ -298,6 +527,8 @@ def test_perform_run_reports_ordered_progress(
         for event in events
         if event.total and event.processed == event.total
     ]
+    # Reports are on-demand by default, so the phase completes instantly
+    # but still appears in order for progress consumers.
     assert completed_phases == [
         RunPhase.PREPARING,
         RunPhase.LOADING_CURRENT_EXCEL,
@@ -330,6 +561,7 @@ def test_cancelled_report_cleans_owned_directory_and_records_no_history(
             DeliverableProfile(name="cancelled"),
             mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
             cancellation_token=token,
+            write_reports=True,
         )
 
     runs_dir = work_dir / "runs"
@@ -371,6 +603,7 @@ def test_immediate_runs_get_distinct_private_report_paths(
         {},
         DeliverableProfile(name="first"),
         mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+        write_reports=True,
     )
     second = perform_run(
         work_dir,
@@ -378,6 +611,7 @@ def test_immediate_runs_get_distinct_private_report_paths(
         {},
         DeliverableProfile(name="second"),
         mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+        write_reports=True,
     )
 
     assert first.report_paths != second.report_paths
@@ -410,7 +644,7 @@ async def test_main_page_renders(user: User, tmp_path: Path) -> None:
     await user.should_see("QC Tool")
     await user.should_see("Run QC")
     await user.should_see("Deliverable profile")
-    await user.should_see("Override large-workbook refusal")
+    await user.should_see("Override workbook workload refusals")
     await user.should_see("Current-file preflight")
     await user.should_see("Cycle comparison")
     await user.should_see("Final-package QC")
@@ -488,15 +722,20 @@ async def test_guide_page_renders_packaged_operator_content(
     await user.should_see("they do not block read-only QC")
     await user.should_see("Profiles, controls, and waivers")
     await user.should_see("Pattern review-item counts are analyst decisions")
-    await user.should_see("Mass alone is a grouping detector")
-    await user.should_see("implicit numeric refresh block is Warning")
-    await user.should_see("Excel selected/total")
-    await user.should_see("preflight, cycle-comparison, and final-package modes")
+    await user.should_see("Grouping never makes an error safer")
+    await user.should_see("Scope narrows only Excel and PowerPoint findings")
+    await user.should_see("Workbook workload override: use it only after a refusal")
+    await user.should_see("ask a senior reviewer")
+    await user.should_see("Every finding is retained")
     await user.should_see("operation: subtract")
     await user.should_see("Availability controls blankness only")
     await user.should_see("Coverage and severity")
     await user.should_see("Safeguards are visible")
     await user.should_see("Excel to PowerPoint mappings")
+    await user.should_see("Treat the list as a search aid, not as proof of source")
+    await user.should_see("Suggestions are not proof")
+    await user.should_see("merged or multi-row headers")
+    await user.should_see("if no single saved cell is the defensible source")
     await user.should_see("Privacy, sharing, and attestations")
     await user.should_see("CLI and automation")
     await user.should_see("Troubleshooting")
@@ -511,6 +750,15 @@ async def test_guide_page_renders_packaged_operator_content(
     await user.should_see("Worked example")
     await user.should_see("formula replaced by a constant")
     await user.should_see("Archive before you delete")
+
+
+def test_workload_override_copy_names_its_full_run_scope() -> None:
+    source = inspect.getsource(app_module.create_pages)
+
+    assert "Override workbook workload refusals" in source
+    assert "formula-link safety limits" in source
+    assert "for every workbook in this run" in source
+    assert "large-workbook refusal overridden" not in source
 
 
 @pytest.mark.asyncio
@@ -569,13 +817,54 @@ def test_run_blockers_wait_for_hashes_and_reject_identical_pairs() -> None:
         files,
         file_hashes={"baseline_excel": "same", "current_excel": "same"},
     ) == [
-        "Baseline and current Excel are byte-identical; a comparison would prove nothing"
+        "Baseline and current Excel for member 'primary' are byte-identical; "
+        "a comparison would prove nothing"
     ]
     assert _run_blockers(
         QCRunMode.CYCLE_COMPARISON,
         files,
         file_hashes={"baseline_excel": "a", "current_excel": "b"},
     ) == []
+
+
+def test_run_blockers_validate_dynamic_members_and_duplicate_bytes() -> None:
+    files = {
+        "baseline_excel:core": Path("core-old.xlsx"),
+        "current_excel:core": Path("core-new.xlsx"),
+        "current_excel:ops": Path("ops.xlsx"),
+    }
+
+    blockers = _run_blockers(
+        QCRunMode.CYCLE_COMPARISON,
+        files,
+        file_hashes={
+            "baseline_excel:core": "same-core",
+            "current_excel:core": "same-core",
+            "current_excel:ops": "same-core",
+        },
+    )
+
+    assert blockers == [
+        "Duplicate bytes for excel on the current side: "
+        "Current — Excel workbook · core and Current — Excel workbook · ops",
+        "Baseline and current Excel for member 'core' are byte-identical; "
+        "a comparison would prove nothing",
+    ]
+
+
+def test_files_for_mode_keeps_all_selected_current_workbook_members() -> None:
+    files = {
+        "current_excel:core": Path("core.xlsx"),
+        "current_excel:ops": Path("ops.xlsx"),
+        "current_ppt": Path("deck.pptx"),
+        "baseline_excel:core": Path("old.xlsx"),
+    }
+
+    assert _files_for_mode(QCRunMode.FINAL_PACKAGE, files) == {
+        "current_excel:core": Path("core.xlsx"),
+        "current_excel:ops": Path("ops.xlsx"),
+        "current_ppt": Path("deck.pptx"),
+    }
 
 
 def test_run_blockers_name_the_files_a_rerun_still_needs() -> None:
@@ -693,6 +982,30 @@ def test_history_row_exposes_mode_profile_capability_and_decisions(
     assert decisions and all(set(entry) == {"k", "n"} for entry in decisions)
     assert row["started"] == record.started_at.isoformat(timespec="seconds")
     assert "baseline.xlsx" in str(row["files"])
+    size = row["size"]
+    assert isinstance(size, int) and size > 0  # measured at record time
+    assert str(row["size_label"]).endswith(("B", "KB", "MB", "GB"))
+
+
+def test_format_bytes_covers_unknown_and_scales() -> None:
+    assert _format_bytes(None) == "\u2014"
+    assert _format_bytes(512) == "512 B"
+    assert _format_bytes(4096) == "4.0 KB"
+    assert _format_bytes(5 * 1024 * 1024) == "5.0 MB"
+    assert _format_bytes(3 * 1024**3) == "3.0 GB"
+
+
+def test_storage_prompt_fires_at_threshold_then_waits_for_growth() -> None:
+    threshold = 1_000
+    assert not _storage_prompt_due(999, threshold=threshold)
+    assert _storage_prompt_due(1_000, threshold=threshold)
+    # Dismissal silences the prompt until roughly 10% further growth.
+    assert not _storage_prompt_due(
+        1_050, threshold=threshold, dismissed_at_bytes=1_000
+    )
+    assert _storage_prompt_due(1_100, threshold=threshold, dismissed_at_bytes=1_000)
+    # Cleanup below the threshold silences it entirely.
+    assert not _storage_prompt_due(900, threshold=threshold, dismissed_at_bytes=1_000)
 
 
 def test_history_trend_row_contains_only_fixed_aggregate_fields(
@@ -901,7 +1214,9 @@ async def test_run_detail_page(user: User, fixture_dir: Path, tmp_path: Path) ->
     await user.should_see("Review queue")
     await user.should_see("Atomic evidence")
     await user.should_see("atomic findings")
-    await user.should_see("Start review timer")
+    await user.should_see("review time")
+    await user.should_see("0:00")
+    await user.should_see("Start")
     # Review queue is the default view; evidence tabs are opt-in.
     panels = user.find(kind=ui.tab_panels).elements.pop()
     assert panels.value == "review"
@@ -1098,11 +1413,13 @@ def _emit(element: ui.element, event_type: str, args: object) -> None:
     """Drive a slot-emitted table event the way the browser would."""
     for listener in element._event_listeners.values():
         if listener.type == event_type and listener.handler is not None:
-            listener.handler(
-                events.GenericEventArguments(
-                    sender=element, client=element.client, args=args
+            # Handlers may schedule client JavaScript, which needs a slot.
+            with element.parent_slot or element.client.layout.default_slot:
+                listener.handler(
+                    events.GenericEventArguments(
+                        sender=element, client=element.client, args=args
+                    )
                 )
-            )
             return
     raise AssertionError(f"no {event_type!r} listener on {element}")
 
@@ -1137,7 +1454,11 @@ async def test_group_review_survives_the_panel_refresh_it_triggers(
         for element in user.find(kind=ui.table).elements
         if "review-groups-table" in element.classes
     )
-    _emit(group_table, "select", {"id": str(group_table.rows[0]["id"])})
+    # Related-series parents are a navigation lens with no group review action.
+    reviewable = next(
+        row for row in group_table.rows if row.get("kind") != "cluster"
+    )
+    _emit(group_table, "select", {"id": str(reviewable["id"])})
     await user.should_see("Review group")
 
     user.find("Review group").click()
@@ -1200,6 +1521,1061 @@ def test_review_rows_have_keyboard_and_focus_contracts() -> None:
     assert ".reviewclass-inline { display: inline; }" in CSS
 
 
+def test_shared_wordmark_is_an_accessible_home_link() -> None:
+    source = inspect.getsource(page_frame)
+
+    assert 'ui.link("QC Tool", "/").classes("wordmark")' in source
+    assert ".wordmark:focus-visible" in CSS
+
+
+def test_keyboard_triage_script_has_all_focus_and_dialog_guards() -> None:
+    source = inspect.getsource(app_module._render_result_view)
+
+    for contract in (
+        "if not mutable:",
+        "activeElementIsEditable()",
+        "a.isContentEditable",
+        "dialogIsOpen()",
+        "if (!visibleIds().length) return",
+        "if (activeElementIsEditable() || dialogIsOpen()) return",
+        "persist_group_review(",
+        "replace_existing=False",
+    ):
+        assert contract in source
+
+
+def test_longitudinal_panel_reuses_the_loaded_dossier_for_recurrence() -> None:
+    source = inspect.getsource(app_module._render_result_view)
+    body = source.split("def load_longitudinal", 1)[1].split(
+        "expansion.on_value_change", 1
+    )[0]
+
+    assert "recurrence_eligibility_from_dossier" in body
+    assert "active_history.recurrence_eligibility," not in body
+
+
 def test_atomic_slot_can_confirm_the_current_severity() -> None:
     assert 'label="Confirm severity"' in app_module.FINDINGS_BODY_SLOT
     assert "value: props.row.severity" in app_module.FINDINGS_BODY_SLOT
+
+
+# --- bounded logical-series context panels ------------------------------------
+
+
+def _context_finding(
+    finding_id: str,
+    location: str,
+    severity: Severity,
+    *,
+    excerpt: GridExcerpt | None = None,
+) -> Finding:
+    return Finding(
+        finding_id=finding_id,
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=severity,
+        sheet="Ops",
+        location=location,
+        baseline_location=location,
+        baseline_value="1",
+        current_value="2",
+        message=f"Ops!{location}: value changed",
+        current_excerpt=excerpt,
+    )
+
+
+def _window(rows: list[int], cols: list[str], hit: tuple[int, int]) -> GridExcerpt:
+    return GridExcerpt(
+        cols=cols,
+        rows=rows,
+        cells=[[f"{col}{row}" for col in cols] for row in rows],
+        hit_row=hit[0],
+        hit_col=hit[1],
+    )
+
+
+def test_overlapping_excerpts_merge_into_one_panel() -> None:
+    members = [
+        _context_finding(
+            "F1",
+            "B3",
+            Severity.CRITICAL,
+            excerpt=_window([2, 3, 4], ["A", "B", "C"], (1, 1)),
+        ),
+        _context_finding(
+            "F2",
+            "B5",
+            Severity.WARNING,
+            excerpt=_window([4, 5, 6], ["A", "B", "C"], (1, 1)),
+        ),
+    ]
+
+    context = build_cluster_context(members, side="current", selected_finding_id="F2")
+
+    assert context.merged
+    assert len(context.panels) == 1
+    panel = context.panels[0]
+    assert panel.rows == (2, 3, 4, 5, 6)
+    assert panel.cols == ("A", "B", "C")
+    assert panel.marks == {(1, 1): "critical", (3, 1): "warning"}
+    assert panel.selected == (3, 1)
+    assert context.shown == 2
+    assert context.total == 2
+    assert context.complete
+
+
+def test_disconnected_windows_stay_separate_panels() -> None:
+    members = [
+        _context_finding(
+            "F1",
+            "B3",
+            Severity.CRITICAL,
+            excerpt=_window([2, 3, 4], ["A", "B", "C"], (1, 1)),
+        ),
+        _context_finding(
+            "F2",
+            "B40",
+            Severity.WARNING,
+            excerpt=_window([39, 40, 41], ["A", "B", "C"], (1, 1)),
+        ),
+    ]
+
+    context = build_cluster_context(members, side="current")
+
+    assert [panel.rows for panel in context.panels] == [(2, 3, 4), (39, 40, 41)]
+    assert context.shown == 2
+
+
+def test_panels_are_bounded_to_twenty_five_rows_by_fifteen_columns() -> None:
+    rows = list(range(1, 61))
+    cols = [get_column_letter(index) for index in range(1, 21)]
+    members = [
+        _context_finding(
+            "F1", "A1", Severity.CRITICAL, excerpt=_window(rows, cols, (0, 0))
+        )
+    ]
+
+    context = build_cluster_context(members, side="current")
+
+    assert context.panels
+    for panel in context.panels:
+        assert len(panel.rows) <= 25
+        assert len(panel.cols) <= 15
+    assert sum(len(panel.rows) for panel in context.panels) >= 60
+
+
+def test_conflicting_stored_values_fall_back_to_individual_excerpts() -> None:
+    first = _window([2, 3, 4], ["A", "B", "C"], (1, 1))
+    second = _window([2, 3, 4], ["A", "B", "C"], (1, 1))
+    second.cells[1][1] = "contradicting"
+    members = [
+        _context_finding("F1", "B3", Severity.CRITICAL, excerpt=first),
+        _context_finding("F2", "B4", Severity.WARNING, excerpt=second),
+    ]
+
+    context = build_cluster_context(members, side="current")
+
+    assert not context.merged
+    assert len(context.panels) == 2
+
+
+def test_context_coverage_is_reported_when_excerpts_are_missing() -> None:
+    members = [
+        _context_finding(
+            "F1",
+            "B3",
+            Severity.CRITICAL,
+            excerpt=_window([2, 3, 4], ["A", "B", "C"], (1, 1)),
+        ),
+        _context_finding("F2", "B90", Severity.WARNING),
+    ]
+
+    context = build_cluster_context(members, side="current")
+
+    assert not context.complete
+    assert context.coverage_note == "1 of 2 related finding cells shown"
+
+
+def test_panel_html_escapes_values_and_labels_every_severity_cell() -> None:
+    excerpt = _window([2, 3, 4], ["A", "B", "C"], (1, 1))
+    excerpt.cells[1][1] = "<script>alert(1)</script>"
+    members = [_context_finding("F1", "B3", Severity.CRITICAL, excerpt=excerpt)]
+
+    context = build_cluster_context(members, side="current", selected_finding_id="F1")
+    rendered = _cluster_context_html(context.panels[0], "current")
+
+    assert "<script>alert(1)</script>" not in rendered
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in rendered
+    assert 'class="sev-critical hit"' in rendered
+    assert 'aria-label="critical finding at B3"' in rendered
+    assert 'title="critical finding at B3"' in rendered
+
+
+def test_theme_defines_a_non_color_only_severity_legend() -> None:
+    for rule in (
+        ".ctxgrid td.sev-critical",
+        ".ctxgrid td.sev-warning",
+        ".ctxgrid td.sev-info",
+        ".ctxgrid td.sev-expected",
+        ".ctxlegend",
+    ):
+        assert rule in CSS
+
+
+# --- UI craftsmanship pass (2026-08-08) ----------------------------------------
+
+
+def test_display_cell_text_tames_repr_noise_but_keeps_the_exact_value() -> None:
+    short, full = app_module._display_cell_text("3428.8569518319678")
+    assert short == "3428.857"
+    assert full == "3428.8569518319678"
+
+    date, full_date = app_module._display_cell_text("2024-02-23T00:00:00")
+    assert date == "2024-02-23"
+    assert full_date == "2024-02-23T00:00:00"
+
+    # short numbers, text, and non-midnight stamps stay verbatim
+    assert app_module._display_cell_text("1216") == ("1216", None)
+    assert app_module._display_cell_text("=B4*C4") == ("=B4*C4", None)
+    assert app_module._display_cell_text("2024-02-23T10:30:00") == (
+        "2024-02-23T10:30:00",
+        None,
+    )
+
+
+def test_class_filter_label_summarizes_instead_of_chipping() -> None:
+    assert _class_filter_label(21, 21) == "All classes"
+    assert _class_filter_label(0, 21) == "No classes"
+    assert _class_filter_label(5, 21) == "5 of 21 classes"
+    assert _class_filter_label(0, 0) == "All classes"
+
+
+def test_warning_is_amber_not_a_second_red() -> None:
+    assert "--warning: #9a6700" in CSS  # light
+    assert "--warning: #e2b54b" in CSS  # dark
+    # non-color outline cues in context grids
+    assert "outline: 2px dashed var(--warning)" in CSS
+    assert "outline: 2px dotted var(--info)" in CSS
+
+
+def test_toolbar_is_sticky_and_the_queue_scrolls_internally() -> None:
+    toolbar = CSS.split(".reviewtoolbar {", 1)[1].split("}", 1)[0]
+    assert "position: sticky" in toolbar
+    assert ".review-groups-table .q-table__middle { max-height:" in CSS
+    assert (
+        ".review-groups-table thead tr th { position: sticky; top: 0;" in CSS
+    )
+
+
+def test_detail_panel_pins_header_and_scrolls_body() -> None:
+    assert ".detailhead" in CSS
+    assert ".detailbody" in CSS
+    body_rule = CSS.split(".detailbody {", 1)[1].split("}", 1)[0]
+    assert "overflow-y: auto" in body_rule
+    source = inspect.getsource(app_module._render_result_view)
+    # every detail renderer builds head + body, with actions in the head
+    assert source.count('classes("detailhead")') >= 4
+    assert source.count('classes("detailbody")') >= 4
+    assert 'classes("detailactions")' in source
+
+
+def test_parent_row_renders_mix_chips() -> None:
+    template = app_module.REVIEW_GROUPS_BODY_SLOT.split("<q-tr v-else", 1)[0]
+    assert "props.row.mix" in template
+    assert "mixchip mix-" in template
+
+
+def test_cluster_legend_lists_only_markers_that_can_appear() -> None:
+    # The cluster view opens a whole series, never one finding, so its grids
+    # cannot show the amber "open finding" cell; single-finding excerpts show
+    # the box without a legend and need none. User-flagged 2026-08-08.
+    source = inspect.getsource(app_module._render_result_view)
+    assert "open finding" not in source
+    assert "selected finding<" not in source
+    assert 'swatch selected' not in source
+    # the legend is pinned in the cluster detail head, above the scroll
+    head = source.split("def _render_cluster_detail", 1)[1].split(
+        'classes("detailbody")', 1
+    )[0]
+    assert "_severity_legend_html()" in head
+
+
+# --- follow-up review pass (2026-08-08) -----------------------------------------
+
+
+def test_format_review_time_reads_like_a_clock() -> None:
+    assert app_module._format_review_time(None) == "0:00"
+    assert app_module._format_review_time(0) == "0:00"
+    assert app_module._format_review_time(59.9) == "0:59"
+    assert app_module._format_review_time(605) == "10:05"
+    assert app_module._format_review_time(3600) == "1:00:00"
+    assert app_module._format_review_time(3725) == "1:02:05"
+
+
+def test_timer_kpi_is_a_stat_box_pinned_top_right() -> None:
+    source = inspect.getsource(app_module._render_result_view)
+    assert 'classes("stat timerkpi")' in source
+    assert "review time" in source
+    # a finalized run shows its frozen time and offers no controls
+    assert 'ui.label("finalized").classes("a")' in source
+    kpi_rule = CSS.split(".timerkpi {", 1)[1].split("}", 1)[0]
+    assert "position: absolute" in kpi_rule
+    assert "right: 0" in kpi_rule
+    header_rule = CSS.split(".runheader {", 1)[1].split("}", 1)[0]
+    assert "position: relative" in header_rule
+
+
+def test_cluster_row_states_each_fact_once() -> None:
+    entries = _entries()
+    row = entries[0].row
+
+    # LOCATION carries only the axis; the period count lives in the # column,
+    # so no number is printed three times per row.
+    assert str(row["location"]).startswith(("column ", "row "))
+    assert "period" not in str(row["location"])
+    message = str(row["message"])
+    assert "findings" not in message
+    assert "lens" not in message
+    assert "decision" in message
+
+
+def test_queue_pager_sits_under_the_queue_it_turns() -> None:
+    # In the toolbar the pager read as detail-panel chrome; it pages the
+    # queue, so it lives with the queue, like the members dialog pager.
+    source = inspect.getsource(app_module._render_result_view)
+    assert '"items-center queuepager"' in source
+    table = source.index('add_slot("body", REVIEW_GROUPS_BODY_SLOT)')
+    pager = source.index('"items-center queuepager"')
+    detail = source.index('classes("detailpanel")')
+    assert table < pager < detail
+    assert "lenspager" not in source
+    # centred under the table, with a persisted rows-per-page choice
+    pager_rule = CSS.split(".queuepager {", 1)[1].split("}", 1)[0]
+    assert "justify-content: center" in pager_rule
+    assert app_module._TOP_PAGE_SIZES == (10, 25, 50, 100)
+    assert 'app.storage.general["review_page_size"]' in source
+    assert 'start // size' in source  # resizing keeps the first row stable
+
+
+def test_queue_columns_have_light_boundaries_and_manual_resize() -> None:
+    # boundaries use the theme line variable so both modes stay quiet
+    assert (
+        ".review-groups-table th:not(:last-child),\n"
+        ".review-groups-table td:not(:last-child) "
+        "{ border-right: 1px solid var(--line-soft); }" in CSS
+    )
+    from qc_tool.ui.theme import COL_RESIZE_JS
+
+    # drag a header boundary to trade width between neighbours; double-click
+    # restores the stylesheet defaults; a grab never toggles the sort
+    assert "col-resize" in COL_RESIZE_JS
+    assert "dblclick" in COL_RESIZE_JS
+    assert "stopPropagation" in COL_RESIZE_JS
+    assert "MIN = 48" in COL_RESIZE_JS
+    source = inspect.getsource(app_module._render_result_view)
+    assert "ui.add_body_html(COL_RESIZE_JS)" in source
+
+
+def test_sheet_facet_filters_children_and_keeps_matching_parents() -> None:
+    # the fixture series live on the Ops sheet: constraining to Ops keeps
+    # everything, constraining elsewhere empties the queue
+    assert len(_entries(sheets={"Ops"})) == 4
+    assert _entries(sheets={"Elsewhere"}) == []
+    assert _entries(sheets=set()) == []
+    assert len(_entries(sheets=None)) == 4  # unconstrained default
+
+
+def test_where_facet_helpers_name_what_they_filter() -> None:
+    assert app_module._facet_filter_label(3, 9, "sheets") == "3 of 9 sheets"
+    assert app_module._facet_filter_label(9, 9, "sheets") == "All sheets"
+    assert app_module._facet_filter_label(0, 9, "slides") == "No slides"
+    assert _class_filter_label(5, 21) == "5 of 21 classes"  # wrapper unchanged
+
+    def _group(sheet: str | None, slide: str | None) -> ReviewGroup:
+        return cast(
+            "ReviewGroup", SimpleNamespace(sheet=sheet, slide=slide)
+        )
+
+    # slide labels are titles when the deck has them, so the noun must come
+    # from the group fields, never from string matching
+    assert app_module._where_noun([_group("Ops", None)]) == "sheets"
+    assert app_module._where_noun([_group(None, "Executive Summary")]) == "slides"
+    assert (
+        app_module._where_noun(
+            [_group("Ops", None), _group(None, "slide 2")]
+        )
+        == "sheets/slides"
+    )
+    assert app_module._where_noun([]) == "sheets"
+
+    ordered = sorted(["slide 10", "slide 2", "Ops"], key=app_module._natural_key)
+    assert ordered == ["Ops", "slide 2", "slide 10"]
+
+
+def test_toolbar_offers_a_sheet_facet_like_the_class_facet() -> None:
+    source = inspect.getsource(app_module._render_result_view)
+    assert "where_button" in source
+    assert "_all_wheres" in source
+    assert "_set_where" in source
+    assert '"whole file"' in source  # blank locations stay reachable
+    assert "sheets=set(selected_wheres)" in source
+
+
+def test_queue_sort_never_splits_a_series_from_its_children() -> None:
+    # Quasar client-side header sort scattered child rows away from their
+    # parents (user-found 2026-08-08): the queue's flat row array interleaves
+    # families, so ordering must be Python-owned at the entry level.
+    assert all("sortable" not in column for column in app_module._REVIEW_GROUP_COLUMNS)
+
+    entries = _entries()
+    by_severity = app_module._sort_lens_entries(entries, "severity")
+    # families intact: every entry keeps exactly its own children
+    assert {id(e) for e in by_severity} == {id(e) for e in entries}
+    ranks = [
+        [s.value for s in Severity].index(str(e.row["severity"]))
+        for e in by_severity
+    ]
+    assert ranks == sorted(ranks)
+
+    by_findings = app_module._sort_lens_entries(entries, "findings", descending=True)
+    counts = [int(str(e.row["members"])) for e in by_findings]
+    assert counts == sorted(counts, reverse=True)
+
+    by_location = app_module._sort_lens_entries(entries, "location")
+    locations = [str(e.row["location"]) for e in by_location]
+    assert locations == sorted(locations, key=app_module._natural_key)
+
+    # priority keeps the evidence order; descending is an honest reversal
+    assert app_module._sort_lens_entries(entries, "priority") == entries
+    assert app_module._sort_lens_entries(entries, "priority", descending=True) == list(
+        reversed(entries)
+    )
+
+    source = inspect.getsource(app_module._render_result_view)
+    assert "_sort_lens_entries(" in source
+    assert "order: priority" in source
+    assert "Reverse queue order" in source
+
+
+def test_mix_chips_are_quiet_and_allowed_to_wrap() -> None:
+    chip_rule = CSS.split(".mixchip {", 1)[1].split("}", 1)[0]
+    assert "border" not in chip_rule  # dot + count, no pill chrome
+    assert (
+        ".review-groups-table tr.clusterrow > td:first-child { white-space: normal; }"
+        in CSS
+    )
+
+
+# --- related-series lens rows -------------------------------------------------
+
+
+def _lens_fixture() -> tuple[
+    SeriesReviewLens, dict[str, ReviewGroup], dict[str, str]
+]:
+    findings, anchors = series_oracle()
+    groups = build_pattern_groups(findings)
+    lens = build_series_review_lens(groups, anchors)
+    return lens, {group.group_id: group for group in groups}, {}
+
+
+def test_parent_detail_names_new_and_cleared_period_segments() -> None:
+    source = inspect.getsource(app_module._render_result_view)
+    body = source.split("def _render_cluster_detail", 1)[1].split(
+        "def _render_slice_detail", 1
+    )[0]
+
+    assert 'segment == "new_period"' in body
+    assert 'band = "new period"' in body
+    assert 'segment == "cleared_period"' in body
+    assert 'band = "cleared period"' in body
+    assert "member.temporal_context.value" in body
+
+
+def test_context_pager_turns_both_sides_together() -> None:
+    # One shared index: independent per-side pagers made analysts compare
+    # panel 3 of current against panel 1 of baseline. Live-found 2026-08-08.
+    source = inspect.getsource(app_module._render_result_view)
+    body = source.split("def _render_cluster_context", 1)[1].split(
+        "def _render_cluster_detail", 1
+    )[0]
+
+    assert "shared_index" in body
+    assert "def draw_sides" in body
+    assert "turn: Callable[[int], None] = turn" in body
+    assert "on_click=_turn_handler(-1)" in body
+    assert "on_click=_turn_handler(1)" in body
+    assert "on_click=lambda: turn" not in body
+    # exactly one pager for both sides, hosted in the slot BETWEEN the grids
+    assert body.count("chevron_left") == 1
+    assert body.count("chevron_right") == 1
+    assert "pager_slot" in body
+    assert body.index("pager_slot = ui.element") < body.index('f"{label} context"')
+    assert '" · both sides"' in body
+
+
+def _entries(**overrides: object) -> list[LensEntry]:
+    lens, groups_by_id, rationales = _lens_fixture()
+    kwargs: dict[str, object] = {
+        "severities": {severity.value for severity in Severity},
+        "finding_classes": {FindingClass.VALUE_CHANGED.value},
+        "review_state": "all",
+    }
+    kwargs.update(overrides)
+    return _lens_entries(lens, groups_by_id, rationales, **kwargs)  # type: ignore[arg-type]
+
+
+def test_lens_entries_expose_four_structural_parents() -> None:
+    entries = _entries()
+
+    assert len(entries) == 4
+    assert [len(entry.children) for entry in entries] == [2, 2, 3, 3] or sorted(
+        len(entry.children) for entry in entries
+    ) == [2, 2, 3, 3]
+    for entry in entries:
+        assert entry.row["kind"] == "cluster"
+        assert entry.row["class"] == "related_series"
+        assert entry.row["parent"] == ""
+        assert entry.hidden == 0
+        # WHERE carries the sheet once; LOCATION carries the axis position
+        assert entry.row["where"] == "Ops"
+        assert str(entry.row["location"]).startswith("column ")
+        assert entry.row["mix"], "severity mix chips must be populated"
+    assert sum(int(str(entry.row["members"])) for entry in entries) == 19
+
+
+def test_collapsed_parents_render_no_child_rows() -> None:
+    entries = _entries()
+
+    rows = _flatten_lens_rows(entries, expanded=set(), child_pages={})
+
+    assert len(rows) == 4
+    assert all(row["kind"] == "cluster" for row in rows)
+    assert all(row["expanded"] is False for row in rows)
+
+
+def test_expanding_one_parent_adds_only_its_children() -> None:
+    entries = _entries()
+    target = next(
+        entry for entry in entries if str(entry.row["location"]).endswith("column M")
+        or "column M" in str(entry.row["location"])
+    )
+    parent_id = str(target.row["id"])
+
+    rows = _flatten_lens_rows(entries, expanded={parent_id}, child_pages={})
+
+    children = [row for row in rows if row["kind"] == "child"]
+    assert len(rows) == 4 + len(target.children)
+    assert {row["parent"] for row in children} == {parent_id}
+    assert [int(str(row["members"])) for row in children] == [2, 1, 1]
+    assert [row["severity"] for row in children] == ["critical", "warning", "warning"]
+    parent_row = next(row for row in rows if row["id"] == parent_id)
+    assert parent_row["expanded"] is True
+    assert parent_row["sevmix"] == "2 critical · 2 warning"
+
+
+def test_top_level_pagination_counts_parents_not_children() -> None:
+    entries = _entries()
+
+    first = _flatten_lens_rows(
+        entries, expanded=set(), child_pages={}, page=0, page_size=2
+    )
+    second = _flatten_lens_rows(
+        entries, expanded=set(), child_pages={}, page=1, page_size=2
+    )
+
+    assert len(first) == 2
+    assert len(second) == 2
+    assert {row["id"] for row in first}.isdisjoint({row["id"] for row in second})
+
+
+def test_child_rows_are_paged_within_an_expanded_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app_module, "_CHILD_PAGE_SIZE", 2)
+    entries = _entries()
+    target = next(entry for entry in entries if len(entry.children) == 3)
+    parent_id = str(target.row["id"])
+
+    first = _flatten_lens_rows(entries, expanded={parent_id}, child_pages={})
+    second = _flatten_lens_rows(
+        entries, expanded={parent_id}, child_pages={parent_id: 1}
+    )
+
+    assert len([row for row in first if row["kind"] == "child"]) == 2
+    assert len([row for row in second if row["kind"] == "child"]) == 1
+    parent_row = next(row for row in first if row["id"] == parent_id)
+    assert parent_row["child_page"] == "1-2 of 3"
+
+
+def test_lens_rows_never_duplicate_or_lose_an_atomic_finding() -> None:
+    lens, _groups_by_id, _rationales = _lens_fixture()
+    findings, _anchors = series_oracle()
+
+    seen = [
+        member.finding_id
+        for cluster in lens.clusters
+        for child in cluster.slices
+        for member in child.members
+    ]
+
+    assert sorted(seen) == sorted(finding.finding_id for finding in findings)
+
+
+def test_parent_row_template_toggles_and_omits_triage_shortcuts() -> None:
+    template = app_module.REVIEW_GROUPS_BODY_SLOT
+    parent, child = template.split("<q-tr v-else", 1)
+
+    assert "aria-expanded" in parent
+    assert "$parent.$emit('toggle'" in parent
+    assert "keydown.enter.prevent=\"$parent.$emit('toggle'" in parent
+    assert "keydown.space.prevent=\"$parent.$emit('toggle'" in parent
+    assert "triage-key-action" not in parent
+    assert "$parent.$emit('childpage'" in parent
+    assert "triage-key-action" in child
+    assert "$parent.$emit('select'" in child
+
+
+# --- lens filters, story pins and keyboard semantics ---------------------------
+
+
+def test_severity_filter_hides_children_and_discloses_the_count() -> None:
+    entries = _entries(severities={Severity.WARNING.value})
+
+    assert len(entries) == 4
+    m_series = next(
+        entry for entry in entries if "column M" in str(entry.row["location"])
+    )
+    assert [int(str(child["members"])) for child in m_series.children] == [1, 1]
+    assert m_series.hidden == 1
+    assert int(str(m_series.row["hidden_children"])) == 1
+    assert int(str(m_series.row["members"])) == 2
+    assert m_series.row["sevmix"] == "2 warning"
+
+
+def test_a_parent_disappears_when_every_child_is_filtered_out() -> None:
+    entries = _entries(severities={Severity.EXPECTED.value})
+
+    assert entries == []
+
+
+def test_text_filter_applies_at_child_level() -> None:
+    entries = _entries(needle="M137")
+
+    assert len(entries) == 1
+    assert "column M" in str(entries[0].row["location"])
+    assert [int(str(child["members"])) for child in entries[0].children] == [1]
+    assert entries[0].hidden == 2
+
+
+def test_story_pin_by_canonical_group_surfaces_every_derived_slice() -> None:
+    lens, groups_by_id, _rationales = _lens_fixture()
+    historical = next(
+        group for group in groups_by_id.values() if group.member_count == 8
+    )
+
+    entries = _lens_entries(
+        lens,
+        groups_by_id,
+        {},
+        severities={severity.value for severity in Severity},
+        finding_classes={FindingClass.VALUE_CHANGED.value},
+        review_state="all",
+        story_scope={historical.group_id},
+    )
+
+    assert len(entries) == 4
+    surfaced = [
+        child
+        for entry in entries
+        for child in entry.children
+    ]
+    assert {child["group_id"] for child in surfaced} == {historical.group_id}
+    assert sum(int(str(child["members"])) for child in surfaced) == 8
+
+
+def test_parent_review_state_aggregates_its_visible_children() -> None:
+    findings, anchors = series_oracle()
+    for finding in findings:
+        if finding.location in {"M132", "M136"}:
+            finding.analyst_comment = "checked"
+    groups = build_pattern_groups(findings)
+    lens = build_series_review_lens(groups, anchors)
+
+    entries = _lens_entries(
+        lens,
+        {group.group_id: group for group in groups},
+        {},
+        severities={severity.value for severity in Severity},
+        finding_classes={FindingClass.VALUE_CHANGED.value},
+        review_state="all",
+    )
+    m_series = next(
+        entry for entry in entries if "column M" in str(entry.row["location"])
+    )
+
+    assert m_series.row["review_state"] == "needs_review"
+    assert int(str(m_series.row["reviewed"])) == 2
+    assert int(str(m_series.row["reviewable_members"])) == 4
+
+    reviewed_only = _lens_entries(
+        lens,
+        {group.group_id: group for group in groups},
+        {},
+        severities={severity.value for severity in Severity},
+        finding_classes={FindingClass.VALUE_CHANGED.value},
+        review_state="reviewed",
+    )
+    reviewed_m = next(
+        entry
+        for entry in reviewed_only
+        if "column M" in str(entry.row["location"])
+    )
+    assert reviewed_m.row["review_state"] == "reviewed"
+    assert reviewed_m.hidden == 2
+
+
+def test_keyboard_navigation_focuses_parents_instead_of_toggling_them() -> None:
+    source = inspect.getsource(app_module._render_result_view)
+
+    assert "function activate(id)" in source
+    assert "el.dataset.reviewKind === 'cluster'" in source
+    assert "activate(ids[next])" in source
+    assert "activate(ids[previous])" in source
+
+
+def test_row_level_actions_never_resolve_a_parent_row() -> None:
+    source = inspect.getsource(app_module._render_result_view)
+
+    assert "def _reviewable_group(row_id: str)" in source
+    assert "if row_id in lens.cluster_by_id:" in source
+    assert "dataclasses.replace(group, members=item.members)" in source
+    assert "group = _reviewable_group(group_id)" in source
+
+
+# --- confirm visible ----------------------------------------------------------
+
+
+def test_confirm_visible_commits_before_touching_memory() -> None:
+    source = inspect.getsource(app_module._render_result_view)
+    body = source.split("def open_cluster_confirmation", 1)[1].split(
+        "def open_group_review", 1
+    )[0]
+
+    commit = body.index("history.set_annotations_bulk")
+    mutate = body.index("finding.severity_overridden = True")
+    rebuild = body.index("refresh_review_groups()")
+
+    assert commit < mutate < rebuild
+    assert "cluster_confirmation_updates(visible" in body
+    assert "not an override or a replacement" in body
+    assert "hidden by the\n" in body or "hidden by the " in body
+    assert "Your decisions were saved. Reload this run before " in body
+    assert 'ui.run_javascript("window.location.reload()")' in body
+
+
+@pytest.mark.asyncio
+async def test_confirm_visible_preserves_each_severity_and_skips_hidden(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+    history = RunHistory(work_dir / "history.sqlite3")
+    assert history.get_series_anchors(artifacts.run_id)
+    severities_before = {
+        finding.finding_id: finding.severity
+        for finding in history.get_run(artifacts.run_id).findings
+    }
+
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+
+    group_table = next(
+        element
+        for element in user.find(kind=ui.table).elements
+        if "review-groups-table" in element.classes
+    )
+    parent = next(row for row in group_table.rows if row["kind"] == "cluster")
+    _emit(group_table, "toggle", {"id": str(parent["id"])})
+    await user.should_see("Confirm visible")
+
+    user.find("Confirm visible").click()
+    await user.should_see("not an override or a replacement")
+
+    user.find("Confirm listed findings").click()
+    await user.should_see("Confirmed")
+
+    annotations = history.get_annotations(artifacts.run_id)
+    assert len(annotations) == int(str(parent["members"]))
+    for finding_id, (severity, _comment) in annotations.items():
+        engine_severity = severities_before[finding_id]
+        assert engine_severity is not None
+        assert severity == engine_severity.value
+    assert {
+        finding.severity
+        for finding in history.get_run(artifacts.run_id).findings
+        if finding.finding_id in annotations
+    } == {
+        severities_before[finding_id] for finding_id in annotations
+    }
+
+
+def test_guide_documents_the_related_series_lens() -> None:
+    from qc_tool.ui.guide import render_guide
+
+    text = inspect.getsource(render_guide)
+
+    for contract in (
+        "Related series",
+        "navigation lens, not a decision",
+        "structural only",
+        "Confirm visible",
+        "N of M related finding cells shown",
+        "keep today's grouping",
+        "new period",
+        "cleared period",
+        "periods affected",
+        "wiped period row",
+    ):
+        assert contract in text
+
+
+async def _open_cluster_confirmation(
+    user: User, work_dir: Path, run_id: int
+) -> dict[str, object]:
+    create_pages(work_dir)
+    await user.open(f"/runs/{run_id}")
+    group_table = next(
+        element
+        for element in user.find(kind=ui.table).elements
+        if "review-groups-table" in element.classes
+    )
+    parent = next(row for row in group_table.rows if row["kind"] == "cluster")
+    _emit(group_table, "toggle", {"id": str(parent["id"])})
+    await user.should_see("Confirm visible")
+    user.find("Confirm visible").click()
+    await user.should_see("not an override or a replacement")
+    return parent
+
+
+@pytest.mark.asyncio
+async def test_confirm_visible_database_failure_leaves_memory_unchanged(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+    history = RunHistory(work_dir / "history.sqlite3")
+    await _open_cluster_confirmation(user, work_dir, artifacts.run_id)
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("annotation store is unavailable")
+
+    monkeypatch.setattr(RunHistory, "set_annotations_bulk", boom)
+    user.find("Confirm listed findings").click()
+    await user.should_see("annotation store is unavailable")
+
+    assert history.get_annotations(artifacts.run_id) == {}
+    assert all(
+        not finding.severity_overridden and not finding.analyst_comment
+        for finding in history.get_run(artifacts.run_id).findings
+    )
+    # the dialog stays open, so the selection is untouched
+    await user.should_see("not an override or a replacement")
+
+
+@pytest.mark.asyncio
+async def test_confirm_visible_post_commit_failure_reports_saved_and_reloads(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+    history = RunHistory(work_dir / "history.sqlite3")
+    await _open_cluster_confirmation(user, work_dir, artifacts.run_id)
+
+    def boom(*args: object, **kwargs: object) -> list[ReviewGroup]:
+        raise RuntimeError("lens rebuild failed")
+
+    monkeypatch.setattr(app_module, "build_pattern_groups", boom)
+    with caplog.at_level(logging.ERROR, logger="qc_tool.ui.app"):
+        user.find("Confirm listed findings").click()
+        await user.should_see("Your decisions were saved")
+
+    assert "cluster-confirmation-rebuild-failed" in caplog.text
+    caplog.clear()
+    # the transaction is authoritative; nothing was rolled back
+    assert history.get_annotations(artifacts.run_id)
+
+
+def test_atomic_pager_slices_the_sequence_serverside() -> None:
+    """Step 7: past the inline threshold the atomic tab pages server-side."""
+    from qc_tool.findings_store import BLOCK_FINDINGS
+    from qc_tool.ui.app import (
+        _ATOMIC_INLINE_THRESHOLD,
+        _ATOMIC_PAGE_SIZE,
+        _atomic_page_rows,
+        _FindingIndex,
+    )
+
+    # The inline threshold must not exceed the sequence page cache (4 blocks),
+    # below which lazy reads hand out stable cached objects like a list.
+    assert _ATOMIC_INLINE_THRESHOLD <= 4 * BLOCK_FINDINGS
+
+    findings = [
+        Finding(
+            finding_id=f"F{index:04d}",
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            severity=Severity.CRITICAL,
+            sheet="Data",
+            location=f"B{index}",
+            message=f"value changed {index}",
+        )
+        for index in range(1, 302)
+    ]
+    result = QCRunResult(profile_name="paged", findings=findings)
+
+    first = _atomic_page_rows(result, 0)
+    assert len(first) == _ATOMIC_PAGE_SIZE
+    assert first[0]["id"] == "F0001"
+    last = _atomic_page_rows(result, 3)
+    assert [row["id"] for row in last] == ["F0301"]
+
+    index = _FindingIndex(result.findings)
+    found = index.get("F0250")
+    assert found is not None and found.location == "B250"
+    assert index.get("F9999") is None
+
+
+def test_workbench_budget_refuses_fat_monster_runs() -> None:
+    """OOM regression: the interactive workbench is bounded on 16 GB machines."""
+    from qc_tool.ui.app import (
+        _WORKBENCH_BUDGET_BYTES,
+        _estimated_workbench_bytes,
+        _workbench_within_budget,
+    )
+
+    def batch(count: int, payload: str) -> list[Finding]:
+        return [
+            Finding(
+                finding_id=f"F{index:04d}",
+                artifact="excel",
+                finding_class=FindingClass.VALUE_CHANGED,
+                severity=Severity.CRITICAL,
+                sheet="Data",
+                location=f"B{index}",
+                message=payload,
+            )
+            for index in range(1, count + 1)
+        ]
+
+    # Below the paging threshold the estimate is zero: always interactive.
+    assert _estimated_workbench_bytes(batch(50, "x" * 4000)) == 0
+    assert _workbench_within_budget(batch(50, "x" * 4000))
+
+    # A fat monster run (UNAIDS shape: ~1.4 KB raw JSON per finding at 948k
+    # findings materialized to ~13.7 GB) must refuse the full workbench.
+    fat = batch(30_000, "x" * 1400)
+    projected = _estimated_workbench_bytes(fat)
+    per_finding = projected // (len(fat) * 8)
+    assert per_finding >= 1400
+    assert not _workbench_within_budget(
+        fat * (1 + _WORKBENCH_BUDGET_BYTES // projected)
+    )
+
+    # A skinny run of the same count stays interactive.
+    assert _workbench_within_budget(batch(30_000, "value moved"))
+
+
+def test_summary_review_rows_match_materialized_rows() -> None:
+    """Step 2 (16 GB plan): the summary queue rows equal canonical rows."""
+    from qc_tool.review import build_pattern_groups, prioritize_review
+    from qc_tool.review_stream import (
+        prioritize_review_summaries,
+        summarize_pattern_groups_with_priority,
+    )
+    from qc_tool.story import build_stories
+    from qc_tool.ui.app import _review_group_rows, _summary_review_row
+
+    findings = []
+    for index in range(1, 8):
+        findings.append(
+            Finding(
+                finding_id=f"F{index:04d}",
+                artifact="excel",
+                finding_class=(
+                    FindingClass.VALUE_CHANGED
+                    if index % 2
+                    else FindingClass.STYLE_CHANGED
+                ),
+                severity=Severity.CRITICAL if index % 3 else Severity.INFO,
+                sheet="Data",
+                location=f"B{index}",
+                baseline_location=f"B{index}",
+                message=f"changed {index}",
+            )
+        )
+    stories = build_stories(findings)
+    prioritized = prioritize_review(build_pattern_groups(findings), stories)
+    canonical_rows = _review_group_rows(
+        [item.group for item in prioritized],
+        {item.group.group_id: item.rationale for item in prioritized},
+    )
+    summaries, aggregates = summarize_pattern_groups_with_priority(iter(findings))
+    by_id = {finding.finding_id: finding for finding in findings}
+    summary_rows = []
+    for item in prioritize_review_summaries(summaries, aggregates, stories):
+        message = ""
+        if item.summary.member_count == 1:
+            message = by_id[item.summary.member_finding_ids[0]].message
+        summary_rows.append(
+            _summary_review_row(item.summary, item.rationale, frozenset(), message)
+        )
+    assert summary_rows == canonical_rows
+
+
+def test_style_key_legend_matches_the_loader_field_count(tmp_path: Path) -> None:
+    """The decoded legend must track the loader's pipe-joined style key."""
+    from openpyxl import Workbook
+
+    from qc_tool.io.loader import _style_key
+    from qc_tool.ui.app import _STYLE_KEY_FIELDS
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    assert worksheet is not None
+    cell = worksheet["A1"]
+    cell.value = "probe"
+    key = _style_key(cell)
+    assert len(key.split("|")) == len(_STYLE_KEY_FIELDS)

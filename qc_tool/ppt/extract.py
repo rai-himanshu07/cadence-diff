@@ -21,6 +21,7 @@ from qc_tool.ppt.model import (
     SlideContent,
     TableContent,
 )
+from qc_tool.ppt.shapes import iter_text_leaf_shapes
 from qc_tool.progress import CancellationToken, check_cancelled
 
 logger = logging.getLogger(__name__)
@@ -64,11 +65,16 @@ def _shape_source_id(
     )
 
 
+def _normalized_text(text: str) -> str:
+    """python-pptx renders <a:br/> soft line breaks as vertical tab."""
+    return text.replace("\v", "\n")
+
+
 def _shape_texts(shape: Any) -> list[str]:
     if not shape.has_text_frame:
         return []
     return [
-        paragraph.text
+        _normalized_text(paragraph.text)
         for paragraph in shape.text_frame.paragraphs
         if paragraph.text.strip()
     ]
@@ -113,7 +119,7 @@ def _notes(slide: Any) -> list[str]:
     if frame is None:
         return []
     return [
-        paragraph.text
+        _normalized_text(paragraph.text)
         for paragraph in frame.paragraphs
         if paragraph.text.strip()
     ]
@@ -134,7 +140,9 @@ def load_deck_snapshot(
     for index, slide in enumerate(presentation.slides):
         check_cancelled(cancellation_token)
         title_shape = slide.shapes.title
-        title = title_shape.text if title_shape is not None else None
+        title = (
+            _normalized_text(title_shape.text) if title_shape is not None else None
+        )
         try:
             notes = _notes(slide)
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
@@ -190,11 +198,14 @@ def load_deck_snapshot(
             )
             if base_shape.has_text_frame and base_shape is not title_shape:
                 content.texts.extend(texts)
+            elif shape_type == "GROUP":
+                for text_shape in iter_text_leaf_shapes(shape):
+                    content.texts.extend(_shape_texts(text_shape))
             if base_shape.has_table:
                 content.tables.append(
                     TableContent(
                         rows=[
-                            [cell.text for cell in row.cells]
+                            [_normalized_text(cell.text) for cell in row.cells]
                             for row in shape.table.rows
                         ],
                         source_id=source_id,

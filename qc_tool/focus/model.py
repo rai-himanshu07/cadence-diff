@@ -15,6 +15,8 @@ from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from qc_tool.package import MEMBER_ID_PATTERN
+
 logger = logging.getLogger(__name__)
 
 #: Bumped whenever a stored seed changes meaning. A run recorded under any other
@@ -43,6 +45,10 @@ class FocusRole(StrEnum):
         return FocusArtifact.PPT
 
 
+def focus_role_key(role: FocusRole, member_id: str = "primary") -> str:
+    return role.value if member_id == "primary" else f"{role.value}:{member_id}"
+
+
 class FocusTargetSeed(BaseModel):
     """One role-specific location inside one already-open saved document."""
 
@@ -50,6 +56,7 @@ class FocusTargetSeed(BaseModel):
 
     artifact: FocusArtifact
     role: FocusRole
+    member_id: str = Field(default="primary", pattern=MEMBER_ID_PATTERN)
     sheet: str | None = None
     address: str | None = None
     slide_index: int | None = Field(default=None, ge=1)
@@ -71,6 +78,10 @@ class FocusTargetSeed(BaseModel):
                 raise ValueError("a PowerPoint focus seed requires a slide index")
         return self
 
+    @property
+    def role_key(self) -> str:
+        return focus_role_key(self.role, self.member_id)
+
 
 class FocusTargetSidecar(BaseModel):
     """Decoded sidecar; ``version`` 0 means legacy, absent, or unreadable."""
@@ -89,9 +100,18 @@ class FocusTargetSidecar(BaseModel):
             return ()
         return self.targets.get(finding_id, ())
 
-    def seed(self, finding_id: str, role: FocusRole) -> FocusTargetSeed | None:
+    def seed(
+        self,
+        finding_id: str,
+        role: FocusRole,
+        member_id: str = "primary",
+    ) -> FocusTargetSeed | None:
         """The single seed for one finding and role, or ``None`` if ambiguous."""
-        matches = [seed for seed in self.seeds(finding_id) if seed.role is role]
+        matches = [
+            seed
+            for seed in self.seeds(finding_id)
+            if seed.role is role and seed.member_id == member_id
+        ]
         if len(matches) != 1:
             return None
         return matches[0]

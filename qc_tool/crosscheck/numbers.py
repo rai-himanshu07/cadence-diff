@@ -48,6 +48,8 @@ class ParsedFigure:
     is_percent: bool
     decimals: int  # displayed decimal places of the mantissa
     negative: bool
+    currency: str = ""
+    suffix: str = ""
 
     @property
     def value(self) -> float:
@@ -57,12 +59,22 @@ class ParsedFigure:
             return signed / 100.0
         return signed * self.scale
 
+    @property
+    def unit_key(self) -> str:
+        """Typed display unit independent of numeric scale and precision."""
+        if self.is_percent:
+            return "percent"
+        if self.currency:
+            return f"currency:{self.currency}"
+        return "dimensionless"
+
 
 def _from_match(match: re.Match[str]) -> ParsedFigure:
     number = match["number"].replace(",", "")
     mantissa = float(number)
     decimals = len(number.rsplit(".", 1)[1]) if "." in number else 0
     suffix = (match["suffix"] or "").lower()
+    currency = (match["currency"] or "")
     negative = bool(match["sign"]) or bool(match["open"] and match["close"])
     return ParsedFigure(
         raw=match.group(0).strip(),
@@ -71,6 +83,8 @@ def _from_match(match: re.Match[str]) -> ParsedFigure:
         is_percent=suffix == "%",
         decimals=decimals,
         negative=negative,
+        currency=currency,
+        suffix=suffix,
     )
 
 

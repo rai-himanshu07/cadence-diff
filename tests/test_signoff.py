@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import zipfile
@@ -63,6 +64,26 @@ def _finalize_ready(fixture_dir: Path, work_dir: Path):
         set(required_acknowledgements(record)),
     )
     return run_id, signoff
+
+
+def test_finalization_stops_this_runs_review_timer(
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    run_id, _files = _reviewed_run(fixture_dir, work_dir)
+    history = RunHistory(work_dir / "history.sqlite3")
+    history.start_review_session(run_id)
+    record = history.get_run(run_id)
+
+    finalize_run(work_dir, run_id, set(required_acknowledgements(record)))
+
+    # the recorded review time is frozen with the sign-off
+    assert history.active_review_run() is None
+    frozen = history.review_seconds(run_id)
+    assert frozen is not None
+    later = dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)
+    assert history.review_seconds(run_id, now=later) == frozen
 
 
 def test_finalization_creates_v2_attestation_and_locks_review_mutations(

@@ -13,12 +13,14 @@ Exit codes: 0 ok · 1 usage/runtime error · 2 findings at/above the
 import argparse
 import getpass
 import os
+import re
 import sys
 from pathlib import Path
 
 from platformdirs import user_data_dir
 
 from qc_tool import __version__
+from qc_tool.package import MEMBER_ID_PATTERN, PackageManifest
 from qc_tool.security import private_directory
 
 _SUBCOMMANDS = {
@@ -160,6 +162,20 @@ def _run_parser() -> argparse.ArgumentParser:
             f"--{role.replace('_', '-')}", type=Path, default=None, metavar="FILE"
         )
     parser.add_argument(
+        "--baseline-workbook",
+        action="append",
+        default=[],
+        metavar="MEMBER=FILE",
+        help="add a baseline Excel package member (repeatable; max eight)",
+    )
+    parser.add_argument(
+        "--current-workbook",
+        action="append",
+        default=[],
+        metavar="MEMBER=FILE",
+        help="add a current Excel package member (repeatable; max eight)",
+    )
+    parser.add_argument(
         "--mode",
         choices=[*_MODE_ALIASES, *_MODE_ALIASES.values()],
         default=None,
@@ -238,8 +254,9 @@ def _run_parser() -> argparse.ArgumentParser:
         "--allow-large-workbooks",
         action="store_true",
         help=(
-            "override OOXML workload refusal for this run; requires sufficient "
-            "local memory and degrades workload coverage"
+            "override physical-size and formula-link workload refusals for all "
+            "workbooks in this run; requires sufficient local memory and "
+            "degrades workload coverage"
         ),
     )
     parser.add_argument(
@@ -274,6 +291,16 @@ def _run_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--member-sheets",
+        action="append",
+        default=[],
+        metavar="MEMBER=NAMES",
+        help=(
+            "comma-separated sheet scope for one current workbook member "
+            "(repeatable)"
+        ),
+    )
+    parser.add_argument(
         "--slides",
         default="",
         metavar="INDEXES",
@@ -303,9 +330,14 @@ def _run_parser() -> argparse.ArgumentParser:
 
 
 def _infer_mode(files: dict[str, Path]) -> str:
-    if "baseline_excel" in files or "baseline_ppt" in files:
+    if any(
+        key.startswith("baseline_excel") or key == "baseline_ppt"
+        for key in files
+    ):
         return "cycle_comparison"
-    if "current_excel" in files and "current_ppt" in files:
+    if any(key.startswith("current_excel") for key in files) and (
+        "current_ppt" in files
+    ):
         return "final_package"
     return "current_file_preflight"
 
@@ -334,13 +366,15 @@ def _parse_passwords(pairs: list[str], files: dict[str, Path]) -> dict[str, str]
 
 
 def _password_roles(key: str, files: dict[str, Path]) -> list[str]:
-    if key in _ROLES:
-        if key not in files:
-            raise ValueError(f"password role {key!r} has no supplied file")
+    if key in files:
         return [key]
     matches = [role for role, path in files.items() if path.name == key]
     if not matches:
         raise ValueError(f"password key {key!r} matches no supplied file or role")
+    if len(matches) > 1:
+        raise ValueError(
+            f"password filename {key!r} is ambiguous; use an exact role key"
+        )
     return matches
 
 
@@ -410,6 +444,46 @@ def _cmd_run(args: list[str]) -> int:
         for role in _ROLES
         if getattr(ns, role) is not None
     }
+    def _add_member_workbooks(pairs: list[str], prefix: str) -> None:
+        for pair in pairs:
+            key, sep, raw_path = pair.partition("=")
+            if not sep:
+                raise ValueError(f"expected MEMBER=PATH, got {pair!r}")
+            member = key.strip()
+            if member == "primary":
+                raise ValueError(
+                    "member id 'primary' uses --baseline-excel/--current-excel"
+                )
+            if re.fullmatch(MEMBER_ID_PATTERN, member) is None:
+                raise ValueError(f"invalid member id {member!r}")
+            path = Path(raw_path)
+            if not path.exists():
+                raise ValueError(f"member workbook {path} not found")
+            role = f"{prefix}:{member}"
+            if role in files:
+                raise ValueError(f"duplicate member role {role}")
+            files[role] = path
+
+    _add_member_workbooks(ns.baseline_workbook, "baseline_excel")
+    _add_member_workbooks(ns.current_workbook, "current_excel")
+
+    # Parse member-qualified sheet selections
+    compare_member_sheets: dict[str, tuple[str, ...]] = {}
+    for pair in ns.member_sheets:
+        key, sep, raw_names = pair.partition("=")
+        if not sep:
+            raise ValueError(f"expected MEMBER=NAMES, got {pair!r}")
+        member = key.strip()
+        if re.fullmatch(MEMBER_ID_PATTERN, member) is None:
+            raise ValueError(f"invalid member id {member!r}")
+        if member in compare_member_sheets:
+            raise ValueError(f"duplicate member sheets for {member}")
+        names = [n.strip() for n in raw_names.split(",") if n.strip()]
+        if not names:
+            raise ValueError(f"no sheet names supplied for {member}")
+        compare_member_sheets[member] = tuple(names)
+    if ns.sheets and compare_member_sheets:
+        raise ValueError("--sheets cannot be combined with --member-sheets")
     if not files:
         raise ValueError(
             f"{_program_name()} run: supply at least one file (see --help)"
@@ -422,11 +496,10 @@ def _cmd_run(args: list[str]) -> int:
     from qc_tool.findings import Severity
     from qc_tool.progress import ProgressEvent
     from qc_tool.report.json_report import write_json_report
-    from qc_tool.review import (
-        build_pattern_groups,
-        build_review_groups,
-        count_pattern_groups,
-        review_counts,
+    from qc_tool.review_stream import (
+        counts_from_summaries,
+        summarize_pattern_groups,
+        summarize_review_groups,
     )
     from qc_tool.run_service import perform_run
 
@@ -460,7 +533,10 @@ def _cmd_run(args: list[str]) -> int:
         acceptance_relative=ns.accept_percent / 100.0,
         compare_sheets=_parse_sheet_list(ns.sheets),
         compare_slides=_parse_slide_list(ns.slides),
+        package_manifest=PackageManifest.from_role_files(files),
+        compare_member_sheets=dict(compare_member_sheets),
         on_progress=on_progress,
+        write_reports=True,  # CLI is batch: the report files ARE the output
     )
     result = artifacts.result
 
@@ -471,9 +547,13 @@ def _cmd_run(args: list[str]) -> int:
             "status: capability-limited - one or more required checks were "
             "unavailable, so a low finding count is not a clean result"
         )
-    groups = build_pattern_groups(result.findings)
-    pattern_counts = count_pattern_groups(groups)
-    grouped_counts = review_counts(build_review_groups(result.findings))
+    # Streaming summaries: identical counts to the list builders without
+    # holding every finding of a monster run in memory.
+    pattern_summaries = summarize_pattern_groups(result.findings)
+    pattern_counts = counts_from_summaries(pattern_summaries)
+    grouped_counts = counts_from_summaries(
+        summarize_review_groups(result.findings)
+    )
     print(
         "pattern review items:",
         "  ".join(
@@ -527,19 +607,19 @@ def _cmd_run(args: list[str]) -> int:
         ]
     else:
         ranked = [
-            group
-            for group in groups
-            if group.severity in (Severity.CRITICAL, Severity.WARNING)
+            summary
+            for summary in pattern_summaries
+            if summary.severity in (Severity.CRITICAL, Severity.WARNING)
         ]
         lines = [
             (
-                f"  {group.group_id} {group.severity.value:8s} "
-                f"{group.finding_class.value:24s} "
-                f"{group.sheet or group.slide or ''}!{group.bounding_range}  "
-                f"{group.member_count:,} affected finding"
-                f"{'s' if group.member_count != 1 else ''}"
+                f"  {summary.group_id} {summary.severity.value:8s} "
+                f"{summary.finding_class.value:24s} "
+                f"{summary.sheet or summary.slide or ''}!{summary.bounding_range}  "
+                f"{summary.member_count:,} affected finding"
+                f"{'s' if summary.member_count != 1 else ''}"
             )
-            for group in ranked[: ns.top]
+            for summary in ranked[: ns.top]
         ]
     for line in lines:
         print(line)
@@ -642,11 +722,24 @@ def _sanitize_package_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=f"{_program_name()} sanitize-package",
         description=(
-            "Strictly sanitize current Excel+PowerPoint together, re-project "
-            "confirmed mappings, verify privacy, and write a redaction manifest."
+            "Strictly sanitize current Excel member(s)+PowerPoint together, "
+            "re-project confirmed mappings, verify privacy, and write a "
+            "redaction manifest."
         ),
     )
-    parser.add_argument("--excel", type=Path, required=True)
+    parser.add_argument(
+        "--excel",
+        type=Path,
+        default=None,
+        help="primary current workbook",
+    )
+    parser.add_argument(
+        "--workbook",
+        action="append",
+        default=[],
+        metavar="MEMBER=FILE",
+        help="add a current workbook member (repeatable; max eight)",
+    )
     parser.add_argument("--ppt", type=Path, required=True)
     parser.add_argument("--profile", required=True, metavar="NAME_OR_PATH")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -664,15 +757,37 @@ def _sanitize_package_parser() -> argparse.ArgumentParser:
 
 def _cmd_sanitize_package(args: list[str]) -> int:
     ns = _sanitize_package_parser().parse_args(args)
-    from qc_tool.package_sanitize import sanitize_package
+    from qc_tool.package_sanitize import sanitize_package_files
     from qc_tool.sanitize import SanitizeError
 
     data_dir = ns.data_dir or default_data_dir()
     profile = _resolve_profile(ns.profile, data_dir)
+    files: dict[str, Path] = {"current_ppt": ns.ppt}
+    if ns.excel is not None:
+        files["current_excel"] = ns.excel
+    for pair in ns.workbook:
+        raw_member, separator, raw_path = pair.partition("=")
+        if not separator:
+            raise ValueError(f"expected MEMBER=PATH, got {pair!r}")
+        member_id = raw_member.strip()
+        if member_id == "primary":
+            raise ValueError("member id 'primary' uses --excel")
+        if re.fullmatch(MEMBER_ID_PATTERN, member_id) is None:
+            raise ValueError(f"invalid member id {member_id!r}")
+        role_key = f"current_excel:{member_id}"
+        if role_key in files:
+            raise ValueError(f"duplicate member role {role_key}")
+        files[role_key] = Path(raw_path)
+    if not any(role.startswith("current_excel") for role in files):
+        raise ValueError("sanitize-package needs --excel and/or --workbook")
+    for role, path in files.items():
+        if not path.is_file():
+            raise ValueError(f"{role}: {path} not found")
+    package_manifest = PackageManifest.from_role_files(files)
     try:
-        manifest = sanitize_package(
-            ns.excel,
-            ns.ppt,
+        manifest = sanitize_package_files(
+            files,
+            package_manifest,
             ns.output_dir,
             profile,
             seed=ns.seed,
@@ -732,22 +847,91 @@ def _fingerprint_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=f"{_program_name()} fingerprint",
         description=(
-            "Write structural-only JSON: dimensions, types, period grammars, "
+            "Write structural-only JSON: dimensions, types, period label patterns, "
             "regions, hashed formula patterns, table/chart shapes — no source "
             "values, visible text, paths, formulas, images, or identifiers."
         ),
     )
-    parser.add_argument("source", type=Path)
+    parser.add_argument("source", type=Path, nargs="?")
+    for role in _ROLES:
+        parser.add_argument(
+            f"--{role.replace('_', '-')}",
+            type=Path,
+            default=None,
+            metavar="FILE",
+        )
+    parser.add_argument(
+        "--baseline-workbook",
+        action="append",
+        default=[],
+        metavar="MEMBER=FILE",
+    )
+    parser.add_argument(
+        "--current-workbook",
+        action="append",
+        default=[],
+        metavar="MEMBER=FILE",
+    )
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--password-env", default=None, metavar="ENV_VAR")
     parser.add_argument("--password-file", type=Path, default=None)
     parser.add_argument("--password-prompt", action="store_true")
+    parser.add_argument(
+        "--package-password-env",
+        action="append",
+        default=[],
+        metavar="ROLE_OR_FILENAME=ENV_VAR",
+    )
+    parser.add_argument(
+        "--package-password-file",
+        action="append",
+        default=[],
+        metavar="ROLE_OR_FILENAME=PATH",
+    )
+    parser.add_argument(
+        "--package-password-prompt",
+        action="append",
+        default=[],
+        metavar="ROLE_OR_FILENAME",
+    )
     return parser
 
 
 def _cmd_fingerprint(args: list[str]) -> int:
     ns = _fingerprint_parser().parse_args(args)
-    from qc_tool.fingerprint import write_fingerprint
+    from qc_tool.fingerprint import write_fingerprint, write_package_fingerprint
+
+    package_files = {
+        role: getattr(ns, role)
+        for role in _ROLES
+        if getattr(ns, role) is not None
+    }
+    for pairs, prefix in (
+        (ns.baseline_workbook, "baseline_excel"),
+        (ns.current_workbook, "current_excel"),
+    ):
+        for pair in pairs:
+            raw_member, separator, raw_path = pair.partition("=")
+            if not separator:
+                raise ValueError(f"expected MEMBER=PATH, got {pair!r}")
+            member_id = raw_member.strip()
+            if member_id == "primary":
+                raise ValueError(
+                    f"member id 'primary' uses --{prefix.replace('_', '-')}"
+                )
+            if re.fullmatch(MEMBER_ID_PATTERN, member_id) is None:
+                raise ValueError(f"invalid member id {member_id!r}")
+            role_key = f"{prefix}:{member_id}"
+            if role_key in package_files:
+                raise ValueError(f"duplicate member role {role_key}")
+            package_files[role_key] = Path(raw_path)
+    if ns.source is not None and package_files:
+        raise ValueError("a single source cannot be combined with package members")
+    if ns.source is None and not package_files:
+        raise ValueError("fingerprint needs a source or package member arguments")
+    for role, path in package_files.items():
+        if not path.is_file():
+            raise ValueError(f"{role}: {path} not found")
 
     password = None
     sources = sum(
@@ -756,6 +940,10 @@ def _cmd_fingerprint(args: list[str]) -> int:
     )
     if sources > 1:
         raise ValueError("choose only one fingerprint password source")
+    if package_files and sources:
+        raise ValueError(
+            "single-source password flags cannot be combined with package members"
+        )
     if ns.password_env:
         if ns.password_env not in os.environ:
             raise ValueError(f"environment variable {ns.password_env!r} is not set")
@@ -767,8 +955,31 @@ def _cmd_fingerprint(args: list[str]) -> int:
             )
         password = ns.password_file.read_text(encoding="utf-8").rstrip("\r\n")
     elif ns.password_prompt:
-        password = getpass.getpass(f"Password for {ns.source.name}: ")
-    payload = write_fingerprint(ns.source, ns.output, password=password)
+        source_label = ns.source.name if ns.source is not None else "source"
+        password = getpass.getpass(f"Password for {source_label}: ")
+    if package_files:
+        password_ns = argparse.Namespace(
+            password=[],
+            password_env=ns.package_password_env,
+            password_file=ns.package_password_file,
+            password_prompt=ns.package_password_prompt,
+        )
+        payload = write_package_fingerprint(
+            package_files,
+            PackageManifest.from_role_files(package_files),
+            ns.output,
+            passwords=_parse_password_sources(password_ns, package_files),
+        )
+    else:
+        if (
+            ns.package_password_env
+            or ns.package_password_file
+            or ns.package_password_prompt
+        ):
+            raise ValueError("package password flags need package members")
+        if ns.source is None:  # guarded above; narrows Path for Pyright
+            raise ValueError("fingerprint source is missing")
+        payload = write_fingerprint(ns.source, ns.output, password=password)
     print(f"fingerprint: {payload['fingerprint_id']} -> {ns.output}")
     return 0
 

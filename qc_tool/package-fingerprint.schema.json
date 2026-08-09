@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cadence-diff.local/schema/package-fingerprint-v2.json",
+  "title": "cadence-diff structural package fingerprint v2",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "schema",
+    "artifact",
+    "format",
+    "package_manifest",
+    "members",
+    "fingerprint_id"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "schema": {"const": "https://cadence-diff.local/schema/package-fingerprint-v2.json"},
+    "artifact": {"const": "package"},
+    "format": {"const": "package"},
+    "package_manifest": {
+      "type": "object",
+      "required": ["version", "members"],
+      "properties": {
+        "version": {"const": 1},
+        "members": {"type": "array"}
+      },
+      "additionalProperties": false
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "fingerprint"],
+        "properties": {
+          "role": {"type": "string"},
+          "fingerprint": {
+            "type": "object",
+            "required": ["schema_version", "artifact", "fingerprint_id"]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "fingerprint_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

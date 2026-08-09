@@ -9,23 +9,25 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 from pptx import Presentation
 from pptx.util import Inches
 
 from qc_tool.attestation import create_attestation, verify_attestation
 from qc_tool.config.profile import DeliverableProfile, PptProfile
-from qc_tool.coverage import CoverageState
+from qc_tool.coverage import CoverageState, QCRunMode
 from qc_tool.engine import run_qc
 from qc_tool.findings import Finding, FindingClass, Severity
 from qc_tool.history.store import RunHistory
 from qc_tool.ppt.diff import diff_decks
-from qc_tool.ppt.extract import DeckSnapshot, load_deck_snapshot
+from qc_tool.ppt.extract import DeckSnapshot, SlideContent, load_deck_snapshot
 from qc_tool.ppt.match import SlideMatching, match_slides
 from qc_tool.ppt.preflight import preflight_deck
 from qc_tool.report.excel_report import write_excel_report
 from qc_tool.report.html_report import write_html_report
 from qc_tool.report.json_report import result_payload
 from tests.fixtures.manifest_schema import FixtureManifest
+from tests.fixtures.ppt_builder import build_grouped_text_deck
 
 
 @pytest.fixture(scope="module")
@@ -160,6 +162,145 @@ def test_embedded_picture_bytes_are_hashed_without_decoding(tmp_path: Path) -> N
     assert first_shape.media_digest == same.slides[0].shapes[0].media_digest
     assert first_shape.media_digest != changed.slides[0].shapes[0].media_digest
     assert first.media_available and changed.media_available
+
+
+def _soft_break_deck(path: Path) -> None:
+    """Deck whose text carries PowerPoint soft line breaks (<a:br/> = \\v)."""
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+    title = slide.shapes.title
+    assert title is not None
+    title.text_frame.text = "Weekly Revenue\vRegional Outlook"
+    box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(4), Inches(1))
+    box.text_frame.text = "First line\vTBD second line"
+    table = slide.shapes.add_table(
+        1, 1, Inches(1), Inches(4), Inches(2), Inches(1)
+    ).table
+    table.cell(0, 0).text = "cell\vbreak"
+    notes_frame = slide.notes_slide.notes_text_frame
+    assert notes_frame is not None
+    notes_frame.text = "note\vbreak"
+    presentation.save(str(path))
+
+
+def test_soft_line_breaks_are_normalized_at_extraction(tmp_path: Path) -> None:
+    path = tmp_path / "soft-breaks.pptx"
+    _soft_break_deck(path)
+
+    deck = load_deck_snapshot(path)
+
+    slide = deck.slides[0]
+    assert slide.title == "Weekly Revenue\nRegional Outlook"
+    assert slide.display_name == "Weekly Revenue\nRegional Outlook"
+    assert "First line\nTBD second line" in slide.texts
+    assert slide.tables[0].rows[0][0] == "cell\nbreak"
+    assert slide.notes == ["note\nbreak"]
+    everything = [
+        slide.title or "",
+        *slide.texts,
+        *slide.notes,
+        *(cell for table in slide.tables for row in table.rows for cell in row),
+        *(text for shape in slide.shapes for text in shape.texts),
+    ]
+    assert not any("\v" in text for text in everything)
+
+
+def test_nested_group_text_extracts_once_in_depth_first_shape_order(
+    tmp_path: Path,
+) -> None:
+    path = build_grouped_text_deck(
+        tmp_path / "grouped.pptx",
+        top_before=("Before 1",),
+        grouped_lines=("Outer 2",),
+        nested_lines=("Nested 3",),
+        top_after=("After 4",),
+    )
+
+    slide = load_deck_snapshot(path).slides[0]
+
+    assert slide.texts == [
+        "Grouped KPIs",
+        "Before 1",
+        "Outer 2",
+        "Nested 3",
+        "After 4",
+    ]
+    assert slide.texts.count("Nested 3") == 1
+
+
+def test_grouped_text_changes_flow_through_slide_matching_and_diff(
+    tmp_path: Path,
+) -> None:
+    baseline = load_deck_snapshot(
+        build_grouped_text_deck(
+            tmp_path / "baseline-grouped.pptx",
+            grouped_lines=("Revenue $100M for Jan-26",),
+            nested_lines=("Margin 20% for Jan-26",),
+        )
+    )
+    current = load_deck_snapshot(
+        build_grouped_text_deck(
+            tmp_path / "current-grouped.pptx",
+            grouped_lines=("Revenue $110M for Jan-26",),
+            nested_lines=("Margin 20% for Jan-26",),
+        )
+    )
+
+    findings = diff_decks(match_slides(baseline, current))
+    changed = _by_class(findings, FindingClass.SLIDE_TEXT_CHANGED)
+
+    assert len(changed) == 1
+    assert changed[0].baseline_value == "Revenue $100M for Jan-26"
+    assert changed[0].current_value == "Revenue $110M for Jan-26"
+    assert changed[0].expected_reason is not None
+
+    unchanged = diff_decks(match_slides(current, current))
+    assert _by_class(unchanged, FindingClass.SLIDE_TEXT_CHANGED) == []
+
+
+def test_whitespace_only_ppt_text_alignment_does_not_create_a_finding() -> None:
+    baseline = SlideContent(
+        index=0,
+        title="KPIs",
+        texts=["New infections\t1.3 million\t[1.0-1.7 million]"],
+        shape_count=1,
+    )
+    current = SlideContent(
+        index=0,
+        title="KPIs",
+        texts=["New infections\t        1.3 million\t[1.0-1.7 million]"],
+        shape_count=1,
+    )
+
+    findings = diff_decks(SlideMatching(pairs=[(baseline, current)]))
+
+    assert _by_class(findings, FindingClass.SLIDE_TEXT_CHANGED) == []
+
+
+def test_preflight_report_survives_soft_line_break_titles(tmp_path: Path) -> None:
+    path = tmp_path / "current.pptx"
+    _soft_break_deck(path)
+
+    result = run_qc(current_ppt=path, mode=QCRunMode.CURRENT_FILE_PREFLIGHT)
+
+    draft = [
+        finding
+        for finding in result.findings
+        if finding.finding_class is FindingClass.PPT_DRAFT_TOKEN
+    ]
+    assert draft, "fixture must produce a finding on the soft-break slide"
+    assert all("\v" not in (finding.slide or "") for finding in draft)
+
+    report = tmp_path / "report.xlsx"
+    write_excel_report(result, report)  # raised IllegalCharacterError before fix
+
+    findings_sheet = load_workbook(report)["Findings"]
+    labels = [
+        row[4] for row in findings_sheet.iter_rows(min_row=2, values_only=True)
+    ]
+    assert any(
+        label and "Weekly Revenue" in str(label) for label in labels
+    )
 
 
 def test_linked_and_malformed_picture_relationships_degrade_without_leakage(
@@ -338,6 +479,29 @@ def test_slide_add_remove_reorder_findings(findings: list[Finding]) -> None:
     assert [(f.slide, f.expected_growth) for f in reordered] == [
         ("Notes & Definitions", True)
     ]
+
+
+def test_reorder_message_distinguishes_relative_displacement() -> None:
+    """LIS flags relative displacement; equal positions must not read 'N to N'."""
+
+    def slide(index: int, title: str) -> SlideContent:
+        return SlideContent(index=index, title=title, texts=[], shape_count=1)
+
+    matching = SlideMatching(
+        reordered=[
+            (slide(6, "Held"), slide(6, "Held")),
+            (slide(7, "Moved"), slide(5, "Moved")),
+        ]
+    )
+
+    messages = {
+        finding.slide: finding.message
+        for finding in _by_class(diff_decks(matching), FindingClass.SLIDE_REORDERED)
+    }
+    assert messages["Held"] == (
+        "slide 'Held' kept position 7 while surrounding slides moved"
+    )
+    assert messages["Moved"] == "slide 'Moved' moved from position 8 to 6"
 
 
 def test_text_changes_split_wording_from_figures(

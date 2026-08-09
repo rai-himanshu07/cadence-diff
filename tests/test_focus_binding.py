@@ -809,6 +809,38 @@ def test_binding_is_scoped_to_one_client_run_and_role(workspace) -> None:
     assert registry.get("client-a", 7, FocusRole.BASELINE_EXCEL) is None
 
 
+def test_binding_is_scoped_to_exact_member_within_one_role(workspace) -> None:
+    managed_root, source, digest = workspace
+    registry = BindingRegistry()
+    primary_request = _request(managed_root, digest)
+    member_request = BindingRequest(
+        run_id=7,
+        role=FocusRole.CURRENT_EXCEL,
+        member_id="ops",
+        expected_sha256=digest,
+        managed_root=managed_root,
+    )
+    _outcome, document, identity = resolve_binding(
+        primary_request,
+        _discovery(_excel(full_name=str(source))),
+    )
+    assert document is not None and identity is not None
+
+    registry.bind("client", primary_request, document, identity)
+    registry.bind("client", member_request, document, identity)
+
+    primary = registry.get("client", 7, FocusRole.CURRENT_EXCEL)
+    ops = registry.get(
+        "client",
+        7,
+        FocusRole.CURRENT_EXCEL,
+        member_id="ops",
+    )
+    assert primary is not None and primary.member_id == "primary"
+    assert ops is not None and ops.member_id == "ops"
+    assert len(registry) == 2
+
+
 def test_binding_expires(workspace) -> None:
     managed_root, source, digest = workspace
     registry = BindingRegistry()

@@ -23,8 +23,9 @@ from qc_tool.findings import (
 from qc_tool.history.store import RunHistory
 from qc_tool.report.excel_report import write_excel_report
 from qc_tool.report.html_report import _member_payload, render_html_report
-from qc_tool.report.json_report import result_payload
+from qc_tool.report.json_report import result_payload, review_summary
 from qc_tool.review import apply_group_review, build_pattern_groups, count_pattern_groups
+from qc_tool.review_stream import summarize_pattern_groups
 from qc_tool.triage.rules import triage
 
 
@@ -134,10 +135,12 @@ def test_machine_json_stays_atomic_and_the_review_summary_is_opt_in() -> None:
 
     assert "review_summary" not in default_payload
     assert default_payload["schema_version"] == 1
+    assert summary_payload["schema_version"] == 2
     assert len(default_payload["findings"]) == len(result.findings)
     assert summary_payload["findings"] == default_payload["findings"]
     summary = summary_payload["review_summary"]
-    assert summary["summary_version"] == 3
+    assert summary["summary_version"] == 4
+    assert summary["alignment_trust"] is None
     assert sum(summary["pattern_review_counts"].values()) == len(summary["groups"])
     assert sum(summary["atomic_findings_by_severity"].values()) == len(result.findings)
     assert {
@@ -149,10 +152,29 @@ def test_machine_json_stays_atomic_and_the_review_summary_is_opt_in() -> None:
     assert all("temporal_context" in group for group in summary["groups"])
     assert all("evidence_tags" in group for group in summary["groups"])
     stories = summary["stories"]
-    assert stories, "v3 summary must carry change stories"
+    assert stories, "v4 summary must carry change stories"
     assert {
         finding_id for story in stories for finding_id in story["finding_ids"]
     } == {finding.finding_id for finding in result.findings}
+
+
+def test_direct_review_summary_remains_v3_without_alignment_trust() -> None:
+    summary = review_summary(_result())
+
+    assert summary["summary_version"] == 3
+    assert "alignment_trust" not in summary
+
+
+def test_review_summary_v4_carries_exact_alignment_trust(qc_result) -> None:
+    payload = result_payload(qc_result, include_review_summary=True)
+
+    assert payload["schema_version"] == 2
+    assert payload["review_summary"]["summary_version"] == 4
+    assert payload["review_summary"]["alignment_trust"] == (
+        qc_result.alignment_trust.model_dump(mode="json")
+        if qc_result.alignment_trust is not None
+        else None
+    )
 
 
 def test_every_surface_reproduces_the_same_pattern_counts(tmp_path: Path) -> None:
@@ -223,7 +245,8 @@ def test_all_evidence_axes_reach_html_atomic_members() -> None:
     )
     result = QCRunResult(profile_name="evidence", findings=[finding])
 
-    member = next(iter(_member_payload(result).values()))[0]
+    payload = _member_payload(result, summarize_pattern_groups(result.findings))
+    member = next(iter(payload.values()))[0]
 
     assert member["provenance"] == "inherited"
     assert member["subtype"] == "replacement"

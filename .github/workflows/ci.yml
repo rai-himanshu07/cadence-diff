@@ -36,7 +36,7 @@ jobs:
         run: >-
           conda install --yes --name cadence-diff-ci --channel conda-forge
           openpyxl pyxlsb msoffcrypto-tool python-pptx rapidfuzz networkx
-          "pydantic>=2.7" pyyaml jinja2 nicegui platformdirs
+          "pydantic>=2.13" pyyaml jinja2 nicegui platformdirs
           "pytest>=8" pytest-asyncio ruff pyright psutil
 
       - name: Install Windows adapter dependency with Conda

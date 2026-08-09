@@ -128,6 +128,13 @@ _WORKLOAD_LIMITS = (
     ("style_count", 50_000, 250_000, "cell styles"),
     ("largest_sheet_area", 10_000_000, 50_000_000, "largest sheet area"),
 )
+_XLSB_WORKLOAD_LIMITS = (
+    ("cell_count", 2_500_000, 5_000_000, "retained cells"),
+    ("formula_count", 2_000_000, 4_000_000, "formulas"),
+    ("worksheet_binary_bytes", 160 * _MIB, 512 * _MIB, "worksheet binary bytes"),
+    ("shared_string_bytes", 64 * _MIB, 256 * _MIB, "shared-string bytes"),
+    ("styles_bytes", 8 * _MIB, 32 * _MIB, "style binary bytes"),
+)
 
 #: BIFF12 BOOLERR codes (pyxlsb yields them as hex strings) -> error literals.
 _XLSB_ERRORS = {
@@ -151,6 +158,10 @@ class OOXMLCellStreamError(ValueError):
 
 class OOXMLWorkloadError(ValueError):
     """An OOXML package exceeds safe local processing limits."""
+
+
+class XLSBWorkloadError(ValueError):
+    """An XLSB package exceeds safe local processing limits."""
 
 
 def _constant_cell_value(value: object) -> CellValue:
@@ -207,6 +218,7 @@ def load_workbook_snapshot(
         return _load_xlsb(
             data,
             source_name=path.name,
+            allow_large_workbook=allow_large_workbook,
             cancellation_token=cancellation_token,
         )
     loader = (
@@ -1005,6 +1017,50 @@ def _scan_xlsb(data: bytes, source_name: str) -> tuple[XlsbFormulaScan | None, s
         return None, f"Formula-presence scan failed: {exc}"
 
 
+def _assess_xlsb_workload(
+    scan: XlsbFormulaScan,
+    *,
+    source_name: str,
+    allow_large_workbook: bool,
+) -> WorkbookWorkload:
+    largest_rows, largest_columns = scan.largest_sheet_dimensions
+    workload = WorkbookWorkload(
+        format="xlsb",
+        metrics_available=scan.workload_metrics_available,
+        cell_count=scan.cell_count,
+        worksheet_binary_bytes=scan.worksheet_binary_bytes,
+        shared_string_bytes=scan.shared_string_bytes,
+        styles_bytes=scan.styles_bytes,
+        formula_count=scan.formula_count,
+        sheet_count=scan.sheet_count,
+        largest_sheet_rows=largest_rows,
+        largest_sheet_columns=largest_columns,
+        largest_sheet_area=scan.largest_sheet_area,
+    )
+    if not workload.metrics_available:
+        return workload
+
+    warnings: list[str] = []
+    refusals: list[str] = []
+    for field_name, warning_limit, refusal_limit, label in _XLSB_WORKLOAD_LIMITS:
+        value = int(getattr(workload, field_name))
+        if value >= refusal_limit:
+            refusals.append(f"{label} {value:,} >= refusal limit {refusal_limit:,}")
+        elif value >= warning_limit:
+            warnings.append(f"{label} {value:,} >= warning limit {warning_limit:,}")
+    if refusals and not allow_large_workbook:
+        raise XLSBWorkloadError(
+            f"{source_name}: workbook workload refused: {'; '.join(refusals)}. "
+            "Review the workbook and rerun with the explicit local "
+            "allow_large_workbook override only when sufficient memory is available."
+        )
+    if refusals:
+        warnings.extend(f"override accepted: {reason}" for reason in refusals)
+        workload.override_used = True
+    workload.warning_reasons = tuple(warnings)
+    return workload
+
+
 def _extract_xlsb_formulas(data: bytes, formula_scan: XlsbFormulaScan) -> FormulaExtraction:
     if sys.platform == "win32":
         from qc_tool.io.excel_formula import extract_formulas_with_excel
@@ -1032,10 +1088,20 @@ def _load_xlsb(
     data: bytes,
     *,
     source_name: str,
+    allow_large_workbook: bool = False,
     cancellation_token: CancellationToken | None = None,
 ) -> WorkbookSnapshot:
     check_cancelled(cancellation_token)
     formula_scan, scan_detail = _scan_xlsb(data, source_name)
+    workload = (
+        _assess_xlsb_workload(
+            formula_scan,
+            source_name=source_name,
+            allow_large_workbook=allow_large_workbook,
+        )
+        if formula_scan is not None
+        else WorkbookWorkload(format="xlsb", metrics_available=False)
+    )
     snapshot = WorkbookSnapshot(
         source_name=source_name,
         file_format="xlsb",
@@ -1057,6 +1123,7 @@ def _load_xlsb(
             "scope cannot be read"
         ),
         intrinsic_risks=_xlsb_risks(formula_scan),
+        workload=workload,
     )
     _apply_vba(snapshot, data)
     with open_xlsb(io.BytesIO(data)) as wb:

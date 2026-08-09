@@ -13,7 +13,9 @@ from qc_tool.coverage import CoverageState, QCRunMode
 from qc_tool.engine import QCRunResult, run_qc
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.history.store import RunHistory
+from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.peek import peek_sheet_names, peek_slide_titles
+from qc_tool.package import PackageManifest
 from qc_tool.report.json_report import result_payload
 from qc_tool.review import build_pattern_groups
 from qc_tool.scope import ComparisonScope
@@ -218,6 +220,126 @@ def test_legacy_history_defaults_to_unrestricted_scope(tmp_path: Path) -> None:
         )
 
     assert history.get_run(run_id).comparison_scope == ComparisonScope()
+
+
+def test_member_scope_validates_and_filters_duplicate_sheet_names(
+    tmp_path: Path,
+) -> None:
+    baseline, current = _write_pair(tmp_path)
+    workbooks = {
+        "core": load_workbook_snapshot(baseline),
+        "ops": load_workbook_snapshot(current),
+    }
+    scope = ComparisonScope(
+        excel_member_sheets={"core": ("Alpha",), "ops": ("Beta",)}
+    ).validate_loaded(workbooks_by_member=workbooks)
+    findings = [
+        Finding(
+            artifact="excel",
+            artifact_member=member,
+            finding_class=FindingClass.VALUE_CHANGED,
+            sheet=sheet,
+            message=f"{member}/{sheet}",
+        )
+        for member in ("core", "ops")
+        for sheet in ("Alpha", "Beta")
+    ]
+
+    filtered = scope.filter_findings(findings)
+
+    assert [(finding.artifact_member, finding.sheet) for finding in filtered] == [
+        ("core", "Alpha"),
+        ("ops", "Beta"),
+    ]
+    assert scope.disclosure() == (
+        "Comparison scope narrowed by analyst - Excel member core: Alpha; "
+        "Excel member ops: Beta; unlisted Excel members use all sheets. "
+        "Excel/PPT findings outside the selected scope are not reported; "
+        "package analyses remain whole-package; files loaded fully."
+    )
+    assert scope.coverage_item(workbooks_by_member=workbooks).detail == (
+        "Excel 2/4 sheets across 2/2 members; files loaded fully"
+    )
+
+
+def test_member_scope_rejects_unknown_members_sheets_and_legacy_scope(
+    tmp_path: Path,
+) -> None:
+    baseline, current = _write_pair(tmp_path)
+    workbooks = {
+        "core": load_workbook_snapshot(baseline),
+        "ops": load_workbook_snapshot(current),
+    }
+
+    with pytest.raises(ValueError, match="unknown workbook members"):
+        ComparisonScope(
+            excel_member_sheets={"missing": ("Alpha",)}
+        ).validate_loaded(workbooks_by_member=workbooks)
+    with pytest.raises(ValueError, match="unknown Excel sheet scope for member ops"):
+        ComparisonScope(
+            excel_member_sheets={"ops": ("Missing",)}
+        ).validate_loaded(workbooks_by_member=workbooks)
+    with pytest.raises(ValueError, match="legacy Excel sheet scope is ambiguous"):
+        ComparisonScope(excel_sheets=("Alpha",)).validate_loaded(
+            workbooks_by_member=workbooks
+        )
+
+
+def test_integrated_member_scope_rejects_unknown_member_before_qc(
+    tmp_path: Path,
+) -> None:
+    _baseline, current = _write_pair(tmp_path)
+    files = {"current_excel:ops": current}
+
+    with pytest.raises(ValueError, match="unknown workbook members in scope"):
+        run_qc(
+            profile=default_profile(),
+            package_manifest=PackageManifest.from_role_files(files),
+            package_files=files,
+            mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+            compare_member_sheets={"missing": ("Alpha",)},
+        )
+
+
+def test_partial_member_scope_leaves_unlisted_members_and_crosschecks_unrestricted(
+) -> None:
+    scope = ComparisonScope(excel_member_sheets={"core": ("Alpha",)})
+    findings = [
+        Finding(
+            artifact="excel",
+            artifact_member=member,
+            finding_class=FindingClass.VALUE_CHANGED,
+            sheet=sheet,
+            message=f"{member}/{sheet}",
+        )
+        for member in ("core", "ops")
+        for sheet in ("Alpha", "Beta")
+    ]
+    findings.append(
+        Finding(
+            artifact="crosscheck",
+            artifact_member="core",
+            finding_class=FindingClass.CROSSCHECK_MISMATCH,
+            sheet="Beta",
+            message="whole-package mapping mismatch",
+        )
+    )
+
+    filtered = scope.filter_findings(findings)
+
+    assert [
+        (finding.artifact, finding.artifact_member, finding.sheet)
+        for finding in filtered
+    ] == [
+        ("excel", "core", "Alpha"),
+        ("excel", "ops", "Alpha"),
+        ("excel", "ops", "Beta"),
+        ("crosscheck", "core", "Beta"),
+    ]
+    disclosure = scope.disclosure()
+    assert disclosure is not None
+    assert "unlisted Excel members use all sheets" in disclosure
+    assert "package analyses remain whole-package" in disclosure
 
 
 @pytest.mark.parametrize(

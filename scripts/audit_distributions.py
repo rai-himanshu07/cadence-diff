@@ -11,6 +11,10 @@ _REQUIRED_PACKAGE_FILES = {
     "qc_tool/__init__.py",
     "qc_tool/cli.py",
     "qc_tool/ui/guide.py",
+    "qc_tool/fingerprint.schema.json",
+    "qc_tool/package-fingerprint.schema.json",
+    "qc_tool/package-sanitize.schema.json",
+    "qc_tool/report/findings-v2.schema.json",
     "qc_tool/report/findings.schema.json",
     "qc_tool/report/templates/report.html.j2",
 }

@@ -12,11 +12,25 @@ import io
 import posixpath
 import zipfile
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from xml.etree import ElementTree
 
 _ROW_RECORD = 0x0000
+_RETAINED_CELL_RECORDS = frozenset(
+    {
+        0x0002,  # BrtCellRk
+        0x0003,  # BrtCellError
+        0x0004,  # BrtCellBool
+        0x0005,  # BrtCellReal
+        0x0007,  # BrtCellIsst
+        0x0008,  # BrtFmlaString
+        0x0009,  # BrtFmlaNum
+        0x000A,  # BrtFmlaBool
+        0x000B,  # BrtFmlaError
+    }
+)
 _FORMULA_RECORDS = frozenset({0x0008, 0x0009, 0x000A, 0x000B})
+_DIMENSION_RECORD = 0x0194
 _SHEET_RECORD = 0x019C
 _MAX_RECORD_BYTES = 64 * 1024 * 1024
 _MAX_STRING_CHARS = 1_000_000
@@ -63,15 +77,64 @@ class XlsbFormulaScanError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class XlsbWorksheetMetrics:
+    """Bounded structural workload facts for one binary worksheet."""
+
+    cell_count: int = 0
+    max_row: int = 0
+    max_column: int = 0
+    binary_bytes: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class XlsbFormulaScan:
     """Formula coordinates and risky package features found in an XLSB."""
 
     formula_cells: dict[str, frozenset[tuple[int, int]]]
     risky_features: tuple[str, ...] = ()
+    worksheet_metrics: dict[str, XlsbWorksheetMetrics] = field(default_factory=dict)
+    package_worksheet_binary_bytes: int = 0
+    shared_string_bytes: int = 0
+    styles_bytes: int = 0
+    sheet_count: int = 0
 
     @property
     def formula_count(self) -> int:
         return sum(len(cells) for cells in self.formula_cells.values())
+
+    @property
+    def cell_count(self) -> int:
+        return sum(metrics.cell_count for metrics in self.worksheet_metrics.values())
+
+    @property
+    def worksheet_binary_bytes(self) -> int:
+        return self.package_worksheet_binary_bytes or sum(
+            metrics.binary_bytes for metrics in self.worksheet_metrics.values()
+        )
+
+    @property
+    def largest_sheet_area(self) -> int:
+        return max(
+            (
+                metrics.max_row * metrics.max_column
+                for metrics in self.worksheet_metrics.values()
+            ),
+            default=0,
+        )
+
+    @property
+    def largest_sheet_dimensions(self) -> tuple[int, int]:
+        if not self.worksheet_metrics:
+            return 0, 0
+        metrics = max(
+            self.worksheet_metrics.values(),
+            key=lambda item: item.max_row * item.max_column,
+        )
+        return metrics.max_row, metrics.max_column
+
+    @property
+    def workload_metrics_available(self) -> bool:
+        return self.sheet_count > 0 and len(self.worksheet_metrics) == self.sheet_count
 
     @property
     def safe_for_external_engine(self) -> bool:
@@ -220,9 +283,14 @@ def _workbook_sheets(data: bytes) -> list[tuple[str, str]]:
     return sheets
 
 
-def _worksheet_formula_cells(data: bytes, sheet_name: str) -> frozenset[tuple[int, int]]:
+def _worksheet_scan(
+    data: bytes, sheet_name: str
+) -> tuple[frozenset[tuple[int, int]], XlsbWorksheetMetrics]:
     row: int | None = None
     cells: set[tuple[int, int]] = set()
+    cell_count = 0
+    max_row = 0
+    max_column = 0
     for record_id, payload in _records(data):
         if record_id == _ROW_RECORD:
             if len(payload) < 4:
@@ -230,25 +298,74 @@ def _worksheet_formula_cells(data: bytes, sheet_name: str) -> frozenset[tuple[in
             row = int.from_bytes(payload[:4], "little")
             if row > _MAX_ROW:
                 raise XlsbFormulaScanError(f"{sheet_name}: row {row} is out of bounds")
-        elif record_id in _FORMULA_RECORDS:
+        elif record_id == _DIMENSION_RECORD:
+            if len(payload) < 16:
+                raise XlsbFormulaScanError(
+                    f"{sheet_name}: truncated BrtWsDim record"
+                )
+            first_row = int.from_bytes(payload[0:4], "little")
+            last_row = int.from_bytes(payload[4:8], "little")
+            first_column = int.from_bytes(payload[8:12], "little")
+            last_column = int.from_bytes(payload[12:16], "little")
+            if first_row > last_row or last_row > _MAX_ROW:
+                raise XlsbFormulaScanError(
+                    f"{sheet_name}: worksheet row dimensions are out of bounds"
+                )
+            if first_column > last_column or last_column > _MAX_COLUMN:
+                raise XlsbFormulaScanError(
+                    f"{sheet_name}: worksheet column dimensions are out of bounds"
+                )
+            max_row = max(max_row, last_row + 1)
+            max_column = max(max_column, last_column + 1)
+        elif record_id in _RETAINED_CELL_RECORDS:
             if row is None:
                 raise XlsbFormulaScanError(
-                    f"{sheet_name}: formula record appears before a row header"
+                    f"{sheet_name}: cell record appears before a row header"
                 )
             if len(payload) < 4:
-                raise XlsbFormulaScanError(f"{sheet_name}: truncated formula cell record")
+                raise XlsbFormulaScanError(f"{sheet_name}: truncated cell record")
             column = int.from_bytes(payload[:4], "little")
             if column > _MAX_COLUMN:
                 raise XlsbFormulaScanError(
                     f"{sheet_name}: column {column} is out of bounds"
                 )
+            cell_count += 1
+            max_row = max(max_row, row + 1)
+            max_column = max(max_column, column + 1)
+            if record_id not in _FORMULA_RECORDS:
+                continue
             coordinate = (row + 1, column + 1)
             if coordinate in cells:
                 raise XlsbFormulaScanError(
                     f"{sheet_name}: duplicate formula cell at {coordinate}"
                 )
             cells.add(coordinate)
-    return frozenset(cells)
+    return frozenset(cells), XlsbWorksheetMetrics(
+        cell_count=cell_count,
+        max_row=max_row,
+        max_column=max_column,
+        binary_bytes=len(data),
+    )
+
+
+def _package_part_bytes(archive: zipfile.ZipFile, part: str) -> int:
+    normalized = part.casefold()
+    return sum(
+        info.file_size
+        for info in archive.infolist()
+        if info.filename.replace("\\", "/").casefold() == normalized
+    )
+
+
+def _package_worksheet_bytes(archive: zipfile.ZipFile) -> int:
+    return sum(
+        info.file_size
+        for info in archive.infolist()
+        if (name := info.filename.replace("\\", "/").casefold()).startswith(
+            "xl/worksheets/"
+        )
+        and name.endswith(".bin")
+    )
 
 
 def _risky_features(
@@ -297,8 +414,10 @@ def scan_xlsb_formulas(data: bytes) -> XlsbFormulaScan:
             except KeyError as exc:
                 raise XlsbFormulaScanError("missing required XLSB part xl/workbook.bin") from exc
 
+            sheets = _workbook_sheets(workbook_data)
             formula_cells: dict[str, frozenset[tuple[int, int]]] = {}
-            for sheet_name, relationship_id in _workbook_sheets(workbook_data):
+            worksheet_metrics: dict[str, XlsbWorksheetMetrics] = {}
+            for sheet_name, relationship_id in sheets:
                 relationship = relationships.get(relationship_id)
                 if relationship is None:
                     raise XlsbFormulaScanError(
@@ -306,6 +425,7 @@ def scan_xlsb_formulas(data: bytes) -> XlsbFormulaScan:
                     )
                 if relationship.kind != "worksheet":
                     formula_cells[sheet_name] = frozenset()
+                    worksheet_metrics[sheet_name] = XlsbWorksheetMetrics()
                     continue
                 try:
                     sheet_data = archive.read(relationship.target)
@@ -313,11 +433,20 @@ def scan_xlsb_formulas(data: bytes) -> XlsbFormulaScan:
                     raise XlsbFormulaScanError(
                         f"sheet {sheet_name!r} is missing part {relationship.target!r}"
                     ) from exc
-                formula_cells[sheet_name] = _worksheet_formula_cells(sheet_data, sheet_name)
+                formulas, metrics = _worksheet_scan(sheet_data, sheet_name)
+                formula_cells[sheet_name] = formulas
+                worksheet_metrics[sheet_name] = metrics
 
             return XlsbFormulaScan(
                 formula_cells=formula_cells,
                 risky_features=_risky_features(archive, relationships),
+                worksheet_metrics=worksheet_metrics,
+                package_worksheet_binary_bytes=_package_worksheet_bytes(archive),
+                shared_string_bytes=_package_part_bytes(
+                    archive, "xl/sharedStrings.bin"
+                ),
+                styles_bytes=_package_part_bytes(archive, "xl/styles.bin"),
+                sheet_count=len(sheets),
             )
     except zipfile.BadZipFile as exc:
         raise XlsbFormulaScanError("invalid XLSB ZIP package") from exc

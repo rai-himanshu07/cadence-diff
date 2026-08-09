@@ -285,3 +285,26 @@ def test_period_regression_is_not_refresh() -> None:
     changed = _by_class(findings, FindingClass.VALUE_CHANGED)
     assert changed, "both changes must be reported"
     assert all(not f.expected_growth for f in changed)  # nothing excused
+
+
+def test_blank_to_blank_transitions_are_not_value_changes() -> None:
+    """User decision 2026-08-09: absent vs blank cells render identically."""
+    from qc_tool.config.profile import NumericTolerance
+    from qc_tool.excel.diff_values import _values_differ
+    from qc_tool.io.model import CellRecord, CellValue
+
+    tolerance = NumericTolerance()
+
+    def cell(value: CellValue) -> CellRecord:
+        return CellRecord(row=1, column=1, value=value)
+
+    # every blank pairing is silent: absent, None-valued, empty, whitespace
+    assert not _values_differ(None, cell(""), tolerance)
+    assert not _values_differ(cell(""), None, tolerance)
+    assert not _values_differ(cell(None), cell("   "), tolerance)
+    assert not _values_differ(cell(" "), cell(""), tolerance)
+    # blank against substance still fires, in both directions
+    assert _values_differ(None, cell("x"), tolerance)
+    assert _values_differ(cell(""), cell("x"), tolerance)
+    assert _values_differ(cell(0), cell(""), tolerance)
+    assert _values_differ(None, cell(0), tolerance)

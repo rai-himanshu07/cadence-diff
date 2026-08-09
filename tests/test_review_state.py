@@ -9,10 +9,12 @@ from qc_tool.findings import (
     FindingClass,
     FindingEvidenceTag,
     FindingExpectedReason,
+    SeriesAnchorV1,
     Severity,
 )
 from qc_tool.history.review_state import (
     FINDING_EVIDENCE_FIELDS,
+    EvidenceFieldRole,
     finding_evidence_digest,
 )
 from qc_tool.history.store import RunHistory
@@ -45,6 +47,29 @@ def _finding() -> Finding:
 
 def test_every_finding_field_has_an_evidence_role() -> None:
     assert set(FINDING_EVIDENCE_FIELDS) == set(Finding.model_fields)
+
+
+def test_series_anchor_is_private_and_never_enters_evidence_or_public_json() -> None:
+    finding = _finding()
+    digest = finding_evidence_digest(finding)
+    payload = finding.model_dump(mode="json")
+
+    anchored = finding.model_copy(
+        update={
+            "series_anchor": SeriesAnchorV1(
+                sheet="Data",
+                current_region_id="Data!A1:D9",
+                period_axis="rows",
+                series_index=2,
+                period_index=2,
+            )
+        }
+    )
+
+    assert FINDING_EVIDENCE_FIELDS["series_anchor"] is EvidenceFieldRole.EXCLUDED
+    assert finding_evidence_digest(anchored) == digest
+    assert anchored.model_dump(mode="json") == payload
+    assert "series_anchor" not in payload
 
 
 def test_evidence_digest_ignores_prose_ids_analyst_state_and_collection_order() -> None:

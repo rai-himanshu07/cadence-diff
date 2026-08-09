@@ -223,7 +223,11 @@ class ProfileDraft:
         self.dirty = True
 
     def set_mapping(self, path: DraftPath, key: str, value: object) -> None:
-        mapping = self.get(path)
+        try:
+            mapping = self.get(path)
+        except KeyError:
+            self.set(path, {})
+            mapping = self.get(path)
         if not isinstance(mapping, dict):
             raise TypeError("draft path is not a mapping")
         key = key.strip()

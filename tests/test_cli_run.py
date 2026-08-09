@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from qc_tool import cli
+from qc_tool.history.store import RunHistory
 
 
 def _run(args: list[str]) -> int:
@@ -124,8 +125,6 @@ def test_password_role_syntax(fixture_dir: Path, tmp_path: Path, manifest) -> No
 
 
 def test_run_records_history(fixture_dir: Path, tmp_path: Path) -> None:
-    from qc_tool.history.store import RunHistory
-
     data_dir = tmp_path / "data"
     _run(
         [
@@ -137,6 +136,127 @@ def test_run_records_history(fixture_dir: Path, tmp_path: Path) -> None:
     runs = RunHistory(data_dir / "history.sqlite3").list_runs()
     assert len(runs) == 1
     assert runs[0].files["current_excel"] == "current.xlsx"
+
+
+def test_repeatable_current_workbook_flag_records_member_manifest_and_v2_json(
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    output = tmp_path / "package.json"
+
+    code = _run(
+        [
+            "--current-workbook",
+            f"ops={fixture_dir / 'current.xlsx'}",
+            "--data-dir",
+            str(data_dir),
+            "--json",
+            str(output),
+            "--fail-on",
+            "never",
+        ]
+    )
+
+    record = RunHistory(data_dir / "history.sqlite3").get_run(1)
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert code == 0
+    assert record.files == {"current_excel:ops": "current.xlsx"}
+    assert record.package_manifest is not None
+    assert record.package_manifest.role_keys == ("current_excel:ops",)
+    assert payload["schema_version"] == 2
+    assert payload["package_manifest"]["members"][0]["member_id"] == "ops"
+
+
+def test_duplicate_or_reserved_cli_member_id_fails_before_recording(
+    fixture_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "data"
+    source = fixture_dir / "current.xlsx"
+
+    duplicate = _run(
+        [
+            "--current-workbook",
+            f"ops={source}",
+            "--current-workbook",
+            f"ops={source}",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    duplicate_error = capsys.readouterr().err
+    reserved = _run(
+        [
+            "--current-workbook",
+            f"primary={source}",
+            "--data-dir",
+            str(data_dir),
+        ]
+    )
+    reserved_error = capsys.readouterr().err
+
+    assert duplicate == 1
+    assert "duplicate member role current_excel:ops" in duplicate_error
+    assert reserved == 1
+    assert "member id 'primary' uses --baseline-excel/--current-excel" in (
+        reserved_error
+    )
+    assert not (data_dir / "history.sqlite3").exists()
+
+
+def test_byte_identical_cycle_refuses_before_reports_or_history(
+    fixture_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = fixture_dir / "current.xlsx"
+    data_dir = tmp_path / "data"
+
+    code = _run(
+        [
+            "--baseline-excel",
+            str(source),
+            "--current-excel",
+            str(source),
+            "--data-dir",
+            str(data_dir),
+            "--fail-on",
+            "never",
+        ]
+    )
+
+    assert code == 1
+    assert "byte-identical" in capsys.readouterr().err
+    assert not (data_dir / "history.sqlite3").exists()
+    assert not list((data_dir / "runs").glob("*/qc_report.*"))
+
+
+def test_same_side_duplicate_member_bytes_refuse_before_history(
+    fixture_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = fixture_dir / "current.xlsx"
+    data_dir = tmp_path / "data"
+
+    code = _run(
+        [
+            "--current-workbook",
+            f"core={source}",
+            "--current-workbook",
+            f"ops={source}",
+            "--data-dir",
+            str(data_dir),
+            "--fail-on",
+            "never",
+        ]
+    )
+
+    assert code == 1
+    assert "duplicate bytes" in capsys.readouterr().err.casefold()
+    assert not (data_dir / "history.sqlite3").exists()
 
 
 def test_invalid_mode_combination_returns_clean_error(

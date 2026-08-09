@@ -14,9 +14,8 @@ from pathlib import Path
 from qc_tool.config.profile import DeliverableProfile, NumericTolerance
 from qc_tool.coverage import QCRunMode
 from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings, run_qc
-from qc_tool.focus.model import FocusTargetSeed
-from qc_tool.focus.targets import build_focus_targets
-from qc_tool.history.store import RunHistory, sha256_file
+from qc_tool.history.store import RunHistory
+from qc_tool.package import PackageManifest, paths_by_member
 from qc_tool.progress import (
     CancellationToken,
     ProgressCallback,
@@ -26,9 +25,21 @@ from qc_tool.progress import (
 )
 from qc_tool.report.excel_report import write_excel_report
 from qc_tool.report.html_report import write_html_report
+from qc_tool.run_preflight import (
+    hash_run_files,
+    reject_duplicate_bytes,
+    verify_run_file_hashes,
+)
 from qc_tool.security import private_directory
 
 logger = logging.getLogger(__name__)
+
+#: Reports are on-demand everywhere (user decision 2026-08-09): the queue
+#: worker never writes them at run time — the run page generates and stores
+#: them on request. Only explicit ``write_reports=True`` callers (the CLI,
+#: whose report files ARE the output) write eagerly. This constant remains
+#: the budget for run-completion extras such as the re-QC delta.
+REPORT_DEFER_FINDINGS = 50_000
 
 
 @dataclass(slots=True)
@@ -38,20 +49,6 @@ class RunArtifacts:
     report_paths: dict[str, Path]
     rerun_of: int | None = None
     delta: FindingsDelta | None = None
-
-
-def _focus_targets(
-    result: QCRunResult, file_hashes: dict[str, str]
-) -> dict[str, tuple[FocusTargetSeed, ...]]:
-    """Private desktop-focus locators; a failure here never fails the QC run."""
-    try:
-        return build_focus_targets(
-            result.findings, mode=result.mode, file_hashes=file_hashes
-        )
-    except Exception:
-        # Fixed code only: never log locators, paths, values, or exception text.
-        logger.warning("focus-target-generation-failed")
-        return {}
 
 
 def perform_run(
@@ -69,8 +66,15 @@ def perform_run(
     compare_slides: list[int] | None = None,
     cancellation_token: CancellationToken | None = None,
     on_progress: ProgressCallback | None = None,
+    package_manifest: PackageManifest | dict[str, object] | None = None,
+    compare_member_sheets: dict[str, tuple[str, ...]] | None = None,
+    write_reports: bool = False,
 ) -> RunArtifacts:
-    """Run QC, write both reports, and record the run in history."""
+    """Run QC, record the run in history, and defer reports to on-demand.
+
+    Reports are generated from the run page when actually needed;
+    ``write_reports=True`` (the CLI) writes them eagerly at run time.
+    """
     if acceptance_absolute < 0 or acceptance_relative < 0:
         raise ValueError("acceptance thresholds cannot be negative")
     run_acceptance = (
@@ -78,54 +82,89 @@ def perform_run(
         if acceptance_absolute > 0 or acceptance_relative > 0
         else None
     )
-    password_by_file = {
-        files[role].name: password
+    credentials = {
+        role: password
         for role, password in passwords.items()
         if role in files and password
     }
+    manifest_obj = (
+        PackageManifest.from_role_files(files)
+        if package_manifest is None
+        else (
+            package_manifest
+            if isinstance(package_manifest, PackageManifest)
+            else PackageManifest.model_validate(package_manifest)
+        )
+    )
+    paths_by_member(files, manifest_obj)
+    file_hashes = hash_run_files(files, cancellation_token=cancellation_token)
+    reject_duplicate_bytes(mode, files, file_hashes)
+
     result = run_qc(
         baseline_excel=files.get("baseline_excel"),
         current_excel=files.get("current_excel"),
         baseline_ppt=files.get("baseline_ppt"),
         current_ppt=files.get("current_ppt"),
         profile=profile,
-        passwords=password_by_file,
+        passwords=credentials,
         mode=mode,
         allow_large_workbooks=allow_large_workbooks,
         run_acceptance=run_acceptance,
         compare_sheets=compare_sheets,
         compare_slides=compare_slides,
+        package_manifest=manifest_obj,
+        package_files=files,
+        compare_member_sheets={
+            key: tuple(value)
+            for key, value in (compare_member_sheets or {}).items()
+        },
         cancellation_token=cancellation_token,
         on_progress=on_progress,
     )
     check_cancelled(cancellation_token)
-    runs_dir = private_directory(work_dir / "runs")
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S.%fZ-")
-    run_dir = Path(tempfile.mkdtemp(prefix=stamp, dir=runs_dir))
-    private_directory(run_dir)
-    report_paths = {
-        "excel": run_dir / "qc_report.xlsx",
-        "html": run_dir / "qc_report.html",
-    }
+    verify_run_file_hashes(
+        files,
+        file_hashes,
+        cancellation_token=cancellation_token,
+    )
+    defer_reports = not write_reports
+    report_paths: dict[str, Path] = {}
+    run_dir: Path | None = None
+    if not defer_reports:
+        runs_dir = private_directory(work_dir / "runs")
+        stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S.%fZ-")
+        run_dir = Path(tempfile.mkdtemp(prefix=stamp, dir=runs_dir))
+        private_directory(run_dir)
+        report_paths = {
+            "excel": run_dir / "qc_report.xlsx",
+            "html": run_dir / "qc_report.html",
+        }
     recorded = False
     try:
-        report_progress(on_progress, RunPhase.WRITING_REPORTS, total=2)
-        write_excel_report(result, report_paths["excel"])
-        check_cancelled(cancellation_token)
-        report_progress(
-            on_progress,
-            RunPhase.WRITING_REPORTS,
-            processed=1,
-            total=2,
-        )
-        write_html_report(result, report_paths["html"])
-        check_cancelled(cancellation_token)
-        report_progress(
-            on_progress,
-            RunPhase.WRITING_REPORTS,
-            processed=2,
-            total=2,
-        )
+        if defer_reports:
+            # Reports generate on demand from the run page; the phase is
+            # reported complete so progress consumers see every stage.
+            report_progress(
+                on_progress, RunPhase.WRITING_REPORTS, processed=2, total=2
+            )
+        else:
+            report_progress(on_progress, RunPhase.WRITING_REPORTS, total=2)
+            write_excel_report(result, report_paths["excel"])
+            check_cancelled(cancellation_token)
+            report_progress(
+                on_progress,
+                RunPhase.WRITING_REPORTS,
+                processed=1,
+                total=2,
+            )
+            write_html_report(result, report_paths["html"])
+            check_cancelled(cancellation_token)
+            report_progress(
+                on_progress,
+                RunPhase.WRITING_REPORTS,
+                processed=2,
+                total=2,
+            )
 
         report_progress(on_progress, RunPhase.RECORDING_HISTORY, total=1)
         history = RunHistory(work_dir / "history.sqlite3")
@@ -133,22 +172,22 @@ def perform_run(
         if rerun_of is not None:
             try:
                 previous = history.get_run(rerun_of)
-                delta = compare_findings(previous.findings, result.findings)
+                # The delta banner walks both runs finding by finding;
+                # monster re-QCs skip it (the run page says so too).
+                if (
+                    len(previous.findings) <= REPORT_DEFER_FINDINGS
+                    and len(result.findings) <= REPORT_DEFER_FINDINGS
+                ):
+                    delta = compare_findings(previous.findings, result.findings)
             except KeyError:
                 logger.warning("re-QC referenced missing run %s", rerun_of)
                 rerun_of = None
-        file_hashes: dict[str, str] = {}
-        for role, path in files.items():
-            check_cancelled(cancellation_token)
-            file_hashes[role] = sha256_file(path)
-        check_cancelled(cancellation_token)
         run_id = history.record_run(
             result,
             file_hashes=file_hashes,
             report_paths={kind: str(path) for kind, path in report_paths.items()},
             file_paths={role: str(path) for role, path in files.items()},
             rerun_of=rerun_of,
-            focus_targets=_focus_targets(result, file_hashes),
             profile_snapshot=profile,
         )
         recorded = True
@@ -160,7 +199,7 @@ def perform_run(
         )
         report_progress(on_progress, RunPhase.COMPLETE, processed=1, total=1)
     except BaseException:
-        if not recorded:
+        if not recorded and run_dir is not None:
             shutil.rmtree(run_dir, ignore_errors=True)
         raise
     return RunArtifacts(

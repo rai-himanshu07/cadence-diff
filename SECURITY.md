@@ -2,8 +2,7 @@
 
 ## Supported Versions
 
-Security fixes are provided for the latest stable `0.1.x` release and the
-current `0.2` alpha while the project remains in alpha.
+Security fixes are provided for the latest stable `1.x` release line.
 
 ## Reporting a Vulnerability
 

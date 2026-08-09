@@ -27,6 +27,7 @@ presence safely enables hardcode, removal, and missing fill checks; semantic
 logic and consistency checks require compatible decoded text on both sides.
 """
 
+import difflib
 import hashlib
 import logging
 import re
@@ -34,11 +35,17 @@ from collections import Counter
 from dataclasses import dataclass
 
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
 
 from qc_tool.availability import cell_in_ranges, excel_blank_allowed
 from qc_tool.config.profile import DeliverableProfile, SheetProfile
 from qc_tool.excel.align import RegionAlignment, WorkbookAlignment
-from qc_tool.excel.formula_tokens import formula_reference_operands, tokenize_formula
+from qc_tool.excel.formula_tokens import (
+    FormulaDiffKind,
+    FormulaDiffSegment,
+    formula_reference_operands,
+    tokenize_formula,
+)
 from qc_tool.findings import (
     Finding,
     FindingClass,
@@ -1017,3 +1024,94 @@ def diff_workbook_formulas(
                 _extension_findings(curr_sheet, region, sheet_profile)
             )
     return findings
+
+
+def formula_token_diff(
+    baseline_formula: str | None,
+    current_formula: str | None,
+    baseline_location: str,
+    current_location: str,
+) -> tuple[FormulaDiffSegment, ...]:
+    """Compute a token-level diff of two original formula texts.
+
+    Returns an empty tuple on any parse/validation problem. The returned
+    segments are coalesced by kind and always prefixed by a single '=' equal
+    segment when non-empty.
+    """
+    try:
+        if not baseline_formula or not current_formula:
+            return ()
+        if not (baseline_formula.startswith("=") and current_formula.startswith("=")):
+            return ()
+        try:
+            base_row, base_col = coordinate_to_tuple(baseline_location)
+            curr_row, curr_col = coordinate_to_tuple(current_location)
+        except Exception:
+            return ()
+        try:
+            base_tokens = tokenize_formula(baseline_formula)
+            curr_tokens = tokenize_formula(current_formula)
+        except Exception:
+            return ()
+
+        def _keys_texts(tokens, host_row, host_col):
+            keys: list[tuple[str, str, str]] = []
+            texts: list[str] = []
+            for t in tokens:
+                if t.type == "OPERAND" and t.subtype == "RANGE":
+                    normalized = _range_token_to_r1c1(t.value, host_row, host_col)
+                    key = normalized.casefold()
+                    keys.append((t.type, t.subtype, key))
+                    texts.append(normalized)
+                else:
+                    text = t.value
+                    key = (
+                        text
+                        if t.type == "OPERAND" and t.subtype == "TEXT"
+                        else text.casefold()
+                    )
+                    keys.append((t.type, t.subtype, key))
+                    texts.append(text)
+            return keys, texts
+
+        base_keys, base_texts = _keys_texts(base_tokens, base_row, base_col)
+        curr_keys, curr_texts = _keys_texts(curr_tokens, curr_row, curr_col)
+
+        matcher = difflib.SequenceMatcher(a=base_keys, b=curr_keys, autojunk=False)
+        segments: list[FormulaDiffSegment] = []
+        # prefix one leading '=' equal segment
+        segments.append(FormulaDiffSegment("=", FormulaDiffKind.EQUAL))
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                text = "".join(curr_texts[j1:j2])
+                if text:
+                    segments.append(FormulaDiffSegment(text, FormulaDiffKind.EQUAL))
+            elif tag == "delete":
+                text = "".join(base_texts[i1:i2])
+                if text:
+                    segments.append(FormulaDiffSegment(text, FormulaDiffKind.REMOVED))
+            elif tag == "insert":
+                text = "".join(curr_texts[j1:j2])
+                if text:
+                    segments.append(FormulaDiffSegment(text, FormulaDiffKind.ADDED))
+            elif tag == "replace":
+                text_b = "".join(base_texts[i1:i2])
+                text_c = "".join(curr_texts[j1:j2])
+                if text_b:
+                    segments.append(FormulaDiffSegment(text_b, FormulaDiffKind.REMOVED))
+                if text_c:
+                    segments.append(FormulaDiffSegment(text_c, FormulaDiffKind.ADDED))
+
+        # coalesce adjacent segments of same kind
+        coalesced: list[FormulaDiffSegment] = []
+        for seg in segments:
+            if coalesced and coalesced[-1].kind is seg.kind:
+                coalesced[-1] = FormulaDiffSegment(
+                    coalesced[-1].text + seg.text,
+                    coalesced[-1].kind,
+                )
+            else:
+                coalesced.append(seg)
+        return tuple(coalesced)
+    except Exception:
+        return ()

@@ -27,7 +27,9 @@ from qc_tool.io.formula_enrichment import FormulaExtraction
 from qc_tool.io.loader import (
     OOXMLWorkloadError,
     UnsupportedFormatError,
+    XLSBWorkloadError,
     _assess_ooxml_workload,
+    _assess_xlsb_workload,
     _load_ooxml_oracle,
     _load_ooxml_streaming,
     _parse_pivots,
@@ -39,6 +41,11 @@ from qc_tool.io.ooxml_worksheet import (
     WorkbookMetadata,
     WorksheetMetadata,
     parse_ooxml_worksheet_metadata,
+)
+from qc_tool.io.xlsb_formula import (
+    XlsbFormulaScan,
+    XlsbFormulaScanError,
+    XlsbWorksheetMetrics,
 )
 from tests.fixtures.manifest_schema import FixtureManifest
 from tests.fixtures.xlsb_writer import _record, write_xlsb
@@ -201,6 +208,33 @@ def test_ooxml_workload_preflight_rejects_sparse_pathological_area() -> None:
             source_name="sparse.xlsx",
             allow_large_workbook=False,
         )
+
+
+def test_xlsb_workload_preflight_warns_without_requiring_override() -> None:
+    scan = XlsbFormulaScan(
+        formula_cells={"Data": frozenset()},
+        worksheet_metrics={
+            "Data": XlsbWorksheetMetrics(
+                cell_count=2_500_000,
+                max_row=250_000,
+                max_column=10,
+                binary_bytes=100 * 1024 * 1024,
+            )
+        },
+        sheet_count=1,
+    )
+
+    workload = _assess_xlsb_workload(
+        scan,
+        source_name="large.xlsb",
+        allow_large_workbook=False,
+    )
+
+    assert workload.degraded
+    assert not workload.override_used
+    assert workload.warning_reasons == (
+        "retained cells 2,500,000 >= warning limit 2,500,000",
+    )
 
 
 def test_sources_unmodified_by_loading(fixture_dir: Path, manifest: FixtureManifest) -> None:
@@ -896,6 +930,72 @@ def test_xlsb_snapshot(fixture_dir: Path, manifest: FixtureManifest) -> None:
     assert cell is not None and cell.value == float(xb01.current or "")
     assert cell.formula is None and cell.style_key is None
     assert cell.is_formula is False and not cell.has_formula
+    assert snap.workload.metrics_available
+    assert snap.workload.format == "xlsb"
+    assert snap.workload.cell_count == len(sheet.cells)
+    assert "BIFF12" in snap.workload.detail
+
+
+def test_xlsb_scan_failure_preserves_cached_values_and_marks_metrics_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "degraded.xlsb"
+    write_xlsb(path, {"Data": [["Label", 42.0]]})
+
+    def reject_scan(_data: bytes) -> XlsbFormulaScan:
+        raise XlsbFormulaScanError("synthetic structural scan failure")
+
+    monkeypatch.setattr(loader_module, "scan_xlsb_formulas", reject_scan)
+
+    snapshot = load_workbook_snapshot(path)
+    cell = snapshot.sheet("Data").cell("B1")
+
+    assert cell is not None and cell.value == 42.0
+    assert not snapshot.formula_presence_available
+    assert not snapshot.workload.metrics_available
+    assert snapshot.workload.detail == "XLSB workload metrics unavailable"
+
+
+def test_xlsb_workload_refuses_before_materialization_and_override_is_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "large.xlsb"
+    write_xlsb(path, {"Data": [[1.0]]})
+    scan = XlsbFormulaScan(
+        formula_cells={"Data": frozenset()},
+        worksheet_metrics={
+            "Data": XlsbWorksheetMetrics(
+                cell_count=5_000_000,
+                max_row=500_000,
+                max_column=10,
+                binary_bytes=200 * 1024 * 1024,
+            )
+        },
+        sheet_count=1,
+    )
+    monkeypatch.setattr(loader_module, "scan_xlsb_formulas", lambda _data: scan)
+    real_open_xlsb = loader_module.open_xlsb
+    materialized = False
+
+    def tracked_open_xlsb(*args: Any, **kwargs: Any) -> Any:
+        nonlocal materialized
+        materialized = True
+        return real_open_xlsb(*args, **kwargs)
+
+    monkeypatch.setattr(loader_module, "open_xlsb", tracked_open_xlsb)
+
+    with pytest.raises(XLSBWorkloadError, match="retained cells"):
+        load_workbook_snapshot(path)
+
+    assert not materialized
+    snapshot = load_workbook_snapshot(path, allow_large_workbook=True)
+
+    assert materialized
+    assert snapshot.workload.override_used
+    assert snapshot.workload.cell_count == 5_000_000
+    assert "override accepted" in snapshot.workload.detail
 
 
 def test_xlsb_enrichment_preserves_original_cached_value(

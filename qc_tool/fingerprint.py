@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 
 from openpyxl.utils.cell import range_boundaries
@@ -15,6 +16,12 @@ from qc_tool.excel.periods import parse_period
 from qc_tool.excel.regions import detect_regions
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.model import CellRecord, WorkbookSnapshot, display_cell_value
+from qc_tool.package import (
+    PackageManifest,
+    PackageMember,
+    paths_by_member,
+    structural_member_aliases,
+)
 from qc_tool.ppt.extract import DeckSnapshot, load_deck_snapshot
 from qc_tool.security import private_directory, private_file
 
@@ -361,8 +368,73 @@ def fingerprint_file(path: Path, *, password: str | None = None) -> dict:
     }
 
 
+def package_fingerprint(
+    package_files: Mapping[str, Path],
+    package_manifest: PackageManifest,
+    *,
+    passwords: Mapping[str, str] | None = None,
+) -> dict:
+    """Fingerprint an exact package topology without source member identifiers."""
+    paths_by_member(package_files, package_manifest)
+    aliases = structural_member_aliases(package_manifest)
+
+    redacted_members: list[PackageMember] = []
+    fingerprints: list[dict[str, object]] = []
+    credentials = passwords or {}
+    for member in package_manifest.members:
+        alias = aliases[(member.artifact, member.member_id)]
+        redacted = PackageMember(
+            member_id=alias,
+            side=member.side,
+            artifact=member.artifact,
+            display_name=f"{alias}.office",
+        )
+        redacted_members.append(redacted)
+        fingerprints.append(
+            {
+                "role": redacted.role_key,
+                "fingerprint": fingerprint_file(
+                    package_files[member.role_key],
+                    password=credentials.get(member.role_key),
+                ),
+            }
+        )
+    redacted_manifest = PackageManifest(members=tuple(redacted_members))
+    payload = {
+        "schema_version": 2,
+        "schema": "https://cadence-diff.local/schema/package-fingerprint-v2.json",
+        "artifact": "package",
+        "format": "package",
+        "package_manifest": redacted_manifest.model_dump(mode="json"),
+        "members": fingerprints,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {
+        **payload,
+        "fingerprint_id": hashlib.sha256(canonical.encode()).hexdigest(),
+    }
+
+
 def write_fingerprint(path: Path, output: Path, *, password: str | None = None) -> dict:
     payload = fingerprint_file(path, password=password)
+    private_directory(output.parent)
+    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    private_file(output)
+    return payload
+
+
+def write_package_fingerprint(
+    package_files: Mapping[str, Path],
+    package_manifest: PackageManifest,
+    output: Path,
+    *,
+    passwords: Mapping[str, str] | None = None,
+) -> dict:
+    payload = package_fingerprint(
+        package_files,
+        package_manifest,
+        passwords=passwords,
+    )
     private_directory(output.parent)
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     private_file(output)

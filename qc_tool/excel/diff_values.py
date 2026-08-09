@@ -8,7 +8,8 @@ entirely.
 """
 
 import logging
-from collections.abc import Iterable
+import math
+from collections.abc import Iterable, Iterator
 
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
@@ -36,6 +37,8 @@ from qc_tool.findings import (
     FindingExpectedReason,
     FindingSubtype,
     FindingTemporalContext,
+    NumericCounterfactualBasis,
+    SeriesAnchorV2,
 )
 from qc_tool.io.model import (
     CellRecord,
@@ -118,10 +121,12 @@ class _AcceptanceBands:
 def _values_differ(
     base: CellRecord | None, curr: CellRecord | None, tolerance: NumericTolerance
 ) -> bool:
+    # An absent cell and a blank one render identically; suppressing the
+    # pair kills the ''->'' noise class (user decision 2026-08-09).
+    if _is_blank(base) and _is_blank(curr):
+        return False
     base_value = base.value if base else None
     curr_value = curr.value if curr else None
-    if base_value is None and curr_value is None:
-        return False
     if isinstance(base_value, int | float) and isinstance(curr_value, int | float):
         if isinstance(base_value, bool) or isinstance(curr_value, bool):
             return base_value != curr_value
@@ -146,6 +151,13 @@ def _both_numeric(base_value: object, curr_value: object) -> bool:
         and not isinstance(base_value, bool)
         and not isinstance(curr_value, bool)
     )
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    converted = float(value)
+    return converted if math.isfinite(converted) else None
 
 
 def _period_advanced(base_value: object, curr_value: object) -> bool:
@@ -190,7 +202,34 @@ def diff_region_values(
     windows: RestatementWindows | None = None,
     run_acceptance: NumericTolerance | None = None,
 ) -> list[Finding]:
-    findings: list[Finding] = []
+    return list(
+        iter_region_value_findings(
+            base_sheet,
+            curr_sheet,
+            region,
+            tolerance,
+            ignore=ignore,
+            refresh=refresh,
+            sheet_profile=sheet_profile,
+            windows=windows,
+            run_acceptance=run_acceptance,
+        )
+    )
+
+
+def iter_region_value_findings(
+    base_sheet: SheetSnapshot,
+    curr_sheet: SheetSnapshot,
+    region: RegionAlignment,
+    tolerance: NumericTolerance,
+    *,
+    ignore: _RangeSet,
+    refresh: _RangeSet,
+    sheet_profile: SheetProfile | None,
+    windows: RestatementWindows | None = None,
+    run_acceptance: NumericTolerance | None = None,
+) -> Iterator[Finding]:
+    """Yield the region's cell-level findings in production order."""
     sheet_name = curr_sheet.name
     refresh_block = _is_refresh_block(base_sheet, curr_sheet, region)
     recency_windows = windows if windows is not None else RestatementWindows()
@@ -200,8 +239,8 @@ def diff_region_values(
     )
     temporal_by_position: dict[int, FindingTemporalContext] = {}
     period_axis = region.current.period_axis
+    is_rows_axis = period_axis == "rows"
     if period_axis in ("rows", "columns"):
-        is_rows_axis = period_axis == "rows"
         populated = _data_positions(
             curr_sheet, region.current, is_rows=is_rows_axis
         )
@@ -258,6 +297,7 @@ def diff_region_values(
             materiality = None
             temporal_context = None
             evidence_tags = set()
+            display_format: str | None = None
             if subtype is FindingSubtype.VALUE_REPLACEMENT:
                 display_format = (
                     curr_cell.number_format if curr_cell else None
@@ -296,22 +336,77 @@ def diff_region_values(
             else:
                 expected_reason = None
                 reason = ""
-            findings.append(
-                Finding(
-                    artifact="excel",
-                    finding_class=FindingClass.VALUE_CHANGED,
-                    expected_reason=expected_reason,
-                    subtype=subtype,
-                    materiality=materiality,
-                    temporal_context=temporal_context,
-                    evidence_tags=evidence_tags,
+            basis = None
+            baseline_number = _finite_number(base_value)
+            current_number = _finite_number(curr_value)
+            if (
+                subtype is FindingSubtype.VALUE_REPLACEMENT
+                and materiality is not None
+                and baseline_number is not None
+                and current_number is not None
+            ):
+                basis = NumericCounterfactualBasis(
+                    baseline=baseline_number,
+                    current=current_number,
+                    number_format=display_format,
                     sheet=sheet_name,
                     location=location,
-                    baseline_location=baseline_location,
-                    baseline_value=_display(base_value),
-                    current_value=_display(curr_value),
-                    message=f"{sheet_name}!{location}: {wording}{reason}",
                 )
+
+            # Structural-only continuity anchor. A restatement needs a proved
+            # materiality tier and temporal context. A first-time population
+            # needs a dated period position and a finite numeric current value;
+            # a single-cell clear mirrors that with its baseline value, and only
+            # while sibling measures keep the period position alive — a wiped
+            # period row proves nothing and stays one cross-column event.
+            series_anchor = None
+            if period_axis in ("rows", "columns"):
+                position = curr_row if is_rows_axis else curr_col
+                segment = None
+                if (
+                    subtype is FindingSubtype.VALUE_REPLACEMENT
+                    and materiality is not None
+                    and temporal_context is not None
+                ):
+                    segment = "restatement"
+                elif (
+                    subtype is FindingSubtype.VALUE_ADDED_POPULATION
+                    and position in temporal_by_position
+                    and _finite_number(curr_value) is not None
+                ):
+                    segment = "new_period"
+                elif (
+                    subtype is FindingSubtype.VALUE_CLEARED_POPULATION
+                    and position in temporal_by_position
+                    and _finite_number(base_value) is not None
+                ):
+                    segment = "cleared_period"
+                if segment is not None:
+                    series_anchor = SeriesAnchorV2(
+                        sheet=sheet_name,
+                        current_region_id=region.current.region_id,
+                        period_axis=period_axis,
+                        series_index=curr_col if is_rows_axis else curr_row,
+                        period_index=position,
+                        segment=segment,
+                    )
+
+            yield Finding(
+                artifact="excel",
+                finding_class=FindingClass.VALUE_CHANGED,
+                expected_reason=expected_reason,
+                subtype=subtype,
+                materiality=materiality,
+                temporal_context=temporal_context,
+                evidence_tags=evidence_tags,
+                sheet=sheet_name,
+                location=location,
+                baseline_location=baseline_location,
+                baseline_value=_display(base_value),
+                current_value=_display(curr_value),
+                message=f"{sheet_name}!{location}: {wording}{reason}",
+                counterfactual_basis=basis,
+                series_anchor=series_anchor,
             )
 
         if base_cell is not None and curr_cell is not None:
@@ -320,36 +415,31 @@ def diff_region_values(
                 and curr_cell.number_format is not None
                 and base_cell.number_format != curr_cell.number_format
             ):
-                findings.append(
-                    Finding(
-                        artifact="excel",
-                        finding_class=FindingClass.NUMBER_FORMAT_CHANGED,
-                        sheet=sheet_name,
-                        location=location,
-                        baseline_location=baseline_location,
-                        baseline_value=base_cell.number_format,
-                        current_value=curr_cell.number_format,
-                        message=f"{sheet_name}!{location}: number format changed",
-                    )
+                yield Finding(
+                    artifact="excel",
+                    finding_class=FindingClass.NUMBER_FORMAT_CHANGED,
+                    sheet=sheet_name,
+                    location=location,
+                    baseline_location=baseline_location,
+                    baseline_value=base_cell.number_format,
+                    current_value=curr_cell.number_format,
+                    message=f"{sheet_name}!{location}: number format changed",
                 )
             if (
                 base_cell.style_key is not None
                 and curr_cell.style_key is not None
                 and base_cell.style_key != curr_cell.style_key
             ):
-                findings.append(
-                    Finding(
-                        artifact="excel",
-                        finding_class=FindingClass.STYLE_CHANGED,
-                        sheet=sheet_name,
-                        location=location,
-                        baseline_location=baseline_location,
-                        baseline_value=base_cell.style_key,
-                        current_value=curr_cell.style_key,
-                        message=f"{sheet_name}!{location}: cell style changed",
-                    )
+                yield Finding(
+                    artifact="excel",
+                    finding_class=FindingClass.STYLE_CHANGED,
+                    sheet=sheet_name,
+                    location=location,
+                    baseline_location=baseline_location,
+                    baseline_value=base_cell.style_key,
+                    current_value=curr_cell.style_key,
+                    message=f"{sheet_name}!{location}: cell style changed",
                 )
-    return findings
 
 
 _AXIS_WORDING = {
@@ -581,6 +671,78 @@ def _axis_findings(
     return findings
 
 
+def low_confidence_finding(sheet_name: str, region: RegionAlignment) -> Finding:
+    """The disclosure emitted instead of cell comparison for a weak match."""
+    return Finding(
+        artifact="excel",
+        finding_class=FindingClass.ALIGNMENT_LOW_CONFIDENCE,
+        sheet=sheet_name,
+        location=region.current.cell_range,
+        baseline_location=region.baseline.cell_range,
+        message=(
+            f"{sheet_name} ({region.current.region_id}): key matching "
+            "fell below 50%; cell-level value, format, style, and "
+            "formula comparison was skipped for this region"
+        ),
+    )
+
+
+def iter_region_findings(
+    base_sheet: SheetSnapshot,
+    curr_sheet: SheetSnapshot,
+    region: RegionAlignment,
+    tolerance: NumericTolerance,
+    *,
+    ignore: _RangeSet,
+    refresh: _RangeSet,
+    sheet_profile: SheetProfile | None,
+    windows: RestatementWindows | None = None,
+    run_acceptance: NumericTolerance | None = None,
+) -> Iterator[Finding]:
+    """One aligned region's full production: values, then row/column events."""
+    if region.low_confidence:
+        yield low_confidence_finding(curr_sheet.name, region)
+        return
+    yield from iter_region_value_findings(
+        base_sheet,
+        curr_sheet,
+        region,
+        tolerance,
+        ignore=ignore,
+        refresh=refresh,
+        sheet_profile=sheet_profile,
+        windows=windows,
+        run_acceptance=run_acceptance,
+    )
+    region_id = region.current.region_id
+    yield from _axis_findings(
+        base_sheet,
+        curr_sheet,
+        region,
+        region.rows,
+        is_rows=True,
+        region_id=region_id,
+    )
+    yield from _axis_findings(
+        base_sheet,
+        curr_sheet,
+        region,
+        region.columns,
+        is_rows=False,
+        region_id=region_id,
+    )
+
+
+def region_range_sets(
+    sheet_profile: SheetProfile | None,
+) -> tuple[_RangeSet, _RangeSet]:
+    """The (ignore, refresh) range sets a sheet's regions diff against."""
+    return (
+        _RangeSet(sheet_profile.ignore_ranges if sheet_profile else []),
+        _RangeSet(sheet_profile.refresh_ranges if sheet_profile else []),
+    )
+
+
 def diff_workbook_values(
     baseline: WorkbookSnapshot,
     current: WorkbookSnapshot,
@@ -598,28 +760,11 @@ def diff_workbook_values(
         base_sheet = baseline.sheet(sheet_name)
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name) if profile else None
-        ignore = _RangeSet(sheet_profile.ignore_ranges if sheet_profile else [])
-        refresh = _RangeSet(sheet_profile.refresh_ranges if sheet_profile else [])
+        ignore, refresh = region_range_sets(sheet_profile)
         for region in regions:
             check_cancelled(cancellation_token)
-            if region.low_confidence:
-                findings.append(
-                    Finding(
-                        artifact="excel",
-                        finding_class=FindingClass.ALIGNMENT_LOW_CONFIDENCE,
-                        sheet=sheet_name,
-                        location=region.current.cell_range,
-                        baseline_location=region.baseline.cell_range,
-                        message=(
-                            f"{sheet_name} ({region.current.region_id}): key matching "
-                            "fell below 50%; cell-level value, format, style, and "
-                            "formula comparison was skipped for this region"
-                        ),
-                    )
-                )
-                continue
             findings.extend(
-                diff_region_values(
+                iter_region_findings(
                     base_sheet,
                     curr_sheet,
                     region,
@@ -629,27 +774,6 @@ def diff_workbook_values(
                     sheet_profile=sheet_profile,
                     windows=windows,
                     run_acceptance=run_acceptance,
-                )
-            )
-            region_id = region.current.region_id
-            findings.extend(
-                _axis_findings(
-                    base_sheet,
-                    curr_sheet,
-                    region,
-                    region.rows,
-                    is_rows=True,
-                    region_id=region_id,
-                )
-            )
-            findings.extend(
-                _axis_findings(
-                    base_sheet,
-                    curr_sheet,
-                    region,
-                    region.columns,
-                    is_rows=False,
-                    region_id=region_id,
                 )
             )
     return findings

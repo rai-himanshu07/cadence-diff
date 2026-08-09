@@ -2,7 +2,9 @@
 
 from enum import StrEnum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from qc_tool.package import MEMBER_ID_PATTERN
 
 
 class QCRunMode(StrEnum):
@@ -21,6 +23,11 @@ class CoverageItem(BaseModel):
     check_id: str
     label: str
     artifact: str
+    artifact_member: str = Field(
+        default="primary",
+        pattern=MEMBER_ID_PATTERN,
+        exclude_if=lambda value: value == "primary",
+    )
     state: CoverageState
     findings: int = 0
     detail: str = ""

@@ -8,20 +8,59 @@ and cross-check mapping anchors.
 
 import datetime as dt
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
-from qc_tool.config.profile import DeliverableProfile
+from qc_tool.config.profile import (
+    DeliverableProfile,
+    legacy_excel_profile_is_empty,
+    profile_for_excel_member,
+)
 from qc_tool.crosscheck.trace import extract_deck_figures
 from qc_tool.excel.periods import parse_period
 from qc_tool.excel.references import ReferenceStatus, resolve_reference
+from qc_tool.findings import FindingClass
 from qc_tool.io.model import WorkbookSnapshot
+from qc_tool.package import PackageArtifact, PackageManifest, PackageSide
 from qc_tool.ppt.extract import DeckSnapshot
 
 _SHEET_REF_RE = re.compile(r"^(?:'(?P<quoted>[^']+)'|(?P<plain>[^'!]+))!(?P<ref>.+)$")
 _NAME_RE = re.compile(r"^[A-Za-z_\\][A-Za-z0-9_.\\]*$")
+
+_NON_EXCEL_WAIVER_CLASSES = frozenset(
+    {
+        FindingClass.SLIDE_ADDED,
+        FindingClass.SLIDE_REMOVED,
+        FindingClass.SLIDE_REORDERED,
+        FindingClass.SLIDE_TEXT_CHANGED,
+        FindingClass.TABLE_VALUE_CHANGED,
+        FindingClass.CHART_VALUE_CHANGED,
+        FindingClass.PPT_TABLE_STRUCTURE_CHANGED,
+        FindingClass.PPT_CHART_STRUCTURE_CHANGED,
+        FindingClass.PPT_CHART_PLOT_CHANGED,
+        FindingClass.PPT_CHART_SERIES_CHANGED,
+        FindingClass.PPT_CHART_AXIS_CHANGED,
+        FindingClass.PPT_CHART_LEGEND_CHANGED,
+        FindingClass.PPT_CHART_LABELS_CHANGED,
+        FindingClass.PPT_SHAPE_GEOMETRY_CHANGED,
+        FindingClass.PPT_MEDIA_CHANGED,
+        FindingClass.PPT_DRAFT_TOKEN,
+        FindingClass.PPT_EMPTY_SLIDE,
+        FindingClass.PPT_DUPLICATE_TITLE,
+        FindingClass.PPT_REQUIRED_SLIDE_MISSING,
+        FindingClass.PPT_PERIOD_INCONSISTENT,
+        FindingClass.PPT_REPEATED_CLAIM_MISMATCH,
+        FindingClass.PPT_TABLE_BLANK,
+        FindingClass.PPT_CHART_LENGTH_MISMATCH,
+        FindingClass.PPT_CHART_VALUE_MISSING,
+        FindingClass.CROSSCHECK_MISMATCH,
+        FindingClass.CROSSCHECK_UNRESOLVED,
+        FindingClass.PACKAGE_PERIOD_MISMATCH,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,3 +623,90 @@ def lint_profile(
                 )
             )
     return issues
+
+
+def lint_package_profile(
+    profile: DeliverableProfile,
+    manifest: PackageManifest,
+    *,
+    workbooks: Mapping[str, WorkbookSnapshot] | None = None,
+    deck: DeckSnapshot | None = None,
+) -> list[LintIssue]:
+    """Validate package identity and each current workbook projection."""
+    issues = lint_profile(profile, deck=deck)
+    current_members = manifest.members_for(
+        PackageSide.CURRENT,
+        PackageArtifact.EXCEL,
+    )
+    member_ids = {member.member_id for member in current_members}
+    for member_id in sorted(set(profile.excel.members) - member_ids):
+        issues.append(
+            LintIssue(
+                "error",
+                "excel.members",
+                f"unknown current Excel member {member_id!r}",
+            )
+        )
+    if len(current_members) > 1 and not legacy_excel_profile_is_empty(profile):
+        issues.append(
+            LintIssue(
+                "error",
+                "excel",
+                "legacy unscoped Excel rules are ambiguous; use excel.members",
+            )
+        )
+    for waiver in profile.waivers:
+        if (
+            waiver.finding_class not in _NON_EXCEL_WAIVER_CLASSES
+            and waiver.member not in member_ids
+        ):
+            issues.append(
+                LintIssue(
+                    "error",
+                    "waivers",
+                    f"waiver references unknown current Excel member {waiver.member!r}",
+                )
+            )
+    for mapping in profile.crosscheck.mappings:
+        if mapping.source_member not in member_ids:
+            issues.append(
+                LintIssue(
+                    "error",
+                    "crosscheck.mappings",
+                    "mapping references unknown current Excel member "
+                    f"{mapping.source_member!r}",
+                )
+            )
+
+    workbook_count = len(current_members)
+    for member in current_members:
+        workbook = None if workbooks is None else workbooks.get(member.member_id)
+        if workbooks is not None and workbook is None:
+            issues.append(
+                LintIssue(
+                    "error",
+                    f"excel.members[{member.member_id}]",
+                    "selected workbook was not loaded",
+                )
+            )
+            continue
+        try:
+            projected = profile_for_excel_member(
+                profile,
+                member.member_id,
+                workbook_count,
+            )
+        except ValueError as exc:
+            issues.append(LintIssue("error", "excel", str(exc)))
+            continue
+        projected.crosscheck.mappings = [
+            mapping
+            for mapping in projected.crosscheck.mappings
+            if mapping.source_member == member.member_id
+        ]
+        issues.extend(lint_profile(projected, workbook=workbook))
+
+    unique: dict[tuple[str, str, str], LintIssue] = {}
+    for issue in issues:
+        unique[(issue.level, issue.where, issue.message)] = issue
+    return [unique[key] for key in sorted(unique)]

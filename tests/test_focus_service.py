@@ -176,6 +176,37 @@ def test_an_ambiguous_role_seed_is_not_actionable(tmp_path: Path) -> None:
     assert service.seed(record, "F0001", FocusRole.CURRENT_EXCEL) is None
 
 
+def test_identical_hash_suppression_is_scoped_to_one_member(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    seeds = tuple(
+        FocusTargetSeed(
+            artifact=FocusArtifact.EXCEL,
+            role=role,
+            member_id=member_id,
+            sheet="Data",
+            address="A1",
+        )
+        for member_id in ("core", "ops")
+        for role in (FocusRole.BASELINE_EXCEL, FocusRole.CURRENT_EXCEL)
+    )
+    record = _record(
+        hashes={
+            "baseline_excel:core": "a" * 64,
+            "current_excel:core": "a" * 64,
+            "baseline_excel:ops": "b" * 64,
+            "current_excel:ops": "c" * 64,
+        },
+        seeds={"F0001": seeds},
+    )
+
+    actionable = service.seeds(record, "F0001")
+
+    assert {(seed.role, seed.member_id) for seed in actionable} == {
+        (FocusRole.BASELINE_EXCEL, "ops"),
+        (FocusRole.CURRENT_EXCEL, "ops"),
+    }
+
+
 # --------------------------------------------------------------------------
 # action tokens
 # --------------------------------------------------------------------------
@@ -186,6 +217,23 @@ def test_a_token_is_single_use(tmp_path: Path) -> None:
     token = service.issue_token(CLIENT, 7, "F0001", FocusRole.CURRENT_EXCEL)
     assert isinstance(service.consume_token(CLIENT, token), ActionClaim)
     assert service.consume_token(CLIENT, token) is TokenRejection.UNKNOWN_TOKEN
+
+
+def test_action_token_authorizes_one_exact_member(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    token = service.issue_token(
+        CLIENT,
+        7,
+        "F0001",
+        FocusRole.CURRENT_EXCEL,
+        member_id="ops",
+    )
+
+    claim = service.consume_token(CLIENT, token)
+
+    assert isinstance(claim, ActionClaim)
+    assert claim.role is FocusRole.CURRENT_EXCEL
+    assert claim.member_id == "ops"
 
 
 def test_a_token_expires(tmp_path: Path) -> None:
@@ -314,6 +362,53 @@ async def test_bind_offers_one_document_and_confirmation_creates_the_binding(
         is BindOutcome.MATCHED
     )
     assert service.binding(CLIENT, 7, FocusRole.CURRENT_EXCEL) is not None
+
+
+async def test_non_primary_binding_never_occupies_primary_role_slot(
+    tmp_path: Path,
+    open_workbook: tuple[Path, str],
+) -> None:
+    source, digest = open_workbook
+    navigator, _seen = _navigator(
+        [
+            HelperRun(
+                payload={
+                    "outcome": FocusOutcome.DISCOVERED.value,
+                    "discovery": _payload(_document(source)),
+                }
+            )
+        ]
+    )
+    service = _service(tmp_path / "data", navigator=navigator)
+    seed = FocusTargetSeed(
+        artifact=FocusArtifact.EXCEL,
+        role=FocusRole.CURRENT_EXCEL,
+        member_id="ops",
+        sheet="Summary",
+        address="B5",
+    )
+    record = _record(
+        hashes={"current_excel:ops": digest},
+        seeds={"F0001": (seed,)},
+    )
+
+    report = await service.bind(
+        CLIENT,
+        record,
+        FocusRole.CURRENT_EXCEL,
+        "ops",
+    )
+
+    assert report.offered
+    assert report.role_key == "current_excel:ops"
+    assert service.confirm(
+        CLIENT,
+        record,
+        FocusRole.CURRENT_EXCEL,
+        "ops",
+    ) is BindOutcome.MATCHED
+    assert service.binding(CLIENT, 7, FocusRole.CURRENT_EXCEL) is None
+    assert service.binding(CLIENT, 7, FocusRole.CURRENT_EXCEL, "ops") is not None
 
 
 async def test_focus_requires_a_confirmed_binding(

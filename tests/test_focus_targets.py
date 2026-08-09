@@ -161,6 +161,47 @@ def test_seed_role_and_artifact_must_agree() -> None:
         )
 
 
+def test_v1_sidecar_without_member_id_defaults_to_primary() -> None:
+    raw = json.dumps(
+        {
+            "version": 1,
+            "targets": {
+                "F0001": [
+                    {
+                        "artifact": "excel",
+                        "role": "current_excel",
+                        "sheet": "Data",
+                        "address": "A1",
+                    }
+                ]
+            },
+        }
+    )
+
+    seed = decode_focus_targets(raw).seed("F0001", FocusRole.CURRENT_EXCEL)
+
+    assert seed is not None
+    assert seed.member_id == "primary"
+    assert seed.role_key == "current_excel"
+
+
+def test_v1_sidecar_round_trips_non_primary_member_identity() -> None:
+    seed = FocusTargetSeed(
+        artifact=FocusArtifact.EXCEL,
+        role=FocusRole.CURRENT_EXCEL,
+        member_id="ops",
+        sheet="Data",
+        address="A1",
+    )
+
+    restored = decode_focus_targets(
+        encode_focus_targets({"F0001": (seed,)})
+    ).seed("F0001", FocusRole.CURRENT_EXCEL, "ops")
+
+    assert restored == seed
+    assert restored is not None and restored.role_key == "current_excel:ops"
+
+
 # --------------------------------------------------------------------------
 # target matrix
 # --------------------------------------------------------------------------
@@ -184,6 +225,48 @@ def test_changed_excel_cell_seeds_both_sides() -> None:
         (FocusRole.CURRENT_EXCEL, "Summary", "B5"),
         (FocusRole.BASELINE_EXCEL, "Summary", "B4"),
     }
+
+
+def test_changed_excel_cell_uses_exact_member_role_hashes() -> None:
+    finding = Finding(
+        artifact="excel",
+        artifact_member="ops",
+        finding_class=FindingClass.VALUE_CHANGED,
+        sheet="Summary",
+        location="B5",
+        baseline_location="B4",
+        message="value changed",
+    )
+
+    seeds = _targets(
+        [finding],
+        file_hashes={
+            "baseline_excel:ops": "a" * 64,
+            "current_excel:ops": "b" * 64,
+        },
+    )["F0001"]
+
+    assert {seed.role_key for seed in seeds} == {
+        "baseline_excel:ops",
+        "current_excel:ops",
+    }
+    assert {seed.member_id for seed in seeds} == {"ops"}
+
+
+def test_member_seed_is_dropped_without_its_exact_role_hash() -> None:
+    finding = Finding(
+        artifact="excel",
+        artifact_member="ops",
+        finding_class=FindingClass.VALUE_CHANGED,
+        sheet="Summary",
+        location="B5",
+        message="value changed",
+    )
+
+    assert _targets(
+        [finding],
+        file_hashes={"current_excel": "a" * 64},
+    ) == {}
 
 
 def test_deleted_row_seeds_only_the_baseline_side() -> None:
@@ -578,17 +661,17 @@ def test_history_round_trips_the_private_sidecar(tmp_path: Path) -> None:
         focus_targets={"F0001": (seed,)},
     )
     record = history.get_run(run_id)
-    assert record.focus_targets.seed("F0001", FocusRole.CURRENT_EXCEL) == seed
+    assert record.focus_sidecar().seed("F0001", FocusRole.CURRENT_EXCEL) == seed
 
 
 def test_runs_recorded_without_targets_have_no_focus(tmp_path: Path) -> None:
+    """No actionable role hashes means no seeds, gracefully empty."""
     history = RunHistory(tmp_path / "history.sqlite3")
-    run_id = history.record_run(
-        _result(), file_hashes={"current_excel": "b" * 64}, report_paths={}
-    )
+    run_id = history.record_run(_result(), file_hashes={}, report_paths={})
     record = history.get_run(run_id)
-    assert not record.focus_targets.usable
-    assert record.focus_targets.seeds("F0001") == ()
+    assert record.focus_blocks is None
+    assert not record.focus_sidecar().usable
+    assert record.focus_sidecar().seeds("F0001") == ()
 
 
 def test_legacy_database_gains_the_column(tmp_path: Path) -> None:
@@ -617,7 +700,7 @@ def test_legacy_database_gains_the_column(tmp_path: Path) -> None:
     run_id = history.record_run(
         _result(), file_hashes={"current_excel": "b" * 64}, report_paths={}
     )
-    assert not history.get_run(run_id).focus_targets.usable
+    assert not history.get_run(run_id).focus_sidecar().usable
 
 
 def test_exported_archive_contains_no_focus_locators(tmp_path: Path) -> None:
@@ -648,3 +731,127 @@ def test_exported_archive_contains_no_focus_locators(tmp_path: Path) -> None:
     with zipfile.ZipFile(destination) as bundle:
         manifest = json.loads(bundle.read("manifest.json"))
     assert "focus_targets" not in json.dumps(manifest)
+
+
+def test_streaming_encoder_matches_dict_encoder_bytes() -> None:
+    """Step 8: the one-pass encoder is byte-identical for padded ids."""
+    from qc_tool.focus.targets import encode_focus_targets_streaming
+
+    findings = []
+    for index, (sheet, address) in enumerate(
+        [("Summary", "B5"), ("Data", "C7"), ("Data", "D9")], start=1
+    ):
+        finding = Finding(
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            sheet=sheet,
+            location=address,
+            baseline_location=address,
+            message="value changed",
+        )
+        finding.finding_id = f"F{index:04d}"
+        finding.severity = Severity.WARNING
+        findings.append(finding)
+
+    streamed = encode_focus_targets_streaming(
+        findings, mode=QCRunMode.CYCLE_COMPARISON, file_hashes=ALL_HASHES
+    )
+    monolithic = encode_focus_targets(
+        build_focus_targets(
+            findings, mode=QCRunMode.CYCLE_COMPARISON, file_hashes=ALL_HASHES
+        )
+    )
+    assert streamed == monolithic
+
+    assert (
+        encode_focus_targets_streaming(
+            [], mode=QCRunMode.CYCLE_COMPARISON, file_hashes=ALL_HASHES
+        )
+        == EMPTY_SIDECAR_JSON
+    )
+
+
+def test_record_fetch_defers_the_sidecar_decode(tmp_path: Path) -> None:
+    """OOM regression: fetching a record must not decode the sidecar."""
+    history = RunHistory(tmp_path / "history.sqlite3")
+    seed = FocusTargetSeed(
+        artifact=FocusArtifact.EXCEL,
+        role=FocusRole.CURRENT_EXCEL,
+        sheet="Summary",
+        address="B5",
+    )
+    run_id = history.record_run(
+        _result(),
+        file_hashes={"current_excel": "b" * 64},
+        report_paths={},
+        focus_targets={"F0001": (seed,)},
+    )
+    record = history.get_run(run_id)
+    assert record.focus_targets_raw is not None
+    assert not record.focus_targets.targets  # untouched until focus is used
+    assert record.focus_sidecar().seeds("F0001") == (seed,)
+    assert record.focus_targets_raw is None  # decoded exactly once
+
+
+def test_oversized_sidecar_degrades_instead_of_decoding(tmp_path: Path) -> None:
+    import datetime as dt
+
+    from qc_tool.history.store import FOCUS_SIDECAR_DECODE_CAP, RunRecord
+
+    record = RunRecord(
+        run_id=1,
+        started_at=dt.datetime(2026, 8, 9, tzinfo=dt.UTC),
+        profile="default",
+        mode=QCRunMode.CYCLE_COMPARISON,
+        files={},
+        file_hashes={},
+        counts={},
+        review_counts={},
+        disclosures=[],
+        verified_crosschecks=0,
+        report_paths={},
+        focus_targets_raw="x" * (FOCUS_SIDECAR_DECODE_CAP + 1),
+    )
+    assert not record.focus_sidecar().usable
+    assert record.focus_targets_raw is None
+
+
+def test_block_storage_round_trips_seeds_across_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inline generation aligns focus blocks with finding blocks."""
+    import qc_tool.history.store as history_store
+
+    monkeypatch.setattr(history_store, "BLOCK_FINDINGS", 2)
+    findings = []
+    for index in range(1, 6):
+        finding = Finding(
+            finding_id=f"F{index:04d}",
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            severity=Severity.WARNING,
+            sheet="Summary",
+            location=f"B{index}",
+            baseline_location=f"B{index}",
+            message="value changed",
+        )
+        findings.append(finding)
+    result = QCRunResult(profile_name="blocks", findings=findings)
+    history = RunHistory(tmp_path / "history.sqlite3")
+    run_id = history.record_run(
+        result,
+        file_hashes={"current_excel": "b" * 64, "baseline_excel": "a" * 64},
+        report_paths={},
+    )
+    record = history.get_run(run_id)
+    assert record.focus_blocks is not None
+    assert not record.focus_degraded()
+    for index in range(1, 6):  # spans three 2-finding blocks
+        seeds = record.focus_seeds(f"F{index:04d}")
+        assert {seed.role for seed in seeds} == {
+            FocusRole.BASELINE_EXCEL,
+            FocusRole.CURRENT_EXCEL,
+        }
+        assert {seed.address for seed in seeds} == {f"B{index}"}
+    assert record.focus_seeds("F9999") == ()
+    assert record.focus_seeds("garbage") == ()

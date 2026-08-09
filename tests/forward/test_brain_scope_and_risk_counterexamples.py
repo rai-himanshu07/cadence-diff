@@ -11,7 +11,7 @@ from pptx import Presentation
 from qc_tool import engine as engine_module
 from qc_tool.coverage import QCRunMode
 from qc_tool.engine import run_qc
-from qc_tool.findings import FindingClass, Severity, limit_findings
+from qc_tool.findings import FindingClass, Severity
 from qc_tool.io.model import (
     CellRecord,
     SheetSnapshot,
@@ -56,21 +56,11 @@ def _write_blank_deck(path: Path) -> None:
         QCRunMode.FINAL_PACKAGE,
     ],
 )
-def test_scope_filters_before_global_budget_in_every_mode(
+def test_scope_filters_findings_in_every_mode(
     mode: QCRunMode,
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     baseline, current = _write_scope_workbooks(tmp_path)
-    monkeypatch.setattr(
-        engine_module,
-        "limit_findings",
-        lambda findings: limit_findings(
-            findings,
-            max_per_class_scope=500,
-            max_total=2,
-        ),
-    )
     kwargs: dict[str, object] = {
         "current_excel": current,
         "compare_sheets": ["Selected"],
@@ -90,6 +80,8 @@ def test_scope_filters_before_global_budget_in_every_mode(
         and finding.sheet == "Selected"
         for finding in result.findings
     )
+    # The out-of-scope Flood sheet contributes nothing in any mode.
+    assert not any(finding.sheet == "Flood" for finding in result.findings)
 
 
 def test_unknown_sheet_scope_fails_actionably(tmp_path: Path) -> None:

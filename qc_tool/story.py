@@ -12,7 +12,8 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from qc_tool.findings import (
@@ -148,61 +149,174 @@ def _severity_counts(members: list[Finding]) -> dict[str, int]:
     counts = Counter(
         (member.severity or Severity.WARNING).value for member in members
     )
+    return _severity_names(counts)
+
+
+def _severity_names(counts: Counter[str]) -> dict[str, int]:
     return {severity.value: counts.get(severity.value, 0) for severity in Severity}
+
+
+def _story_sort_key(story: ChangeStory) -> tuple[int, int, str]:
+    kind_rank = {
+        StoryKind.STRUCTURE_DRIVER: 0,
+        StoryKind.ERROR_POPULATION: 1,
+        StoryKind.DERIVED_LABELS: 2,
+        StoryKind.DATA_REFRESH: 3,
+        StoryKind.ACCEPTED_DIFFERENCES: 4,
+        StoryKind.REPRESENTATION_NOISE: 5,
+        StoryKind.INHERITED: 6,
+        StoryKind.RESIDUAL: 7,
+    }[story.kind]
+    return (kind_rank, -story.member_count, story.story_id)
 
 
 def _clip(text: str, limit: int = 140) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "\u2026"
 
 
-def annotate_story_evidence(findings: list[Finding]) -> None:
-    """Attach direct cross-finding evidence used by deterministic story edges."""
-    driver_tokens = {
-        token
-        for finding in findings
-        if finding.finding_class in _DRIVER_CLASSES and not finding.expected_growth
-        for token in _driver_tokens(finding)
-    }
-    linked_formula_cells: dict[tuple[str, str], Finding] = {}
-    for finding in findings:
-        if finding.finding_class is not FindingClass.FORMULA_LOGIC_CHANGED:
-            continue
-        added = _added_reference_tokens(finding)
-        if added & driver_tokens:
-            finding.evidence_tags.update(
-                {
-                    FindingEvidenceTag.ADDED_REFERENCE,
-                    FindingEvidenceTag.RESOLVED_DRIVER,
-                }
-            )
-        linked = (
-            FindingEvidenceTag.RESOLVED_DRIVER in finding.evidence_tags
-            or (
-                finding.subtype
-                in (FindingSubtype.FORMULA_WRAPPED, FindingSubtype.FORMULA_UNWRAPPED)
-                and bool(finding.event_key)
-            )
-        )
-        if linked and finding.sheet and finding.location:
-            linked_formula_cells[(finding.sheet, finding.location)] = finding
+@dataclass(slots=True)
+class StoryEvidenceContext:
+    """Cross-finding evidence collected in one pass, applied per finding."""
 
-    for finding in findings:
-        if finding.finding_class not in (
+    driver_tokens: set[tuple[str, str]]
+    colocated_cells: set[tuple[str, str, str]]
+
+    @classmethod
+    def collect(cls, findings: Iterable[Finding]) -> StoryEvidenceContext:
+        collector = StoryEvidenceCollector()
+        for finding in findings:
+            collector.observe(finding)
+        return collector.context()
+
+    def apply(self, finding: Finding) -> None:
+        """Idempotent per-finding twin of the batch annotation."""
+        key = (
+            finding.artifact_member,
+            finding.sheet or "",
+            finding.location or "",
+        )
+        if finding.finding_class is FindingClass.FORMULA_LOGIC_CHANGED:
+            added = _added_reference_tokens(finding)
+            if {(finding.artifact_member, token) for token in added} & (
+                self.driver_tokens
+            ):
+                finding.evidence_tags.update(
+                    {
+                        FindingEvidenceTag.ADDED_REFERENCE,
+                        FindingEvidenceTag.RESOLVED_DRIVER,
+                    }
+                )
+            if key in self.colocated_cells:
+                finding.evidence_tags.add(FindingEvidenceTag.EXACT_COLOCATION)
+        elif finding.finding_class in (
             FindingClass.NUMBER_FORMAT_CHANGED,
             FindingClass.STYLE_CHANGED,
         ):
-            continue
-        formula = linked_formula_cells.get(
-            (finding.sheet or "", finding.location or "")
+            if key in self.colocated_cells:
+                finding.evidence_tags.add(FindingEvidenceTag.EXACT_COLOCATION)
+
+
+class StoryEvidenceCollector:
+    """Incremental twin of ``StoryEvidenceContext.collect`` for streamed parts."""
+
+    __slots__ = ("_driver_tokens", "_formula_cells", "_style_cells")
+
+    def __init__(self) -> None:
+        self._driver_tokens: set[tuple[str, str]] = set()
+        self._formula_cells: list[tuple[tuple[str, str, str], set[str], bool]] = []
+        self._style_cells: set[tuple[str, str, str]] = set()
+
+    def observe(self, finding: Finding) -> None:
+        if (
+            finding.finding_class in _DRIVER_CLASSES
+            and not finding.expected_growth
+        ):
+            self._driver_tokens.update(
+                (finding.artifact_member, token)
+                for token in _driver_tokens(finding)
+            )
+        elif finding.finding_class is FindingClass.FORMULA_LOGIC_CHANGED:
+            if finding.sheet and finding.location:
+                self._formula_cells.append(
+                    (
+                        (
+                            finding.artifact_member,
+                            finding.sheet,
+                            finding.location,
+                        ),
+                        _added_reference_tokens(finding),
+                        FindingEvidenceTag.RESOLVED_DRIVER
+                        in finding.evidence_tags
+                        or (
+                            finding.subtype
+                            in (
+                                FindingSubtype.FORMULA_WRAPPED,
+                                FindingSubtype.FORMULA_UNWRAPPED,
+                            )
+                            and bool(finding.event_key)
+                        ),
+                    )
+                )
+        elif finding.finding_class in (
+            FindingClass.NUMBER_FORMAT_CHANGED,
+            FindingClass.STYLE_CHANGED,
+        ):
+            self._style_cells.add(
+                (
+                    finding.artifact_member,
+                    finding.sheet or "",
+                    finding.location or "",
+                )
+            )
+
+    def context(self) -> StoryEvidenceContext:
+        linked_cells = {
+            key
+            for key, added, already_linked in self._formula_cells
+            if already_linked
+            or {(key[0], token) for token in added} & self._driver_tokens
+        }
+        return StoryEvidenceContext(
+            driver_tokens=self._driver_tokens,
+            colocated_cells=linked_cells & self._style_cells,
         )
-        if formula is None:
-            continue
-        finding.evidence_tags.add(FindingEvidenceTag.EXACT_COLOCATION)
-        formula.evidence_tags.add(FindingEvidenceTag.EXACT_COLOCATION)
 
 
-def build_stories(findings: list[Finding]) -> list[ChangeStory]:
+def annotate_story_evidence(findings: Sequence[Finding]) -> None:
+    """Attach direct cross-finding evidence used by deterministic story edges."""
+    context = StoryEvidenceContext.collect(findings)
+    for finding in findings:
+        context.apply(finding)
+
+
+def build_stories(findings: Sequence[Finding]) -> list[ChangeStory]:
     """Partition triaged findings into deterministic, evidence-cited stories."""
+    member_ids = sorted({finding.artifact_member for finding in findings})
+    if len(member_ids) > 1:
+        stories: list[ChangeStory] = []
+        for member_id in member_ids:
+            member_stories = build_stories(
+                [
+                    finding
+                    for finding in findings
+                    if finding.artifact_member == member_id
+                ]
+            )
+            if member_id == "primary":
+                stories.extend(member_stories)
+                continue
+            stories.extend(
+                replace(
+                    story,
+                    story_id=_stable_id(
+                        story.kind,
+                        f"{member_id}|{story.story_id}",
+                    ),
+                    title=f"{member_id} · {story.title}",
+                )
+                for story in member_stories
+            )
+        return sorted(stories, key=_story_sort_key)
     annotate_story_evidence(findings)
     assigned: dict[int, tuple[StoryKind, int]] = {}  # index -> (kind, component)
 
@@ -344,20 +458,7 @@ def build_stories(findings: list[Finding]) -> list[ChangeStory]:
         members = [findings[i] for i in sorted(indices)]
         stories.append(_materialize(kind, component, members))
 
-    def sort_key(story: ChangeStory) -> tuple[int, int, str]:
-        kind_rank = {
-            StoryKind.STRUCTURE_DRIVER: 0,
-            StoryKind.ERROR_POPULATION: 1,
-            StoryKind.DERIVED_LABELS: 2,
-            StoryKind.DATA_REFRESH: 3,
-            StoryKind.ACCEPTED_DIFFERENCES: 4,
-            StoryKind.REPRESENTATION_NOISE: 5,
-            StoryKind.INHERITED: 6,
-            StoryKind.RESIDUAL: 7,
-        }[story.kind]
-        return (kind_rank, -story.member_count, story.story_id)
-
-    return sorted(stories, key=sort_key)
+    return sorted(stories, key=_story_sort_key)
 
 
 def _missing_evidence(finding: Finding) -> tuple[str, ...]:

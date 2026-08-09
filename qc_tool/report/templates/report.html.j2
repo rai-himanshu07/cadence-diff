@@ -35,6 +35,11 @@
   .member-pages button { border: 1px solid #bbb; background: #fff; padding: 0.2rem 0.55rem;
     border-radius: 3px; cursor: pointer; }
   .member-pages button:disabled { color: #999; cursor: default; }
+  /* formula token diff */
+  .formula-diff { font-family: ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 14rem; overflow: auto; padding: 0.35rem; border: 1px solid #eee; border-radius: 4px; }
+  .formula-diff .fdiff-equal { color: #1a1a1a; }
+  .formula-diff .fdiff-removed { color: #c00000; text-decoration: line-through; background: rgba(192,0,0,0.04); }
+  .formula-diff .fdiff-added { color: #548235; text-decoration: underline; background: rgba(84,130,53,0.04); }
 </style>
 </head>
 <body>
@@ -49,6 +54,18 @@
 {% if capability_limited %}
 <div class="note">One or more required checks were unavailable, so a low finding
 count is not a clean result. Review the check coverage table below.</div>
+{% endif %}
+{% if result.package_manifest and not result.package_manifest.is_legacy_projection %}
+<h2>Package members</h2>
+<table class="coverage">
+  <thead><tr><th>Side</th><th>Artifact</th><th>Member</th><th>Display name</th></tr></thead>
+  <tbody>
+  {% for member in result.package_manifest.members %}
+  <tr><td>{{ member.side.value }}</td><td>{{ member.artifact.value }}</td>
+    <td class="mono">{{ member.member_id }}</td><td>{{ member.display_name }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
 {% endif %}
 {% if result.mapping_coverage %}
 <h2>Mapping coverage</h2>
@@ -74,6 +91,62 @@ count is not a clean result. Review the check coverage table below.</div>
 {% for disclosure in result.disclosures %}
 <div class="note">{{ disclosure }}</div>
 {% endfor %}
+{% if not atomics_included %}
+<div class="note">This run produced {{ result.findings | length }} atomic
+findings, above the {{ atomics_threshold }}-row inline limit for a single
+HTML file, so per-finding detail is not embedded here. Every decision,
+story, and coverage row below is complete; the Excel and JSON exports and
+the review app carry every atomic finding.</div>
+{% endif %}
+{% if result.alignment_trust %}
+<h2>Alignment trust</h2>
+<div class="meta">Per-region pairing counts and low-confidence/unpaired indicators.</div>
+<table class="coverage">
+  <thead><tr><th>Member</th><th>Sheet</th><th>Region</th>
+    <th>Baseline range</th><th>Current range</th>
+    <th>Row method</th><th>Row fallback</th><th>Rows p/d/i/g</th>
+    <th>Col method</th><th>Col fallback</th><th>Cols p/d/i/g</th>
+    <th>Cell pairs</th><th>Skipped cells</th><th>Low confidence</th></tr></thead>
+  <tbody>
+  {% for r in result.alignment_trust.regions %}
+  <tr>
+    <td>{{ r.artifact_member }}</td>
+    <td>{{ r.sheet }}</td>
+    <td class="mono">{{ r.region_id }}</td>
+    <td class="mono">{{ r.baseline_range }}</td>
+    <td class="mono">{{ r.current_range }}</td>
+    <td>{{ r.row.method }}</td>
+    <td>{{ r.row.low_confidence_fallback }}</td>
+    <td>{{ r.row.paired }}/{{ r.row.deleted }}/{{ r.row.inserted }}/{{ r.row.growth }}</td>
+    <td>{{ r.column.method }}</td>
+    <td>{{ r.column.low_confidence_fallback }}</td>
+    <td>{{ r.column.paired }}/{{ r.column.deleted }}/{{ r.column.inserted }}/{{ r.column.growth }}</td>
+    <td>{{ r.comparable_cell_pairs }}</td>
+    <td>{{ r.skipped_low_confidence_cells }}</td>
+    <td>{{ r.low_confidence }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if result.alignment_trust.unpaired %}
+<h3>Unpaired regions</h3>
+<table class="coverage">
+  <thead><tr><th>Side</th><th>Member</th><th>Sheet</th><th>Region</th><th>Range</th><th>Orientation</th></tr></thead>
+  <tbody>
+  {% for u in result.alignment_trust.unpaired %}
+  <tr>
+    <td>{{ u.side }}</td>
+    <td>{{ u.artifact_member }}</td>
+    <td>{{ u.sheet }}</td>
+    <td class="mono">{{ u.region_id }}</td>
+    <td class="mono">{{ u.cell_range }}</td>
+    <td>{{ u.orientation }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
 {% if stories %}
 <h2>Change stories</h2>
 <div class="meta">Cross-class narrative synthesis; severities and counts are
@@ -123,17 +196,18 @@ unchanged — stories are a lens over the same findings.</div>
       <td class="mono">{{ group.group_id }}</td>
       <td class="sev">{{ group.severity.value }}</td>
       <td class="mono">{{ group.finding_class.value }}</td>
-      <td>{{ group.sheet or group.slide or "" }}</td>
+      <td>{% if group.artifact_member != 'primary' %}<span class="mono">{{ group.artifact_member }}</span> · {% endif %}{{ group.sheet or group.slide or "" }}</td>
       <td class="mono range-list">{{ group.ranges | join("; ") or group.bounding_range }}</td>
       <td>{{ group.member_count }}</td>
       <td>{% if group.member_count == 1 %}{{ group.members[0].message }}{% else %}
-        {{ group.member_count }} contiguous {{ group.finding_class.value | replace("_", " ") }} findings
+        {{ group.member_count }} {{ group.finding_class.value | replace("_", " ") }} findings
         {% endif %}</td>
     </tr>
     <tr><td colspan="7">
+      {%- if atomics_included %}
       <details><summary>View {{ group.member_count }} atomic finding{% if group.member_count != 1 %}s{% endif %}</summary>
         <table class="member-table">
-          <thead><tr><th>ID</th><th>Severity</th><th>Location</th><th>Element</th>
+          <thead><tr><th>ID</th><th>Severity</th>{% if result.package_manifest and not result.package_manifest.is_legacy_projection %}<th>Member</th>{% endif %}<th>Location</th><th>Element</th>
             <th>Baseline</th><th>Current</th><th>Message</th><th>Analyst comment</th>
             <th>Root cause</th><th>Waiver</th><th>Provenance</th><th>Subtype</th>
             <th>Materiality</th><th>Temporal context</th><th>Expected reason</th>
@@ -147,6 +221,9 @@ unchanged — stories are a lens over the same findings.</div>
         </div>
         <script type="application/json" data-members="{{ group.group_id }}">{{ member_payload[group.group_id] | tojson }}</script>
       </details>
+      {%- else %}
+      <span class="meta">Atomic detail is in the Excel/JSON exports and the review app.</span>
+      {%- endif %}
     </td></tr>
   </tbody>
   {% endfor %}
@@ -160,6 +237,7 @@ unchanged — stories are a lens over the same findings.</div>
     });
   }
   boxes.forEach(box => box.addEventListener('change', apply));
+{%- if atomics_included %}
   const pageSize = 50;
   function textCell(row, value, className = '') {
     const cell = document.createElement('td');
@@ -186,6 +264,11 @@ unchanged — stories are a lens over the same findings.</div>
         const row = document.createElement('tr');
         textCell(row, member.finding_id, 'mono');
         textCell(row, member.severity + (member.overridden ? ' *' : ''));
+        if (member.artifact_member !== 'primary') {
+          textCell(row, member.artifact_member, 'mono');
+        } else if ({{ 'true' if result.package_manifest and not result.package_manifest.is_legacy_projection else 'false' }}) {
+          textCell(row, 'primary', 'mono');
+        }
         textCell(row, member.location, 'mono');
         textCell(row, member.element);
         textCell(row, member.baseline, 'mono');
@@ -196,6 +279,26 @@ unchanged — stories are a lens over the same findings.</div>
           impacts.className = 'impacts';
           impacts.textContent = `impacts: ${member.impacts}`;
           message.appendChild(impacts);
+        }
+        // Formula token diff details (safe DOM creation, textContent only)
+        if (member.formula_diff && member.formula_diff.length) {
+          const diffDetails = document.createElement('details');
+          diffDetails.className = 'formula-diff-details';
+          const summary = document.createElement('summary');
+          summary.textContent = 'Formula token diff';
+          diffDetails.appendChild(summary);
+          const container = document.createElement('div');
+          container.className = 'formula-diff';
+          container.setAttribute('role', 'group');
+          container.setAttribute('aria-label', 'Formula token diff');
+          member.formula_diff.forEach(seg => {
+            const span = document.createElement('span');
+            span.className = `fdiff-${seg.kind}`;
+            span.textContent = seg.text;
+            container.appendChild(span);
+          });
+          diffDetails.appendChild(container);
+          message.appendChild(diffDetails);
         }
         textCell(row, member.comment);
         textCell(row, member.root, 'mono');
@@ -216,6 +319,7 @@ unchanged — stories are a lens over the same findings.</div>
     previous.addEventListener('click', () => { pageIndex -= 1; renderPage(); });
     next.addEventListener('click', () => { pageIndex += 1; renderPage(); });
   });
+{%- endif %}
   apply();
 </script>
 </body>

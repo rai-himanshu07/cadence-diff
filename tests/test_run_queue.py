@@ -11,6 +11,7 @@ import queue as queue_module
 import threading
 import time
 from collections.abc import Callable, Iterator
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,6 +25,7 @@ from qc_tool.config.profile import DeliverableProfile
 from qc_tool.coverage import QCRunMode
 from qc_tool.history.run_state import RunStateStore, RunStatus
 from qc_tool.history.store import RunHistory
+from qc_tool.package import PackageManifest
 from qc_tool.runqueue import (
     QueueBusyError,
     RunQueueManager,
@@ -506,6 +508,105 @@ def test_reported_failures_are_sanitized_before_persistence(
 
 
 # --- privacy and restart -----------------------------------------------------
+
+
+def test_package_manifest_request_is_primitive_json_round_trip(
+    make_manager: ManagerFactory,
+) -> None:
+    manager = make_manager(_sequenced_worker)
+    manifest = PackageManifest.from_role_files(
+        {"current_excel:ops": Path("ops.xlsx")}
+    )
+    request = _request(
+        manager,
+        files={"current_excel:ops": "/managed/ops.xlsx"},
+        display_files={"current_excel:ops": "ops.xlsx"},
+        package_manifest=manifest.model_dump(mode="json"),
+        compare_member_sheets={"ops": ("Data", "Summary")},
+    )
+
+    payload = json.loads(json.dumps(asdict(request)))
+
+    assert payload["package_manifest"] == manifest.model_dump(mode="json")
+    assert payload["compare_member_sheets"] == {
+        "ops": ["Data", "Summary"]
+    }
+    assert payload["files"] == {
+        "current_excel:ops": "/managed/ops.xlsx"
+    }
+    assert "password" not in json.dumps(payload).casefold()
+
+
+def test_member_password_reaches_worker_only_and_never_queue_state(
+    make_manager: ManagerFactory,
+) -> None:
+    secret = "member-secret-not-persisted"
+    manager = make_manager(_credential_probe_worker)
+    request = _request(
+        manager,
+        files={"current_excel:ops": "/managed/ops.xlsx"},
+        display_files={"current_excel:ops": "ops.xlsx"},
+        package_manifest=PackageManifest.from_role_files(
+            {"current_excel:ops": Path("ops.xlsx")}
+        ).model_dump(mode="json"),
+    )
+    manager.submit(request, {"current_excel:ops": secret})
+
+    assert manager.wait(request.request_id).status is RunStatus.SUCCEEDED
+    assert (manager.work_dir / "credential-roles.txt").read_text(
+        encoding="utf-8"
+    ) == "current_excel:ops"
+    record = manager.store.get(request.request_id)
+    assert record is not None
+    assert secret not in json.dumps(record.files)
+    assert secret.encode() not in (manager.work_dir / "history.sqlite3").read_bytes()
+
+
+def test_worker_rejects_malformed_package_manifest_before_running(
+    tmp_path: Path,
+) -> None:
+    events: queue_module.Queue[dict[str, Any]] = queue_module.Queue()
+    credentials = {"current_excel:Bad ID": "secret"}
+    payload = {
+        "request_id": "bad-manifest",
+        "work_dir": str(tmp_path),
+        "mode": QCRunMode.CURRENT_FILE_PREFLIGHT.value,
+        "profile_name": "fixture",
+        "profile": {"name": "fixture"},
+        "files": {"current_excel:Bad ID": str(tmp_path / "missing.xlsx")},
+        "display_files": {"current_excel:Bad ID": "missing.xlsx"},
+        "allow_large_workbooks": False,
+        "acceptance_absolute": 0.0,
+        "acceptance_relative": 0.0,
+        "compare_sheets": (),
+        "compare_slides": (),
+        "rerun_of": None,
+        "package_manifest": {
+            "version": 1,
+            "members": [
+                {
+                    "member_id": "Bad ID",
+                    "side": "current",
+                    "artifact": "excel",
+                    "display_name": "missing.xlsx",
+                }
+            ],
+        },
+        "compare_member_sheets": {},
+    }
+
+    worker_main(
+        payload,
+        credentials,
+        cast(Any, events),
+        cast(Any, threading.Event()),
+    )
+    message = events.get_nowait()
+
+    assert message["kind"] == "error"
+    assert "ValidationError" in message["error"]
+    assert credentials == {}
+    assert RunHistory(tmp_path / "history.sqlite3").list_runs() == []
 
 
 def test_passwords_never_reach_persisted_or_serialized_queue_state(

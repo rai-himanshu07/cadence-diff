@@ -19,6 +19,9 @@ _ALLOWED_FILES = {
     "pyproject.toml",
     "scripts/audit_distributions.py",
     "scripts/audit_public_tree.py",
+    "scripts/windows_excel_acceptance.py",
+    "scripts/windows_focus_acceptance.py",
+    "scripts/windows_office_discovery.py",
 }
 _ALLOWED_PREFIXES = ("qc_tool/", "tests/")
 _PRIVATE_SUFFIXES = {

@@ -37,6 +37,7 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.FORMULA_HARDCODED: Severity.CRITICAL,
     FindingClass.FORMULA_REMOVED: Severity.CRITICAL,
     FindingClass.FORMULA_MISSING: Severity.CRITICAL,
+    FindingClass.CIRCULAR_REFERENCE: Severity.CRITICAL,
     FindingClass.EXTERNAL_LINK: Severity.CRITICAL,
     FindingClass.ACTIVE_CONTENT: Severity.CRITICAL,
     #: Macro logic can rewrite any figure in the deliverable.
@@ -57,6 +58,7 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.ROW_DELETED: Severity.CRITICAL,
     FindingClass.COLUMN_DELETED: Severity.CRITICAL,
     FindingClass.SHEET_REMOVED: Severity.CRITICAL,
+    FindingClass.WORKBOOK_REMOVED: Severity.CRITICAL,
     #: An in-place key change on a constant key rewrites history identity.
     FindingClass.ROW_KEY_CHANGED: Severity.CRITICAL,
     FindingClass.COLUMN_KEY_CHANGED: Severity.CRITICAL,
@@ -78,6 +80,7 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.PPT_TABLE_BLANK: Severity.WARNING,
     FindingClass.PPT_CHART_LENGTH_MISMATCH: Severity.WARNING,
     FindingClass.PPT_CHART_VALUE_MISSING: Severity.WARNING,
+    FindingClass.PPT_REPEATED_CLAIM_MISMATCH: Severity.WARNING,
     FindingClass.CONTROL_INVALID: Severity.WARNING,
     FindingClass.WAIVER_EXPIRED: Severity.WARNING,
     FindingClass.NUMBER_FORMAT_CHANGED: Severity.WARNING,
@@ -116,6 +119,7 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.CHART_GEOMETRY_CHANGED: Severity.INFO,
     FindingClass.PPT_SHAPE_GEOMETRY_CHANGED: Severity.INFO,
     FindingClass.SHEET_ADDED: Severity.INFO,
+    FindingClass.WORKBOOK_ADDED: Severity.INFO,
     FindingClass.SLIDE_ADDED: Severity.INFO,
     FindingClass.SLIDE_REORDERED: Severity.INFO,
     FindingClass.CROSSCHECK_UNRESOLVED: Severity.INFO,
@@ -247,41 +251,74 @@ def triage(
 ) -> list[Finding]:
     """Assign severities, order deterministically, and number the findings."""
     today = dt.date.today()
+    findings.extend(expired_waiver_findings(profile, today))
+    assign_severities(findings, profile, today=today)
+
+    candidates = [
+        (finding, key)
+        for finding in findings
+        if (key := root_cause_candidate_key(finding)) is not None
+    ]
+    root_counts = Counter(key for _, key in candidates)
+    for finding, key in candidates:
+        if root_counts[key] > 1:
+            finding.root_cause_key = key
+    ordered = sorted(findings, key=triage_sort_key)
+    for index, finding in enumerate(ordered, start=1):
+        finding.finding_id = f"F{index:04d}"
+    return ordered
+
+
+def expired_waiver_findings(
+    profile: DeliverableProfile | None, today: dt.date
+) -> list[Finding]:
+    """One finding per profile waiver whose expiry date has passed."""
     waivers = profile.waivers if profile is not None else []
-    for waiver in waivers:
-        if waiver.expires >= today:
-            continue
-        findings.append(
-            Finding(
-                artifact="profile",
-                finding_class=FindingClass.WAIVER_EXPIRED,
-                sheet=waiver.sheet,
-                slide=waiver.slide,
-                location=waiver.location,
-                element=waiver.element or waiver.finding_class.value,
-                current_value=waiver.expires.isoformat(),
-                message=(
-                    f"waiver for {waiver.finding_class.value} expired on "
-                    f"{waiver.expires.isoformat()}: {waiver.reason}"
-                ),
-            )
+    return [
+        Finding(
+            artifact="profile",
+            artifact_member=waiver.member,
+            finding_class=FindingClass.WAIVER_EXPIRED,
+            sheet=waiver.sheet,
+            slide=waiver.slide,
+            location=waiver.location,
+            element=waiver.element or waiver.finding_class.value,
+            current_value=waiver.expires.isoformat(),
+            message=(
+                f"waiver for {waiver.finding_class.value} expired on "
+                f"{waiver.expires.isoformat()}: {waiver.reason}"
+            ),
         )
+        for waiver in waivers
+        if waiver.expires < today
+    ]
 
-    def matches_waiver(finding: Finding, waiver) -> bool:
-        return (
-            finding.finding_class is waiver.finding_class
-            and (waiver.sheet is None or finding.sheet == waiver.sheet)
-            and (waiver.slide is None or finding.slide == waiver.slide)
-            and (waiver.location is None or finding.location == waiver.location)
-            and (waiver.element is None or finding.element == waiver.element)
-        )
 
+def _matches_waiver(finding: Finding, waiver) -> bool:
+    return (
+        finding.finding_class is waiver.finding_class
+        and finding.artifact_member == waiver.member
+        and (waiver.sheet is None or finding.sheet == waiver.sheet)
+        and (waiver.slide is None or finding.slide == waiver.slide)
+        and (waiver.location is None or finding.location == waiver.location)
+        and (waiver.element is None or finding.element == waiver.element)
+    )
+
+
+def assign_severities(
+    findings: list[Finding],
+    profile: DeliverableProfile | None,
+    *,
+    today: dt.date,
+) -> None:
+    """Apply active waivers and severity rules to each finding in place."""
+    waivers = profile.waivers if profile is not None else []
     for finding in findings:
         active = next(
             (
                 waiver
                 for waiver in waivers
-                if waiver.expires >= today and matches_waiver(finding, waiver)
+                if waiver.expires >= today and _matches_waiver(finding, waiver)
             ),
             None,
         )
@@ -293,7 +330,9 @@ def triage(
         else:
             finding.severity = assign_severity(finding, profile)
 
-    formula_classes = {
+
+_ROOT_CAUSE_CLASSES = frozenset(
+    {
         FindingClass.FORMULA_ERROR,
         FindingClass.FORMULA_HARDCODED,
         FindingClass.FORMULA_REMOVED,
@@ -302,32 +341,37 @@ def triage(
         FindingClass.FORMULA_LOGIC_CHANGED,
         FindingClass.FORMULA_INCONSISTENT,
     }
-    candidates = [
-        (
-            finding,
-            f"{finding.artifact}:{finding.sheet or finding.slide}:"
-            f"{finding.location or finding.element}",
+)
+
+
+def root_cause_candidate_key(finding: Finding) -> str | None:
+    """Formula co-location key; shared keys mark a common root cause."""
+    if finding.finding_class not in _ROOT_CAUSE_CLASSES:
+        return None
+    if not (finding.location or finding.element):
+        return None
+    return (
+        f"{finding.artifact}"
+        + (
+            f":{finding.artifact_member}"
+            if finding.artifact_member != "primary"
+            else ""
         )
-        for finding in findings
-        if finding.finding_class in formula_classes
-        and (finding.location or finding.element)
-    ]
-    root_counts = Counter(key for _, key in candidates)
-    for finding, key in candidates:
-        if root_counts[key] > 1:
-            finding.root_cause_key = key
-    ordered = sorted(
-        findings,
-        key=lambda f: (
-            _SEVERITY_RANK[f.severity or Severity.WARNING],
-            f.artifact,
-            f.sheet or f.slide or "",
-            f.location or "",
-            f.element or "",
-            f.finding_class.value,
-            f.message,
-        ),
+        + ":"
+        f"{finding.sheet or finding.slide}:"
+        f"{finding.location or finding.element}"
     )
-    for index, finding in enumerate(ordered, start=1):
-        finding.finding_id = f"F{index:04d}"
-    return ordered
+
+
+def triage_sort_key(finding: Finding) -> tuple[int, str, str, str, str, str, str, str]:
+    """The global deterministic ordering every report and store relies on."""
+    return (
+        _SEVERITY_RANK[finding.severity or Severity.WARNING],
+        finding.artifact,
+        finding.artifact_member,
+        finding.sheet or finding.slide or "",
+        finding.location or "",
+        finding.element or "",
+        finding.finding_class.value,
+        finding.message,
+    )

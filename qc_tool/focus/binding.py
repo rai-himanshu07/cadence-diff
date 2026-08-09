@@ -128,6 +128,7 @@ class DocumentBinding:
     file_id: tuple[int, int]
     bound_at: dt.datetime
     unsaved_changes: bool = False
+    member_id: str = "primary"
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +138,7 @@ class BindingRequest:
     expected_sha256: str
     managed_root: Path
     managed_path: Path | None = None
+    member_id: str = "primary"
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,9 +304,9 @@ class BindingRegistry:
     def __init__(self, *, ttl: dt.timedelta = BINDING_TTL) -> None:
         self._ttl = ttl
         self._key = secrets.token_bytes(32)
-        self._bindings: dict[tuple[str, int, FocusRole], DocumentBinding] = {}
+        self._bindings: dict[tuple[str, int, FocusRole, str], DocumentBinding] = {}
         # Private server state. Never returned to a helper, a log, or the UI.
-        self._paths: dict[tuple[str, int, FocusRole], str] = {}
+        self._paths: dict[tuple[str, int, FocusRole, str], str] = {}
 
     def path_hmac(self, full_name: str) -> str:
         """Server-keyed digest of a canonical path; helpers never see the key."""
@@ -335,26 +337,38 @@ class BindingRegistry:
             file_id=identity.file_id,
             bound_at=now or dt.datetime.now(dt.UTC),
             unsaved_changes=document.saved is False,
+            member_id=request.member_id,
         )
-        key = (client_id, request.run_id, request.role)
+        key = (client_id, request.run_id, request.role, request.member_id)
         self._bindings[key] = binding
         self._paths[key] = document.full_name
         return binding
 
     def path_digest(
-        self, client_id: str, run_id: int, role: FocusRole, salt: bytes
+        self,
+        client_id: str,
+        run_id: int,
+        role: FocusRole,
+        salt: bytes,
+        *,
+        member_id: str = "primary",
     ) -> str | None:
         """Salted digest of the bound path, so a helper never receives the path."""
-        full_name = self._paths.get((client_id, run_id, role))
+        full_name = self._paths.get((client_id, run_id, role, member_id))
         if full_name is None:
             return None
         return path_digest(full_name, salt)
 
     def folder_label(
-        self, client_id: str, run_id: int, role: FocusRole
+        self,
+        client_id: str,
+        run_id: int,
+        role: FocusRole,
+        *,
+        member_id: str = "primary",
     ) -> str:
         """Privacy-minimised parent-folder name shown at confirmation time."""
-        full_name = self._paths.get((client_id, run_id, role))
+        full_name = self._paths.get((client_id, run_id, role, member_id))
         if not full_name:
             return ""
         return PureWindowsPath(full_name.replace("/", "\\")).parent.name
@@ -365,9 +379,10 @@ class BindingRegistry:
         run_id: int,
         role: FocusRole,
         *,
+        member_id: str = "primary",
         now: dt.datetime | None = None,
     ) -> DocumentBinding | None:
-        key = (client_id, run_id, role)
+        key = (client_id, run_id, role, member_id)
         binding = self._bindings.get(key)
         if binding is None:
             return None

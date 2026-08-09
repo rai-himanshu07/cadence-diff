@@ -5,12 +5,19 @@ engine (severity module) classifies them. Reports must never re-derive
 diff logic from raw artifacts.
 """
 
-from collections import Counter
-from dataclasses import dataclass
+import math
 from enum import StrEnum
-from typing import Self
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+
+from qc_tool.package import MEMBER_ID_PATTERN
 
 
 class FindingClass(StrEnum):
@@ -24,6 +31,7 @@ class FindingClass(StrEnum):
     FORMULA_NOT_EXTENDED = "formula_not_extended"
     FORMULA_LOGIC_CHANGED = "formula_logic_changed"
     FORMULA_INCONSISTENT = "formula_inconsistent"
+    CIRCULAR_REFERENCE = "circular_reference"
     NUMBER_FORMAT_CHANGED = "number_format_changed"
     STYLE_CHANGED = "style_changed"
     # axis / structure
@@ -37,6 +45,8 @@ class FindingClass(StrEnum):
     COLUMN_GROWTH = "column_growth"
     SHEET_ADDED = "sheet_added"
     SHEET_REMOVED = "sheet_removed"
+    WORKBOOK_ADDED = "workbook_added"
+    WORKBOOK_REMOVED = "workbook_removed"
     HIDDEN_CHANGED = "hidden_changed"
     NAMED_RANGE_CHANGED = "named_range_changed"
     VBA_MODULE_CHANGED = "vba_module_changed"
@@ -57,6 +67,7 @@ class FindingClass(StrEnum):
     PIVOT_SOURCE_CHANGED = "pivot_source_changed"
     REGION_UNPAIRED = "region_unpaired"
     ALIGNMENT_LOW_CONFIDENCE = "alignment_low_confidence"
+    # Retained for stored runs recorded while output budgets existed (pre-0.2.0a2).
     FINDINGS_CAPPED = "findings_capped"
     PERIOD_DUPLICATE = "period_duplicate"
     PERIOD_OUT_OF_ORDER = "period_out_of_order"
@@ -92,6 +103,7 @@ class FindingClass(StrEnum):
     PPT_SHAPE_GEOMETRY_CHANGED = "ppt_shape_geometry_changed"
     PPT_MEDIA_CHANGED = "ppt_media_changed"
     PPT_DRAFT_TOKEN = "ppt_draft_token"
+    PPT_REPEATED_CLAIM_MISMATCH = "ppt_repeated_claim_mismatch"
     PPT_EMPTY_SLIDE = "ppt_empty_slide"
     PPT_DUPLICATE_TITLE = "ppt_duplicate_title"
     PPT_REQUIRED_SLIDE_MISSING = "ppt_required_slide_missing"
@@ -221,9 +233,83 @@ class GridExcerpt(BaseModel):
     hit_col: int | None = None  # index into cols
 
 
+
+class NumericCounterfactualBasis(BaseModel):
+    """Typed, versioned private basis for numeric WHAT-IF previews.
+
+    This model is intentionally frozen/immutable and excluded from public
+    serializations when attached to a `Finding`.
+    """
+
+    version: Literal[1] = 1
+    baseline: float
+    current: float
+    number_format: str | None = None
+    sheet: str = Field(min_length=1)
+    location: str = Field(min_length=1)
+
+    model_config = {"frozen": True}
+
+    @field_validator("baseline", "current", mode="before")
+    @classmethod
+    def validate_number(cls, value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError("counterfactual values must be numeric non-bools")
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError("counterfactual values must be finite")
+        return converted
+
+
+class SeriesAnchorV1(BaseModel):
+    """Structural-only private anchor tying a finding to one logical series.
+
+    Carries no value, formula, header, or metric text — only the coordinates a
+    producer already proved while diffing an aligned period region.
+    """
+
+    version: Literal[1] = 1
+    sheet: str = Field(min_length=1)
+    current_region_id: str = Field(min_length=1)
+    period_axis: Literal["rows", "columns"]
+    series_index: int = Field(ge=1)
+    period_index: int = Field(ge=1)
+
+    model_config = {"frozen": True}
+
+
+class SeriesAnchorV2(BaseModel):
+    """A series anchor that also names which segment of the series it belongs to.
+
+    ``new_period`` covers a period populated for the first time this cycle;
+    ``cleared_period`` covers a historical cell cleared to blank while sibling
+    measures keep the period alive. Neither has a baseline/current number pair,
+    so neither carries a materiality tier or temporal context.
+    """
+
+    version: Literal[2] = 2
+    sheet: str = Field(min_length=1)
+    current_region_id: str = Field(min_length=1)
+    period_axis: Literal["rows", "columns"]
+    series_index: int = Field(ge=1)
+    period_index: int = Field(ge=1)
+    segment: Literal["restatement", "new_period", "cleared_period"] = "restatement"
+
+    model_config = {"frozen": True}
+
+
+#: Readable anchor versions. V1 payloads keep their exact stored digest.
+SeriesAnchor = SeriesAnchorV1 | SeriesAnchorV2
+
+
 class Finding(BaseModel):
     finding_id: str = ""  # assigned when a run collects findings
     artifact: str  # "excel" | "ppt" | "crosscheck"
+    artifact_member: str = Field(
+        default="primary",
+        pattern=MEMBER_ID_PATTERN,
+        exclude_if=lambda value: value == "primary",
+    )
     finding_class: FindingClass
     severity: Severity | None = None  # assigned by the triage rule engine
     #: Compatibility output for earlier history/report consumers. New producers
@@ -266,11 +352,75 @@ class Finding(BaseModel):
     waiver_reason: str = ""
     waiver_expires: str = ""
 
+    #: Private counterfactual basis attached by the diff engine for preview.
+    counterfactual_basis: NumericCounterfactualBasis | None = Field(
+        default=None, exclude=True
+    )
+
+    #: Private logical-series anchor attached by `diff_region_values` only.
+    series_anchor: SeriesAnchorV1 | SeriesAnchorV2 | None = Field(
+        default=None, exclude=True
+    )
+
     @model_validator(mode="after")
     def derive_expected_growth(self) -> Self:
         if self.expected_reason is not None:
             self.expected_growth = True
         return self
+
+    @classmethod
+    def from_trusted_payload(cls, payload: dict[str, Any]) -> "Finding":
+        """Fast constructor for payloads this application wrote itself.
+
+        Stored block lines were validated when produced; re-validating them
+        on every read pass dominated monster-run recording. This coerces
+        exactly the typed fields and skips constraint checks — equality with
+        ``model_validate`` is pinned by tests over every stored field.
+        Never use it on external or hand-edited data.
+        """
+        data: dict[str, Any] = dict(payload)
+        data["finding_class"] = FindingClass(data["finding_class"])
+        severity = data.get("severity")
+        if severity is not None:
+            data["severity"] = Severity(severity)
+        reason = data.get("expected_reason")
+        if reason is not None:
+            data["expected_reason"] = FindingExpectedReason(reason)
+        provenance = data.get("provenance")
+        if provenance is not None:
+            data["provenance"] = FindingProvenance(provenance)
+        subtype = data.get("subtype")
+        if subtype is not None:
+            data["subtype"] = FindingSubtype(subtype)
+        materiality = data.get("materiality")
+        if materiality is not None:
+            data["materiality"] = Materiality(materiality)
+        temporal = data.get("temporal_context")
+        if temporal is not None:
+            data["temporal_context"] = FindingTemporalContext(temporal)
+        data["evidence_tags"] = {
+            FindingEvidenceTag(tag) for tag in data.get("evidence_tags", ())
+        }
+        data["impacts"] = list(data.get("impacts", ()))
+        for key in ("baseline_excerpt", "current_excerpt"):
+            excerpt = data.get(key)
+            if excerpt is not None:
+                data[key] = GridExcerpt.model_construct(**excerpt)
+        basis = data.get("counterfactual_basis")
+        if basis is not None:
+            data["counterfactual_basis"] = (
+                NumericCounterfactualBasis.model_construct(**basis)
+            )
+        anchor = data.get("series_anchor")
+        if isinstance(anchor, dict):
+            anchor_model = (
+                SeriesAnchorV2 if anchor.get("version") == 2 else SeriesAnchorV1
+            )
+            data["series_anchor"] = anchor_model.model_construct(**anchor)
+        finding = cls.model_construct(**data)
+        if finding.expected_reason is not None:
+            finding.expected_growth = True
+        return finding
 
     def mark_expected(self, reason: FindingExpectedReason) -> None:
         """Set the canonical reason and its legacy compatibility projection."""
@@ -282,91 +432,3 @@ class Finding(BaseModel):
         self, evidence_tags: set[FindingEvidenceTag]
     ) -> list[str]:
         return sorted(tag.value for tag in evidence_tags)
-
-
-@dataclass(slots=True)
-class FindingsBudgetResult:
-    findings: list[Finding]
-    omitted_by_artifact: dict[str, int]
-    global_omitted: int = 0
-
-
-def limit_findings(
-    findings: list[Finding],
-    *,
-    max_per_class_scope: int = 500,
-    max_total: int = 10_000,
-) -> FindingsBudgetResult:
-    """Bound output volume and disclose every omitted finding."""
-    if max_per_class_scope < 1 or max_total < 2:
-        raise ValueError("findings budgets must retain at least one detail and summary")
-    retained: list[Finding] = []
-    kept: Counter[tuple[str, FindingClass, str]] = Counter()
-    omitted: Counter[tuple[str, FindingClass, str]] = Counter()
-    for finding in findings:
-        scope = (
-            finding.sheet
-            or (f"slide {finding.slide_index}" if finding.slide_index is not None else None)
-            or finding.slide
-            or "workbook/package"
-        )
-        key = (finding.artifact, finding.finding_class, scope)
-        if kept[key] < max_per_class_scope:
-            retained.append(finding)
-            kept[key] += 1
-        else:
-            omitted[key] += 1
-
-    omitted_by_artifact: Counter[str] = Counter()
-    for (artifact, finding_class, scope), omitted_count in sorted(
-        omitted.items(),
-        key=lambda item: (
-            item[0][0],
-            item[0][2],
-            item[0][1].value,
-        ),
-    ):
-        omitted_by_artifact[artifact] += omitted_count
-        retained.append(
-            Finding(
-                artifact=artifact,
-                finding_class=FindingClass.FINDINGS_CAPPED,
-                sheet=scope if artifact == "excel" else None,
-                slide=scope if artifact == "ppt" else None,
-                element=finding_class.value,
-                current_value=(
-                    f"{max_per_class_scope} retained; {omitted_count} omitted"
-                ),
-                message=(
-                    f"{scope}: output budget retained the first "
-                    f"{max_per_class_scope} {finding_class.value} findings and "
-                    f"omitted {omitted_count}; affected coverage is degraded"
-                ),
-            )
-        )
-
-    global_omitted = 0
-    if len(retained) > max_total:
-        keep_count = max_total - 1
-        dropped = retained[keep_count:]
-        retained = retained[:keep_count]
-        global_omitted = len(dropped)
-        for finding in dropped:
-            omitted_by_artifact[finding.artifact] += 1
-        retained.append(
-            Finding(
-                artifact="run",
-                finding_class=FindingClass.FINDINGS_CAPPED,
-                element="global",
-                current_value=f"{keep_count} retained; {global_omitted} omitted",
-                message=(
-                    f"Run output budget retained {keep_count} findings and omitted "
-                    f"{global_omitted}; all affected coverage is degraded"
-                ),
-            )
-        )
-    return FindingsBudgetResult(
-        findings=retained,
-        omitted_by_artifact=dict(omitted_by_artifact),
-        global_omitted=global_omitted,
-    )

@@ -14,7 +14,6 @@ from qc_tool.findings import (
     FindingProvenance,
     FindingSubtype,
     Severity,
-    limit_findings,
 )
 from qc_tool.io.loader import _xlsb_risks, load_workbook_snapshot
 from qc_tool.io.model import (
@@ -184,26 +183,6 @@ class TestColumnarErrorPopulations:
 
         assert len({finding.event_key for finding in errors}) == 2
         assert len(groups) == 2
-
-    def test_population_caps_reconcile_to_the_full_atomic_total(self) -> None:
-        errors = triage(_preflight_errors(_error_column(2, 250)))
-
-        budget = limit_findings(errors, max_per_class_scope=5, max_total=20)
-        details = [
-            finding
-            for finding in budget.findings
-            if finding.finding_class is FindingClass.FORMULA_ERROR
-        ]
-        summaries = [
-            finding
-            for finding in budget.findings
-            if finding.finding_class is FindingClass.FINDINGS_CAPPED
-        ]
-
-        assert len(details) == 5
-        assert len(summaries) == 1
-        assert summaries[0].current_value == "5 retained; 245 omitted"
-        assert len(details) + budget.omitted_by_artifact["excel"] == 250
 
 
 def _cycle_errors(

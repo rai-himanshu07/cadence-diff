@@ -11,24 +11,10 @@ from qc_tool.availability import (
 )
 from qc_tool.config.profile import PptProfile
 from qc_tool.coverage import CoverageItem, CoverageState
-from qc_tool.excel.periods import Period, parse_period
 from qc_tool.findings import Finding, FindingClass
+from qc_tool.ppt.claim_periods import CURRENT_PERIOD_CONTEXT, periods_in_text
 from qc_tool.ppt.extract import DeckSnapshot
-
-_PERIOD_PATTERNS = (
-    re.compile(
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[A-Za-z]*"
-        r"[-_ ]?'?\d{2,4}\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\b\d{4}-\d{2}(?:-\d{2})?\b"),
-    re.compile(r"\b(?:CW|WK|W)[-_ ]?\d{1,2}(?:[-_ ]?'?\d{2,4})?\b", re.IGNORECASE),
-    re.compile(r"\bQ[1-4](?:[-_ ]?(?:FY)?[-_ ]?'?\d{2,4})?\b", re.IGNORECASE),
-)
-_CURRENT_PERIOD_CONTEXT = re.compile(
-    r"\b(?:as of|reporting period|cycle|month ending|week ending|quarter ending)\b",
-    re.IGNORECASE,
-)
+from qc_tool.ppt.repetition import check_repeated_claims
 
 
 @dataclass(slots=True)
@@ -74,24 +60,14 @@ def media_structural_coverage(
     )
 
 
-def _periods_in_text(text: str) -> list[tuple[str, Period]]:
-    periods: list[tuple[str, Period]] = []
-    for pattern in _PERIOD_PATTERNS:
-        for match in pattern.finditer(text):
-            parsed = parse_period(match.group(0))
-            if parsed is not None:
-                periods.append((match.group(0), parsed))
-    return periods
-
-
 def contextual_periods(deck: DeckSnapshot) -> dict[tuple[str, tuple[int, int, int]], set[str]]:
     """Reporting-period labels used in explicit cycle/as-of text."""
     periods: dict[tuple[str, tuple[int, int, int]], set[str]] = {}
     for slide in deck.slides:
         for text in [slide.title or "", *slide.texts]:
-            if not _CURRENT_PERIOD_CONTEXT.search(text):
+            if not CURRENT_PERIOD_CONTEXT.search(text):
                 continue
-            for label, period in _periods_in_text(text):
+            for label, period in periods_in_text(text):
                 periods.setdefault((period.kind, period.sort_key), set()).add(
                     f"{slide.display_name}: {label}"
                 )
@@ -172,6 +148,10 @@ def preflight_deck(deck: DeckSnapshot, profile: PptProfile) -> PptPreflightResul
             findings=len(result.findings) - inventory_start,
         )
     )
+
+    repetition = check_repeated_claims(deck)
+    result.findings.extend(repetition.findings)
+    result.coverage.append(repetition.coverage)
 
     content_start = len(result.findings)
     for slide in deck.slides:

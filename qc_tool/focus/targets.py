@@ -8,13 +8,20 @@ successful with an empty sidecar rather than a guessed navigation target.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+from collections.abc import Iterable, Mapping, Sequence
 from enum import Enum, auto
 
 from qc_tool.coverage import QCRunMode
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.focus.locator import parse_excel_location, parse_qualified_location
-from qc_tool.focus.model import FocusArtifact, FocusRole, FocusTargetSeed
+from qc_tool.focus.model import (
+    EMPTY_SIDECAR_JSON,
+    FOCUS_SIDECAR_VERSION,
+    FocusArtifact,
+    FocusRole,
+    FocusTargetSeed,
+)
 
 
 class FocusTargetContractError(RuntimeError):
@@ -64,6 +71,7 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
     FindingClass.FORMULA_NOT_EXTENDED: TargetRule.EXCEL_LOCATION,
     FindingClass.FORMULA_LOGIC_CHANGED: TargetRule.EXCEL_LOCATION,
     FindingClass.FORMULA_INCONSISTENT: TargetRule.EXCEL_LOCATION,
+    FindingClass.CIRCULAR_REFERENCE: TargetRule.EXCEL_CURRENT_LOCATION,
     FindingClass.NUMBER_FORMAT_CHANGED: TargetRule.EXCEL_LOCATION,
     FindingClass.STYLE_CHANGED: TargetRule.EXCEL_LOCATION,
     FindingClass.CELL_COMMENT_CHANGED: TargetRule.EXCEL_LOCATION,
@@ -80,6 +88,8 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
     # --- Excel sheet-level evidence ------------------------------------------
     FindingClass.SHEET_ADDED: TargetRule.EXCEL_SHEET_CURRENT,
     FindingClass.SHEET_REMOVED: TargetRule.EXCEL_SHEET_BASELINE,
+    FindingClass.WORKBOOK_ADDED: TargetRule.NONE,
+    FindingClass.WORKBOOK_REMOVED: TargetRule.NONE,
     # Focus never unhides a worksheet, so a hidden-state change has no target.
     FindingClass.HIDDEN_CHANGED: TargetRule.NONE,
     # --- Excel profile controls (current workbook) ---------------------------
@@ -146,6 +156,7 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
     FindingClass.PPT_DUPLICATE_TITLE: TargetRule.NONE,
     FindingClass.PPT_REQUIRED_SLIDE_MISSING: TargetRule.NONE,
     FindingClass.PPT_PERIOD_INCONSISTENT: TargetRule.NONE,
+    FindingClass.PPT_REPEATED_CLAIM_MISMATCH: TargetRule.NONE,
     # --- Crosscheck ----------------------------------------------------------
     FindingClass.CROSSCHECK_MISMATCH: TargetRule.CROSSCHECK_CURRENT,
     FindingClass.CROSSCHECK_UNRESOLVED: TargetRule.CROSSCHECK_CURRENT,
@@ -153,11 +164,20 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
 }
 
 
-def _excel_seed(role: FocusRole, sheet: str | None, address: str | None) -> FocusTargetSeed | None:
+def _excel_seed(
+    role: FocusRole,
+    sheet: str | None,
+    address: str | None,
+    member_id: str = "primary",
+) -> FocusTargetSeed | None:
     if not sheet:
         return None
     return FocusTargetSeed(
-        artifact=FocusArtifact.EXCEL, role=role, sheet=sheet, address=address
+        artifact=FocusArtifact.EXCEL,
+        role=role,
+        member_id=member_id,
+        sheet=sheet,
+        address=address,
     )
 
 
@@ -185,17 +205,52 @@ def _seeds_for(finding: Finding, rule: TargetRule) -> list[FocusTargetSeed]:
             current = parse_excel_location(finding.location)
             baseline = parse_excel_location(finding.baseline_location)
             if current is not None:
-                seeds.append(_excel_seed(FocusRole.CURRENT_EXCEL, finding.sheet, current))
+                seeds.append(
+                    _excel_seed(
+                        FocusRole.CURRENT_EXCEL,
+                        finding.sheet,
+                        current,
+                        finding.artifact_member,
+                    )
+                )
             if baseline is not None:
-                seeds.append(_excel_seed(FocusRole.BASELINE_EXCEL, finding.sheet, baseline))
+                seeds.append(
+                    _excel_seed(
+                        FocusRole.BASELINE_EXCEL,
+                        finding.sheet,
+                        baseline,
+                        finding.artifact_member,
+                    )
+                )
         case TargetRule.EXCEL_CURRENT_LOCATION:
             current = parse_excel_location(finding.location)
             if current is not None:
-                seeds.append(_excel_seed(FocusRole.CURRENT_EXCEL, finding.sheet, current))
+                seeds.append(
+                    _excel_seed(
+                        FocusRole.CURRENT_EXCEL,
+                        finding.sheet,
+                        current,
+                        finding.artifact_member,
+                    )
+                )
         case TargetRule.EXCEL_SHEET_CURRENT:
-            seeds.append(_excel_seed(FocusRole.CURRENT_EXCEL, finding.sheet, None))
+            seeds.append(
+                _excel_seed(
+                    FocusRole.CURRENT_EXCEL,
+                    finding.sheet,
+                    None,
+                    finding.artifact_member,
+                )
+            )
         case TargetRule.EXCEL_SHEET_BASELINE:
-            seeds.append(_excel_seed(FocusRole.BASELINE_EXCEL, finding.sheet, None))
+            seeds.append(
+                _excel_seed(
+                    FocusRole.BASELINE_EXCEL,
+                    finding.sheet,
+                    None,
+                    finding.artifact_member,
+                )
+            )
         case TargetRule.PPT_MATCHED_SLIDE:
             seeds.append(
                 _ppt_seed(
@@ -235,7 +290,14 @@ def _seeds_for(finding: Finding, rule: TargetRule) -> list[FocusTargetSeed]:
             qualified = parse_qualified_location(finding.location)
             if qualified is not None:
                 sheet, address = qualified
-                seeds.append(_excel_seed(FocusRole.CURRENT_EXCEL, sheet, address))
+                seeds.append(
+                    _excel_seed(
+                        FocusRole.CURRENT_EXCEL,
+                        sheet,
+                        address,
+                        finding.artifact_member,
+                    )
+                )
             seeds.append(
                 _ppt_seed(
                     FocusRole.CURRENT_PPT,
@@ -257,19 +319,78 @@ def build_focus_targets(
     Raises ``FocusTargetContractError`` when a finding has no assigned id, its
     class has no rule, or its producer contradicts that rule.
     """
-    allowed = {
-        role
-        for role in _MODE_ROLES[mode]
-        if file_hashes.get(role.value)
-    }
     targets: dict[str, tuple[FocusTargetSeed, ...]] = {}
+    for finding_id, seeds in _iter_focus_seeds(
+        findings, mode=mode, file_hashes=file_hashes
+    ):
+        targets[finding_id] = seeds
+    return targets
+
+
+def encode_focus_targets_streaming(
+    findings: Iterable[Finding],
+    *,
+    mode: QCRunMode,
+    file_hashes: Mapping[str, str],
+) -> str:
+    """One-pass sidecar encoding that never holds every seed at once.
+
+    Byte-identical to ``encode_focus_targets(build_focus_targets(...))`` while
+    finding ids keep their four-digit zero padding (every existing fixture):
+    there, production order equals the old ``sorted()`` order. Past 9,999
+    findings the entries stay in production order — the decoded mapping is
+    order-insensitive, and no stored row predates this encoder at that scale.
+    """
+    fragments: list[str] = []
+    for finding_id, seeds in _iter_focus_seeds(
+        findings, mode=mode, file_hashes=file_hashes
+    ):
+        encoded_seeds = json.dumps([seed.model_dump(mode="json") for seed in seeds])
+        fragments.append(f"{json.dumps(finding_id)}: {encoded_seeds}")
+    if not fragments:
+        return EMPTY_SIDECAR_JSON
+    body = ", ".join(fragments)
+    return f'{{"version": {FOCUS_SIDECAR_VERSION}, "targets": {{{body}}}}}'
+
+
+def focus_seeds_for_finding(
+    finding: Finding,
+    *,
+    mode: QCRunMode,
+    file_hashes: Mapping[str, str],
+) -> tuple[FocusTargetSeed, ...]:
+    """Role seeds for one triaged finding; the per-block storage unit.
+
+    Raises ``FocusTargetContractError`` exactly like ``build_focus_targets``.
+    """
+    if not finding.finding_id:
+        raise FocusTargetContractError("focus targets need triaged finding ids")
+    rule = FINDING_CLASS_RULES.get(finding.finding_class)
+    if rule is None:
+        raise FocusTargetContractError("finding class has no focus target rule")
+    return tuple(
+        seed
+        for seed in _seeds_for(finding, rule)
+        if seed.role in _MODE_ROLES[mode] and file_hashes.get(seed.role_key)
+    )
+
+
+def _iter_focus_seeds(
+    findings: Iterable[Finding],
+    *,
+    mode: QCRunMode,
+    file_hashes: Mapping[str, str],
+) -> Iterable[tuple[str, tuple[FocusTargetSeed, ...]]]:
     for finding in findings:
         if not finding.finding_id:
             raise FocusTargetContractError("focus targets need triaged finding ids")
         rule = FINDING_CLASS_RULES.get(finding.finding_class)
         if rule is None:
             raise FocusTargetContractError("finding class has no focus target rule")
-        seeds = tuple(seed for seed in _seeds_for(finding, rule) if seed.role in allowed)
+        seeds = tuple(
+            seed
+            for seed in _seeds_for(finding, rule)
+            if seed.role in _MODE_ROLES[mode] and file_hashes.get(seed.role_key)
+        )
         if seeds:
-            targets[finding.finding_id] = seeds
-    return targets
+            yield finding.finding_id, seeds

@@ -5,9 +5,11 @@ from pathlib import Path
 import pytest
 
 from qc_tool.excel.align import WorkbookAlignment, align_workbooks
+from qc_tool.excel.formula_tokens import FormulaDiffKind, FormulaDiffSegment
 from qc_tool.excel.formulas import (
     _differs_only_by_extension,
     diff_workbook_formulas,
+    formula_token_diff,
     to_r1c1,
 )
 from qc_tool.findings import Finding, FindingClass
@@ -53,6 +55,95 @@ def test_to_r1c1(formula: str, row: int, col: int, expected: str) -> None:
 )
 def test_differs_only_by_extension(base: str, curr: str, expected: bool) -> None:
     assert _differs_only_by_extension(base, curr) is expected
+
+
+def test_formula_token_diff_marks_one_reference_replacement() -> None:
+    assert formula_token_diff("=A1", "=B1", "C1", "C1") == (
+        FormulaDiffSegment("=", FormulaDiffKind.EQUAL),
+        FormulaDiffSegment("RC[-2]", FormulaDiffKind.REMOVED),
+        FormulaDiffSegment("RC[-1]", FormulaDiffKind.ADDED),
+    )
+
+
+def test_formula_token_diff_normalizes_each_formula_at_its_own_host() -> None:
+    assert formula_token_diff("=A1", "=B2", "B1", "C2") == (
+        FormulaDiffSegment("=RC[-1]", FormulaDiffKind.EQUAL),
+    )
+
+
+def test_formula_token_diff_coalesces_identical_formula() -> None:
+    assert formula_token_diff("=A1+B1", "=A1+B1", "C1", "C1") == (
+        FormulaDiffSegment("=RC[-2]+RC[-1]", FormulaDiffKind.EQUAL),
+    )
+
+
+def test_formula_token_diff_preserves_text_operands() -> None:
+    segments = formula_token_diff(
+        '="Jan-26"',
+        '="Feb-26"',
+        "A1",
+        "A1",
+    )
+
+    assert any(
+        segment.kind is FormulaDiffKind.REMOVED and '"Jan-26"' in segment.text
+        for segment in segments
+    )
+    assert any(
+        segment.kind is FormulaDiffKind.ADDED and '"Feb-26"' in segment.text
+        for segment in segments
+    )
+
+
+def test_formula_token_diff_handles_long_let_formula_without_losing_structure() -> None:
+    segments = formula_token_diff(
+        "=LET(x,A1,y,B1,x+y)",
+        "=LET(x,A1,y,C1,x+y)",
+        "E1",
+        "E1",
+    )
+
+    assert segments[0].kind is FormulaDiffKind.EQUAL
+    assert segments[0].text.startswith("=LET(")
+    assert any(segment.kind is FormulaDiffKind.REMOVED for segment in segments)
+    assert any(segment.kind is FormulaDiffKind.ADDED for segment in segments)
+    assert "".join(segment.text for segment in segments).endswith("x+y)")
+
+
+@pytest.mark.parametrize(
+    ("baseline", "current", "baseline_location", "current_location"),
+    [
+        (None, "=A1", "A1", "A1"),
+        ("=A1", None, "A1", "A1"),
+        ("A1", "=B1", "A1", "A1"),
+        ("=A1", "B1", "A1", "A1"),
+        ("=A1", "=B1", "not-a-cell", "A1"),
+        ("=A1", "=B1", "A1", "not-a-cell"),
+    ],
+)
+def test_formula_token_diff_returns_empty_on_unrenderable_input(
+    baseline: str | None,
+    current: str | None,
+    baseline_location: str,
+    current_location: str,
+) -> None:
+    assert formula_token_diff(
+        baseline,
+        current,
+        baseline_location,
+        current_location,
+    ) == ()
+
+
+def test_formula_token_diff_keeps_named_ranges_as_symbols() -> None:
+    assert formula_token_diff(
+        "=SUM(RevenueData)",
+        "=SUM(RevenueData)",
+        "B3",
+        "B3",
+    ) == (
+        FormulaDiffSegment("=SUM(RevenueData)", FormulaDiffKind.EQUAL),
+    )
 
 
 @pytest.fixture(scope="module")

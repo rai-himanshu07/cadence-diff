@@ -29,6 +29,7 @@ COMMON_TASKS = (
     ("See a worked example", "example"),
     ("Run a first preflight", "modes"),
     ("Review a reporting cycle", "review"),
+    ("Handle a workload refusal", "coverage"),
     ("Re-QC after a correction", "reqc"),
     ("Share evidence safely", "privacy"),
     ("Interpret a capability-limited run", "coverage"),
@@ -89,8 +90,8 @@ GLOSSARY = (
     ),
     (
         "story",
-        "A severity-neutral narrative linking findings across classes by proved "
-        "evidence edges. Stories never change counts or severities.",
+        "A plain-language summary linking findings through confirmed structural "
+        "relationships. Stories never change counts or severities.",
     ),
     (
         "scope",
@@ -106,6 +107,16 @@ GLOSSARY = (
         "Expected reason",
         "The typed justification for an Expected finding, such as cadence "
         "growth or a rolling chart window.",
+    ),
+    (
+        "workbook workload refusal",
+        "A safety stop raised when workbook size or formula-link complexity may "
+        "use too much memory or time. It is not a QC finding.",
+    ),
+    (
+        "projected finding volume",
+        "An estimate of how many differences the changed sheets could produce. "
+        "It helps choose scope, but it is not a memory-safety check.",
     ),
 )
 
@@ -123,7 +134,8 @@ GUIDE_SCRIPT = r"""
         mappings: 'mapping unavailable opaque screenshot raster image claim',
         review: 'unreviewed only replace all confirm severity reviewed note',
         reqc: 'rerun repeat carry forward history',
-        files: 'xlsb formula encrypted password same file',
+        files: 'xlsb formula encrypted password same file workload memory refusal',
+        coverage: 'workload refusal override memory projected findings safety',
     };
   const mobile = () => window.matchMedia('(max-width: 640px)').matches;
 
@@ -348,7 +360,7 @@ def render_guide() -> None:
                         "Open the <strong>Review queue</strong>: the two Critical items are the top rows.",
                         "Select a row to see baseline and current values side by side with the surrounding cells.",
                         "Set <strong>Show severities</strong> to include Expected when you want to audit the growth row itself.",
-                        "Add a comment such as <code>confirmed with data owner</code>, then export — the comment travels with the report.",
+                        "Add a specific comment such as <code>Revenue!D4 confirmed by J. Smith (data owner), 2026-06-30</code>, then export — the comment travels with the report.",
                         "Fix the source file, then use <strong>Re-QC</strong> to prove the two Critical items are resolved.",
                     ]
                 )
@@ -372,20 +384,20 @@ def render_guide() -> None:
                     [
                         [
                             "Current-file preflight",
-                            "Latest Excel and/or latest PPT",
-                            "Is this file internally sound now?",
+                            "Latest Excel member(s) and/or latest PPT",
+                            "Is this package internally sound now?",
                             "Whether historical content changed",
                         ],
                         [
                             "Cycle comparison",
-                            "Baseline/current Excel pair and/or PPT pair",
+                            "Baseline/current Excel members and/or PPT pair",
                             "What changed, excluding expected cadence growth?",
-                            "Upstream-data correctness or recalculated formulas",
+                            "Whether saved formula results are numerically correct, or what Excel would recalculate from upstream data",
                         ],
                         [
                             "Final-package QC",
-                            "Latest Excel plus latest PPT",
-                            "Does the final deck reconcile to its workbook?",
+                            "One to eight current Excel members plus latest PPT",
+                            "Does the final deck reconcile to its nominated workbooks?",
                             "Whether either artifact changed from last cycle",
                         ],
                     ],
@@ -407,17 +419,22 @@ def render_guide() -> None:
                         "Excel sheet/workbook protection and locked, unlocked, or formula-hidden cells control editing; they do not block read-only QC, and protection settings are not themselves audited.",
                         "IRM, sensitivity-label encryption, or missing filesystem read permission can still prevent automated access.",
                         "A comparison requires both sides of an artifact pair; incomplete pairs are rejected.",
+                        "Add up to eight Excel workbook members per side. Stable member IDs pair baseline and current workbooks; added or removed members are reported explicitly.",
+                        "Duplicate sheet names remain qualified by workbook member. Ambiguous unscoped profile rules are refused instead of being applied to several workbooks.",
                         "Re-QC reuses a stored upload only after its hash still matches the recorded run.",
                     ]
                 )
                 _callout(
-                    "XLSB formula coverage",
-                    "The original XLSB supplies saved values. On Windows, installed desktop "
-                    "Excel can supply Formula2 text; on Linux, LibreOffice runs inside a "
-                    "networkless bubblewrap sandbox. Formula text is trusted only when its "
-                    "coordinates exactly match an independent BIFF12 scan. Missing tools, "
-                    "active/external content, timeouts, or mismatches fall back to "
-                    "presence-only checks and are reported as degraded.",
+                    "XLSB values, formulas, and workload",
+                    "QC always reads saved values from the original XLSB. Before loading those "
+                    "values, it counts retained cells, formulas, and binary worksheet bytes; "
+                    "an oversized file is refused unless the workload override is deliberately "
+                    "enabled. Formula text is an additional capability: Windows can use "
+                    "installed desktop Excel, while Linux can use LibreOffice in a networkless "
+                    "sandbox. Formula text is accepted only when its cells exactly match an "
+                    "independent structural scan of the binary file. Missing tools, active or "
+                    "external content, timeouts, or mismatches fall back to formula-presence "
+                    "checks and are clearly reported as degraded. Saved values are still read.",
                     warning=True,
                 )
 
@@ -460,7 +477,7 @@ def render_guide() -> None:
                     "Select files on Compare, then validate from Manage profiles to check "
                     "sheet, range, slide, and mapping references with the same local read-only "
                     "loaders and passwords. Current files take precedence over baseline files. "
-                    "Large-workbook refusal and cancellation remain active. XLSB reference "
+                    "Workbook workload refusal and cancellation remain active. XLSB reference "
                     "lint stays bounded; formula-text adapter availability and degradation are "
                     "reported by the subsequent QC run.",
                 )
@@ -512,26 +529,23 @@ def render_guide() -> None:
                     ],
                 )
                 _paragraph(
-                    "Numeric value changes carry magnitude and temporal context as separate "
-                    "axes. Representation noise (display-identical, ULP-scale) is Info. "
-                    "Per-range acceptance_bands report in-band changes as visible "
-                    "within-tolerance Info. A current or recent in-window change is Warning "
-                    "only when it clears hard anomaly guards: sign flips, zero-boundary "
-                    "changes, and 10x-or-greater magnitude ratios remain Critical regardless "
-                    "of position. Historical material changes stay Critical. An implicit "
-                    "numeric refresh block is Warning; a profile-declared refresh range may "
-                    "be Expected. restatement_windows controls the local recency window, and "
-                    "profiles can still override materiality_severity."
+                    "Numeric changes are judged on two separate questions: how large is the "
+                    "change, and how old is the period? Sub-display-precision rounding noise "
+                    "is Info. A profile can define tolerance bands for particular ranges; an "
+                    "accepted change remains visible as within-tolerance Info. A current or "
+                    "recent change is normally Warning, but a sign flip, crossing zero, or a "
+                    "10x-or-larger jump remains Critical. Material changes to older periods "
+                    "stay Critical. A profile can define which recent periods may be restated, "
+                    "which ranges are expected refreshes, and how each materiality level maps "
+                    "to severity."
                 )
                 _paragraph(
-                    "Inherited errors remain literal and evidence aware: an explicit NA() "
-                    "formula may report as Info, and a formula-backed concentrated or "
-                    "contiguous data-state population may report as Warning when formula "
-                    "text is unavailable. Structural, new, or changed errors remain "
-                    "Critical. Inherited consistency deviations can report as Info. "
-                    "In-place key changes on formula-derived labels are "
-                    "Warnings that point at the upstream driver; constant-key rewrites of "
-                    "history remain Critical."
+                    "An inherited error is one that was already present in the baseline; it "
+                    "was not introduced by the current file. It may be Info or Warning only "
+                    "when the evidence shows the same non-structural condition. Structural "
+                    "errors, and every new or changed error, remain Critical. A row or column "
+                    "label produced by a formula points reviewers to the upstream cause; a "
+                    "manually rewritten historical key remains Critical."
                 )
                 _paragraph(
                     "Change stories are one of the result views, alongside the review "
@@ -548,23 +562,25 @@ def render_guide() -> None:
                     "acceptance threshold (absolute value and/or percentage; either "
                     "bound accepts; in-band changes stay visible as within-tolerance "
                     "Info and the threshold is disclosed with the run) and a "
-                    "comparison scope (pick sheets and slides; files still load fully "
-                    "so cross-references resolve; the validated scope is disclosed and "
-                    "out-of-scope findings are simply not reported; comparison-scope "
-                    "coverage shows Excel selected/total, PowerPoint selected/total, and "
-                    "files loaded fully). Both default off."
+                    "comparison scope (pick sheets and slides; the validated scope and "
+                    "selected/total counts are disclosed). In a multi-workbook package, "
+                    "scope is set per workbook member; a member with no sheet selection "
+                    "remains fully compared. Scope narrows only Excel and PowerPoint "
+                    "findings. Package mappings, source suggestions, readable-claim counts, "
+                    "and period reconciliation still use the whole package. Every selected "
+                    "file still loads fully, so scope does not reduce physical loading risk "
+                    "or bypass a workload refusal. Both controls default off."
                 )
                 _paragraph(
-                    "Saved-error populations that reach 200 cells by sheer mass, or at "
-                    "least 20 cells with concentration or contiguity evidence, are grouped "
-                    "as one incident rather than hundreds of independent decisions. Mass "
-                    "alone is a grouping detector, not a severity rule. Warning requires "
-                    "formula presence plus concentration or contiguity; sparse value-only "
-                    "mass stays Critical. Only data-state errors (#N/A, #DIV/0!, #VALUE!, "
-                    "#NUM!) can be Warning. Structural breakage (#REF!, #NAME?, #NULL!) "
-                    "and new or changed errors always stay Critical. Intrinsic workbook "
-                    "risks, including external links and active content, produce Critical "
-                    "findings in preflight, cycle-comparison, and final-package modes."
+                    "A large block of the same saved error may be shown as one review "
+                    "decision instead of hundreds of repeated decisions: this happens at "
+                    "200 cells by population alone, or from 20 cells when they form a clear "
+                    "cluster. Grouping never makes an error safer. Only data-state errors "
+                    "(#N/A, #DIV/0!, #VALUE!, #NUM!) can become Warning when formula and "
+                    "clustering evidence support it. Sparse errors, structural breakage "
+                    "(#REF!, #NAME?, #NULL!), and every new or changed error stay Critical. "
+                    "External links and active content also produce Critical findings in all "
+                    "run modes."
                 )
                 _callout(
                     "Zero findings is not automatically a full pass",
@@ -574,9 +590,29 @@ def render_guide() -> None:
                 )
                 _callout(
                     "Safeguards are visible",
-                    "Excel workload warnings, accepted large-workbook overrides, findings caps, "
-                    "and low-confidence alignment all degrade coverage and explain the affected "
-                    "scope. They never silently truncate or guess.",
+                    "Excel workload warnings, accepted workload overrides, and low-confidence "
+                    "alignment all degrade coverage and explain the affected scope. Every "
+                    "finding is retained; safeguards never silently truncate or guess.",
+                )
+                _callout(
+                    "Workbook workload override: use it only after a refusal",
+                    "The normal run checks two safety areas: physical workbook load (OOXML or "
+                    "XLSB size, cells, and package bytes) and formula-link complexity (how many "
+                    "formulas, references, projected dependencies, and interaction rules must "
+                    "be analysed). Override workbook workload refusals applies to every workbook "
+                    "in that run and bypasses both safety stops. First read the exact refusal "
+                    "reason. If you cannot confirm enough memory and time, stop and ask a senior "
+                    "reviewer. Do not tick the override in advance, and do not treat sheet scope "
+                    "as a memory workaround because files still load fully. The separate "
+                    "projected-finding dialog estimates review volume; it is not a safety check "
+                    "and does not make a workbook cheaper to load.",
+                    warning=True,
+                )
+                _paragraph(
+                    "When alignment cannot deterministically pair cells, the run records an "
+                    "alignment trust manifest listing per-region paired counts, low-confidence "
+                    "regions, and unpaired regions. Use Coverage → Alignment trust per region "
+                    "to inspect these factual counts when interpreting degraded comparisons."
                 )
                 _paragraph(
                     "Tables, structured references, combo charts, interaction rules, "
@@ -586,6 +622,13 @@ def render_guide() -> None:
                     "unambiguous implicit intersections are resolved; missing spill extents, "
                     "including XLSB extents, degrade reference coverage. Unsupported formulas, chart parts, "
                     "rule families, or theme styles are disclosed separately."
+                )
+                _paragraph(
+                    "Circular-reference detection builds a separate compact graph over "
+                    "formula cells only. It reports exact self and multi-cell cycles; "
+                    "unparseable, unsupported, invalid, or edge-budgeted references "
+                    "degrade the circular-reference coverage row instead of producing a "
+                    "false clean result."
                 )
                 _paragraph(
                     "Workbook metadata beyond the grid is compared too, each with its own "
@@ -642,19 +685,25 @@ def render_guide() -> None:
                 )
                 _list(
                     [
-                        "Filter by severity or free text, and read the capability status before concluding a run is clean.",
+                        "Filter by severity, class, sheet or slide, or free text, and read the capability status before concluding a run is clean. The sheet/slide list comes from this run's findings; <em>whole file</em> covers findings that belong to no single sheet.",
+                        "The queue pages under its own footer: choose 10 to 100 rows per page (remembered on this machine), pick an order — <em>priority</em> (the evidence default), severity, location, or findings — with a direction toggle, and drag a column boundary in the header to resize; double-click the boundary to restore the defaults. Ordering moves a related series and its decisions together, never splitting them.",
+                        "The <strong>review time</strong> box at the top right is an explicit Start/Pause timer with a four-hour cap per session; finalizing the run freezes it, and the recorded minutes feed the longitudinal dossier.",
                         "The queue is ordered by evidence, not by sheet position. The detail panel says <em>prioritized because</em> and names the counts it scored on: severity, materiality, historical position, provenance, downstream impacts, population size, and whether a story explains it.",
                         "Ordering only reorders. Every review item and every atomic finding stays reachable; nothing is hidden.",
                         "Waived, already-reviewed, and expected-growth decisions sink below everything still open, because they need no new judgement.",
                         "Pattern review-item counts are analyst decisions; atomic-finding counts are the underlying evidence. Spatial review counts remain a compatibility metric.",
                         "Select a review item to see its evidence axes, baseline/current values, impacts, and nearby cells in the detail panel.",
+                        "For formula logic changes, expand <strong>Formula token diff</strong> to see a normalized token-level comparison; added tokens are underlined and removed tokens are struck through.",
                         "Open a group for paged atomic members, or use the Atomic evidence view for every individual finding.",
-                        "Use Unreviewed only to preserve prior member decisions; Replace all is an explicit bulk override.",
+                        "Use Unreviewed only to preserve prior member decisions. Replace all overwrites every existing member decision in that group, so use it only when you intend to replace prior analyst work.",
+                        "Use the Review selector to show All, Needs review, or Reviewed groups. Keyboard triage is available: <code>j</code>/<code>k</code> or Arrow keys move between visible review items; <code>1</code>/<code>2</code>/<code>3</code>/<code>4</code> set Critical/Warning/Info/Expected for the current unreviewed group and advance; <code>c</code> confirms the current severity as reviewed.",
+                        "What-if preview uses private typed numeric evidence to show how temporary acceptance bounds or a materiality review floor would change atomics and decisions. It ignores analyst overrides, never parses display strings, never writes the run or profile, and keeps accepted changes visible as Info.",
                         "A shared <strong>root cause</strong> key groups multiple truthful symptoms at one location.",
                         "Use the severity selector only for an analyst disposition; it does not rewrite engine logic.",
-                        "Add a comment explaining evidence, approval, source, or required follow-up.",
+                        "Add a specific comment naming the evidence, approver or source, date, and required follow-up. Avoid comments such as <em>looks fine</em> or <em>checked</em> with no support.",
                         "Exports are regenerated from the reviewed state so comments and overrides are included.",
                         "Excel and HTML exports lead with semantic pattern groups while retaining every atomic finding; Excel links stay inside the report workbook.",
+                        "On very large runs (over 50,000 findings) report files are not written at run time — the run becomes reviewable sooner, and <strong>Generate Excel/HTML report</strong> on the run page builds the file on demand, stores it with the run, and downloads it. Expect several minutes for a million-finding report; reviewing continues meanwhile.",
                     ]
                 )
                 _callout(
@@ -686,23 +735,84 @@ def render_guide() -> None:
                         "Annotations belong to the run. A Re-QC starts a new run with no annotations; the delta reports resolved, new, and persisting.",
                     ]
                 )
+                _paragraph(
+                    "<strong>Related series</strong> rows collapse one logical time series "
+                    "that the engine correctly split across several decisions, so you can "
+                    "read a measure column in one place."
+                )
+                _list(
+                    [
+                        "A related-series row is a <strong>navigation lens, not a decision</strong>. Decision and atomic counts in the run header keep counting canonical decisions, so promoting a series can make the queue show more top-level rows, never fewer.",
+                        "Parent labels are <strong>structural only</strong>: sheet, measure column letter or row number, and how many periods changed. No metric name, header text, or cell value is captured, stored, or shown in the label.",
+                        "Parents start collapsed. Click, or press Enter or Space, to expand. <code>j</code>/<code>k</code> move focus over a parent without expanding it, and the <code>1</code>-<code>4</code> and <code>c</code> shortcuts are deliberately unavailable on a parent row.",
+                        "Each child segment is one canonical decision intersected with that series: it keeps that decision's identity, severity, and temporal context.",
+                        "<strong>Confirm visible</strong> records every visible, still-unreviewed finding at <em>its own current severity</em>. It is a confirmation, never a bulk override or a replacement, and it lists the exact counts before you apply it.",
+                        "Under an active filter, Confirm visible touches only the visible child segments and states how many segments and findings stay hidden and untouched.",
+                        "Parent context merges the neighbouring cells this run stored around each finding. When some related cells were not stored, the panel says <strong>N of M related finding cells shown</strong>; the parent still lists every related finding.",
+                        "A period populated for the first time this cycle joins its column as a <strong>new period</strong> segment, and a historical cell cleared to blank joins as a <strong>cleared period</strong> segment, provided sibling measures still prove that period exists. Both sort at their period position so a parent reads in time order, carry no materiality tier or temporal context (there is no baseline/current pair to measure), and keep their own severity exactly like any other member.",
+                        "A parent that contains a new or cleared period is labelled <strong>periods affected</strong> rather than <em>changed periods</em>, because a period that appeared or disappeared was not changed.",
+                        "A <strong>wiped period row</strong> is one event, not one finding per column: when no measure retains data at that period, its cleared cells stay together in their own decision instead of being scattered across column parents.",
+                        "Runs recorded before this feature keep today's grouping. Re-QC that deliverable to get producer-authored series evidence; nothing is guessed from coordinates.",
+                    ]
+                )
 
             with _guide_section("mappings", "Excel to PowerPoint mappings"):
                 _paragraph(
                     "Final-package QC extracts eligible figures from the current deck and ranks "
                     "candidate workbook cells by display match, label affinity, and numeric distance."
                 )
+                _table(
+                    ["Stage", "What QC Tool does", "What the analyst must do"],
+                    [
+                        [
+                            "Read the deck",
+                            "Extracts figures from readable text, table cells, and visible native-chart labels.",
+                            "Check coverage for pictures, embedded objects, or unavailable chart labels.",
+                        ],
+                        [
+                            "Find candidates",
+                            "Normalizes displayed forms such as $1.2M, 12%, and (1,234), then searches numeric workbook cells for display matches and near matches within 5%.",
+                            "Treat the list as a search aid, not as proof of source.",
+                        ],
+                        [
+                            "Rank candidates",
+                            "Compares slide wording with the workbook member, sheet name, and nearest text to the left and above each cell. Exact display matches rank before near matches.",
+                            "Confirm the business meaning, unit, workbook member, sheet, and cell.",
+                        ],
+                        [
+                            "Recheck later",
+                            "Stores the confirmed slide wording pattern and exact source cell, then compares them deterministically on later runs.",
+                            "Re-confirm when wording, figure order, sheet layout, or source location changes.",
+                        ],
+                    ],
+                )
                 _list(
                     [
                         "Use a <strong>named profile</strong>; the default profile cannot persist confirmations.",
                         "Expand a suggestion and compare slide context, source labels, value, and match type.",
                         "Confirm only when the workbook cell is the intended source, not merely the same number.",
+                        "For a multi-workbook package, confirm the nominated workbook member as well as the sheet and cell.",
                         "A <strong>near match</strong> is useful for locating drift but is not a successful reconciliation.",
                         "Coverage distinguishes eligible, mapped, verified, mismatched, unresolved, and unmapped figures.",
                         "Coverage also counts <strong>unavailable</strong> surfaces: a figure rendered into a picture or an embedded object is a real claim nobody here can read, so it is counted and named rather than dropped from the denominator.",
                         "Visible native chart labels use chart, series, and category anchors and can be confirmed like text or table figures.",
                         "Re-run Final-package QC after confirmations to verify persisted mappings independently.",
+                        "QC Tool also detects semantically identical claims repeated across slides and reports mismatches (ppt-internal-repetition).",
                     ]
+                )
+                _callout(
+                    "Suggestions are not proof",
+                    "Real Excel and PowerPoint files often name the same measure differently: "
+                    "abbreviations, renamed sheets, merged or multi-row headers, transposed "
+                    "tables, hidden units, and month or region labels can all weaken the text "
+                    "score. Formatting can differ too: the deck may show $1.2M while Excel "
+                    "stores 1,249,999, or several unrelated cells may display the same rounded "
+                    "number. QC Tool has no LLM or business dictionary, does not prove currency "
+                    "or unit meaning from Excel formatting, and returns at most the configured "
+                    "top candidate list. The intended source can therefore rank lower or be "
+                    "absent. Confirm against the workbook's business logic; if no single saved "
+                    "cell is the defensible source, leave the claim unmapped and document it.",
+                    warning=True,
                 )
                 _callout(
                     "A clean mapping result still has a population",
@@ -728,7 +838,21 @@ def render_guide() -> None:
                 )
                 _paragraph(
                     "History is also a shelf you curate. Tick one or more runs to "
-                    "act on them together."
+                    "act on them together. Every run is stored in full, so the "
+                    "list shows the storage each run occupies; when the total "
+                    "grows large the app suggests exporting what you need and "
+                    "archiving or deleting the rest."
+                )
+                _paragraph(
+                    "Dossier and recurrence: when a finding can be matched to a"
+                    " stable anchor across an unbroken rerun chain, the UI shows a"
+                    " per-run dossier (exact/changed/ambiguous/no stored observation)."
+                )
+                _paragraph(
+                    "Recurrence is an advisory detection: it requires three consecutive"
+                    " finalized matching observations, the same analyst disposition,"
+                    " and at least two manual confirmations. The UI may nudge when"
+                    " recurrence is eligible; it never auto-applies promotions."
                 )
                 _table(
                     ["Action", "Effect"],
@@ -764,8 +888,8 @@ def render_guide() -> None:
                     ["Artifact", "Contains source information?", "Use"],
                     [
                         ["Numeric sanitize", "Yes", "Local testing only; not safe to share"],
-                        ["Strict sanitize", "Transformed figures and period grammar", "Verified share candidate"],
-                        ["Fingerprint", "No values or visible text", "Safest structural evidence"],
+                        ["Strict sanitize", "Transformed figures; date and category labels are kept only in structural form; package members use aliases", "Verified share candidate"],
+                        ["Fingerprint", "No values, visible text, paths, filenames, or member IDs", "Safest structural evidence"],
                         ["JSON", "Findings and compared values", "Private CI integration"],
                         ["JSON context", "Includes neighborhoods/candidates", "Private diagnostics only"],
                         [".qca attestation", "Full findings and reports", "Private audit/archive"],
@@ -790,6 +914,10 @@ def render_guide() -> None:
 cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
     --profile monthly --json findings.json --progress
 
+# Semantic JSON review summary (pattern groups, stories, alignment trust) — v2
+cadence-diff run --current-excel current.xlsx --json findings.json \\
+    --json-review-summary
+
 # Analyst acceptance threshold (visible-Info, never suppressed)
 cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
     --accept-absolute 1 --accept-percent 0.1
@@ -798,15 +926,24 @@ cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
 cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
     --sheets "Dashboard,Data" --slides 1,3-5
 
-# Deliberate local override after reviewing workload refusal
+# Overrides physical-size and formula-link safety refusals for this run
 cadence-diff run --current-excel unusually-large.xlsx --allow-large-workbooks
 
 # Structural-only evidence
 cadence-diff fingerprint current.xlsx -o current.fingerprint.json
 
+# Structural-only package evidence
+cadence-diff fingerprint --current-excel core.xlsx \\
+    --current-workbook ops=ops.xlsx --current-ppt deck.pptx \\
+    -o package.fingerprint.json
+
 # Strict verified package redaction
 cadence-diff sanitize-package --excel current.xlsx --ppt current.pptx \\
   --profile monthly --output-dir sanitized --forbid "Client Name"
+
+# Multi-workbook package redaction
+cadence-diff sanitize-package --excel core.xlsx --workbook ops=ops.xlsx \\
+    --ppt deck.pptx --profile monthly --output-dir sanitized
 
 # Signed audit evidence
 cadence-diff run --current-excel current.xlsx --fail-on never \\
@@ -855,8 +992,12 @@ qc-tool network local --data-dir data"""
                         ["Formula cache missing", "Open and recalculate in Excel, save, then rerun"],
                         [
                             "Workbook workload refused",
-                            "Review the reported XML, shared-string, style, cell, and sheet-area metrics. "
-                            "Use the per-run override only when sufficient local memory is confirmed.",
+                            "Read the reason shown: it will name workbook size/cell counts, "
+                            "XLSB cells/formulas/binary bytes, or formula-link complexity. "
+                            "If you cannot confirm enough local memory and time, do not "
+                            "override; ask a senior reviewer. Sheet scope is not a workaround "
+                            "because the complete workbook still loads. When approved, enable "
+                            "Override workbook workload refusals for that run and record why.",
                         ],
                         [
                             "Run cancelled",
@@ -922,6 +1063,7 @@ qc-tool network local --data-dir data"""
                         "Expected findings and active waivers were sampled for correctness.",
                         "Final-package mapping coverage is acceptable and unresolved figures are documented.",
                         "Re-QC deltas are reviewed after corrected files arrive.",
+                        "Any non-zero acceptance threshold or workbook workload override has a documented reason and approval.",
                         "Exports or attestations were generated only after analyst comments and overrides were saved.",
                         "A human still performs any visual or domain checks outside the reported coverage.",
                     ]

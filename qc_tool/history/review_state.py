@@ -76,6 +76,7 @@ FINDING_EVIDENCE_FIELDS: dict[str, EvidenceFieldRole] = {
     "evidence_tags": EvidenceFieldRole.NORMALIZED,
     "event_key": EvidenceFieldRole.INCLUDED,
     "sheet": EvidenceFieldRole.INCLUDED,
+    "artifact_member": EvidenceFieldRole.DERIVED,
     "location": EvidenceFieldRole.INCLUDED,
     "baseline_location": EvidenceFieldRole.INCLUDED,
     "element": EvidenceFieldRole.INCLUDED,
@@ -95,6 +96,8 @@ FINDING_EVIDENCE_FIELDS: dict[str, EvidenceFieldRole] = {
     "root_cause_key": EvidenceFieldRole.INCLUDED,
     "waiver_reason": EvidenceFieldRole.INCLUDED,
     "waiver_expires": EvidenceFieldRole.INCLUDED,
+    "counterfactual_basis": EvidenceFieldRole.EXCLUDED,
+    "series_anchor": EvidenceFieldRole.EXCLUDED,
 }
 
 
@@ -127,6 +130,8 @@ def finding_evidence_payload(finding: Finding) -> dict[str, object]:
         if finding.expected_reason is not None
         else bool(finding.expected_growth)
     )
+    if finding.artifact_member != "primary":
+        payload["artifact_member"] = finding.artifact_member
     return {
         "version": FINDING_EVIDENCE_VERSION,
         "evidence": payload,

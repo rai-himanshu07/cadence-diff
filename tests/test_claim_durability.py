@@ -23,6 +23,7 @@ from qc_tool.crosscheck.trace import extract_deck_figures
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.ppt.extract import load_deck_snapshot
 from qc_tool.ppt.model import DeckSnapshot, ShapeContent, SlideContent
+from tests.fixtures.ppt_builder import build_grouped_text_deck
 
 
 def _deck(path: Path, slides: list[tuple[str, list[str]]]) -> Path:
@@ -184,6 +185,26 @@ def test_readable_deck_reports_a_complete_population(tmp_path: Path) -> None:
 
     assert population.complete is True
     assert population.unreadable_shapes == 0
+
+
+def test_grouped_figures_join_the_readable_claim_population(tmp_path: Path) -> None:
+    deck = load_deck_snapshot(
+        build_grouped_text_deck(
+            tmp_path / "grouped-claims.pptx",
+            grouped_lines=("Revenue $120M for Jan-26",),
+            nested_lines=("Margin 41.5% for Jan-26",),
+        )
+    )
+
+    occurrences = extract_deck_figures(deck)
+    population = claim_population(deck, occurrences)
+
+    assert [item.line for item in occurrences] == [
+        "Revenue $120M for Jan-26",
+        "Margin 41.5% for Jan-26",
+    ]
+    assert population.readable == 2
+    assert population.reconciles(mapped=0, unmapped=2)
 
 
 def test_unavailable_surfaces_degrade_crosscheck_coverage(tmp_path: Path) -> None:

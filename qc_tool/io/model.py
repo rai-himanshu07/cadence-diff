@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TypeGuard
+from typing import Literal, TypeGuard
 
 from qc_tool.io.ooxml_metadata import WorkbookMetadataScan
 from qc_tool.io.vba import VbaProjectScan
@@ -74,11 +74,18 @@ class CellRecord:
 
 @dataclass(slots=True)
 class WorkbookWorkload:
+    format: Literal["ooxml", "xlsb"] = "ooxml"
+    metrics_available: bool = True
     cell_count: int = 0
     worksheet_xml_bytes: int = 0
+    worksheet_binary_bytes: int = 0
     shared_string_bytes: int = 0
     styles_bytes: int = 0
     style_count: int = 0
+    formula_count: int = 0
+    sheet_count: int = 0
+    largest_sheet_rows: int = 0
+    largest_sheet_columns: int = 0
     largest_sheet_area: int = 0
     warning_reasons: tuple[str, ...] = ()
     override_used: bool = False
@@ -89,6 +96,24 @@ class WorkbookWorkload:
 
     @property
     def detail(self) -> str:
+        if not self.metrics_available:
+            return "XLSB workload metrics unavailable"
+        if self.format == "xlsb":
+            metrics = (
+                f"{self.cell_count:,} retained cells; "
+                f"{self.formula_count:,} formulas; "
+                f"{self.worksheet_binary_bytes / (1024 * 1024):.1f} MiB "
+                f"BIFF12 worksheets; "
+                f"{self.shared_string_bytes / (1024 * 1024):.1f} MiB shared strings; "
+                f"{self.styles_bytes / (1024 * 1024):.1f} MiB styles; "
+                f"{self.sheet_count:,} sheets; "
+                f"largest measured extent {self.largest_sheet_rows:,} x "
+                f"{self.largest_sheet_columns:,} "
+                f"({self.largest_sheet_area:,} cells)"
+            )
+            if self.warning_reasons:
+                return f"{metrics}; " + "; ".join(self.warning_reasons)
+            return metrics
         metrics = (
             f"{self.cell_count:,} physical cells; "
             f"{self.worksheet_xml_bytes / (1024 * 1024):.1f} MiB worksheet XML; "

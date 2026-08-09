@@ -9,15 +9,18 @@ from qc_tool.config.profile import DeliverableProfile
 from qc_tool.coverage import CoverageState
 from qc_tool.engine import run_qc
 from qc_tool.excel.align import (
+    AlignmentTrustManifest,
+    AxisAlignment,
     AxisEntry,
     RegionAlignment,
     WorkbookAlignment,
     _align_axis,
     _pair_regions,
     align_workbooks,
+    build_alignment_trust_manifest,
 )
 from qc_tool.excel.periods import parse_period
-from qc_tool.excel.regions import detect_regions
+from qc_tool.excel.regions import TableRegion, detect_regions
 from qc_tool.findings import FindingClass
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.model import CellRecord, SheetSnapshot, WorkbookSnapshot
@@ -237,3 +240,107 @@ def test_cell_pairs_identity_on_unchanged_history(alignment: WorkbookAlignment) 
     assert ((7, 3), (7, 3)) in pairs  # E01's cell maps onto itself
     assert len(pairs) == 20 * 5
     assert all(base == curr for base, curr in pairs)
+
+
+def test_alignment_trust_manifest_reconciles_every_paired_region(
+    alignment: WorkbookAlignment,
+) -> None:
+    manifest = build_alignment_trust_manifest(alignment)
+    trust_by_region = {
+        (region.sheet, region.region_id): region
+        for region in manifest.regions
+    }
+
+    for sheet, regions in alignment.regions.items():
+        for region in regions:
+            trust = trust_by_region[(sheet, region.current.region_id)]
+            assert trust.baseline_range == region.baseline.cell_range
+            assert trust.current_range == region.current.cell_range
+            assert trust.row.paired == len(region.rows.pairs)
+            assert trust.row.deleted == len(region.rows.deleted)
+            assert trust.row.inserted == len(region.rows.inserted)
+            assert trust.row.growth == len(region.rows.growth)
+            assert trust.column.paired == len(region.columns.pairs)
+            assert trust.column.deleted == len(region.columns.deleted)
+            assert trust.column.inserted == len(region.columns.inserted)
+            assert trust.column.growth == len(region.columns.growth)
+            assert trust.comparable_cell_pairs == (
+                len(region.rows.pairs) * len(region.columns.pairs)
+            )
+            assert trust.skipped_low_confidence_cells == (
+                trust.comparable_cell_pairs if region.low_confidence else 0
+            )
+            assert "confidence_score" not in trust.model_dump(mode="json")
+
+
+def test_alignment_trust_counts_all_low_confidence_pairs_as_skipped() -> None:
+    baseline = TableRegion("Data", 1, 1, 4, 2, "block", None, 1, "none")
+    current = TableRegion("Data", 1, 1, 4, 2, "block", None, 1, "none")
+    rows = AxisAlignment(
+        pairs=[(1, 1), (2, 2), (3, 3), (4, 4)],
+        method="positional",
+        low_confidence_fallback=True,
+    )
+    columns = AxisAlignment(pairs=[(1, 1), (2, 2)])
+    alignment = WorkbookAlignment(
+        common_sheets=["Data"],
+        regions={
+            "Data": [
+                RegionAlignment(
+                    baseline=baseline,
+                    current=current,
+                    rows=rows,
+                    columns=columns,
+                )
+            ]
+        },
+        low_confidence_regions=["Data!A1:B4"],
+    )
+
+    trust = build_alignment_trust_manifest(alignment).regions[0]
+
+    assert trust.low_confidence is True
+    assert trust.row.method == "positional"
+    assert trust.row.low_confidence_fallback is True
+    assert trust.comparable_cell_pairs == 8
+    assert trust.skipped_low_confidence_cells == 8
+
+
+def test_alignment_trust_preserves_unpaired_regions_and_member_identity() -> None:
+    baseline = TableRegion("Old", 2, 1, 5, 3, "long", 2, 1, "rows")
+    current = TableRegion("New", 1, 2, 4, 6, "wide", 1, 2, "columns")
+    alignment = WorkbookAlignment(
+        unpaired_baseline_regions=[baseline],
+        unpaired_current_regions=[current],
+    )
+
+    manifest = build_alignment_trust_manifest(alignment, artifact_member="ops")
+
+    assert [entry.side for entry in manifest.unpaired] == ["baseline", "current"]
+    assert [entry.artifact_member for entry in manifest.unpaired] == ["ops", "ops"]
+    assert manifest.unpaired[0].cell_range == "A2:C5"
+    assert manifest.unpaired[1].cell_range == "B1:F4"
+    assert manifest.unpaired[0].orientation == "long"
+    assert manifest.unpaired[1].orientation == "wide"
+
+
+def test_alignment_trust_manifest_json_round_trip(
+    alignment: WorkbookAlignment,
+) -> None:
+    manifest = build_alignment_trust_manifest(alignment, artifact_member="ops")
+
+    restored = AlignmentTrustManifest.model_validate(
+        manifest.model_dump(mode="json")
+    )
+
+    assert restored == manifest
+    assert all(region.artifact_member == "ops" for region in restored.regions)
+
+
+def test_full_cycle_result_carries_alignment_trust(qc_result) -> None:
+    trust = qc_result.alignment_trust
+
+    assert trust is not None
+    assert trust.version == 1
+    assert trust.regions
+    assert sum(region.comparable_cell_pairs for region in trust.regions) > 0

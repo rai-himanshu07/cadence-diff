@@ -176,6 +176,15 @@ def worker_main(
             )
 
     try:
+        # Validate optional package manifest and pass member-scoped sheets
+        from qc_tool.package import PackageManifest
+
+        raw_manifest = payload.get("package_manifest") or None
+        manifest_obj = None
+        if raw_manifest:
+            # Validate shape (primitive-only) and convert to model
+            manifest_obj = PackageManifest.model_validate(raw_manifest)
+
         artifacts = perform_run(
             Path(payload["work_dir"]),
             {role: Path(path) for role, path in payload["files"].items()},
@@ -190,6 +199,10 @@ def worker_main(
             compare_slides=[int(i) for i in payload.get("compare_slides") or []] or None,
             cancellation_token=CancellationToken(owned_flag),
             on_progress=on_progress,
+            package_manifest=manifest_obj,
+            compare_member_sheets={
+                k: tuple(v or ()) for k, v in (payload.get("compare_member_sheets") or {}).items()
+            },
         )
     except RunCancelled:
         message = cancelled_message(telemetry.as_payload())

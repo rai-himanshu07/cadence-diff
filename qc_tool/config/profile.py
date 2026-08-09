@@ -14,11 +14,13 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from qc_tool.findings import FindingClass, Materiality, Severity
+from qc_tool.package import MEMBER_ID_PATTERN
 from qc_tool.security import private_directory, private_file
 
 Orientation = Literal["long", "wide", "block"]
@@ -150,10 +152,30 @@ class ExcelControls(BaseModel):
     tie_outs: list[TieOutControl] = Field(default_factory=list)
 
 
-class ExcelProfile(BaseModel):
+class ExcelMemberProfile(BaseModel):
     ignore_sheets: list[str] = Field(default_factory=list)
     sheets: dict[str, SheetProfile] = Field(default_factory=dict)
     controls: ExcelControls = Field(default_factory=ExcelControls)
+
+
+class ExcelProfile(ExcelMemberProfile):
+    members: dict[str, ExcelMemberProfile] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+
+    @field_validator("members")
+    @classmethod
+    def validate_members_keys(
+        cls,
+        value: dict[str, ExcelMemberProfile],
+    ) -> dict[str, ExcelMemberProfile]:
+        invalid = sorted(
+            key for key in value if re.fullmatch(MEMBER_ID_PATTERN, key) is None
+        )
+        if invalid:
+            raise ValueError(f"invalid Excel member ids: {invalid}")
+        return value
 
 
 class PptAvailabilityRule(BaseModel):
@@ -199,6 +221,11 @@ class CrosscheckMapping(BaseModel):
     label: str = ""
     source_sheet: str
     source_cell: str
+    source_member: str = Field(
+        default="primary",
+        pattern=MEMBER_ID_PATTERN,
+        exclude_if=lambda value: value == "primary",
+    )
 
 
 class CrosscheckProfile(BaseModel):
@@ -214,10 +241,19 @@ class FindingWaiver(BaseModel):
     slide: str | None = None
     location: str | None = None
     element: str | None = None
+    member: str = Field(
+        default="primary",
+        pattern=MEMBER_ID_PATTERN,
+        exclude_if=lambda value: value == "primary",
+    )
 
 
 class DeliverableProfile(BaseModel):
     name: str
+    #: Optional contract id assigned when promoting a profile to a contract.
+    #: Empty string preserves legacy behaviour and must be omitted from the
+    #: canonical profile JSON.
+    contract_id: str = ""
     description: str = ""
     tolerance: NumericTolerance = Field(default_factory=NumericTolerance)
     restatement_windows: RestatementWindows = Field(default_factory=RestatementWindows)
@@ -234,17 +270,35 @@ class DeliverableProfile(BaseModel):
     def sheet_profile(self, sheet_name: str) -> SheetProfile | None:
         return self.excel.sheets.get(sheet_name)
 
+    @model_validator(mode="after")
+    def _validate_contract_id(self) -> "DeliverableProfile":
+        cid = self.contract_id
+        if cid and re.fullmatch(r"[0-9a-f]{32}", cid) is None:
+            raise ValueError("contract_id must be a 32-character lowercase hex string")
+        return self
+
 
 def default_profile(name: str = "default") -> DeliverableProfile:
     return DeliverableProfile(name=name)
 
 
+def new_profile(name: str) -> DeliverableProfile:
+    """Create a named profile for UI-promoted contracts with a stable id.
+
+    The produced profile sets `contract_id` to a uuid4().hex (lowercase
+    hex) to be used as a contract scope. Legacy-created profiles retain an
+    empty `contract_id`.
+    """
+    return DeliverableProfile(name=name, contract_id=uuid4().hex)
+
+
 def canonical_profile_json(profile: DeliverableProfile) -> str:
-    return json.dumps(
-        profile.model_dump(mode="json", by_alias=True),
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    payload = profile.model_dump(mode="json", by_alias=True)
+    # Preserve legacy canonicalization: omit empty contract_id from the
+    # canonical representation so old profiles keep the same hash.
+    if payload.get("contract_id") in (None, ""):
+        payload.pop("contract_id", None)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def canonical_profile_bytes(profile: DeliverableProfile) -> bytes:
@@ -253,6 +307,61 @@ def canonical_profile_bytes(profile: DeliverableProfile) -> bytes:
 
 def profile_sha256(profile: DeliverableProfile) -> str:
     return hashlib.sha256(canonical_profile_bytes(profile)).hexdigest()
+
+
+def _legacy_excel_profile(profile: DeliverableProfile) -> ExcelMemberProfile:
+    return ExcelMemberProfile(
+        ignore_sheets=list(profile.excel.ignore_sheets),
+        sheets=dict(profile.excel.sheets),
+        controls=profile.excel.controls.model_copy(deep=True),
+    )
+
+
+def legacy_excel_profile_is_empty(profile: DeliverableProfile) -> bool:
+    """Whether the unscoped compatibility profile carries no Excel rules."""
+    return _legacy_excel_profile(profile) == ExcelMemberProfile()
+
+
+def excel_profile_for_member(
+    profile: DeliverableProfile,
+    member_id: str,
+    *,
+    workbook_count: int,
+) -> ExcelMemberProfile:
+    """Resolve one member without applying unscoped rules ambiguously."""
+    if workbook_count < 1:
+        raise ValueError("workbook count must be positive")
+    configured = profile.excel.members.get(member_id)
+    if workbook_count == 1 and member_id == "primary" and configured is None:
+        return _legacy_excel_profile(profile)
+    if not legacy_excel_profile_is_empty(profile):
+        raise ValueError(
+            "legacy unscoped Excel rules are ambiguous for this package"
+        )
+    return configured.model_copy(deep=True) if configured else ExcelMemberProfile()
+
+
+def profile_for_excel_member(
+    profile: DeliverableProfile,
+    member_id: str,
+    workbook_count: int,
+) -> DeliverableProfile:
+    """Project one member into the existing single-workbook engine contract."""
+    member_profile = excel_profile_for_member(
+        profile,
+        member_id,
+        workbook_count=workbook_count,
+    )
+    projected = profile.model_copy(deep=True)
+    projected.excel = ExcelProfile(
+        ignore_sheets=list(member_profile.ignore_sheets),
+        sheets=dict(member_profile.sheets),
+        controls=member_profile.controls.model_copy(deep=True),
+    )
+    projected.waivers = [
+        waiver for waiver in projected.waivers if waiver.member == member_id
+    ]
+    return projected
 
 
 def profile_path(profiles_dir: Path, name: str) -> Path:

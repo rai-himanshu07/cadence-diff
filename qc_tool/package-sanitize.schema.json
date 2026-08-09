@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://cadence-diff.local/schema/package-sanitize-v1.json",
-  "title": "cadence-diff package redaction manifest v1",
+  "$id": "https://cadence-diff.local/schema/package-sanitize-v2.json",
+  "title": "cadence-diff package redaction manifest v1/v2",
   "type": "object",
   "required": [
     "schema_version",
@@ -15,7 +15,7 @@
     "privacy"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "generated_at": {"type": "string"},
     "seed": {"type": "integer"},
     "privacy_safe": {"type": "boolean"},
@@ -25,7 +25,17 @@
     "outputs": {"type": "object"},
     "mapping_results": {"type": "array"},
     "sanitizer_stats": {"type": "object"},
-    "privacy": {"type": "object"}
+    "privacy": {"type": "object"},
+    "package_manifest": {"type": "object"}
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": 2}},
+        "required": ["schema_version"]
+      },
+      "then": {"required": ["package_manifest"]}
+    }
+  ],
   "additionalProperties": false
 }

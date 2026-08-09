@@ -94,6 +94,18 @@ class FormulaPrecedentExtraction:
         )
 
 
+class FormulaDiffKind(StrEnum):
+    EQUAL = "equal"
+    REMOVED = "removed"
+    ADDED = "added"
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaDiffSegment:
+    text: str
+    kind: FormulaDiffKind
+
+
 def _rewrite_segment(segment: str) -> str:
     segment = _ANCHOR_FUNCTION_RE.sub("_xlfn.ANCHORARRAY(", segment)
     segment = _SINGLE_FUNCTION_RE.sub("_xlfn.SINGLE(", segment)

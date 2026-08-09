@@ -43,6 +43,15 @@ def test_values_only_workbook_has_formula_presence_capability(tmp_path: Path) ->
     assert scan.formula_cells == {"Data": frozenset()}
     assert scan.formula_count == 0
     assert scan.safe_for_external_engine
+    assert scan.cell_count == 4
+    assert scan.sheet_count == 1
+    assert scan.worksheet_binary_bytes > 0
+    assert scan.shared_string_bytes > 0
+    assert scan.styles_bytes == 0
+    assert scan.largest_sheet_area == 4
+    assert scan.largest_sheet_dimensions == (2, 2)
+    assert scan.worksheet_metrics["Data"].max_row == 2
+    assert scan.worksheet_metrics["Data"].max_column == 2
 
 
 def test_formula_records_are_reported_at_one_based_coordinates(tmp_path: Path) -> None:
@@ -54,6 +63,23 @@ def test_formula_records_are_reported_at_one_based_coordinates(tmp_path: Path) -
 
     assert scan.formula_cells == {"Data": frozenset({(3, 5)})}
     assert scan.formula_count == 1
+    assert scan.cell_count == 1
+    assert scan.largest_sheet_area == 15
+    assert scan.largest_sheet_dimensions == (3, 5)
+
+
+def test_workload_bytes_include_unreferenced_worksheet_parts(tmp_path: Path) -> None:
+    path = tmp_path / "orphan.xlsb"
+    write_xlsb(path, {"Data": [[1.0]]})
+    scan_before = scan_xlsb_formulas(path.read_bytes())
+    orphan = b"unreferenced worksheet bytes"
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("xl/worksheets/orphan.bin", orphan)
+
+    scan = scan_xlsb_formulas(path.read_bytes())
+
+    assert scan.cell_count == scan_before.cell_count
+    assert scan.worksheet_binary_bytes == scan_before.worksheet_binary_bytes + len(orphan)
 
 
 def test_active_content_and_connections_block_external_engine(tmp_path: Path) -> None:

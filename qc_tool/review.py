@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TypeAlias
 
@@ -80,6 +81,7 @@ class ReviewGroup:
     baseline_mixed: bool
     members: tuple[Finding, ...]
     spatial: bool
+    artifact_member: str = "primary"
 
     @property
     def member_count(self) -> int:
@@ -105,7 +107,7 @@ class ReviewAnnotation:
 
 def finding_identity_key(finding: Finding) -> FindingIdentity:
     """Stable identity shared with Re-QC and review-group fingerprints."""
-    return (
+    base = (
         finding.artifact,
         finding.finding_class.value,
         finding.sheet or "",
@@ -113,6 +115,9 @@ def finding_identity_key(finding: Finding) -> FindingIdentity:
         finding.location or finding.baseline_location or "",
         finding.element or "",
     )
+    if finding.artifact_member != "primary":
+        return (*base, finding.artifact_member)
+    return base
 
 
 def _coordinate(location: str | None) -> Coordinate | None:
@@ -142,7 +147,7 @@ def _producer_subtype(finding: Finding) -> str:
 
 def _partition_key(finding: Finding, current: Coordinate) -> tuple[object, ...]:
     severity = finding.severity or Severity.WARNING
-    return (
+    base = (
         finding.artifact,
         finding.sheet or "",
         finding.finding_class.value,
@@ -154,6 +159,7 @@ def _partition_key(finding: Finding, current: Coordinate) -> tuple[object, ...]:
         _producer_subtype(finding),
         _baseline_mode(finding, current),
     )
+    return (*base, finding.artifact_member) if finding.artifact_member != "primary" else base
 
 
 def _eligible(finding: Finding) -> Coordinate | None:
@@ -235,9 +241,17 @@ def _bounding_range(coordinates: set[Coordinate]) -> str:
 
 
 def _group_id(key: tuple[object, ...], members: tuple[Finding, ...]) -> str:
-    identities = sorted(finding_identity_key(member) for member in members)
+    return _group_id_from_identities(
+        key, tuple(finding_identity_key(member) for member in members)
+    )
+
+
+def _group_id_from_identities(
+    key: tuple[object, ...],
+    identities: tuple[FindingIdentity, ...],
+) -> str:
     payload = json.dumps(
-        {"key": key, "members": identities},
+        {"key": key, "members": sorted(identities)},
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
@@ -317,6 +331,7 @@ def _component_groups(
                 baseline_mixed=baseline_mixed,
                 members=members,
                 spatial=True,
+                artifact_member=representative.artifact_member,
             )
         )
     return groups
@@ -359,6 +374,7 @@ def _singleton(finding: Finding) -> ReviewGroup:
         baseline_mixed=False,
         members=(finding,),
         spatial=False,
+        artifact_member=getattr(finding, "artifact_member", "primary"),
     )
 
 
@@ -385,7 +401,7 @@ def _review_sort_key(group: ReviewGroup) -> tuple[object, ...]:
     )
 
 
-def build_review_groups(findings: list[Finding]) -> list[ReviewGroup]:
+def build_review_groups(findings: Sequence[Finding]) -> list[ReviewGroup]:
     """Build a lossless deterministic review layer over atomic findings."""
     partitions: dict[tuple[object, ...], list[tuple[Coordinate, Finding]]] = (
         defaultdict(list)
@@ -493,7 +509,7 @@ def _pattern_key(finding: Finding) -> tuple[object, ...]:
         if finding.subtype is FindingSubtype.COLUMNAR_ERROR_POPULATION
         else ""
     )
-    return (
+    base = (
         finding.artifact,
         finding.sheet or "",
         finding.slide or "",
@@ -518,6 +534,7 @@ def _pattern_key(finding: Finding) -> tuple[object, ...]:
         finding.waiver_reason,
         finding.waiver_expires,
     )
+    return (*base, finding.artifact_member) if finding.artifact_member != "primary" else base
 
 
 def _pattern_group(key: tuple[object, ...], members: tuple[Finding, ...]) -> ReviewGroup:
@@ -560,10 +577,11 @@ def _pattern_group(key: tuple[object, ...], members: tuple[Finding, ...]) -> Rev
         baseline_mixed=0 < len(baseline_coordinates) < len(members),
         members=members,
         spatial=False,
+        artifact_member=representative.artifact_member,
     )
 
 
-def build_pattern_groups(findings: list[Finding]) -> list[ReviewGroup]:
+def build_pattern_groups(findings: Sequence[Finding]) -> list[ReviewGroup]:
     """Semantically pure review groups keyed on meaning, not adjacency.
 
     One group may span disconnected ranges. Every member shares its finding
@@ -596,13 +614,20 @@ def count_pattern_groups(groups: list[ReviewGroup]) -> ReviewCounts:
     return review_counts(groups)
 
 
+def format_ranges(
+    ranges: Sequence[str], bounding_range: str, *, max_spans: int = 3
+) -> str:
+    """Compact exact group geometry for human-facing tables."""
+    if not ranges:
+        return bounding_range
+    if len(ranges) <= max_spans:
+        return "; ".join(ranges)
+    return f"{'; '.join(ranges[:max_spans])}; +{len(ranges) - max_spans} spans"
+
+
 def format_group_ranges(group: ReviewGroup, *, max_spans: int = 3) -> str:
     """Compact exact group geometry for human-facing tables."""
-    if not group.ranges:
-        return group.bounding_range
-    if len(group.ranges) <= max_spans:
-        return "; ".join(group.ranges)
-    return f"{'; '.join(group.ranges[:max_spans])}; +{len(group.ranges) - max_spans} spans"
+    return format_ranges(group.ranges, group.bounding_range, max_spans=max_spans)
 
 
 def apply_group_review(
