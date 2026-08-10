@@ -1270,7 +1270,13 @@ async def test_app_settings_are_discoverable_from_the_header(
     await user.should_see("Local storage · active")
     await user.should_see("use the QC Tool data directory on Linux and Windows")
     await user.should_see("with --data-dir")
-    await user.should_see("Desktop Office focus and Desktop shortcut controls are Windows-only")
+    if os.name == "nt":
+        await user.should_see("Desktop Office focus · Off")
+        await user.should_see("Desktop shortcut")
+    else:
+        await user.should_see(
+            "Desktop Office focus and Desktop shortcut controls are Windows-only"
+        )
 
 
 @pytest.mark.asyncio

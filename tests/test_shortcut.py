@@ -54,7 +54,10 @@ def test_shortcut_targets_absolute_environment_without_path_lookup(
     assert '"' in spec.arguments and str(data_dir) in spec.arguments
     assert spec.working_directory == data_dir.resolve()
     assert "desktop-focus" not in spec.arguments
-    assert spec.icon_location.endswith("qc_tool/assets/qc-tool.ico,0")
+    icon_path, icon_index = spec.icon_location.rsplit(",", 1)
+    assert Path(icon_path).name == "qc-tool.ico"
+    assert Path(icon_path).parent.name == "assets"
+    assert icon_index == "0"
 
 
 def test_shortcut_install_status_stale_and_remove_are_idempotent(
