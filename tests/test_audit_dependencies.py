@@ -30,5 +30,10 @@ def test_vulnerability_is_distinct_from_tool_failure(capsys) -> None:
 
 
 def test_unavailable_feed_or_malformed_output_returns_one(capsys) -> None:
-    assert interpret_audit(1, "not-json", "network unavailable") == 1
-    assert "unavailable" in capsys.readouterr().err
+    stderr = "Traceback (most recent call last):\nroot cause: unsupported pip"
+
+    assert interpret_audit(1, "not-json", stderr) == 1
+
+    captured = capsys.readouterr().err
+    assert "root cause: unsupported pip" in captured
+    assert "Traceback" not in captured

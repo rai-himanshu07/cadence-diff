@@ -18,12 +18,18 @@ AUDIT_COMMAND = (
 )
 
 
+def _tool_error_detail(stderr: str, returncode: int) -> str:
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    detail = lines[-1] if lines else f"exit {returncode}"
+    return detail[:300]
+
+
 def interpret_audit(returncode: int, stdout: str, stderr: str) -> int:
     """Return 0 clean, 1 tool/feed failure, or 2 known vulnerabilities."""
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError:
-        detail = stderr.strip().splitlines()[0] if stderr.strip() else "no JSON output"
+        detail = _tool_error_detail(stderr, returncode) if stderr.strip() else "no JSON output"
         print(f"Dependency audit unavailable: {detail}", file=sys.stderr)
         return 1
     dependencies = payload.get("dependencies") if isinstance(payload, dict) else None
@@ -48,7 +54,7 @@ def interpret_audit(returncode: int, stdout: str, stderr: str) -> int:
             print(f"- {name} {version}: {identifier}")
         return 2
     if returncode != 0:
-        detail = stderr.strip().splitlines()[0] if stderr.strip() else f"exit {returncode}"
+        detail = _tool_error_detail(stderr, returncode)
         print(f"Dependency audit unavailable: {detail}", file=sys.stderr)
         return 1
     print(f"Dependency audit passed: {len(dependencies)} resolved packages checked")

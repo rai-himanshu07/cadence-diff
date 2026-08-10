@@ -47,7 +47,7 @@ jobs:
         if: runner.os == 'Linux' && matrix.python == '3.12'
         run: >-
           conda install --yes --name cadence-diff-ci --channel conda-forge
-          "pytest-cov=7.1.0" "pip-audit=2.10.1"
+          "pip=26.2" "pytest-cov=7.1.0" "pip-audit=2.10.1"
 
       - name: Audit tracked public tree
         run: conda run --name cadence-diff-ci python scripts/audit_public_tree.py
