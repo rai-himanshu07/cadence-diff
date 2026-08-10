@@ -60,6 +60,11 @@ from qc_tool.io.ooxml_worksheet import (
     WorksheetMetadata,
     parse_ooxml_worksheet_metadata,
 )
+from qc_tool.io.opc import (
+    InvalidOfficePackageError,
+    UnsafeRelationshipTargetError,
+    resolve_internal_relationship_target,
+)
 from qc_tool.io.vba import VbaProjectScan, VbaReadError, scan_vba_project
 from qc_tool.io.xlsb_formula import (
     XlsbFormulaScan,
@@ -464,7 +469,7 @@ def _load_ooxml_oracle(
         snapshot.chart_detail = f"Complete chart extraction unavailable: {exc}"
     snapshot.interaction_rule_detail = "; ".join(sorted(set(interaction_details)))
     snapshot.conditional_format_style_detail = "; ".join(sorted(set(conditional_style_details)))
-    snapshot.pivots.extend(_parse_pivots(data))
+    snapshot.pivots.extend(_parse_pivots_bounded(data, source_name))
     return snapshot
 
 
@@ -830,7 +835,7 @@ def _load_ooxml_streaming(
     snapshot.conditional_format_style_detail = "; ".join(
         sorted(set(conditional_style_details))
     )
-    snapshot.pivots.extend(_parse_pivots(data))
+    snapshot.pivots.extend(_parse_pivots_bounded(data, source_name))
     return snapshot
 
 
@@ -852,12 +857,20 @@ def _relationship_targets(
         target = relationship.get("Target")
         if not relationship_id or not target or relationship.get("TargetMode") == "External":
             continue
-        if target.startswith("/"):
-            resolved = target.lstrip("/")
-        else:
-            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
-        targets[relationship_id] = resolved
+        targets[relationship_id] = resolve_internal_relationship_target(
+            source_part,
+            target,
+        )
     return targets
+
+
+def _parse_pivots_bounded(data: bytes, source_name: str) -> list[PivotDescriptor]:
+    try:
+        return _parse_pivots(data)
+    except UnsafeRelationshipTargetError as exc:
+        raise InvalidOfficePackageError(
+            f"{source_name}: invalid Office package relationship target"
+        ) from exc
 
 
 def _apply_defined_name_scope(snapshot: WorkbookSnapshot, data: bytes) -> None:

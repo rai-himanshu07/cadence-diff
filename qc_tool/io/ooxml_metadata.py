@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import io
-import posixpath
 import re
 import zipfile
 from dataclasses import dataclass
 from xml.etree import ElementTree
+
+from qc_tool.io.opc import (
+    UnsafeRelationshipTargetError,
+    resolve_internal_relationship_target,
+)
 
 _WORKBOOK_PART = "xl/workbook.xml"
 _CONNECTIONS_PART = "xl/connections.xml"
@@ -104,8 +108,9 @@ def _xml_bool(value: str | None) -> bool | None:
 
 def _relationships(archive: zipfile.ZipFile, source_part: str) -> list[tuple[str, str, str]]:
     """Return ``(id, type, resolved target)`` for every internal relationship."""
-    part = posixpath.join(
-        posixpath.dirname(source_part), "_rels", f"{posixpath.basename(source_part)}.rels"
+    source_directory, _, source_name = source_part.rpartition("/")
+    part = "/".join(
+        item for item in (source_directory, "_rels", f"{source_name}.rels") if item
     )
     if part not in archive.namelist():
         return []
@@ -121,11 +126,7 @@ def _relationships(archive: zipfile.ZipFile, source_part: str) -> list[tuple[str
         target = relationship.get("Target")
         if not identifier or not target or relationship.get("TargetMode") == "External":
             continue
-        resolved = (
-            target.lstrip("/")
-            if target.startswith("/")
-            else posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
-        )
+        resolved = resolve_internal_relationship_target(source_part, target)
         kind = (relationship.get("Type") or "").rsplit("/", 1)[-1]
         found.append((identifier, kind, resolved))
     return found
@@ -384,9 +385,17 @@ def scan_workbook_metadata(data: bytes) -> WorkbookMetadataScan:
             comments_detail=detail, queries_detail=detail, connections_detail=detail
         )
     with archive:
-        comments, comments_ok, comments_detail = _scan_comments(archive)
-        queries, queries_ok, queries_detail = _scan_queries(archive)
-        connections, connections_ok, connections_detail = _scan_connections(archive)
+        try:
+            comments, comments_ok, comments_detail = _scan_comments(archive)
+            queries, queries_ok, queries_detail = _scan_queries(archive)
+            connections, connections_ok, connections_detail = _scan_connections(archive)
+        except UnsafeRelationshipTargetError:
+            detail = "unsafe relationship target in workbook package"
+            return WorkbookMetadataScan(
+                comments_detail=detail,
+                queries_detail=detail,
+                connections_detail=detail,
+            )
     return WorkbookMetadataScan(
         comments=tuple(sorted(comments, key=lambda item: (item.sheet, item.ref))),
         queries=tuple(sorted(queries, key=lambda item: item.name)),

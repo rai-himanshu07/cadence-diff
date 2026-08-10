@@ -43,7 +43,7 @@ from qc_tool.review import (
 )
 from qc_tool.review_series import SeriesReviewLens, build_series_review_lens
 from qc_tool.security import secure_managed_tree
-from qc_tool.server_config import NetworkMode
+from qc_tool.server_config import NetworkMode, ServerConfig
 from qc_tool.signoff import finalize_run, required_acknowledgements
 from qc_tool.ui.app import (
     LensEntry,
@@ -58,10 +58,12 @@ from qc_tool.ui.app import (
     _format_bytes,
     _history_row,
     _history_trend_row,
+    _initial_mode,
     _input_cautions,
     _lens_entries,
     _mapping_stats,
     _outcome_summary,
+    _persist_expired_lan_config,
     _profile_path,
     _queue_status_line,
     _relative_time,
@@ -70,6 +72,7 @@ from qc_tool.ui.app import (
     _run_blockers,
     _safe_upload_name,
     _scope_summary,
+    _set_desktop_focus_preference,
     _storage_prompt_due,
     _storage_secret,
     build_cluster_context,
@@ -79,7 +82,13 @@ from qc_tool.ui.app import (
     perform_run,
     persist_confirmed_mapping,
 )
-from qc_tool.ui.guide import GUIDE_SCRIPT, PROFILE_CONTROLS_EXAMPLE
+from qc_tool.ui.guide import (
+    COMMON_TASKS,
+    GUIDE_SCRIPT,
+    GUIDE_SECTIONS,
+    PROFILE_CONTROLS_EXAMPLE,
+    render_guide,
+)
 from qc_tool.ui.theme import CSS, page_frame
 from tests.conftest import fixture_profile
 from tests.test_review_series import series_oracle
@@ -102,6 +111,56 @@ def test_mode_toggle_pins_content_color_against_quasar() -> None:
         "evidence_tags",
     ):
         assert field in app_module.FINDINGS_BODY_SLOT
+
+
+def test_initial_mode_defaults_to_preflight_then_restores_valid_choices() -> None:
+    assert _initial_mode(None) is QCRunMode.CURRENT_FILE_PREFLIGHT
+    assert _initial_mode("invalid") is QCRunMode.CURRENT_FILE_PREFLIGHT
+    assert _initial_mode("final_package") is QCRunMode.FINAL_PACKAGE
+    assert _initial_mode(
+        "final_package",
+        rerun_mode=QCRunMode.CYCLE_COMPARISON,
+    ) is QCRunMode.CYCLE_COMPARISON
+
+
+def test_focus_preference_revokes_before_persisting_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[str] = []
+
+    class Service:
+        def set_enabled(self, enabled: bool) -> None:
+            observed.append(f"service:{enabled}")
+
+    def save(_root: Path, _config: object) -> Path:
+        observed.append("save")
+        return tmp_path / "server-config.json"
+
+    monkeypatch.setattr(app_module, "save_server_config", save)
+
+    _set_desktop_focus_preference(tmp_path, Service(), False)  # type: ignore[arg-type]
+    assert observed == ["service:False", "save"]
+    observed.clear()
+    _set_desktop_focus_preference(tmp_path, Service(), True)  # type: ignore[arg-type]
+    assert observed == ["save", "service:True"]
+
+
+@pytest.mark.parametrize("remembered", [False, True])
+def test_lan_expiry_preserves_latest_focus_preference(
+    tmp_path: Path,
+    remembered: bool,
+) -> None:
+    app_module.save_server_config(
+        tmp_path,
+        ServerConfig(network=NetworkMode.LAN, desktop_focus=remembered),
+    )
+
+    _persist_expired_lan_config(tmp_path)
+
+    config = app_module.load_server_config(tmp_path)
+    assert config.network is NetworkMode.LOCAL
+    assert config.desktop_focus is remembered
 
 
 def test_evidence_axes_cover_every_typed_axis() -> None:
@@ -165,6 +224,40 @@ def test_guide_search_matches_all_tokens_and_bounded_aliases() -> None:
     assert "tokens.every" in GUIDE_SCRIPT
     assert "aliases[s.id]" in GUIDE_SCRIPT
     assert "mapping unavailable opaque" in GUIDE_SCRIPT
+
+
+def test_guide_is_task_first_and_documents_desktop_launch() -> None:
+    assert GUIDE_SECTIONS[0] == ("launch", "Launch and first run")
+    assert ("focus", "Desktop Office focus") in GUIDE_SECTIONS
+    assert ("reference", "Advanced capability reference") in GUIDE_SECTIONS
+    assert ("Launch QC Tool", "launch") in COMMON_TASKS
+    assert ("Use Desktop Office focus", "focus") in COMMON_TASKS
+    source = inspect.getsource(render_guide)
+    for text in (
+        "python -m qc_tool",
+        "shortcut install",
+        "--desktop-focus",
+        "Run IDs are permanent",
+        "Bind",
+        "Confirm binding",
+    ):
+        assert text in source
+
+
+def test_guide_documents_data_directory_defaults_and_restart_boundary() -> None:
+    source = inspect.getsource(render_guide)
+
+    for text in (
+        "%LOCALAPPDATA%\\\\qc-tool",
+        "$XDG_DATA_HOME/qc-tool",
+        "~/.local/share/qc-tool",
+        "&lt;repository&gt;/data",
+        "python -m qc_tool --data-dir",
+        "cannot be switched from Local app settings",
+        "does not migrate or delete the old directory",
+        "Changing the path does not migrate history",
+    ):
+        assert text in source
 
 
 def test_review_group_rows_do_not_embed_atomic_member_payloads(qc_result) -> None:
@@ -718,6 +811,12 @@ async def test_guide_page_renders_packaged_operator_content(
     create_pages(tmp_path / "work")
     await user.open("/guide")
     await user.should_see("QC Tool guide")
+    await user.should_see("Installed on Windows")
+    await user.should_see(r"%LOCALAPPDATA%\qc-tool")
+    await user.should_see("Installed on Linux")
+    await user.should_see("$XDG_DATA_HOME/qc-tool")
+    await user.should_see("~/.local/share/qc-tool")
+    await user.should_see("Changing the path does not migrate history")
     await user.should_see("Choose the right QC mode")
     await user.should_see("they do not block read-only QC")
     await user.should_see("Profiles, controls, and waivers")
@@ -1084,12 +1183,22 @@ def test_input_groups_separate_baseline_from_current() -> None:
 async def test_inputs_render_as_baseline_and_current_panels(
     user: User, tmp_path: Path
 ) -> None:
+    app.storage.general.pop("qc_mode", None)
     create_pages(tmp_path / "work")
     await user.open("/")
-    await user.should_see("Baseline")
-    await user.should_see("the previous cycle you compare against")
     await user.should_see("Current")
     await user.should_see("the cycle you are signing off")
+    await user.should_not_see("the previous cycle you compare against")
+
+    mode_toggle = next(iter(user.find(kind=ui.toggle).elements))
+    model_update = next(
+        listener.type
+        for listener in mode_toggle._event_listeners.values()
+        if listener.handler is not None and listener.type.startswith("update:")
+    )
+    _emit(mode_toggle, model_update, 1)
+
+    await user.should_see("the previous cycle you compare against")
 
 
 @pytest.mark.asyncio
@@ -1145,6 +1254,44 @@ async def test_shutdown_control_confirms_before_stopping(
     await user.should_see("Stop the QC Tool server?")
     await user.should_see("Stop server")
     await user.should_see("Keep running")
+
+
+@pytest.mark.asyncio
+async def test_app_settings_are_discoverable_from_the_header(
+    user: User,
+    tmp_path: Path,
+) -> None:
+    create_pages(tmp_path / "work")
+    await user.open("/")
+
+    user.find(marker="app-settings").click()
+
+    await user.should_see("Local app settings")
+    await user.should_see("Local storage · active")
+    await user.should_see("use the QC Tool data directory on Linux and Windows")
+    await user.should_see("with --data-dir")
+    await user.should_see("Desktop Office focus and Desktop shortcut controls are Windows-only")
+
+
+@pytest.mark.asyncio
+async def test_compare_page_remembers_manual_mode_selection(
+    user: User,
+    tmp_path: Path,
+) -> None:
+    app.storage.general.pop("qc_mode", None)
+    create_pages(tmp_path / "work")
+    await user.open("/")
+    await user.should_see("Current-file preflight — cannot run yet")
+
+    mode_toggle = next(iter(user.find(kind=ui.toggle).elements))
+    model_update = next(
+        listener.type
+        for listener in mode_toggle._event_listeners.values()
+        if listener.handler is not None and listener.type.startswith("update:")
+    )
+    _emit(mode_toggle, model_update, 2)
+
+    assert app.storage.general.get("qc_mode") == QCRunMode.FINAL_PACKAGE.value
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ class NetworkMode(StrEnum):
 class ServerConfig(BaseModel):
     network: NetworkMode = NetworkMode.LOCAL
     expires_at: dt.datetime | None = None
+    desktop_focus: bool = False
 
     @property
     def host(self) -> str:
@@ -36,16 +37,24 @@ def config_path(data_dir: Path) -> Path:
     return data_dir / "server-config.json"
 
 
-def local_config() -> ServerConfig:
-    return ServerConfig(network=NetworkMode.LOCAL)
+def local_config(*, desktop_focus: bool = False) -> ServerConfig:
+    return ServerConfig(
+        network=NetworkMode.LOCAL,
+        desktop_focus=desktop_focus,
+    )
 
 
-def temporary_lan_config(minutes: int) -> ServerConfig:
+def temporary_lan_config(
+    minutes: int,
+    *,
+    desktop_focus: bool = False,
+) -> ServerConfig:
     if minutes < 1 or minutes > 24 * 60:
         raise ValueError("LAN exposure duration must be between 1 and 1440 minutes")
     return ServerConfig(
         network=NetworkMode.LAN,
         expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(minutes=minutes),
+        desktop_focus=desktop_focus,
     )
 
 
@@ -71,7 +80,7 @@ def load_server_config(
         save_server_config(data_dir, config)
         return config
     if config.is_expired(now=now):
-        config = local_config()
+        config = local_config(desktop_focus=config.desktop_focus)
         save_server_config(data_dir, config)
     return config
 

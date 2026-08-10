@@ -5,6 +5,38 @@ Excel workbooks and PowerPoint decks. Everything runs on your machine,
 binds to `127.0.0.1` only, never modifies source files, and uses no LLMs
 or external services.
 
+## Install and first start
+
+```bash
+# Works from an activated pip or Conda environment
+python -m pip install cadence-diff
+python -m qc_tool
+
+# Windows: create a per-user Desktop shortcut for this exact environment
+python -m qc_tool shortcut install
+```
+
+Open `http://127.0.0.1:8080` if the browser does not open automatically.
+On Windows, `python -m qc_tool` is the reliable fallback when the Python
+Scripts directory is not in `PATH` and `cadence-diff` is not recognized.
+
+A fresh installation starts in **Current-file preflight**. Upload one current
+Excel workbook and/or PowerPoint deck and run with the built-in `default`
+profile. No baseline or YAML profile is needed for this first run. QC Tool then
+remembers the last mode you select; Re-QC always restores the original run mode.
+
+```bash
+# Inspect or remove the Windows shortcut later
+python -m qc_tool shortcut status
+python -m qc_tool shortcut remove
+```
+
+The shortcut uses the environment's absolute Python path, so neither `PATH` nor
+Conda activation is needed. Installation never changes the Desktop
+automatically.
+
+![QC Tool review queue](https://raw.githubusercontent.com/rai-himanshu07/cadence-diff/main/qc_tool/assets/review-queue.png)
+
 ## Three QC modes
 
 | Mode | Inputs | What it answers |
@@ -12,6 +44,26 @@ or external services.
 | **Current-file preflight** | latest Excel workbook member(s) and/or PPT | Is this package internally sound? (error literals, cleared/inconsistent formulas, period sequence, draft tokens, blanks, broken links…) |
 | **Cycle comparison** | baseline + current workbook members and/or PPT pair | What changed vs last cycle — with members paired by stable ID and expected cadence growth isolated from real errors. |
 | **Final-package QC** | one to eight current Excel members + current PPT | Do the deck's figures reconcile to the nominated workbook members? (suggest → confirm → persist source mappings; coverage reporting.) |
+
+## First review
+
+1. Read the run outcome and capability status; unavailable or degraded checks
+  narrow what a low finding count proves.
+2. Select an open review item and compare baseline/current evidence and nearby
+  cells.
+3. Confirm or change severity and add a specific evidence-based comment.
+4. Continue until material items are dispositioned, then export or finalize.
+
+On local Windows, the header settings dialog can enable **Desktop Office
+focus** after explicit consent. Open the exact saved workbook or presentation
+in desktop Office, then use **Bind → Confirm binding → Focus** on an atomic
+finding. AutoSave, ambiguous documents, changed bytes, active content, LAN mode,
+and unreadable identity refuse the action. Disabling the setting immediately
+clears every focus token and binding. `--desktop-focus` remains a one-launch
+compatibility option.
+
+<details>
+<summary><strong>Detailed capability reference</strong></summary>
 
 Every run reports explicit coverage — checked / degraded / unavailable —
 so a check that could not run is never silently treated as passed.
@@ -151,7 +203,9 @@ history tracks the storage each run occupies and prompts for cleanup when the
 total grows large. Low-confidence alignment is always disclosed through
 summary findings and degraded coverage rather than silently guessing.
 
-## Install & run
+</details>
+
+## Installation and launch reference
 
 ```bash
 # Stable release
@@ -159,11 +213,14 @@ pip install cadence-diff
 cadence-diff                    # web UI → http://127.0.0.1:8080
 cadence-diff --port 9000 --data-dir ~/qc-data
 qc-tool                         # compatibility alias
-python -m qc_tool               # equivalent
+python -m qc_tool               # PATH-independent equivalent
+python -m qc_tool launch        # start quietly, or reuse an authenticated instance
+python -m qc_tool --desktop-focus  # focus enabled for this launch only
 ```
 
-`1.0.0` is the first stable release. Existing `0.1.x` and `0.2.0a1` artifacts
-remain immutable; an unqualified install selects the latest stable version.
+`1.1.0` is the current stable release. Existing `1.0.0`, `0.1.x`, and
+`0.2.0a1` artifacts remain immutable; an unqualified install selects the latest
+stable version.
 
 The web UI includes a packaged **Guide** page at `/guide`. It covers mode
 selection, files, profiles and controls, coverage/severity, finding review,

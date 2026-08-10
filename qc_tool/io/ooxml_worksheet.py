@@ -18,6 +18,10 @@ from qc_tool.io.ooxml_interaction import (
     extract_conditional_formatting_element,
     extract_data_validation_element,
 )
+from qc_tool.io.opc import (
+    UnsafeRelationshipTargetError,
+    resolve_internal_relationship_target,
+)
 from qc_tool.progress import CancellationToken, check_cancelled
 
 
@@ -89,10 +93,12 @@ def _relationship_targets(
         target = relationship.get("Target")
         if not relationship_id or not target or relationship.get("TargetMode") == "External":
             continue
-        if target.startswith("/"):
-            resolved = target.lstrip("/")
-        else:
-            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(source_part), target))
+        try:
+            resolved = resolve_internal_relationship_target(source_part, target)
+        except UnsafeRelationshipTargetError as exc:
+            raise OOXMLMetadataError(
+                f"unsafe relationship target in {relationship_part}"
+            ) from exc
         targets[relationship_id] = resolved
     return targets
 

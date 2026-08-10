@@ -118,6 +118,25 @@ def test_step8_readme_documents_primary_review_and_runtime_controls() -> None:
     assert "Implicit numeric block refreshes are Warning" in readme
 
 
+def test_readme_leads_with_first_run_and_synthetic_screenshot() -> None:
+    root = Path(__file__).parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+
+    first_start = readme.index("## Install and first start")
+    modes = readme.index("## Three QC modes")
+    assert first_start < modes
+    onboarding = readme[first_start:modes]
+    assert "# Works from an activated pip or Conda environment" in onboarding
+    assert "python -m pip install cadence-diff" in onboarding
+    assert "python -m qc_tool" in onboarding
+    assert "# Windows: create a per-user Desktop shortcut" in onboarding
+    assert "python -m qc_tool shortcut install" in onboarding
+    assert "Bind → Confirm binding → Focus" in readme
+    screenshot = root / "qc_tool" / "assets" / "review-queue.png"
+    assert screenshot.exists()
+    assert screenshot.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_capability_limited_is_reported_whenever_a_check_is_unavailable() -> None:
     result = _result()
 

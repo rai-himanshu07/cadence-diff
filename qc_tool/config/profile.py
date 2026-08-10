@@ -373,6 +373,19 @@ def profile_path(profiles_dir: Path, name: str) -> Path:
     return profiles_dir / f"{name}.yaml"
 
 
+def list_profiles(profiles_dir: Path) -> list[str]:
+    """Return the built-in profile followed by saved profile names."""
+    private_directory(profiles_dir)
+    return ["default", *sorted(path.stem for path in profiles_dir.glob("*.yaml"))]
+
+
+def load_profile_by_name(profiles_dir: Path, name: str) -> DeliverableProfile:
+    """Load a named profile from managed storage or return the built-in default."""
+    if name == "default":
+        return default_profile()
+    return load_profile(profile_path(profiles_dir, name))
+
+
 def load_profile(path: Path) -> DeliverableProfile:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):

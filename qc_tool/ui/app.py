@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast, overload
 
+from fastapi import HTTPException
 from nicegui import app, events, ui
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
@@ -33,8 +34,9 @@ from qc_tool.config.profile import (
     CrosscheckMapping,
     DeliverableProfile,
     NumericTolerance,
-    default_profile,
+    list_profiles,
     load_profile,
+    load_profile_by_name,
     new_profile,
     profile_path,
     profile_sha256,
@@ -74,6 +76,13 @@ from qc_tool.history.run_state import RunStateRecord, RunStatus
 from qc_tool.history.store import RunHistory, RunRecord, export_runs_archive, sha256_file
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.peek import peek_sheet_names, peek_slide_titles
+from qc_tool.launcher import (
+    HEALTH_PATH,
+    active_instance_health,
+    claim_local_instance,
+    launcher_log_path,
+    release_local_instance,
+)
 from qc_tool.package import (
     MAX_WORKBOOKS_PER_SIDE,
     MEMBER_ID_PATTERN,
@@ -130,8 +139,15 @@ from qc_tool.security import private_directory, private_file, secure_managed_tre
 from qc_tool.server_config import (
     NetworkMode,
     lan_config_matches,
+    load_server_config,
     local_config,
     save_server_config,
+)
+from qc_tool.shortcut import (
+    ShortcutState,
+    install_shortcut,
+    remove_shortcut,
+    shortcut_status,
 )
 from qc_tool.signoff import assess_signoff, finalize_run
 from qc_tool.story import ChangeStory, build_stories
@@ -156,6 +172,14 @@ from qc_tool.ui.theme import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@app.get(HEALTH_PATH, include_in_schema=False)
+async def _instance_health(challenge: str) -> dict[str, object]:
+    payload = active_instance_health(challenge)
+    if payload is None:
+        raise HTTPException(status_code=404)
+    return payload
 
 __all__ = [
     "RunArtifacts",
@@ -277,7 +301,7 @@ class SessionState:
     upload_generations: dict[str, int] = field(default_factory=dict)
     passwords: dict[str, str] = field(default_factory=dict)  # role -> password
     profile_name: str = "default"
-    mode: QCRunMode = QCRunMode.CYCLE_COMPARISON
+    mode: QCRunMode = QCRunMode.CURRENT_FILE_PREFLIGHT
     allow_large_workbooks: bool = False
     acceptance_absolute: float = 0.0
     acceptance_percent: float = 0.0  # analyst-facing percent; engine gets a fraction
@@ -293,6 +317,42 @@ class SessionState:
     available_member_sheets: dict[str, list[str]] = field(default_factory=dict)
     member_order: dict[str, list[str]] = field(
         default_factory=lambda: {"baseline": [], "current": []}
+    )
+
+
+def _initial_mode(
+    stored: object,
+    *,
+    rerun_mode: QCRunMode | None = None,
+) -> QCRunMode:
+    if rerun_mode is not None:
+        return rerun_mode
+    try:
+        return QCRunMode(str(stored))
+    except ValueError:
+        return QCRunMode.CURRENT_FILE_PREFLIGHT
+
+
+def _set_desktop_focus_preference(
+    work_dir: Path,
+    service: FocusService,
+    enabled: bool,
+) -> None:
+    config = load_server_config(work_dir)
+    updated = config.model_copy(update={"desktop_focus": enabled})
+    if not enabled:
+        service.set_enabled(False)
+        save_server_config(work_dir, updated)
+        return
+    save_server_config(work_dir, updated)
+    service.set_enabled(True)
+
+
+def _persist_expired_lan_config(work_dir: Path) -> None:
+    current = load_server_config(work_dir)
+    save_server_config(
+        work_dir,
+        local_config(desktop_focus=current.desktop_focus),
     )
 
 
@@ -324,17 +384,6 @@ def _storage_secret(work_dir: Path) -> str:
     secret_path.write_text(secret, encoding="utf-8")
     secret_path.chmod(0o600)
     return secret
-
-
-def list_profiles(profiles_dir: Path) -> list[str]:
-    private_directory(profiles_dir)
-    return ["default", *sorted(p.stem for p in profiles_dir.glob("*.yaml"))]
-
-
-def load_profile_by_name(profiles_dir: Path, name: str) -> DeliverableProfile:
-    if name == "default":
-        return default_profile()
-    return load_profile(_profile_path(profiles_dir, name))
 
 
 def _files_for_mode(
@@ -1372,7 +1421,7 @@ _REVIEW_GROUP_COLUMNS = [
 
 _HISTORY_COLUMNS = [
     {"name": "select", "label": "", "field": "sel"},
-    {"name": "id", "label": "Run", "field": "id", "sortable": True},
+    {"name": "id", "label": "Run ID", "field": "id", "sortable": True},
     {"name": "when", "label": "Started", "field": "started", "sortable": True},
     {"name": "mode", "label": "Mode", "field": "mode", "sortable": True},
     {"name": "profile", "label": "Profile", "field": "profile", "sortable": True},
@@ -5336,6 +5385,7 @@ def _render_completed_run(
 def create_pages(
     work_dir: Path,
     *,
+    port: int = 8080,
     network_mode: NetworkMode = NetworkMode.LOCAL,
     expires_at: dt.datetime | None = None,
     desktop_focus: bool = False,
@@ -5349,6 +5399,157 @@ def create_pages(
     focus_service = FocusService(
         work_dir, enabled=desktop_focus, network_mode=network_mode
     )
+
+    def open_app_settings() -> None:
+        with ui.dialog() as dialog, ui.card().classes("w-[36rem] max-w-[94vw]"):
+            ui.label("Local app settings").classes("runhead")
+            ui.label("Local storage · active").classes("runhead")
+            ui.label(
+                "Uploads, profiles, run history, reports, and server configuration "
+                "use the QC Tool data directory on Linux and Windows. Choose a "
+                "different directory when starting QC Tool with --data-dir."
+            ).classes("note")
+            if focus_service.platform != "win32":
+                ui.label(
+                    "Desktop Office focus and Desktop shortcut controls are "
+                    "Windows-only. Local storage and the complete browser review "
+                    "workflow remain available on Linux."
+                ).classes("notecard")
+            else:
+                persisted_focus = load_server_config(work_dir).desktop_focus
+                focus_label = (
+                    "On"
+                    if persisted_focus
+                    else "On for this launch"
+                    if focus_service.enabled
+                    else "Off"
+                )
+                ui.label(f"Desktop Office focus · {focus_label}").classes("runhead")
+                ui.label(
+                    "When enabled, QC Tool can enumerate already-open Excel and "
+                    "PowerPoint documents for an exact-byte Bind → Confirm → Focus "
+                    "action. It never opens, saves, recalculates, or closes a document."
+                ).classes("note")
+                if network_mode is NetworkMode.LAN:
+                    ui.label(
+                        "Focus is unavailable while network access is enabled, even "
+                        "when this preference is remembered."
+                    ).classes("notecard")
+
+                if focus_service.enabled:
+
+                    def disable_focus() -> None:
+                        _set_desktop_focus_preference(work_dir, focus_service, False)
+                        dialog.close()
+                        ui.notify("Desktop Office focus disabled and bindings cleared")
+
+                    ui.button(
+                        "Disable Desktop Office focus",
+                        on_click=disable_focus,
+                    ).classes("ghostbtn").props("flat no-caps")
+                else:
+
+                    def request_focus_consent() -> None:
+                        accepted = {"value": False}
+                        with ui.dialog() as consent, ui.card().classes(
+                            "w-[34rem] max-w-full"
+                        ):
+                            ui.label("Enable Desktop Office focus?").classes("runhead")
+                            ui.label(
+                                "QC Tool will inspect the identity and saved bytes of "
+                                "already-open Office documents. Changing selection can "
+                                "trigger document add-ins or event handlers. Every document "
+                                "still requires an explicit byte-identical binding."
+                            ).classes("notecard")
+
+                            def acknowledge(event: events.ValueChangeEventArguments) -> None:
+                                accepted["value"] = bool(event.value)
+
+                            ui.checkbox(
+                                "I understand and want to remember this setting on this "
+                                "Windows account.",
+                                on_change=acknowledge,
+                            )
+
+                            def confirm() -> None:
+                                if not accepted["value"]:
+                                    ui.notify("Acknowledge the desktop action note first")
+                                    return
+                                _set_desktop_focus_preference(
+                                    work_dir,
+                                    focus_service,
+                                    True,
+                                )
+                                consent.close()
+                                dialog.close()
+                                ui.notify("Desktop Office focus enabled")
+
+                            with ui.row().classes("items-center gap-2"):
+                                ui.button("Enable focus", on_click=confirm).classes(
+                                    "runbtn"
+                                ).props("no-caps")
+                                ui.button("Cancel", on_click=consent.close).props(
+                                    "flat no-caps"
+                                )
+                        consent.open()
+
+                    enable_button = ui.button(
+                        "Enable Desktop Office focus",
+                        on_click=request_focus_consent,
+                    ).classes("runbtn").props("no-caps")
+                    if network_mode is NetworkMode.LAN:
+                        enable_button.disable()
+
+                ui.separator()
+                try:
+                    shortcut = shortcut_status(work_dir, port=port)
+                    ui.label(f"Desktop shortcut · {shortcut.state.value}").classes(
+                        "runhead"
+                    )
+
+                    def create_shortcut() -> None:
+                        try:
+                            result = install_shortcut(work_dir, port=port)
+                        except Exception:
+                            logger.exception("desktop-shortcut-install-failed")
+                            ui.notify("Desktop shortcut could not be created", type="negative")
+                            return
+                        dialog.close()
+                        ui.notify(f"Desktop shortcut {result.state.value}")
+
+                    def delete_shortcut() -> None:
+                        try:
+                            remove_shortcut(work_dir, port=port)
+                        except Exception:
+                            logger.exception("desktop-shortcut-remove-failed")
+                            ui.notify("Desktop shortcut could not be removed", type="negative")
+                            return
+                        dialog.close()
+                        ui.notify("Desktop shortcut removed")
+
+                    if shortcut.state is ShortcutState.INSTALLED:
+                        ui.button("Remove desktop shortcut", on_click=delete_shortcut).classes(
+                            "ghostbtn"
+                        ).props("flat no-caps")
+                    else:
+                        label = (
+                            "Repair desktop shortcut"
+                            if shortcut.state is ShortcutState.STALE
+                            else "Create desktop shortcut"
+                        )
+                        ui.button(label, on_click=create_shortcut).classes(
+                            "ghostbtn"
+                        ).props("flat no-caps")
+                    ui.label(
+                        f"Quiet-launch diagnostics are written to "
+                        f"{launcher_log_path(work_dir).relative_to(work_dir)}."
+                    ).classes("note")
+                except Exception:
+                    logger.exception("desktop-shortcut-status-failed")
+                    ui.label("Desktop shortcut status is unavailable.").classes("notecard")
+            ui.button("Close", on_click=dialog.close).props("flat no-caps")
+        dialog.open()
+
     def on_disconnect(client) -> None:
         focus_service.forget_client(str(client.id))
         RunHistory(work_dir / "history.sqlite3").pause_review_sessions()
@@ -5435,7 +5636,9 @@ def create_pages(
 
     @ui.page("/")
     def main_page(rerun: int | None = None) -> None:  # pyright: ignore[reportUnusedFunction]
-        state = SessionState()
+        state = SessionState(
+            mode=_initial_mode(app.storage.general.get("qc_mode")),
+        )
         file_states: dict[str, ui.label] = {}
         dynamic_member_boxes: dict[str, ui.element] = {}
         add_member_buttons: dict[str, ui.button] = {}
@@ -5447,7 +5650,10 @@ def create_pages(
             try:
                 rerun_record = history.get_run(rerun)
                 state.rerun_of = rerun
-                state.mode = rerun_record.mode
+                state.mode = _initial_mode(
+                    app.storage.general.get("qc_mode"),
+                    rerun_mode=rerun_record.mode,
+                )
             except KeyError:
                 rerun_record = None
 
@@ -5455,6 +5661,7 @@ def create_pages(
             "run",
             network_mode=network_mode.value,
             expires_at=expires_at.isoformat(timespec="seconds") if expires_at else None,
+            on_settings=open_app_settings,
             on_shutdown=request_shutdown,
         ):
             ui.label("Compare deliverables").classes("pagetitle")
@@ -5515,6 +5722,8 @@ def create_pages(
 
             def on_mode_change(e: events.ValueChangeEventArguments) -> None:
                 state.mode = QCRunMode(e.value)
+                if state.rerun_of is None:
+                    app.storage.general["qc_mode"] = state.mode.value
                 update_mode_surface()
                 refresh_readiness()
 
@@ -6604,6 +6813,7 @@ def create_pages(
             "guide",
             network_mode=network_mode.value,
             expires_at=expires_at.isoformat(timespec="seconds") if expires_at else None,
+            on_settings=open_app_settings,
             on_shutdown=request_shutdown,
             colophon="Curated by Himanshu",
         ):
@@ -6615,6 +6825,7 @@ def create_pages(
             "history",
             network_mode=network_mode.value,
             expires_at=expires_at.isoformat(timespec="seconds") if expires_at else None,
+            on_settings=open_app_settings,
             on_shutdown=request_shutdown,
         ):
             ui.label("Run history").classes("pagetitle")
@@ -6695,7 +6906,10 @@ def create_pages(
 
             def refresh_storage_note() -> None:
                 total, archived_bytes, _ = history.storage_summary()
-                text = f"History uses {_format_bytes(total)} across {len(runs)} runs"
+                text = (
+                    f"History uses {_format_bytes(total)} across {len(runs)} stored runs"
+                    " · Run IDs are permanent and may have gaps after deletion"
+                )
                 if archived_bytes:
                     text += f" · {_format_bytes(archived_bytes)} archived"
                 storage_note.text = text
@@ -6964,6 +7178,7 @@ def create_pages(
             "history",
             network_mode=network_mode.value,
             expires_at=expires_at.isoformat(timespec="seconds") if expires_at else None,
+            on_settings=open_app_settings,
             on_shutdown=request_shutdown,
         ):
             history = RunHistory(work_dir / "history.sqlite3")
@@ -7012,39 +7227,50 @@ def run_app(
     network_mode: NetworkMode = NetworkMode.LOCAL,
     expires_at: dt.datetime | None = None,
     desktop_focus: bool = False,
+    show: bool = True,
 ) -> None:
-    create_pages(
-        work_dir,
-        network_mode=network_mode,
-        expires_at=expires_at,
-        desktop_focus=desktop_focus,
+    authority = (
+        claim_local_instance(work_dir, port)
+        if network_mode is NetworkMode.LOCAL and host == "127.0.0.1"
+        else None
     )
-    if network_mode is NetworkMode.LAN:
-        if expires_at is None:
-            raise ValueError("LAN mode requires an expiry timestamp")
+    try:
+        create_pages(
+            work_dir,
+            port=port,
+            network_mode=network_mode,
+            expires_at=expires_at,
+            desktop_focus=desktop_focus,
+        )
+        if network_mode is NetworkMode.LAN:
+            if expires_at is None:
+                raise ValueError("LAN mode requires an expiry timestamp")
 
-        async def expire_network_access() -> None:
-            while True:
-                remaining = (expires_at - dt.datetime.now(dt.UTC)).total_seconds()
-                if remaining <= 0:
-                    save_server_config(work_dir, local_config())
-                    logger.warning("temporary LAN exposure expired; shutting down server")
-                    app.shutdown()
-                    return
-                await asyncio.sleep(min(2.0, remaining))
-                if not lan_config_matches(work_dir, expires_at):
-                    logger.warning(
-                        "LAN exposure config changed or expired; shutting down server"
-                    )
-                    app.shutdown()
-                    return
+            async def expire_network_access() -> None:
+                while True:
+                    remaining = (expires_at - dt.datetime.now(dt.UTC)).total_seconds()
+                    if remaining <= 0:
+                        _persist_expired_lan_config(work_dir)
+                        logger.warning("temporary LAN exposure expired; shutting down server")
+                        app.shutdown()
+                        return
+                    await asyncio.sleep(min(2.0, remaining))
+                    if not lan_config_matches(work_dir, expires_at):
+                        logger.warning(
+                            "LAN exposure config changed or expired; shutting down server"
+                        )
+                        app.shutdown()
+                        return
 
-        app.on_startup(lambda: asyncio.create_task(expire_network_access()))
-    ui.run(
-        title="QC Tool",
-        host=host,
-        port=port,
-        reload=False,
-        show=True,
-        storage_secret=_storage_secret(work_dir),
-    )
+            app.on_startup(lambda: asyncio.create_task(expire_network_access()))
+        ui.run(
+            title="QC Tool",
+            host=host,
+            port=port,
+            reload=False,
+            show=show,
+            storage_secret=_storage_secret(work_dir),
+        )
+    finally:
+        if authority is not None:
+            release_local_instance(authority)

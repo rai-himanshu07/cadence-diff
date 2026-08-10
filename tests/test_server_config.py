@@ -38,6 +38,7 @@ def test_expired_lan_config_falls_back_and_persists_local(tmp_path: Path) -> Non
     expired = ServerConfig(
         network=NetworkMode.LAN,
         expires_at=dt.datetime.now(dt.UTC) - dt.timedelta(seconds=1),
+        desktop_focus=True,
     )
     save_server_config(tmp_path, expired)
 
@@ -48,11 +49,13 @@ def test_expired_lan_config_falls_back_and_persists_local(tmp_path: Path) -> Non
         config_path(tmp_path).read_text(encoding="utf-8")
     )
     assert persisted.network is NetworkMode.LOCAL
+    assert persisted.desktop_focus
     assert expired.expires_at is not None
     assert not lan_config_matches(tmp_path, expired.expires_at)
 
 
 def test_network_cli_switches_config(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    save_server_config(tmp_path, ServerConfig(desktop_focus=True))
     assert (
         cli.main(
             ["network", "lan", "--minutes", "15", "--data-dir", str(tmp_path)]
@@ -61,7 +64,9 @@ def test_network_cli_switches_config(tmp_path: Path, capsys: pytest.CaptureFixtu
     )
     assert "network: lan" in capsys.readouterr().out
     assert load_server_config(tmp_path).network is NetworkMode.LAN
+    assert load_server_config(tmp_path).desktop_focus
 
     assert cli.main(["network", "local", "--data-dir", str(tmp_path)]) == 0
     assert load_server_config(tmp_path).network is NetworkMode.LOCAL
+    assert load_server_config(tmp_path).desktop_focus
     assert not lan_config_matches(tmp_path, dt.datetime.now(dt.UTC))

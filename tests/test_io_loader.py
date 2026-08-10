@@ -33,6 +33,7 @@ from qc_tool.io.loader import (
     _load_ooxml_oracle,
     _load_ooxml_streaming,
     _parse_pivots,
+    _parse_pivots_bounded,
     load_workbook_snapshot,
 )
 from qc_tool.io.model import display_cell_value, serialize_cell_value
@@ -41,6 +42,12 @@ from qc_tool.io.ooxml_worksheet import (
     WorkbookMetadata,
     WorksheetMetadata,
     parse_ooxml_worksheet_metadata,
+)
+from qc_tool.io.opc import (
+    InvalidOfficePackageError,
+    UnsafeRelationshipTargetError,
+    resolve_internal_relationship_target,
+    validate_office_package,
 )
 from qc_tool.io.xlsb_formula import (
     XlsbFormulaScan,
@@ -849,6 +856,97 @@ def test_xlsx_snapshot_captures_table_schema(tmp_path: Path) -> None:
     raw = parse_ooxml_worksheet_metadata(path.read_bytes())
     assert raw.sheets[0].tables == snapshot.tables
     assert _streaming_snapshot(path) == snapshot
+
+
+def test_ooxml_worksheet_relationship_cannot_escape_package(tmp_path: Path) -> None:
+    path = tmp_path / "unsafe-relationship.xlsx"
+    workbook = Workbook()
+    workbook.save(path)
+    with zipfile.ZipFile(path) as archive:
+        relationships = ElementTree.fromstring(
+            archive.read("xl/_rels/workbook.xml.rels")
+        )
+    for relationship in relationships:
+        if (relationship.get("Type") or "").endswith("/worksheet"):
+            relationship.set("Target", "../../outside.xml")
+            break
+    _rewrite_package(
+        path,
+        {
+            "xl/_rels/workbook.xml.rels": ElementTree.tostring(
+                relationships,
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+        },
+    )
+
+    with pytest.raises(OOXMLMetadataError, match="unsafe relationship target"):
+        parse_ooxml_worksheet_metadata(path.read_bytes())
+
+
+def test_opc_relationship_resolution_keeps_valid_parent_targets() -> None:
+    assert resolve_internal_relationship_target(
+        "ppt/slides/slide1.xml",
+        "../slideLayouts/slideLayout1.xml",
+    ) == "ppt/slideLayouts/slideLayout1.xml"
+    with pytest.raises(UnsafeRelationshipTargetError):
+        resolve_internal_relationship_target("xl/workbook.xml", "../../outside.xml")
+    with pytest.raises(UnsafeRelationshipTargetError):
+        resolve_internal_relationship_target("xl/workbook.xml", "https://example.invalid/a")
+    with pytest.raises(UnsafeRelationshipTargetError):
+        resolve_internal_relationship_target("xl/workbook.xml", "C:/outside.xml")
+
+
+def test_office_package_precheck_rejects_escaping_ppt_relationship() -> None:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("[Content_Types].xml", b"<Types/>")
+        archive.writestr("_rels/.rels", b"<Relationships/>")
+        archive.writestr("ppt/presentation.xml", b"<presentation/>")
+        archive.writestr(
+            "ppt/slides/_rels/slide1.xml.rels",
+            b'<Relationships><Relationship Id="rId1" '
+            b'Target="../../../outside.xml"/></Relationships>',
+        )
+
+    with pytest.raises(
+        InvalidOfficePackageError,
+        match=r"deck\.pptx: invalid Office package relationship target",
+    ):
+        validate_office_package(payload.getvalue(), source_name="deck.pptx")
+
+
+def test_office_package_precheck_rejects_malformed_relationship_metadata() -> None:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("[Content_Types].xml", b"<Types/>")
+        archive.writestr("_rels/.rels", b"<Relationships/>")
+        archive.writestr("xl/workbook.xml", b"<workbook/>")
+        archive.writestr("xl/_rels/workbook.xml.rels", b"<not-xml")
+
+    with pytest.raises(
+        InvalidOfficePackageError,
+        match=r"book\.xlsx: invalid Office package relationship metadata",
+    ):
+        validate_office_package(payload.getvalue(), source_name="book.xlsx")
+
+
+def test_pivot_relationship_failure_keeps_filename_at_loader_boundary() -> None:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("xl/workbook.xml", b"<workbook/>")
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            b'<Relationships><Relationship Id="rId1" '
+            b'Target="../../../outside.xml"/></Relationships>',
+        )
+
+    with pytest.raises(
+        InvalidOfficePackageError,
+        match=r"book\.xlsx: invalid Office package relationship target",
+    ):
+        _parse_pivots_bounded(payload.getvalue(), "book.xlsx")
 
 
 def test_pivots_resolve_shared_and_non_positional_caches() -> None:

@@ -9,6 +9,7 @@ from pathlib import Path
 _ALLOWED_FILES = {
     ".gitattributes",
     ".gitignore",
+    ".github/dependabot.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/publish.yml",
     "LICENSE",
@@ -18,6 +19,7 @@ _ALLOWED_FILES = {
     "main.py",
     "pyproject.toml",
     "scripts/audit_distributions.py",
+    "scripts/audit_dependencies.py",
     "scripts/audit_public_tree.py",
     "scripts/windows_excel_acceptance.py",
     "scripts/windows_focus_acceptance.py",
@@ -41,6 +43,7 @@ _SECRET_PATTERNS = {
     "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 }
 _MAX_TRACKED_BYTES = 5 * 1024 * 1024
+_PNG_TEXT_CHUNKS = (b"tEXt", b"zTXt", b"iTXt", b"eXIf")
 
 
 def _tracked_files() -> list[str]:
@@ -69,6 +72,13 @@ def main() -> int:
             )
         if not path.is_file():
             continue
+        if path.suffix.lower() == ".png":
+            payload = path.read_bytes()
+            for chunk in _PNG_TEXT_CHUNKS:
+                if chunk in payload:
+                    errors.append(
+                        f"PNG contains metadata chunk {chunk.decode()}: {relative}"
+                    )
         try:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):

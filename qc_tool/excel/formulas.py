@@ -34,6 +34,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
+from openpyxl.formula.tokenizer import TokenizerError
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
 
@@ -750,8 +751,13 @@ def _paired_cell_findings(
                     operand.value.casefold()
                     for operand in formula_reference_operands(curr_formula)
                 }
-            except Exception:
-                pass
+            except (TokenizerError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "formula-reference-tag-unavailable %s!%s: %s",
+                    sheet_name,
+                    location,
+                    type(exc).__name__,
+                )
             else:
                 if current_references - baseline_references:
                     evidence_tags.add(FindingEvidenceTag.ADDED_REFERENCE)

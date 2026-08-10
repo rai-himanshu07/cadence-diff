@@ -9,6 +9,8 @@ from pathlib import Path, PurePosixPath
 
 _REQUIRED_PACKAGE_FILES = {
     "qc_tool/__init__.py",
+    "qc_tool/assets/qc-tool.ico",
+    "qc_tool/assets/review-queue.png",
     "qc_tool/cli.py",
     "qc_tool/ui/guide.py",
     "qc_tool/fingerprint.schema.json",
@@ -18,6 +20,7 @@ _REQUIRED_PACKAGE_FILES = {
     "qc_tool/report/findings.schema.json",
     "qc_tool/report/templates/report.html.j2",
 }
+_PNG_TEXT_CHUNKS = (b"tEXt", b"zTXt", b"iTXt", b"eXIf")
 _FORBIDDEN_PARTS = {
     ".github",
     ".nicegui",
@@ -93,6 +96,36 @@ def _audit_names(path: Path, names: set[str], *, wheel: bool) -> list[str]:
     return errors
 
 
+def _audit_binary_metadata(path: Path, names: set[str], *, wheel: bool) -> list[str]:
+    errors: list[str] = []
+    if wheel:
+        with zipfile.ZipFile(path) as archive:
+            payloads = {
+                name: archive.read(name)
+                for name in names
+                if name.lower().endswith(".png")
+            }
+    else:
+        with tarfile.open(path, "r:gz") as archive:
+            payloads = {}
+            for member in archive.getmembers():
+                if not member.isfile() or not member.name.lower().endswith(".png"):
+                    continue
+                handle = archive.extractfile(member)
+                if handle is not None:
+                    relative = PurePosixPath(member.name)
+                    name = str(PurePosixPath(*relative.parts[1:]))
+                    payloads[name] = handle.read()
+    for name, payload in payloads.items():
+        for chunk in _PNG_TEXT_CHUNKS:
+            if chunk in payload:
+                errors.append(
+                    f"{path.name} PNG contains metadata chunk "
+                    f"{chunk.decode()}: {name}"
+                )
+    return errors
+
+
 def main(argv: list[str]) -> int:
     directory = Path(argv[1] if len(argv) > 1 else "dist")
     wheels = sorted(directory.glob("*.whl"))
@@ -106,6 +139,8 @@ def main(argv: list[str]) -> int:
     errors = [
         *_audit_names(wheels[0], _wheel_names(wheels[0]), wheel=True),
         *_audit_names(sdists[0], _sdist_names(sdists[0]), wheel=False),
+        *_audit_binary_metadata(wheels[0], _wheel_names(wheels[0]), wheel=True),
+        *_audit_binary_metadata(sdists[0], _sdist_names(sdists[0]), wheel=False),
     ]
     if errors:
         print("Distribution audit failed:")

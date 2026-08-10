@@ -12,6 +12,7 @@ Exit codes: 0 ok · 1 usage/runtime error · 2 findings at/above the
 
 import argparse
 import getpass
+import logging
 import os
 import re
 import sys
@@ -25,6 +26,8 @@ from qc_tool.security import private_directory
 
 _SUBCOMMANDS = {
     "serve",
+    "launch",
+    "shortcut",
     "run",
     "sanitize",
     "sanitize-package",
@@ -104,6 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
             "loopback only; off by default)"
         ),
     )
+    parser.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--launcher-child", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -111,6 +116,10 @@ def _cmd_serve(args: list[str]) -> int:
     ns = build_parser().parse_args(args)
     data_dir = ns.data_dir or default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
+    if ns.launcher_child:
+        from qc_tool.launcher import configure_launcher_logging
+
+        configure_launcher_logging(data_dir)
     from qc_tool.server_config import (
         load_server_config,
         local_config,
@@ -118,31 +127,116 @@ def _cmd_serve(args: list[str]) -> int:
         temporary_lan_config,
     )
 
+    stored_config = load_server_config(data_dir)
     if ns.network == "lan":
         if ns.expose_for is None:
             raise ValueError("--network lan requires --expose-for MINUTES")
-        config = temporary_lan_config(ns.expose_for)
+        config = temporary_lan_config(
+            ns.expose_for,
+            desktop_focus=stored_config.desktop_focus,
+        )
         save_server_config(data_dir, config)
     elif ns.network == "local":
         if ns.expose_for is not None:
             raise ValueError("--expose-for only applies to --network lan")
-        config = local_config()
+        config = local_config(desktop_focus=stored_config.desktop_focus)
         save_server_config(data_dir, config)
     else:
         if ns.expose_for is not None:
             raise ValueError("--expose-for requires --network lan")
-        config = load_server_config(data_dir)
-    from qc_tool.ui.app import run_app  # deferred: keep --help/--version instant
+        config = stored_config
+    try:
+        from qc_tool.ui.app import run_app  # deferred: keep --help/--version instant
 
-    run_app(
-        data_dir,
-        port=ns.port,
-        host=config.host,
-        network_mode=config.network,
-        expires_at=config.expires_at,
-        desktop_focus=ns.desktop_focus,
-    )
+        run_app(
+            data_dir,
+            port=ns.port,
+            host=config.host,
+            network_mode=config.network,
+            expires_at=config.expires_at,
+            desktop_focus=ns.desktop_focus or config.desktop_focus,
+            show=not ns.no_browser,
+        )
+    except Exception as exc:
+        if ns.launcher_child:
+            logging.getLogger(__name__).error(
+                "server-start-failed %s",
+                type(exc).__name__,
+            )
+        raise
     return 0
+
+
+def _launch_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"{_program_name()} launch",
+        description=(
+            "Open an authenticated running local QC Tool instance or start this "
+            "Python environment quietly and wait for it to become ready."
+        ),
+    )
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--data-dir", type=Path, default=None)
+    return parser
+
+
+def _cmd_launch(args: list[str]) -> int:
+    ns = _launch_parser().parse_args(args)
+    data_dir = ns.data_dir or default_data_dir()
+    from qc_tool.launcher import (
+        LaunchOutcome,
+        configure_launcher_logging,
+        launch_local_app,
+    )
+
+    configure_launcher_logging(data_dir)
+    result = launch_local_app(data_dir, port=ns.port)
+    print(f"launch: {result.outcome.value} {result.url}")
+    if result.outcome in {
+        LaunchOutcome.STARTED,
+        LaunchOutcome.REUSED,
+        LaunchOutcome.IN_PROGRESS,
+    }:
+        return 0
+    logging.getLogger(__name__).error("launch-%s", result.outcome.value)
+    if result.detail:
+        print(f"error: {result.detail}", file=sys.stderr)
+    return 1
+
+
+def _shortcut_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"{_program_name()} shortcut",
+        description="Install, inspect, or remove the per-user Windows desktop shortcut.",
+    )
+    parser.add_argument("action", choices=["install", "status", "remove"])
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--data-dir", type=Path, default=None)
+    return parser
+
+
+def _cmd_shortcut(args: list[str]) -> int:
+    ns = _shortcut_parser().parse_args(args)
+    data_dir = ns.data_dir or default_data_dir()
+    from qc_tool.shortcut import (
+        ShortcutState,
+        install_shortcut,
+        remove_shortcut,
+        shortcut_status,
+    )
+
+    operations = {
+        "install": install_shortcut,
+        "status": shortcut_status,
+        "remove": remove_shortcut,
+    }
+    result = operations[ns.action](data_dir, port=ns.port)
+    print(f"shortcut: {result.state.value}")
+    if result.detail:
+        print(result.detail)
+    if ns.action == "remove":
+        return 0 if result.state is ShortcutState.MISSING else 1
+    return 0 if result.state is ShortcutState.INSTALLED else 1
 
 
 # --- run ---------------------------------------------------------------------
@@ -343,8 +437,11 @@ def _infer_mode(files: dict[str, Path]) -> str:
 
 
 def _resolve_profile(spec: str | None, data_dir: Path):
-    from qc_tool.config.profile import default_profile, load_profile
-    from qc_tool.ui.app import load_profile_by_name
+    from qc_tool.config.profile import (
+        default_profile,
+        load_profile,
+        load_profile_by_name,
+    )
 
     if spec is None:
         return default_profile()
@@ -1041,20 +1138,24 @@ def _cmd_network(args: list[str]) -> int:
     )
 
     data_dir = ns.data_dir or default_data_dir()
+    stored_config = load_server_config(data_dir)
     if ns.action == "local":
         if ns.minutes is not None:
             raise ValueError("--minutes only applies to network lan")
-        config = local_config()
+        config = local_config(desktop_focus=stored_config.desktop_focus)
         save_server_config(data_dir, config)
     elif ns.action == "lan":
         if ns.minutes is None:
             raise ValueError("network lan requires --minutes (1-1440)")
-        config = temporary_lan_config(ns.minutes)
+        config = temporary_lan_config(
+            ns.minutes,
+            desktop_focus=stored_config.desktop_focus,
+        )
         save_server_config(data_dir, config)
     else:
         if ns.minutes is not None:
             raise ValueError("--minutes does not apply to network status")
-        config = load_server_config(data_dir)
+        config = stored_config
     print(f"network: {config.network.value}  host={config.host}")
     if config.expires_at is not None:
         print(f"expires: {config.expires_at.isoformat(timespec='seconds')}")
@@ -1117,6 +1218,8 @@ def main(argv: list[str] | None = None) -> int:
         command, rest = "serve", args  # backward compatible bare invocation
     handlers = {
         "serve": _cmd_serve,
+        "launch": _cmd_launch,
+        "shortcut": _cmd_shortcut,
         "run": _cmd_run,
         "sanitize": _cmd_sanitize,
         "sanitize-package": _cmd_sanitize_package,

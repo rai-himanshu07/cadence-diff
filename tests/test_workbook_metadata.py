@@ -6,6 +6,7 @@ import base64
 import io
 import zipfile
 from pathlib import Path
+from xml.etree import ElementTree
 
 from openpyxl import Workbook
 from openpyxl.comments import Comment
@@ -86,6 +87,32 @@ def _snapshot(scan: WorkbookMetadataScan) -> WorkbookSnapshot:
         styles_available=True,
         metadata=scan,
     )
+
+
+def test_metadata_relationship_cannot_escape_package(tmp_path: Path) -> None:
+    path = _workbook_with_comments(
+        tmp_path / "unsafe-metadata.xlsx",
+        {"A1": ("reviewed", "Analyst")},
+    )
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    relationships = ElementTree.fromstring(parts["xl/_rels/workbook.xml.rels"])
+    for relationship in relationships:
+        if (relationship.get("Type") or "").endswith("/worksheet"):
+            relationship.set("Target", "../../outside.xml")
+            break
+    parts["xl/_rels/workbook.xml.rels"] = ElementTree.tostring(relationships)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in parts.items():
+            archive.writestr(name, payload)
+
+    scan = scan_workbook_metadata(buffer.getvalue())
+
+    assert not scan.comments_available
+    assert "unsafe relationship target" in scan.comments_detail
+    assert "unsafe relationship target" in scan.queries_detail
+    assert "unsafe relationship target" in scan.connections_detail
 
 
 # --- comments ------------------------------------------------------------

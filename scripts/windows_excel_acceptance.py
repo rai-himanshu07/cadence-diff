@@ -16,7 +16,6 @@ from typing import Any
 
 import qc_tool.io.excel_formula as excel_formula_module
 from qc_tool.io.excel_formula import (
-    _restrict_windows_path,
     _run_excel_worker,
     _status_identity,
     _worker_request,
@@ -25,6 +24,7 @@ from qc_tool.io.excel_formula import (
 from qc_tool.io.excel_formula_worker import _excel_process
 from qc_tool.io.formula_enrichment import FormulaEnrichmentError
 from qc_tool.io.xlsb_formula import XlsbFormulaScan, scan_xlsb_formulas
+from qc_tool.security import restrict_windows_path_to_current_user
 
 _SCHEMA_VERSION = 1
 _PARENT_DEATH_TIMEOUT_SECONDS = 45.0
@@ -106,7 +106,7 @@ def _probe_dacl(data: bytes) -> dict[str, object]:
 
     with tempfile.TemporaryDirectory(prefix="qc-tool-dacl-probe-") as temporary:
         work_dir = Path(temporary)
-        _restrict_windows_path(work_dir, inherit=True)
+        restrict_windows_path_to_current_user(work_dir, inherit=True)
         input_path = work_dir / "input.xlsb"
         _write_private_windows_file(input_path, data)
         directory = _dacl_summary(
@@ -174,7 +174,7 @@ def _prepare_worker(
     work_dir: Path, data: bytes, scan: XlsbFormulaScan
 ) -> dict[str, object]:
     work_dir.mkdir(parents=True, exist_ok=True)
-    _restrict_windows_path(work_dir, inherit=True)
+    restrict_windows_path_to_current_user(work_dir, inherit=True)
     _write_private_windows_file(work_dir / "input.xlsb", data)
     return _worker_request(work_dir, scan)
 

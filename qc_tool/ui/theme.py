@@ -1119,6 +1119,7 @@ def page_frame(
     *,
     network_mode: str = "local",
     expires_at: str | None = None,
+    on_settings: Callable[[], None] | None = None,
     on_shutdown: Callable[[], None] | None = None,
     colophon: str | None = None,
 ) -> Iterator[None]:
@@ -1150,6 +1151,14 @@ def page_frame(
                 if network_mode == "lan"
                 else "local · read-only"
             ).classes("headnote")
+
+            if on_settings is not None:
+                ui.button(
+                    icon="settings",
+                    on_click=on_settings,
+                ).classes("themebtn").props(
+                    'flat round dense aria-label="Open local app settings"'
+                ).mark("app-settings").tooltip("Local app settings")
 
             def toggle_dark() -> None:
                 dark.value = not dark.value

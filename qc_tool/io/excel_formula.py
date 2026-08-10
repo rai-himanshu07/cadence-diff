@@ -18,6 +18,7 @@ from qc_tool.io.formula_enrichment import (
     validate_formula_extraction,
 )
 from qc_tool.io.xlsb_formula import XlsbFormulaScan
+from qc_tool.security import restrict_windows_path_to_current_user
 
 DEFAULT_EXCEL_TIMEOUT_SECONDS = 300.0
 _WorkerRunner: TypeAlias = Callable[
@@ -27,40 +28,12 @@ _WorkerRunner: TypeAlias = Callable[
 
 def _write_private_windows_file(path: Path, data: bytes) -> None:
     path.write_bytes(data)
-    _restrict_windows_path(path, inherit=False)
-
-
-def _restrict_windows_path(path: Path, *, inherit: bool) -> None:
     try:
-        import ntsecuritycon  # pyright: ignore[reportMissingModuleSource]
-        import win32api  # pyright: ignore[reportMissingModuleSource]
-        import win32con  # pyright: ignore[reportMissingModuleSource]
-        import win32security  # pyright: ignore[reportMissingModuleSource]
+        restrict_windows_path_to_current_user(path, inherit=False)
     except ImportError as exc:  # pragma: no cover - exercised on Windows deployment
-        raise FormulaEnrichmentError("pywin32 is required for Windows formula enrichment") from exc
-
-    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
-    try:
-        user_sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
-    finally:
-        win32api.CloseHandle(token)
-    dacl = win32security.ACL()
-    inheritance = (
-        win32con.CONTAINER_INHERIT_ACE | win32con.OBJECT_INHERIT_ACE
-        if inherit
-        else 0
-    )
-    dacl.AddAccessAllowedAceEx(
-        win32security.ACL_REVISION_DS,
-        inheritance,
-        ntsecuritycon.FILE_ALL_ACCESS,
-        user_sid,
-    )
-    descriptor = win32security.SECURITY_DESCRIPTOR()
-    descriptor.SetSecurityDescriptorDacl(True, dacl, False)
-    win32security.SetFileSecurity(
-        str(path), win32security.DACL_SECURITY_INFORMATION, descriptor
-    )
+        raise FormulaEnrichmentError(
+            "pywin32 is required for Windows formula enrichment"
+        ) from exc
 
 
 def _worker_request(work_dir: Path, scan: XlsbFormulaScan) -> dict[str, object]:
@@ -249,7 +222,12 @@ def extract_formulas_with_excel(
     with tempfile.TemporaryDirectory(prefix="qc-tool-xlsb-") as temporary:
         work_dir = Path(temporary)
         if os.name == "nt":
-            _restrict_windows_path(work_dir, inherit=True)
+            try:
+                restrict_windows_path_to_current_user(work_dir, inherit=True)
+            except ImportError as exc:  # pragma: no cover - Windows deployment
+                raise FormulaEnrichmentError(
+                    "pywin32 is required for Windows formula enrichment"
+                ) from exc
         input_path = work_dir / "input.xlsb"
         if os.name == "nt":
             _write_private_windows_file(input_path, data)

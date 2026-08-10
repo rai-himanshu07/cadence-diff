@@ -10,20 +10,22 @@ from pathlib import Path
 import msoffcrypto
 import msoffcrypto.exceptions
 
+from qc_tool.io.opc import validate_office_package
+
 #: OLE compound-file magic — encrypted OOXML files are CFB containers.
 _OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 _ZIP_MAGIC = b"PK\x03\x04"
 
 
-class PasswordRequiredError(Exception):
+class PasswordRequiredError(ValueError):
     """The file is encrypted and no password was supplied."""
 
 
-class InvalidPasswordError(Exception):
+class InvalidPasswordError(ValueError):
     """The supplied password does not decrypt the file."""
 
 
-class UnsupportedFileError(Exception):
+class UnsupportedFileError(ValueError):
     """The file is neither a plain OOXML zip nor an encrypted container."""
 
 
@@ -43,7 +45,9 @@ def is_encrypted(path: Path) -> bool:
 def open_decrypted(path: Path, password: str | None = None) -> io.BytesIO:
     """Return the plaintext package bytes of ``path`` as an in-memory stream."""
     if not is_encrypted(path):
-        return io.BytesIO(path.read_bytes())
+        data = path.read_bytes()
+        validate_office_package(data, source_name=path.name)
+        return io.BytesIO(data)
     if password is None:
         raise PasswordRequiredError(
             f"{path.name} is password-protected; supply the open password"
@@ -61,4 +65,5 @@ def open_decrypted(path: Path, password: str | None = None) -> io.BytesIO:
                 f"{path.name}: decryption failed — likely a wrong password ({exc})"
             ) from exc
     plaintext.seek(0)
+    validate_office_package(plaintext.getvalue(), source_name=path.name)
     return plaintext

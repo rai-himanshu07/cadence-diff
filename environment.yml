@@ -20,13 +20,15 @@ dependencies:
   # dev / checks
   - pytest>=8.0
   - pytest-asyncio>=1.0
+  - pytest-cov=7.1.0
+  - pip-audit=2.10.1
   - ruff
   - pyright
   - psutil>=6.0
   # packaging
-  - hatchling
-  - python-build
-  - twine
+  - hatchling=1.31.0
+  - python-build=1.5.0
+  - twine=6.2.0
   - pip
   - pip:
       - "pywin32>=306; sys_platform == 'win32'"

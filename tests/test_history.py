@@ -218,6 +218,21 @@ def test_delete_removes_records_annotations_and_managed_reports(
     assert not report.parent.exists()  # the emptied run directory goes too
 
 
+def test_deleting_every_run_does_not_reuse_a_run_id(
+    qc_result: QCRunResult,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    first = history.record_run(qc_result, file_hashes={}, report_paths={})
+
+    assert history.delete_runs([first], managed_root=work_dir / "runs") == 1
+    second = history.record_run(qc_result, file_hashes={}, report_paths={})
+
+    assert second > first
+    assert [record.run_id for record in history.list_runs()] == [second]
+
+
 def test_delete_never_touches_files_outside_the_managed_root(
     qc_result: QCRunResult, tmp_path: Path
 ) -> None:

@@ -2,7 +2,9 @@
 
 import zipfile
 from pathlib import Path
+from xml.etree import ElementTree
 
+import pytest
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.label import DataLabelList
@@ -21,6 +23,7 @@ from qc_tool.io.model import (
     SheetSnapshot,
     WorkbookSnapshot,
 )
+from qc_tool.io.ooxml_chart import ChartParseError, parse_ooxml_charts
 
 
 def _combo_workbook(path: Path) -> None:
@@ -63,6 +66,26 @@ def _combo_workbook(path: Path) -> None:
     columns.anchor = "E2"
     sheet.add_chart(columns)
     workbook.save(path)
+
+
+def test_chart_relationship_cannot_escape_package(tmp_path: Path) -> None:
+    path = tmp_path / "unsafe-chart.xlsx"
+    _combo_workbook(path)
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    relationships = ElementTree.fromstring(parts["xl/_rels/workbook.xml.rels"])
+    for relationship in relationships:
+        if (relationship.get("Type") or "").endswith("/worksheet"):
+            relationship.set("Target", "../../outside.xml")
+            break
+    parts["xl/_rels/workbook.xml.rels"] = ElementTree.tostring(relationships)
+    buffer = Path(tmp_path / "rewritten.xlsx")
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in parts.items():
+            archive.writestr(name, payload)
+
+    with pytest.raises(ChartParseError, match="unsafe relationship target"):
+        parse_ooxml_charts(buffer.read_bytes())
 
 
 def test_combo_chart_extracts_every_plot_series_axis_and_geometry(

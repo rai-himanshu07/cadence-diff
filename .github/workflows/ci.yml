@@ -43,6 +43,12 @@ jobs:
         if: runner.os == 'Windows'
         run: conda install --yes --name cadence-diff-ci --channel conda-forge pywin32
 
+      - name: Install approved diagnostic tools
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: >-
+          conda install --yes --name cadence-diff-ci --channel conda-forge
+          "pytest-cov=7.1.0" "pip-audit=2.10.1"
+
       - name: Audit tracked public tree
         run: conda run --name cadence-diff-ci python scripts/audit_public_tree.py
 
@@ -54,6 +60,28 @@ jobs:
 
       - name: Run Pyright
         run: conda run --name cadence-diff-ci pyright
+
+      - name: Collect diagnostic branch coverage
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: >-
+          conda run --name cadence-diff-ci pytest -q
+          --cov=qc_tool --cov-branch --cov-report=xml:coverage.xml
+          tests/test_cli_run.py tests/test_io_loader.py tests/test_ppt.py
+          tests/test_sanitize.py tests/test_package_sanitize.py
+          tests/test_attestation.py tests/test_run_queue.py
+          tests/test_launcher.py tests/test_shortcut.py
+
+      - name: Upload diagnostic branch coverage
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostic-branch-coverage
+          path: coverage.xml
+          if-no-files-found: error
+
+      - name: Audit installed Python dependencies
+        if: runner.os == 'Linux' && matrix.python == '3.12'
+        run: conda run --name cadence-diff-ci python scripts/audit_dependencies.py
 
   package:
     name: Build and inspect distributions
@@ -72,7 +100,7 @@ jobs:
 
       - name: Build and validate distributions
         run: |
-          python -m pip install --disable-pip-version-check build twine
+          python -m pip install --disable-pip-version-check "build==1.5.0" "twine==6.2.0"
           python -m build
           python -m twine check dist/*
           python scripts/audit_distributions.py dist

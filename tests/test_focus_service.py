@@ -123,6 +123,49 @@ def test_focus_is_available_only_when_all_three_hold(tmp_path: Path) -> None:
     assert _service(tmp_path).available
 
 
+async def test_disabling_focus_revokes_all_client_authority(
+    tmp_path: Path,
+    open_workbook: tuple[Path, str],
+) -> None:
+    source, digest = open_workbook
+    navigator, _seen = _navigator(
+        [
+            HelperRun(
+                payload={
+                    "outcome": FocusOutcome.DISCOVERED.value,
+                    "discovery": _payload(_document(source)),
+                }
+            )
+        ]
+    )
+    service = _service(tmp_path / "data", navigator=navigator)
+    record = _record(hashes={"current_excel": digest})
+    assert (await service.bind(CLIENT, record, FocusRole.CURRENT_EXCEL)).offered
+    assert service.confirm(
+        CLIENT,
+        record,
+        FocusRole.CURRENT_EXCEL,
+    ) is BindOutcome.MATCHED
+    service.acknowledge(CLIENT)
+    token = service.issue_token(CLIENT, 7, "F0001", FocusRole.CURRENT_EXCEL)
+
+    service.set_enabled(False)
+
+    assert service.availability() is FocusUnavailable.FEATURE_OFF
+    assert service.binding(CLIENT, 7, FocusRole.CURRENT_EXCEL) is None
+    assert not service.acknowledged(CLIENT)
+    assert service.consume_token(CLIENT, token) is TokenRejection.UNKNOWN_TOKEN
+    assert service.confirm(
+        CLIENT,
+        record,
+        FocusRole.CURRENT_EXCEL,
+    ) is BindOutcome.NO_EXACT_MATCH
+
+    service.set_enabled(True)
+    assert service.available
+    assert service.binding(CLIENT, 7, FocusRole.CURRENT_EXCEL) is None
+
+
 # --------------------------------------------------------------------------
 # targets and role suppression
 # --------------------------------------------------------------------------

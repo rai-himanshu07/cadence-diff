@@ -8,6 +8,7 @@ from html import escape
 from nicegui import ui
 
 GUIDE_SECTIONS = (
+    ("launch", "Launch and first run"),
     ("start", "Start here"),
     ("example", "Worked example"),
     ("modes", "Choose a mode"),
@@ -15,6 +16,7 @@ GUIDE_SECTIONS = (
     ("profiles", "Profiles and controls"),
     ("coverage", "Coverage and severity"),
     ("review", "Review findings"),
+    ("focus", "Desktop Office focus"),
     ("mappings", "Excel to PowerPoint mappings"),
     ("reqc", "Re-QC and history"),
     ("privacy", "Privacy and sharing"),
@@ -22,13 +24,16 @@ GUIDE_SECTIONS = (
     ("network", "Network access"),
     ("troubleshooting", "Troubleshooting"),
     ("signoff", "Before sign-off"),
+    ("reference", "Advanced capability reference"),
     ("glossary", "Glossary"),
 )
 
 COMMON_TASKS = (
+    ("Launch QC Tool", "launch"),
+    ("Run a first preflight", "launch"),
     ("See a worked example", "example"),
-    ("Run a first preflight", "modes"),
     ("Review a reporting cycle", "review"),
+    ("Use Desktop Office focus", "focus"),
     ("Handle a workload refusal", "coverage"),
     ("Re-QC after a correction", "reqc"),
     ("Share evidence safely", "privacy"),
@@ -130,12 +135,14 @@ GUIDE_SCRIPT = r"""
   const sections = Array.from(document.querySelectorAll('.guide-section'));
   const links = Array.from(document.querySelectorAll('.guide-toc-link'));
     const aliases = {
-        coverage: 'capability limited unavailable degraded not checked',
+        launch: 'install windows path command not found shortcut start browser first run data directory storage localappdata xdg_data_home',
+        coverage: 'capability limited unavailable degraded not checked workload refusal override memory projected findings safety',
         mappings: 'mapping unavailable opaque screenshot raster image claim',
         review: 'unreviewed only replace all confirm severity reviewed note',
         reqc: 'rerun repeat carry forward history',
         files: 'xlsb formula encrypted password same file workload memory refusal',
-        coverage: 'workload refusal override memory projected findings safety',
+        focus: 'desktop office excel powerpoint bind confirm open cell shape',
+        reference: 'vba power query connection structured spill circular parser',
     };
   const mobile = () => window.matchMedia('(max-width: 640px)').matches;
 
@@ -152,7 +159,7 @@ GUIDE_SCRIPT = r"""
     title.addEventListener('keydown', function (e) {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
     });
-    if (mobile() && s.id !== 'start') s.classList.add('collapsed');
+    if (mobile() && s.id !== 'launch') s.classList.add('collapsed');
     title.setAttribute('aria-expanded', String(!s.classList.contains('collapsed')));
   });
 
@@ -306,6 +313,92 @@ def render_guide() -> None:
             ui.html('<button id="guide-toc-more" type="button">All topics</button>')
 
         with ui.element("article").classes("guide-content"):
+            with _guide_section("launch", "Launch and first run"):
+                _paragraph(
+                    "After installation, start the local app with the Python environment "
+                    "that contains cadence-diff. The module command is the most reliable "
+                    "choice on Windows because it does not depend on the Scripts directory "
+                    "being listed in PATH."
+                )
+                _code(
+                    """# Works from an activated pip or Conda environment
+python -m qc_tool
+
+# Windows: create a per-user Desktop shortcut for this exact environment
+python -m qc_tool shortcut install
+python -m qc_tool shortcut status
+python -m qc_tool shortcut remove
+
+# Compatibility: enable Desktop Office focus for this launch only
+python -m qc_tool --desktop-focus"""
+                )
+                _paragraph(
+                    "QC Tool keeps uploads, profiles, run history, generated reports, "
+                    "and local server state together in one data directory."
+                )
+                _table(
+                    ["Launch context", "Default data directory"],
+                    [
+                        [
+                            "Installed on Windows",
+                            "<code>%LOCALAPPDATA%\\qc-tool</code> (normally "
+                            "<code>C:\\Users\\&lt;you&gt;\\AppData\\Local\\qc-tool</code>)",
+                        ],
+                        [
+                            "Installed on Linux",
+                            "<code>$XDG_DATA_HOME/qc-tool</code> when "
+                            "<code>XDG_DATA_HOME</code> is set; otherwise "
+                            "<code>~/.local/share/qc-tool</code>",
+                        ],
+                        [
+                            "Source checkout: python main.py",
+                            "<code>&lt;repository&gt;/data</code> (developer entry point only)",
+                        ],
+                    ],
+                )
+                _code(
+                    """# Show the resolved default for this account and operating system
+python -m qc_tool --help
+
+# Select a different data directory before the server starts
+python -m qc_tool --data-dir "/path/to/qc-data"
+cadence-diff --data-dir "/path/to/qc-data"
+"""
+                )
+                _list(
+                    [
+                        "The data directory contains managed upload copies, profile YAML, SQLite run history, generated reports, and private server or launcher state. Treat the whole directory as sensitive local working data.",
+                        "QC Tool restricts managed files to the current user where the operating system supports it. Choose a trusted local location; do not use a team share as an access-control substitute.",
+                        "The directory is selected before startup and cannot be switched from Local app settings while the server is running. Stop QC Tool before changing <code>--data-dir</code>.",
+                        "Each path is an independent store. Starting with a new path shows a separate history and profile set; it does not migrate or delete the old directory.",
+                        "Quote a custom path that contains spaces. Use the same <code>--data-dir</code> on later launches to return to that store.",
+                    ]
+                )
+                _callout(
+                    "Changing the path does not migrate history",
+                    "To keep using existing runs and profiles, continue pointing QC Tool at "
+                    "their original data directory. Relocating an existing store requires a "
+                    "separate, verified migration rather than copying it while the server runs.",
+                    warning=True,
+                )
+                _list(
+                    [
+                        "The browser opens at <code>http://127.0.0.1:8080</code>. The server remains local and unauthenticated network access stays off.",
+                        "If Windows says <code>cadence-diff is not recognized</code>, use <code>python -m qc_tool</code>. Do not search for or copy a random executable from another environment.",
+                        "A fresh installation opens in <strong>Current-file preflight</strong>. Upload one current Excel workbook and/or PowerPoint deck; the built-in default profile is enough for a first run.",
+                        "After you choose another mode, QC Tool remembers it on this machine. A Re-QC link always restores the original run mode.",
+                        "Use the settings icon in the header to create or remove the Windows shortcut and to manage Desktop Office focus.",
+                        "Use the power icon in the header to stop the local server when finished.",
+                    ]
+                )
+                _callout(
+                    "Shortcut lifecycle",
+                    "The shortcut points to the absolute Python environment that created it, "
+                    "so PATH and Conda activation are not required. If that environment is "
+                    "deleted or moved, recreate the shortcut from the replacement environment. "
+                    "Package installation never changes the Desktop automatically.",
+                )
+
             with _guide_section("start", "Start here"):
                 _paragraph(
                     "A defensible run has four parts: select the mode that answers the "
@@ -315,7 +408,7 @@ def render_guide() -> None:
                 _list(
                     [
                         "Select a <strong>QC mode</strong> before choosing files.",
-                        "Use a <strong>named profile</strong> for recurring deliverables and mappings.",
+                        "Use the built-in <strong>default profile</strong> for a first or one-off run. Create a named profile only for recurring controls, mappings, tolerances, or waivers.",
                         "Run QC, then review <strong>coverage before counts</strong>.",
                         "Expand findings for baseline/current evidence, cell context, and impacts.",
                         "Record analyst comments or severity overrides before exporting or attesting.",
@@ -379,6 +472,10 @@ def render_guide() -> None:
                 )
 
             with _guide_section("modes", "Choose the right QC mode"):
+                _paragraph(
+                    "A fresh installation selects Current-file preflight. The Compare page "
+                    "then remembers your last manual choice; Re-QC always uses the recorded mode."
+                )
                 _table(
                     ["Mode", "Required inputs", "Use it to answer", "Cannot establish"],
                     [
@@ -683,6 +780,16 @@ def render_guide() -> None:
                     "in every view, and Stories, Coverage, and Atomic evidence are one "
                     "click away."
                 )
+                _paragraph("For a first review, follow four steps:")
+                _list(
+                    [
+                        "Read the run outcome and capability status before interpreting the finding count.",
+                        "Select the first open review item and compare its baseline/current evidence and nearby cells.",
+                        "Confirm or change severity and add a specific evidence-based comment.",
+                        "Continue until material items are dispositioned, then generate exports or finalize the review.",
+                    ]
+                )
+                _paragraph("Review controls and advanced workflow:")
                 _list(
                     [
                         "Filter by severity, class, sheet or slide, or free text, and read the capability status before concluding a run is clean. The sheet/slide list comes from this run's findings; <em>whole file</em> covers findings that belong to no single sheet.",
@@ -735,6 +842,7 @@ def render_guide() -> None:
                         "Annotations belong to the run. A Re-QC starts a new run with no annotations; the delta reports resolved, new, and persisting.",
                     ]
                 )
+
                 _paragraph(
                     "<strong>Related series</strong> rows collapse one logical time series "
                     "that the engine correctly split across several decisions, so you can "
@@ -754,6 +862,31 @@ def render_guide() -> None:
                         "A <strong>wiped period row</strong> is one event, not one finding per column: when no measure retains data at that period, its cleared cells stay together in their own decision instead of being scattered across column parents.",
                         "Runs recorded before this feature keep today's grouping. Re-QC that deliverable to get producer-authored series evidence; nothing is guessed from coordinates.",
                     ]
+                )
+
+            with _guide_section("focus", "Desktop Office focus"):
+                _paragraph(
+                    "On Windows, a finding can navigate to the same saved cell or shape in an "
+                    "already-open Excel or PowerPoint document. This is an optional local "
+                    "review aid, not part of the QC verdict or signed evidence."
+                )
+                _list(
+                    [
+                        "Keep the server in local mode. Desktop focus is unavailable in LAN mode even when your preference is remembered.",
+                        "Open the exact workbook or presentation in desktop Office, with AutoSave off. The saved bytes must match the run input exactly.",
+                        "Open local app settings and enable Desktop Office focus. Read and accept the Office side-effect notice; the setting is initially off.",
+                        "Open an atomic finding. Choose <strong>Bind</strong> for the current or baseline role. QC Tool offers a document only when exactly one eligible open document has byte-identical saved content.",
+                        "Review the filename, role, folder label, and unsaved-change warning, then choose <strong>Confirm binding</strong>.",
+                        "Choose <strong>Focus</strong>. QC Tool revalidates the process, window, path identity, saved bytes, AutoSave state, and target immediately before navigation.",
+                        "Disable focus from local app settings to revoke every token, pending offer, acknowledgement, and live binding immediately.",
+                    ]
+                )
+                _callout(
+                    "What focus never does",
+                    "It never opens, saves, recalculates, edits, closes, or quits an Office "
+                    "document. Active content, Protected View, AutoSave, ambiguous copies, "
+                    "multiple windows, unreadable identity, or changed saved bytes refuse the action.",
+                    warning=True,
                 )
 
             with _guide_section("mappings", "Excel to PowerPoint mappings"):
@@ -842,6 +975,11 @@ def render_guide() -> None:
                     "list shows the storage each run occupies; when the total "
                     "grows large the app suggests exporting what you need and "
                     "archiving or deleting the rest."
+                )
+                _paragraph(
+                    "Run IDs are permanent audit identities, not a count of stored runs. "
+                    "Deleting run 12 does not make a later run reuse ID 12, so gaps are "
+                    "normal and old reports, links, and Re-QC references never become ambiguous."
                 )
                 _paragraph(
                     "Dossier and recurrence: when a finding can be matched to a"
@@ -989,6 +1127,22 @@ qc-tool network local --data-dir data"""
                     ["Symptom", "Action"],
                     [
                         ["Password required / invalid", "Enter the open password for the exact file role"],
+                        [
+                            "cadence-diff is not recognized on Windows",
+                            "Activate the environment and run python -m qc_tool. Then create a Desktop shortcut from local app settings or python -m qc_tool shortcut install.",
+                        ],
+                        [
+                            "I have only one current file",
+                            "Choose Current-file preflight; no baseline or named profile is required.",
+                        ],
+                        [
+                            "Desktop shortcut is stale",
+                            "The Python environment moved or was removed. Run python -m qc_tool shortcut install from the environment you want to use.",
+                        ],
+                        [
+                            "Desktop focus controls are missing or unavailable",
+                            "Focus requires Windows and local network mode. Enable it in local app settings, open the exact saved file in desktop Office with AutoSave off, then use Bind and Confirm binding on an atomic finding.",
+                        ],
                         ["Formula cache missing", "Open and recalculate in Excel, save, then rerun"],
                         [
                             "Workbook workload refused",
@@ -1072,6 +1226,24 @@ qc-tool network local --data-dir data"""
                     "QC evidence supports judgment",
                     "The tool makes checks reproducible and reviewable; it does not replace the "
                     "analyst's responsibility for unsupported visual, business, or upstream-data assertions.",
+                )
+
+            with _guide_section("reference", "Advanced capability reference"):
+                _paragraph(
+                    "Use this section when a coverage detail names a specific parser or "
+                    "representation. These capabilities are important, but they are not "
+                    "prerequisites for a first run."
+                )
+                _table(
+                    ["Capability", "Boundary"],
+                    [
+                        ["Defined names", "Workbook and sheet scope are compared separately; XLSB scope is unavailable."],
+                        ["VBA", "Module inventory and source changes are compared without execution; source text never enters findings."],
+                        ["Comments, Power Query, connections", "Content is compared locally; queries/connections are never executed and targets are represented by digests."],
+                        ["Structured and spill references", "Proven extents are resolved; missing or ambiguous metadata degrades coverage instead of guessing."],
+                        ["Circular references", "A compact formula-only graph reports exact cycles; unsupported or budgeted edges degrade coverage."],
+                        ["PowerPoint images", "Embedded-byte changes are checked; rendered pixels, crop/layout equivalence, and OCR remain unavailable."],
+                    ],
                 )
 
             with _guide_section("glossary", "Glossary"):

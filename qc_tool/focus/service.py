@@ -148,6 +148,21 @@ class FocusService:
     def available(self) -> bool:
         return self.availability() is FocusUnavailable.AVAILABLE
 
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def platform(self) -> str:
+        return self._platform
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Change local consent; disabling synchronously revokes all authority."""
+        self._enabled = enabled
+        if not enabled:
+            self._clients.clear()
+            self._registry.clear()
+
     # -- per-client render and token state ---------------------------------
 
     def _state(self, client_id: str) -> _ClientState:

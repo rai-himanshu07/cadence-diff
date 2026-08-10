@@ -13,6 +13,7 @@ htmlcov/
 *.egg-info/
 
 # virtual environments
+.conda/
 .venv/
 venv/
 

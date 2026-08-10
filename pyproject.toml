@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -38,6 +38,8 @@ dependencies = [
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=1.0",
+  "pytest-cov==7.1.0",
+  "pip-audit==2.10.1",
   "ruff",
   "pyright",
   "psutil>=6.0",
@@ -61,7 +63,7 @@ path = "qc_tool/__init__.py"
 packages = ["qc_tool"]
 
 [tool.hatch.build.targets.sdist]
-include = ["qc_tool", "README.md", "LICENSE", "pyproject.toml"]
+include = ["/qc_tool", "/README.md", "/LICENSE", "/pyproject.toml"]
 
 [tool.ruff]
 target-version = "py311"
@@ -83,3 +85,10 @@ testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
+source = ["qc_tool"]
+
+[tool.coverage.report]
+show_missing = true

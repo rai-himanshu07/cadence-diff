@@ -16,6 +16,10 @@ from qc_tool.io.model import (
     ChartPlot,
     ChartSeries,
 )
+from qc_tool.io.opc import (
+    UnsafeRelationshipTargetError,
+    resolve_internal_relationship_target,
+)
 from qc_tool.progress import CancellationToken, check_cancelled
 
 _PLOT_TYPES = frozenset(
@@ -80,13 +84,15 @@ def _relationship_targets(
             or relationship.get("TargetMode") == "External"
         ):
             continue
-        targets[relationship_id] = (
-            target.lstrip("/")
-            if target.startswith("/")
-            else posixpath.normpath(
-                posixpath.join(posixpath.dirname(source_part), target)
+        try:
+            targets[relationship_id] = resolve_internal_relationship_target(
+                source_part,
+                target,
             )
-        )
+        except UnsafeRelationshipTargetError as exc:
+            raise ChartParseError(
+                f"unsafe relationship target in {relationship_part}"
+            ) from exc
     return targets
 
 

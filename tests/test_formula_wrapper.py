@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
+import pytest
+
+import qc_tool.excel.formulas as formulas_module
 from qc_tool.excel.align import AxisAlignment, RegionAlignment, WorkbookAlignment
 from qc_tool.excel.formulas import (
     detect_formula_wrapper,
@@ -120,6 +125,38 @@ def _block_alignment(rows: int, cols: int) -> WorkbookAlignment:
 
 
 class TestDiffIntegration:
+    def test_reference_tag_parse_failure_keeps_finding_and_logs_fixed_code(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        baseline = _formula_workbook({(1, 1): "=B1+C1"}, rows=1, cols=3)
+        current = _formula_workbook({(1, 1): "=B1+D1"}, rows=1, cols=4)
+
+        def fail_reference_parse(_formula: str) -> list[object]:
+            raise ValueError("synthetic malformed formula")
+
+        monkeypatch.setattr(
+            formulas_module,
+            "formula_reference_operands",
+            fail_reference_parse,
+        )
+        with caplog.at_level(logging.WARNING, logger=formulas_module.__name__):
+            findings = diff_workbook_formulas(
+                baseline,
+                current,
+                _block_alignment(1, 4),
+            )
+
+        logic = [
+            finding
+            for finding in findings
+            if finding.finding_class is FindingClass.FORMULA_LOGIC_CHANGED
+        ]
+        assert len(logic) == 1
+        assert FindingEvidenceTag.ADDED_REFERENCE not in logic[0].evidence_tags
+        assert "formula-reference-tag-unavailable" in caplog.text
+
     def test_rollout_collapses_to_one_skeleton_group(self) -> None:
         wrap = "=IF(XLOOKUP($H$1,$F:$F,$G:$G,FALSE),{core},NA())"
         baseline_formulas = {

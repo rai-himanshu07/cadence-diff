@@ -1,6 +1,7 @@
 """Headless `qc-tool run` tests: modes, exit codes, JSON export."""
 
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -278,6 +279,109 @@ def test_invalid_mode_combination_returns_clean_error(
     captured = capsys.readouterr()
     assert "current-file preflight does not accept baseline files" in captured.err
     assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("flag", "filename"),
+    [
+        ("--current-excel", "corrupt.xlsx"),
+        ("--current-ppt", "corrupt.pptx"),
+    ],
+)
+def test_corrupt_office_package_returns_bounded_error_without_history(
+    flag: str,
+    filename: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / filename
+    source.write_bytes(b"PK\x03\x04not-a-valid-zip")
+    data_dir = tmp_path / "data"
+
+    code = _run(
+        [
+            flag,
+            str(source),
+            "--data-dir",
+            str(data_dir),
+            "--fail-on",
+            "never",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert filename in captured.err
+    assert "invalid Office package" in captured.err
+    assert "Traceback" not in captured.err
+    assert str(tmp_path) not in captured.err
+    assert not (data_dir / "history.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    ("flag", "filename"),
+    [
+        ("--current-excel", "empty.xlsx"),
+        ("--current-ppt", "empty.pptx"),
+    ],
+)
+def test_incomplete_office_package_returns_bounded_error_without_history(
+    flag: str,
+    filename: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / filename
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("placeholder", b"")
+    data_dir = tmp_path / "data"
+
+    code = _run(
+        [
+            flag,
+            str(source),
+            "--data-dir",
+            str(data_dir),
+            "--fail-on",
+            "never",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert filename in captured.err
+    assert "required metadata is missing" in captured.err
+    assert "Traceback" not in captured.err
+    assert str(tmp_path) not in captured.err
+    assert not (data_dir / "history.sqlite3").exists()
+
+
+@pytest.mark.parametrize("password_args", [[], ["--password", "current_excel=wrong"]])
+def test_encrypted_password_errors_are_bounded(
+    password_args: list[str],
+    fixture_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    data_dir = tmp_path / "data"
+
+    code = _run(
+        [
+            "--current-excel",
+            str(fixture_dir / "current_encrypted.xlsx"),
+            "--data-dir",
+            str(data_dir),
+            "--fail-on",
+            "never",
+            *password_args,
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "Traceback" not in captured.err
+    assert str(fixture_dir) not in captured.err
+    assert not (data_dir / "history.sqlite3").exists()
 
 
 def test_password_can_be_read_from_environment(
