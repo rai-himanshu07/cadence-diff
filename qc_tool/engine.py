@@ -48,7 +48,7 @@ from qc_tool.excel.context import attach_current_excerpts, attach_excerpts
 from qc_tool.excel.controls import evaluate_controls
 from qc_tool.excel.dependency import (
     DependencyGraph,
-    annotate_impacts,
+    ImpactAccumulator,
     build_dependency_graph,
     detect_circular_references,
     limit_impacts,
@@ -222,7 +222,10 @@ def _enrich_retained_findings(
     closure query or a grid excerpt.
     """
     if dependency_graph is not None:
-        annotate_impacts(findings, dependency_graph)
+        accumulator = ImpactAccumulator(dependency_graph)
+        accumulator.annotate(findings)
+    else:
+        accumulator = None
     if current_workbook is not None:
         annotate_chart_impacts(findings, current_workbook, dependency_graph)
     if (
@@ -232,7 +235,10 @@ def _enrich_retained_findings(
         and crosscheck.mappings
     ):
         annotate_ppt_chart_impacts(findings, current_deck, crosscheck, dependency_graph)
-    limit_impacts(findings)
+    if accumulator is not None:
+        accumulator.finalize(findings)
+    else:
+        limit_impacts(findings)
     if baseline_workbook is not None and current_workbook is not None:
         attach_excerpts(findings, baseline_workbook, current_workbook)
     elif current_workbook is not None:
@@ -378,6 +384,9 @@ def _run_value_parts(
     tolerance = profile.tolerance
     windows = profile.restatement_windows
     part_total = sum(len(regions) for regions in alignment.regions.values())
+    report_progress(
+        on_progress, RunPhase.DIFFING_EXCEL, total=max(part_total, 1)
+    )
     if part_total == 0:
         report_progress(on_progress, RunPhase.DIFFING_EXCEL, processed=1, total=1)
         return 0
@@ -1451,12 +1460,22 @@ def run_qc(
         if disclosure := _pair_formula_disclosure(base_wb, curr_wb):
             result.disclosures.append(disclosure)
         report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)
-        report_progress(on_progress, RunPhase.DIFFING_EXCEL, total=1)
+
+        def _align_tick(index: int, total: int, sheet_name: str) -> None:
+            report_progress(
+                on_progress,
+                RunPhase.ANALYZING_EXCEL,
+                processed=index,
+                total=total + 1,
+                detail=sheet_name,
+            )
+
         alignment = align_workbooks(
             base_wb,
             curr_wb,
             profile,
             cancellation_token=cancellation_token,
+            on_sheet=_align_tick,
         )
         result.alignment_trust = build_alignment_trust_manifest(alignment)
         alignment_manifest = result.alignment_trust
@@ -1643,6 +1662,10 @@ def run_qc(
             )
         )
         formula_findings: list[Finding] = []
+        check_cancelled(cancellation_token)
+        # Close the analysis span before formula comparison opens so the
+        # recorded phases stay sequential instead of nesting.
+        report_progress(on_progress, RunPhase.ANALYZING_EXCEL, processed=1, total=1)
         report_progress(on_progress, RunPhase.COMPARING_FORMULAS, total=1)
         formula_findings = diff_workbook_formulas(
             base_wb,
@@ -1697,9 +1720,6 @@ def run_qc(
                 curr_wb,
                 cancellation_token=cancellation_token,
             )
-            report_progress(
-                on_progress, RunPhase.INDEXING_DEPENDENCIES, processed=1, total=1
-            )
             dependency_state = dependency_graph.coverage_state
             dependency_detail = dependency_graph.coverage_detail
             circular = detect_circular_references(
@@ -1708,6 +1728,9 @@ def run_qc(
             )
             post_batches.append(list(circular.findings))
             circular_coverage = circular.coverage
+            report_progress(
+                on_progress, RunPhase.INDEXING_DEPENDENCIES, processed=1, total=1
+            )
         else:
             dependency_state = CoverageState.UNAVAILABLE
             dependency_detail = "Formula text is unavailable for dependency extraction"
@@ -1744,12 +1767,6 @@ def run_qc(
             result.coverage.append(controls.coverage)
         baseline_workbook = base_wb
         check_cancelled(cancellation_token)
-        report_progress(
-            on_progress,
-            RunPhase.ANALYZING_EXCEL,
-            processed=1,
-            total=1,
-        )
 
     if (
         base_deck is not None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 
@@ -160,6 +161,38 @@ def test_refusal_limits_require_an_explicit_local_override(
     assert any("override accepted" in reason for reason in overridden.warning_reasons)
 
 
+def test_sliding_ranges_stay_below_the_dependency_refusal_limit() -> None:
+    cells = {
+        (row, 1): CellRecord(
+            row,
+            1,
+            0.0,
+            formula=f"=SUM(A{row}:A{row + 9_999})",
+        )
+        for row in range(1, 24_001)
+    }
+
+    workbook = WorkbookSnapshot(
+        "sliding-range.xlsx",
+        "xlsx",
+        True,
+        True,
+        formula_presence_available=True,
+        formula_source="synthetic",
+        sheets=[SheetSnapshot("Data", "visible", 33_999, 1, cells)],
+    )
+
+    complexity = assess_workbook_complexity(workbook)
+
+    assert complexity.formula_count == 24_000
+    assert complexity.projected_concrete_edges == 239_976_000
+    assert not complexity.override_used
+    assert any(
+        "projected cell dependencies 239,976,000" in reason
+        for reason in complexity.warning_reasons
+    )
+
+
 def test_progress_subdivides_every_planned_excel_phase(tmp_path: Path) -> None:
     baseline = tmp_path / "baseline.xlsx"
     current = tmp_path / "current.xlsx"
@@ -181,6 +214,42 @@ def test_progress_subdivides_every_planned_excel_phase(tmp_path: Path) -> None:
         RunPhase.BUILDING_REVIEW,
     } <= set(telemetry.records)
     assert all(path.read_bytes() == data for path, data in before.items())
+
+
+def test_excel_cycle_phases_are_sequential_with_alignment_detail(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _cycle_workbook(baseline, offset=0)
+    _cycle_workbook(current, offset=1)
+    events: list[ProgressEvent] = []
+
+    run_qc(baseline_excel=baseline, current_excel=current, on_progress=events.append)
+
+    def span(phase: RunPhase) -> tuple[int, int]:
+        indices = [i for i, event in enumerate(events) if event.phase is phase]
+        assert indices, f"{phase.value} produced no progress events"
+        return indices[0], indices[-1]
+
+    ordered = [
+        RunPhase.ANALYZING_EXCEL,
+        RunPhase.COMPARING_FORMULAS,
+        RunPhase.INDEXING_DEPENDENCIES,
+        RunPhase.QUERYING_IMPACTS,
+        RunPhase.DIFFING_EXCEL,
+        RunPhase.BUILDING_REVIEW,
+    ]
+    spans = [span(phase) for phase in ordered]
+    for (_, previous_end), (next_start, _) in itertools.pairwise(spans):
+        assert previous_end < next_start
+
+    align_details = {
+        event.detail
+        for event in events
+        if event.phase is RunPhase.ANALYZING_EXCEL and event.detail
+    }
+    assert "Data" in align_details
 
 
 def test_phase_telemetry_records_timings_units_and_sanitized_failures() -> None:

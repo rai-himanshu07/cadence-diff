@@ -26,7 +26,7 @@ from qc_tool.crosscheck.numbers import (
     numeric_skeleton,
     relative_difference,
 )
-from qc_tool.excel.dependency import DependencyGraph, Node, dependent_nodes_of
+from qc_tool.excel.dependency import DependencyGraph, Node, frozen_closure
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot, display_cell_value
 from qc_tool.package import MEMBER_ID_PATTERN
@@ -342,13 +342,14 @@ def annotate_ppt_chart_impacts(
         except ValueError:
             continue
         source: Node = (finding.sheet, row, column)
-        affected = {source, *dependent_nodes_of(dependency_graph, source)}
+        closure = frozen_closure(dependency_graph, source)
         impacts = {
             impact
             for mapped_source, impact in chart_mappings
-            if mapped_source in affected
+            if mapped_source == source or mapped_source in closure
         }
-        finding.impacts = sorted({*finding.impacts, *impacts})
+        if impacts:
+            finding.impacts = sorted({*finding.impacts, *impacts})
 
 
 def verify_mappings(

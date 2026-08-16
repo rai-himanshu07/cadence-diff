@@ -19,7 +19,10 @@ from tests.dependency_oracle import build_oracle_graph, oracle_dependents
 
 _ROOT = Path(__file__).resolve().parents[1]
 _ORACLE_IMPORT = "tests.dependency_oracle"
-_ALLOWED_ORACLE_IMPORTERS = {"tests/test_dependency_index.py"}
+_ALLOWED_ORACLE_IMPORTERS = {
+    "tests/test_dependency_index.py",
+    "tests/test_dependency_scaling.py",
+}
 
 
 def _oracle(name: str) -> dict[str, Any]:
@@ -141,7 +144,15 @@ def test_closures_are_memoized_only_for_requested_sources() -> None:
     second = dependent_nodes_of(graph, ("Data", 1, 1))
 
     assert first == second == {("Data", 1, 2), ("Data", 1, 3)}
-    assert set(graph._closure_cache) == {("Data", 1, 1)}
+    # Non-formula sources share one signature-keyed entry; per-node entries
+    # stay reserved for formula sources. Neither caches intermediates.
+    assert set(graph._closure_cache) == set()
+    assert len(graph._shared_closure_cache) == 1
+
+    formula_closure = dependent_nodes_of(graph, ("Data", 1, 2))
+
+    assert formula_closure == {("Data", 1, 3)}
+    assert set(graph._closure_cache) == {("Data", 1, 2)}
 
 
 @pytest.mark.parametrize(

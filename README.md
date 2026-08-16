@@ -218,9 +218,9 @@ python -m qc_tool launch        # start quietly, or reuse an authenticated insta
 python -m qc_tool --desktop-focus  # focus enabled for this launch only
 ```
 
-`1.1.0` is the current stable release. Existing `1.0.0`, `0.1.x`, and
-`0.2.0a1` artifacts remain immutable; an unqualified install selects the latest
-stable version.
+`1.2.0` is the current stable release. Existing `1.1.0`, `1.0.0`, `0.1.x`,
+and `0.2.0a1` artifacts remain immutable; an unqualified install selects the
+latest stable version.
 
 The web UI includes a packaged **Guide** page at `/guide`. It covers mode
 selection, files, profiles and controls, coverage/severity, finding review,

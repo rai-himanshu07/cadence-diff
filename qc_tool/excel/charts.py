@@ -9,7 +9,13 @@ from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 from qc_tool.config.profile import DeliverableProfile
 from qc_tool.coverage import CoverageState
-from qc_tool.excel.dependency import DependencyGraph, Node, dependent_nodes_of
+from qc_tool.excel.dependency import (
+    DependencyGraph,
+    Node,
+    closure_parts_for,
+    frozen_closure,
+    rect_intersects_members,
+)
 from qc_tool.excel.references import (
     ReferenceStatus,
     is_pure_range_extension,
@@ -913,6 +919,23 @@ def annotate_chart_impacts(
                             impact,
                         )
                     )
+    if not sources:
+        return
+    regime_impacts: dict[tuple[tuple[int, ...], tuple[int, ...]], set[str]] = {}
+    delta_impacts: dict[frozenset[int], set[str]] = {}
+    closure_impacts: dict[frozenset[Node], set[str]] = {}
+
+    def _member_impacts(
+        graph: DependencyGraph, members: frozenset[int]
+    ) -> set[str]:
+        return {
+            impact
+            for sheet, min_row, min_col, max_row, max_col, impact in sources
+            if rect_intersects_members(
+                graph, members, sheet, min_row, max_row, min_col, max_col
+            )
+        }
+
     for finding in findings:
         if finding.sheet is None or finding.location is None:
             continue
@@ -921,19 +944,41 @@ def annotate_chart_impacts(
         except ValueError:
             continue
         finding_node: Node = (finding.sheet, row, column)
-        affected_nodes = {finding_node}
+        impacts: set[str] = set()
+        for sheet, min_row, min_col, max_row, max_col, impact in sources:
+            if (
+                finding_node[0] == sheet
+                and min_row <= finding_node[1] <= max_row
+                and min_col <= finding_node[2] <= max_col
+            ):
+                impacts.add(impact)
         if dependency_graph is not None:
-            affected_nodes.update(
-                dependent_nodes_of(dependency_graph, finding_node)
-            )
-        impacts = {
-            impact
-            for sheet, min_row, min_col, max_row, max_col, impact in sources
-            if any(
-                source_sheet == sheet
-                and min_row <= source_row <= max_row
-                and min_col <= source_column <= max_col
-                for source_sheet, source_row, source_column in affected_nodes
-            )
-        }
+            parts = closure_parts_for(dependency_graph, finding_node)
+            if parts is not None:
+                regime_key, regime, delta = parts
+                cached = regime_impacts.get(regime_key)
+                if cached is None:
+                    cached = _member_impacts(dependency_graph, regime)
+                    regime_impacts[regime_key] = cached
+                impacts.update(cached)
+                if delta:
+                    delta_cached = delta_impacts.get(delta)
+                    if delta_cached is None:
+                        delta_cached = _member_impacts(dependency_graph, delta)
+                        delta_impacts[delta] = delta_cached
+                    impacts.update(delta_cached)
+            else:
+                closure = frozen_closure(dependency_graph, finding_node)
+                if closure:
+                    closure_cached = closure_impacts.get(closure)
+                    if closure_cached is None:
+                        node_ids = dependency_graph._node_ids
+                        members = frozenset(
+                            node_ids[member]
+                            for member in closure
+                            if member in node_ids
+                        )
+                        closure_cached = _member_impacts(dependency_graph, members)
+                        closure_impacts[closure] = closure_cached
+                    impacts.update(closure_cached)
         finding.impacts = sorted({*finding.impacts, *impacts})

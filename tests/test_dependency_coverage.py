@@ -548,6 +548,25 @@ def test_precedent_findings_include_transitive_excel_chart_impact() -> None:
     assert "Excel chart 'Trend' series 'Revenue'" in finding.impacts
 
 
+def test_formula_findings_include_downstream_excel_chart_impact() -> None:
+    workbook = _chart_workbook()
+    sheet = workbook.sheet("Data")
+    sheet.cells[(1, 3)] = CellRecord(1, 3, None, formula="=B1")
+    workbook.charts[0].series[0].values_ref = "Data!$C$1"
+    graph = build_dependency_graph(workbook)
+    finding = Finding(
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        sheet="Data",
+        location="B1",
+        message="changed",
+    )
+
+    annotate_chart_impacts([finding], workbook, graph)
+
+    assert "Excel chart 'Trend' series 'Revenue'" in finding.impacts
+
+
 def test_confirmed_chart_label_mapping_adds_transitive_ppt_chart_impact() -> None:
     workbook = _chart_workbook()
     graph = build_dependency_graph(workbook)

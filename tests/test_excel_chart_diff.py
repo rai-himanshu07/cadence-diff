@@ -274,6 +274,24 @@ def test_source_cell_findings_include_chart_series_impact() -> None:
     assert finding.impacts == ["Excel chart 'Combo' series 'Revenue'"]
 
 
+def test_chart_annotation_normalizes_existing_impacts_without_a_new_match() -> None:
+    chart = _chart(
+        [ChartPlot(0, "barChart", [_series(0, "Revenue", "Data!$B$2:$B$4")])]
+    )
+    finding = Finding(
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        sheet="Data",
+        location="B5",
+        message="value changed",
+        impacts=["zeta", "alpha", "alpha"],
+    )
+
+    annotate_chart_impacts([finding], _workbook(chart))
+
+    assert finding.impacts == ["alpha", "zeta"]
+
+
 def test_unsupported_chart_sources_degrade_and_invalid_sources_are_findings() -> None:
     unsupported = _chart(
         [

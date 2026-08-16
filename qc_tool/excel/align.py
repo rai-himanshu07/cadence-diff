@@ -19,7 +19,7 @@ than producing unreliable correspondences.
 import logging
 import re
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -624,6 +624,7 @@ def align_workbooks(
     profile: DeliverableProfile | None = None,
     *,
     cancellation_token: CancellationToken | None = None,
+    on_sheet: Callable[[int, int, str], None] | None = None,
 ) -> WorkbookAlignment:
     ignore = set(profile.excel.ignore_sheets) if profile else set()
     base_names = [n for n in baseline.sheet_names if n not in ignore]
@@ -635,8 +636,11 @@ def align_workbooks(
         removed_sheets=[n for n in base_names if n not in set(curr_names)],
     )
 
-    for sheet_name in result.common_sheets:
+    total = len(result.common_sheets)
+    for index, sheet_name in enumerate(result.common_sheets, start=1):
         check_cancelled(cancellation_token)
+        if on_sheet is not None:
+            on_sheet(index, total, sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name) if profile else None
         if sheet_profile is not None and sheet_profile.ignore:
             continue
