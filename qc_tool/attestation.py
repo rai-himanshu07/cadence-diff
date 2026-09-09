@@ -14,8 +14,10 @@ from pydantic import BaseModel, Field
 from qc_tool import __version__
 from qc_tool.config.profile import DeliverableProfile, canonical_profile_bytes
 from qc_tool.engine import QCRunResult
+from qc_tool.history.review_state import ANNOTATION_LINEAGE_VERSION, AnnotationLineage
 from qc_tool.package import PackageManifest
 from qc_tool.report.json_report import result_payload
+from qc_tool.review import population_identity_digest
 from qc_tool.security import private_directory, private_file
 
 _KEY_BYTES = 32
@@ -43,12 +45,35 @@ class AttestationSignoff(BaseModel):
     annotation_lineage: list[dict[str, object]] = Field(default_factory=list)
 
 
+class PopulationManifestEntry(BaseModel):
+    """Signed disclosure for one group-first population finding (schema v4)."""
+
+    identity_key_digest: str
+    member_count: int
+    membership_digest: str
+
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
 def _canonical(payload: dict) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _population_manifest(result: QCRunResult) -> list[PopulationManifestEntry] | None:
+    entries = [
+        PopulationManifestEntry(
+            identity_key_digest=population_identity_digest(finding),
+            member_count=finding.population.member_count,
+            membership_digest=_sha256_bytes(
+                _canonical(finding.population.membership.model_dump(mode="json"))
+            ),
+        )
+        for finding in result.findings
+        if finding.population is not None
+    ]
+    return entries or None
 
 
 def _key_id(key: bytes) -> str:
@@ -132,9 +157,12 @@ def create_attestation(
         and not result.package_manifest.is_legacy_projection
         else None
     )
+    population_manifest = _population_manifest(result)
     unsigned = {
         "schema_version": (
-            3 if package_manifest is not None else (2 if signoff is not None else 1)
+            4
+            if population_manifest is not None
+            else (3 if package_manifest is not None else (2 if signoff is not None else 1))
         ),
         "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "tool": {"distribution": "cadence-diff", "version": __version__},
@@ -149,6 +177,11 @@ def create_attestation(
                 else None
             ),
             "verified_crosschecks": result.verified_crosschecks,
+            # Resolved formula-engine/adapter-fingerprint string per excel
+            # role (Criterion 5): a purely informational disclosure so a
+            # cross-run comparison can later be told an engine changed,
+            # never a new schema feature -- present at every schema version.
+            "formula_engines": dict(result.formula_engines),
         },
         "profile_sha256": _sha256_bytes(profile_bytes),
         "inputs": inputs,
@@ -160,6 +193,11 @@ def create_attestation(
         unsigned["package_manifest"] = package_manifest.model_dump(mode="json")
     if signoff is not None:
         unsigned["signoff"] = signoff.model_dump(mode="json")
+    if population_manifest is not None:
+        unsigned["population_manifest"] = [
+            entry.model_dump(mode="json") for entry in population_manifest
+        ]
+        unsigned["lineage_version"] = 2
     signature = hmac.new(key, _canonical(unsigned), hashlib.sha256).hexdigest()
     manifest = {
         **unsigned,
@@ -195,24 +233,88 @@ def verify_attestation(path: Path, *, key: bytes) -> AttestationVerification:
         except (json.JSONDecodeError, UnicodeDecodeError):
             result.add("invalid-manifest", "manifest.json is not valid JSON")
             return result
+        if not isinstance(manifest, dict):
+            result.add("invalid-manifest", "manifest.json is not a JSON object")
+            return result
         schema_version = manifest.get("schema_version")
-        if schema_version not in {1, 2, 3}:
+        if schema_version not in {1, 2, 3, 4}:
             result.add(
                 "schema-version", f"unsupported attestation schema {schema_version!r}"
             )
-        if schema_version == 2 and not isinstance(manifest.get("signoff"), dict):
+
+        # Cumulative, presence-driven feature validation: a v3/v4 bundle can
+        # ALSO carry a sign-off (schema_version reflects the HIGHEST tier
+        # feature present, per `create_attestation`, not an exclusive mode),
+        # so every optional feature is validated whenever ITS OWN key is
+        # present, never skipped just because a higher-tier feature also
+        # exists in the same bundle.
+        if "signoff" in manifest:
+            try:
+                AttestationSignoff.model_validate(manifest.get("signoff"))
+            except (TypeError, ValueError):
+                result.add("signoff", "sign-off evidence is missing or invalid")
+        elif schema_version == 2:
             result.add("missing-signoff", "schema v2 sign-off evidence is missing")
-        package_manifest = None
-        if schema_version == 3:
+
+        package_manifest: PackageManifest | None = None
+        if "package_manifest" in manifest:
             try:
                 package_manifest = PackageManifest.model_validate(
                     manifest.get("package_manifest")
                 )
             except (TypeError, ValueError):
+                result.add("package-manifest", "package manifest is missing or invalid")
+        elif schema_version == 3:
+            result.add(
+                "package-manifest", "schema v3 package manifest is missing or invalid"
+            )
+
+        if "population_manifest" in manifest:
+            population_manifest = manifest.get("population_manifest")
+            if not isinstance(population_manifest, list):
                 result.add(
-                    "package-manifest",
-                    "schema v3 package manifest is missing or invalid",
+                    "population-manifest", "population manifest is missing or invalid"
                 )
+            else:
+                for entry in population_manifest:
+                    try:
+                        PopulationManifestEntry.model_validate(entry)
+                    except (TypeError, ValueError):
+                        result.add(
+                            "population-manifest-entry",
+                            "a population manifest entry does not match its schema",
+                        )
+                        break
+        elif schema_version == 4:
+            result.add(
+                "population-manifest", "schema v4 population manifest is missing or invalid"
+            )
+
+        if "lineage_version" in manifest:
+            if manifest.get("lineage_version") != ANNOTATION_LINEAGE_VERSION:
+                result.add(
+                    "lineage-version",
+                    f"unsupported annotation-lineage schema {manifest.get('lineage_version')!r}",
+                )
+            signoff_payload = manifest.get("signoff")
+            lineage_rows = (
+                signoff_payload.get("annotation_lineage")
+                if isinstance(signoff_payload, dict)
+                else None
+            )
+            if lineage_rows is not None and not isinstance(lineage_rows, list):
+                result.add("lineage-row", "annotation-lineage rows are not a list")
+            elif isinstance(lineage_rows, list):
+                for row in lineage_rows:
+                    try:
+                        AnnotationLineage.model_validate(row)
+                    except (TypeError, ValueError):
+                        result.add(
+                            "lineage-row",
+                            "an annotation-lineage row does not match its declared schema",
+                        )
+                        break
+
         signature = manifest.pop("signature", None)
         if not isinstance(signature, dict):
             result.add("missing-signature", "manifest signature is missing")

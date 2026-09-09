@@ -26,7 +26,7 @@ from qc_tool.coverage import capability_limited
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import Severity
 from qc_tool.findings_store import finding_by_id, finding_ordinal
-from qc_tool.review import format_ranges
+from qc_tool.review import format_ranges, population_summary_text
 from qc_tool.review_stream import (
     GroupSummary,
     counts_from_summaries,
@@ -73,6 +73,7 @@ _COLUMNS = [
     ("Analyst comment", 36),
     ("Root cause", 36),
     ("Waiver", 50),
+    ("Population", 40),
 ]
 
 
@@ -353,11 +354,20 @@ def _write_alignment_trust_sheet(workbook: Workbook, result: QCRunResult) -> Non
         "Cell pairs",
         "Skipped cells",
         "Low confidence",
+        "Identity columns",
+        "Ordinal columns",
+        "Duplicate policy",
+        "Matched unique rows",
+        "Skipped duplicate groups",
+        "Skipped duplicate rows",
+        "Reordered rows",
     )
     for col, header in enumerate(headers, start=1):
         grid.set(1, col, header, font=_WHITE_BOLD, fill=_HEADER_FILL)
     row = 2
     for r in result.alignment_trust.regions:
+        # V1 regions carry none of the identity fields; V2 -only, present as
+        # "unused" defaults for every region that applied no confirmed rule.
         values = (
             r.artifact_member,
             r.sheet,
@@ -379,6 +389,13 @@ def _write_alignment_trust_sheet(workbook: Workbook, result: QCRunResult) -> Non
             r.comparable_cell_pairs,
             r.skipped_low_confidence_cells,
             r.low_confidence,
+            "+".join(getattr(r, "identity_columns", ())),
+            "+".join(getattr(r, "ordinal_columns", ())),
+            getattr(r, "duplicate_policy", None) or "",
+            getattr(r, "matched_unique_rows", 0),
+            getattr(r, "skipped_duplicate_groups", 0),
+            getattr(r, "skipped_duplicate_rows", 0),
+            getattr(r, "reordered_rows", 0),
         )
         for col, value in enumerate(values, start=1):
             grid.set(row, col, value)
@@ -630,6 +647,7 @@ def _write_findings_sheets(
                 if finding.waiver_reason
                 else ""
             ),
+            population_summary_text(finding),
         ]
         cells = []
         for col, value in enumerate(values, start=1):

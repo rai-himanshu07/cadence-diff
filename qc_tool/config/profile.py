@@ -13,10 +13,11 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 from uuid import uuid4
 
 import yaml
+from openpyxl.utils.cell import column_index_from_string, coordinate_to_tuple
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from qc_tool.findings import FindingClass, Materiality, Severity
@@ -98,6 +99,56 @@ class ExcelAvailabilityRule(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class RowIdentityRule(BaseModel):
+    """Analyst-confirmed composite row identity for one positional block region.
+
+    Never auto-activates: the detector only proposes a candidate; this rule
+    takes effect only after the analyst saves it and re-runs QC. ``anchor_cell``
+    identifies the target region -- a rule matches whichever detected block
+    region's bounds contain that cell, so it keeps matching across ordinary
+    row growth. Column letters are used (not header text) so the rule survives
+    header renames and is never confused with a business value.
+    """
+
+    anchor_cell: str
+    identity_columns: list[str] = Field(min_length=1)
+    ordinal_columns: list[str] = Field(default_factory=list)
+    duplicate_policy: Literal["skip", "occurrence", "position"] = "skip"
+
+    @field_validator("anchor_cell")
+    @classmethod
+    def validate_anchor_cell(cls, value: str) -> str:
+        try:
+            coordinate_to_tuple(value)
+        except ValueError as exc:
+            raise ValueError("anchor_cell must be an A1 cell reference") from exc
+        return value.upper()
+
+    @field_validator("identity_columns", "ordinal_columns")
+    @classmethod
+    def validate_columns(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for column in value:
+            candidate = column.upper()
+            try:
+                column_index_from_string(candidate)
+            except ValueError as exc:
+                raise ValueError(f"{column!r} is not a valid column letter") from exc
+            if candidate not in normalized:
+                normalized.append(candidate)
+        return normalized
+
+    @model_validator(mode="after")
+    def identity_and_ordinal_are_disjoint(self) -> Self:
+        overlap = set(self.identity_columns) & set(self.ordinal_columns)
+        if overlap:
+            raise ValueError(
+                "columns cannot be both identity and ordinal: "
+                + ", ".join(sorted(overlap))
+            )
+        return self
+
+
 class SheetProfile(BaseModel):
     ignore: bool = False
     ignore_ranges: list[str] = Field(default_factory=list)
@@ -112,6 +163,11 @@ class SheetProfile(BaseModel):
     availability_rules: list[ExcelAvailabilityRule] = Field(default_factory=list)
     #: Chart-title or ``chart[N]`` overrides for rolling/full source windows.
     chart_windows: dict[str, Literal["rolling", "full"]] = Field(default_factory=dict)
+    #: Confirmed composite row identities for positional block regions.
+    row_identity_rules: list[RowIdentityRule] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
 
 
 class RangeControl(BaseModel):
@@ -152,10 +208,51 @@ class ExcelControls(BaseModel):
     tie_outs: list[TieOutControl] = Field(default_factory=list)
 
 
+class ComparisonPrerequisite(BaseModel):
+    """A profile-pinned scenario/selector cell that must match before diffing.
+
+    Not a business-value check: a mismatch means the two files were not
+    prepared under the same configuration (e.g. a scenario dropdown), so a
+    cycle comparison would be meaningless until the analyst aligns them.
+    """
+
+    name: str = Field(min_length=1, max_length=128)
+    sheet: str = Field(min_length=1, max_length=128)
+    cell: str
+
+    @field_validator("cell")
+    @classmethod
+    def validate_cell(cls, value: str) -> str:
+        try:
+            coordinate_to_tuple(value)
+        except ValueError as exc:
+            raise ValueError("cell must be an A1 cell reference") from exc
+        return value.upper()
+
+
 class ExcelMemberProfile(BaseModel):
     ignore_sheets: list[str] = Field(default_factory=list)
     sheets: dict[str, SheetProfile] = Field(default_factory=dict)
     controls: ExcelControls = Field(default_factory=ExcelControls)
+    #: Selector/scenario cells that must be present, non-blank, and exactly
+    #: equal between baseline and current before any cycle comparison
+    #: proceeds to alignment, diffing, reports, or history.
+    comparison_prerequisites: list[ComparisonPrerequisite] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+    )
+    #: XLSB formula-text adapter. ``auto`` (default) uses the native BIFF12
+    #: kernel when its compiled extension is importable, else falls back to
+    #: the existing platform default (desktop Excel on Windows, LibreOffice
+    #: on Linux). Ignored for xlsx/xlsm, which never need external formula
+    #: enrichment. An explicit ``native``/``excel``/``libreoffice`` choice
+    #: that the current platform or install cannot satisfy degrades to
+    #: formula-presence-only checks (disclosed), same as any other adapter
+    #: failure -- it never fails the whole run.
+    formula_engine: Literal["native", "excel", "libreoffice", "auto"] = Field(
+        default="auto",
+        exclude_if=lambda value: value == "auto",
+    )
 
 
 class ExcelProfile(ExcelMemberProfile):
@@ -248,6 +345,51 @@ class FindingWaiver(BaseModel):
     )
 
 
+#: Classes eligible for group-first population output (Phase A). A closed
+#: list -- adding a class here is a scope decision, not a config typo.
+POPULATION_ELIGIBLE_CLASSES = frozenset(
+    {FindingClass.FORMULA_LOGIC_CHANGED, FindingClass.NUMBER_FORMAT_CHANGED}
+)
+
+
+class PopulationPolicy(BaseModel):
+    """Group-first output policy. Disabled (the default) leaves every
+    legacy run byte-identical: findings, digests, review/pattern/story
+    counts, reports, and ``profile_sha256`` are all unaffected.
+    """
+
+    enabled: bool = False
+    threshold: int = Field(default=10, ge=1)
+    classes: tuple[FindingClass, ...] = tuple(POPULATION_ELIGIBLE_CLASSES)
+    max_rectangles: int = Field(default=2000, ge=1)
+    max_explicit_pairs: int = Field(default=50_000, ge=1)
+
+    @field_validator("classes")
+    @classmethod
+    def validate_classes(
+        cls, value: tuple[FindingClass, ...]
+    ) -> tuple[FindingClass, ...]:
+        invalid = sorted(
+            str(item) for item in value if item not in POPULATION_ELIGIBLE_CLASSES
+        )
+        if invalid:
+            raise ValueError(
+                "population classes must be a subset of "
+                f"{sorted(c.value for c in POPULATION_ELIGIBLE_CLASSES)}: "
+                f"invalid {invalid}"
+            )
+        return value
+
+
+class ReviewPolicy(BaseModel):
+    """Versioned run policy, persisted with the run and included in
+    attestation. Absent from a profile means version-1-disabled behavior.
+    """
+
+    version: Literal[1] = 1
+    populations: PopulationPolicy = Field(default_factory=PopulationPolicy)
+
+
 class DeliverableProfile(BaseModel):
     name: str
     #: Optional contract id assigned when promoting a profile to a contract.
@@ -266,6 +408,12 @@ class DeliverableProfile(BaseModel):
     #: Per-tier severity overrides; absent tiers use the built-in mapping
     #: (noise/within_tolerance -> info, recent_restatement -> warning).
     materiality_severity: dict[Materiality, Severity] = Field(default_factory=dict)
+    #: Explicit, versioned run policy. Absent/disabled means today's
+    #: atomic-only behavior, byte-identical, same profile_sha256.
+    review_policy: ReviewPolicy = Field(
+        default_factory=ReviewPolicy,
+        exclude_if=lambda value: not value.populations.enabled,
+    )
 
     def sheet_profile(self, sheet_name: str) -> SheetProfile | None:
         return self.excel.sheets.get(sheet_name)
@@ -314,6 +462,8 @@ def _legacy_excel_profile(profile: DeliverableProfile) -> ExcelMemberProfile:
         ignore_sheets=list(profile.excel.ignore_sheets),
         sheets=dict(profile.excel.sheets),
         controls=profile.excel.controls.model_copy(deep=True),
+        comparison_prerequisites=list(profile.excel.comparison_prerequisites),
+        formula_engine=profile.excel.formula_engine,
     )
 
 
@@ -357,6 +507,8 @@ def profile_for_excel_member(
         ignore_sheets=list(member_profile.ignore_sheets),
         sheets=dict(member_profile.sheets),
         controls=member_profile.controls.model_copy(deep=True),
+        comparison_prerequisites=list(member_profile.comparison_prerequisites),
+        formula_engine=member_profile.formula_engine,
     )
     projected.waivers = [
         waiver for waiver in projected.waivers if waiver.member == member_id

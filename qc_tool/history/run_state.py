@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS run_state (
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     run_id INTEGER,
     error TEXT NOT NULL DEFAULT '',
-    phases TEXT NOT NULL DEFAULT '[]'
+    phases TEXT NOT NULL DEFAULT '[]',
+    action_required TEXT NOT NULL DEFAULT '{}'
 );
 """
 
@@ -46,6 +47,9 @@ class RunStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     ORPHANED = "orphaned"
+    #: Terminal: the run cannot proceed until the analyst takes an action
+    #: outside this tool (see `qc_tool.run_action`). Never assigned a run id.
+    BLOCKED = "blocked"
 
 
 #: Statuses that still occupy or await the single worker slot.
@@ -61,6 +65,15 @@ ACTIVE_STATUSES = frozenset(
 
 def _now() -> str:
     return dt.datetime.now(dt.UTC).isoformat(timespec="milliseconds")
+
+
+#: New columns added after the table's initial release; existing databases
+#: are migrated in place so a fresh row and a legacy row read identically.
+_MIGRATIONS = {
+    "action_required": (
+        "ALTER TABLE run_state ADD COLUMN action_required TEXT NOT NULL DEFAULT '{}'"
+    ),
+}
 
 
 @dataclass(slots=True)
@@ -83,6 +96,9 @@ class RunStateRecord:
     run_id: int | None = None
     error: str = ""
     phases: list[dict[str, object]] = field(default_factory=list)
+    #: Bounded, primitive-only payload for `RunStatus.BLOCKED`; see
+    #: `qc_tool.run_action.RunActionRequired`. Empty/`None` otherwise.
+    action_required: dict[str, object] | None = None
 
     @property
     def is_active(self) -> bool:
@@ -96,6 +112,18 @@ class RunStateRecord:
 
 def _timestamp(value: str) -> dt.datetime | None:
     return dt.datetime.fromisoformat(value) if value else None
+
+
+def _decode_action_required(row: sqlite3.Row) -> dict[str, object] | None:
+    try:
+        raw = row["action_required"]
+    except (KeyError, IndexError):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return decoded or None
 
 
 def _record(row: sqlite3.Row) -> RunStateRecord:
@@ -117,6 +145,7 @@ def _record(row: sqlite3.Row) -> RunStateRecord:
         run_id=row["run_id"],
         error=row["error"],
         phases=json.loads(row["phases"]),
+        action_required=(_decode_action_required(row)),
     )
 
 
@@ -128,6 +157,10 @@ class RunStateStore:
         self._db_path = db_path
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(run_state)")}
+            for column, statement in _MIGRATIONS.items():
+                if column not in existing:
+                    conn.execute(statement)
         private_file(db_path)
 
     def _connect(self) -> sqlite3.Connection:
@@ -280,6 +313,36 @@ class RunStateStore:
                     _now(),
                     run_id,
                     error,
+                    json.dumps(phases or []),
+                    request_id,
+                ),
+            )
+
+    def finalize_blocked(
+        self,
+        request_id: str,
+        action_required: dict[str, object],
+        *,
+        phases: list[dict[str, object]] | None = None,
+    ) -> None:
+        """Terminal state for a run that cannot proceed; never assigns a run id.
+
+        Stored in a dedicated `action_required` column rather than `error`,
+        since this is not a failure -- it is a bounded, structured reason the
+        analyst must act on outside this tool.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE run_state
+                SET status = ?, finished_at = ?, queue_position = 0,
+                    action_required = ?, phases = ?
+                WHERE request_id = ?
+                """,
+                (
+                    RunStatus.BLOCKED.value,
+                    _now(),
+                    json.dumps(action_required),
                     json.dumps(phases or []),
                     request_id,
                 ),

@@ -6,17 +6,57 @@ xlsb QC path. Record layout is grounded on the pyxlsb reader implementation
 xlsb in this project. Compatibility target is pyxlsb readback, not Excel:
 real deliverables are read, never written, so fixtures only need to exercise
 the reader.
+
+Style/date-system records (`BrtWbProp`, `BrtBeginFmts`/`BrtFmt`,
+`BrtBeginCellXfs`/`BrtXF`) are grounded the same way: cross-checked against
+calamine's independently tested `xlsb` reader (MIT-licensed,
+https://github.com/tafia/calamine), not pyxlsb, because pyxlsb never reads
+`xl/styles.bin` or the workbook date-system flag at all.
 """
 
 import struct
 import zipfile
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from pyxlsb import biff12
 
 CellValue = str | float | int | None
 
+
+@dataclass(frozen=True, slots=True)
+class StyledCell:
+    """A cell needing an explicit cell-XF index and/or a formula record.
+
+    ``xf_index`` indexes into the ``cell_xfs`` list passed to ``write_xlsb``.
+    ``is_formula`` selects BrtFmlaNum instead of BrtCellReal; pyxlsb's own
+    ``CellHandler`` reads an identical col+style+double layout for both and
+    the BIFF12Reader main loop always seeks to the next record boundary by
+    declared length, so a minimal formula record with no trailing token
+    stream is valid input — exactly what the project's own risk/formula
+    scanner already assumes.
+    """
+
+    value: float | int
+    xf_index: int = 0
+    is_formula: bool = False
+
+
+#: One populated cell: a bare value (xf_index 0, not a formula) or an
+#: explicit ``StyledCell``.
+RowCell = CellValue | StyledCell
+
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+#: Naive-decoded (not spec-documented) record ids -- see the matching
+#: constants and comment in `qc_tool/io/xlsb_formula.py` for why these differ
+#: from the officially-documented BrtWbProp/BrtBeginFmts/BrtBeginCellXfs
+#: numbers, and how they were verified against an independent reader.
+_WBPROP = 0x0199
+_FMTS_BEGIN = 0x04E7
+_FMT = 0x002C
+_CELLXFS_BEGIN = 0x04E9
+_XF = 0x002F
 
 _CONTENT_TYPES = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -69,9 +109,10 @@ def _xl_string(text: str) -> bytes:
     return struct.pack("<I", len(encoded) // 2) + encoded
 
 
-def _workbook_part(sheet_names: list[str]) -> bytes:
+def _workbook_part(sheet_names: list[str], *, date1904: bool) -> bytes:
     out = bytearray()
     out += _record(biff12.WORKBOOK)
+    out += _record(_WBPROP, struct.pack("<I", 1 if date1904 else 0))
     out += _record(biff12.SHEETS)
     for index, name in enumerate(sheet_names, start=1):
         payload = struct.pack("<II", 0, index) + _xl_string(f"rId{index}") + _xl_string(name)
@@ -105,7 +146,24 @@ def _shared_strings_part(strings: list[str], total_count: int) -> bytes:
     return bytes(out)
 
 
-def _sheet_part(rows: list[list[CellValue]], string_index: dict[str, int]) -> bytes:
+def _styles_part(custom_formats: dict[int, str], cell_xfs: list[int]) -> bytes:
+    """Just enough of ``xl/styles.bin`` for `parse_xlsb_styles` to round-trip.
+
+    No `BrtBeginStyleSheet`/end-marker wrapper or font/fill/border/cell-style
+    groups: the project's reader is a flat count-driven scan that never looks
+    for them, so omitting them keeps this writer using only verified IDs.
+    """
+    out = bytearray()
+    out += _record(_FMTS_BEGIN, struct.pack("<I", len(custom_formats)))
+    for ifmt, code in custom_formats.items():
+        out += _record(_FMT, struct.pack("<H", ifmt) + _xl_string(code))
+    out += _record(_CELLXFS_BEGIN, struct.pack("<I", len(cell_xfs)))
+    for ifmt in cell_xfs:
+        out += _record(_XF, struct.pack("<HH", 0, ifmt))  # ixfParent=0, iFmt
+    return bytes(out)
+
+
+def _sheet_part(rows: Sequence[Sequence[RowCell]], string_index: dict[str, int]) -> bytes:
     n_rows = len(rows)
     n_cols = max((len(r) for r in rows), default=1)
     out = bytearray()
@@ -116,28 +174,44 @@ def _sheet_part(rows: list[list[CellValue]], string_index: dict[str, int]) -> by
     out += _record(biff12.SHEETDATA)
     for row_idx, row in enumerate(rows):
         out += _record(biff12.ROW, struct.pack("<I", row_idx))
-        for col_idx, value in enumerate(row):
-            if value is None:
+        for col_idx, cell in enumerate(row):
+            if cell is None:
                 continue
+            if isinstance(cell, StyledCell):
+                value, xf_index, is_formula = cell.value, cell.xf_index, cell.is_formula
+            else:
+                value, xf_index, is_formula = cell, 0, False
             if isinstance(value, str):
-                payload = struct.pack("<III", col_idx, 0, string_index[value])
+                payload = struct.pack("<III", col_idx, xf_index, string_index[value])
                 out += _record(biff12.STRING, payload)
             else:
-                payload = struct.pack("<IId", col_idx, 0, float(value))
-                out += _record(biff12.FLOAT, payload)
+                payload = struct.pack("<IId", col_idx, xf_index, float(value))
+                out += _record(biff12.FORMULA_FLOAT if is_formula else biff12.FLOAT, payload)
     out += _record(biff12.SHEETDATA_END)
     out += _record(biff12.WORKSHEET_END)
     return bytes(out)
 
 
-def write_xlsb(path: Path, sheets: dict[str, list[list[CellValue]]]) -> None:
-    """Write a deterministic, pyxlsb-readable values-only xlsb workbook."""
+def write_xlsb(
+    path: Path,
+    sheets: Mapping[str, Sequence[Sequence[RowCell]]],
+    *,
+    date1904: bool = False,
+    custom_formats: dict[int, str] | None = None,
+    cell_xfs: list[int] | None = None,
+) -> None:
+    """Write a deterministic, pyxlsb-readable xlsb workbook.
+
+    ``custom_formats``/``cell_xfs`` are opt-in: omitting both keeps every
+    existing caller's output byte-identical (no `xl/styles.bin` part at all).
+    """
     strings: list[str] = []
     string_index: dict[str, int] = {}
     total_strings = 0
     for rows in sheets.values():
         for row in rows:
-            for value in row:
+            for cell in row:
+                value = cell.value if isinstance(cell, StyledCell) else cell
                 if isinstance(value, str):
                     total_strings += 1
                     if value not in string_index:
@@ -148,10 +222,14 @@ def write_xlsb(path: Path, sheets: dict[str, list[list[CellValue]]]) -> None:
     parts: dict[str, bytes] = {
         "[Content_Types].xml": _CONTENT_TYPES.encode("utf-8"),
         "_rels/.rels": _ROOT_RELS.encode("utf-8"),
-        "xl/workbook.bin": _workbook_part(sheet_names),
+        "xl/workbook.bin": _workbook_part(sheet_names, date1904=date1904),
         "xl/_rels/workbook.bin.rels": _workbook_rels(len(sheet_names)),
         "xl/sharedStrings.bin": _shared_strings_part(strings, total_strings),
     }
+    if custom_formats or cell_xfs:
+        # Read directly by its fixed package path (like the existing workload
+        # scan already does), so no workbook-relationship entry is needed.
+        parts["xl/styles.bin"] = _styles_part(custom_formats or {}, cell_xfs or [0])
     for index, rows in enumerate(sheets.values(), start=1):
         parts[f"xl/worksheets/sheet{index}.bin"] = _sheet_part(rows, string_index)
 

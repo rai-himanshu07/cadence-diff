@@ -19,6 +19,7 @@ from qc_tool.config.profile import (
 from qc_tool.coverage import CoverageState
 from qc_tool.crosscheck.trace import annotate_ppt_chart_impacts
 from qc_tool.engine import run_qc
+from qc_tool.excel import complexity as complexity_module
 from qc_tool.excel.charts import (
     annotate_chart_impacts,
     chart_reference_coverage,
@@ -742,6 +743,123 @@ def test_full_run_attaches_transitive_ppt_chart_label_impact(tmp_path: Path) -> 
         and item.location == "A1"
     )
 
+    assert (
+        "PowerPoint chart label 'chart[0]/Revenue/Jan-26' on slide 'Dashboard'"
+        in finding.impacts
+    )
+
+
+def test_size_policy_skip_degrades_every_dependent_capability_coherently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(complexity_module, "DEPENDENCY_FORMULA_CELLS_MAX", 1)
+    baseline_excel = tmp_path / "baseline.xlsx"
+    current_excel = tmp_path / "current.xlsx"
+    baseline_ppt = tmp_path / "baseline.pptx"
+    current_ppt = tmp_path / "current.pptx"
+    _save_dependency_workbook(baseline_excel, 9)
+    _save_dependency_workbook(current_excel, 10)
+    _save_label_deck(baseline_ppt)
+    _save_label_deck(current_ppt)
+    profile = DeliverableProfile.model_validate(
+        {
+            "name": "dependency-size-policy",
+            "crosscheck": {
+                "mappings": [
+                    {
+                        "slide": "Dashboard",
+                        "line_skeleton": "chart:chart[0]/Revenue/Jan-26",
+                        "figure_index": 0,
+                        "label": "Trend revenue",
+                        "source_sheet": "Data",
+                        "source_cell": "B1",
+                    }
+                ]
+            },
+        }
+    )
+
+    result = run_qc(
+        baseline_excel=baseline_excel,
+        current_excel=current_excel,
+        baseline_ppt=baseline_ppt,
+        current_ppt=current_ppt,
+        profile=profile,
+    )
+
+    coverage = {item.check_id: item for item in result.coverage}
+    for check_id in (
+        "excel-dependencies",
+        "excel-circular-references",
+        "excel-ppt-crosscheck",
+    ):
+        item = coverage[check_id]
+        assert item.state is CoverageState.DEGRADED, check_id
+        assert "skipped by size policy" in item.detail, check_id
+
+    finding = next(
+        item
+        for item in result.findings
+        if item.finding_class is FindingClass.VALUE_CHANGED
+        and item.sheet == "Data"
+        and item.location == "A1"
+    )
+    assert finding.impacts == []
+
+
+def test_allow_dependency_indexing_overrides_the_size_policy_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(complexity_module, "DEPENDENCY_FORMULA_CELLS_MAX", 1)
+    baseline_excel = tmp_path / "baseline.xlsx"
+    current_excel = tmp_path / "current.xlsx"
+    baseline_ppt = tmp_path / "baseline.pptx"
+    current_ppt = tmp_path / "current.pptx"
+    _save_dependency_workbook(baseline_excel, 9)
+    _save_dependency_workbook(current_excel, 10)
+    _save_label_deck(baseline_ppt)
+    _save_label_deck(current_ppt)
+    profile = DeliverableProfile.model_validate(
+        {
+            "name": "dependency-size-policy-override",
+            "crosscheck": {
+                "mappings": [
+                    {
+                        "slide": "Dashboard",
+                        "line_skeleton": "chart:chart[0]/Revenue/Jan-26",
+                        "figure_index": 0,
+                        "label": "Trend revenue",
+                        "source_sheet": "Data",
+                        "source_cell": "B1",
+                    }
+                ]
+            },
+        }
+    )
+
+    result = run_qc(
+        baseline_excel=baseline_excel,
+        current_excel=current_excel,
+        baseline_ppt=baseline_ppt,
+        current_ppt=current_ppt,
+        profile=profile,
+        allow_dependency_indexing=True,
+    )
+
+    coverage = {item.check_id: item for item in result.coverage}
+    for check_id in ("excel-dependencies", "excel-circular-references"):
+        item = coverage[check_id]
+        assert item.state is CoverageState.CHECKED, check_id
+        assert "skipped by size policy" not in item.detail, check_id
+    assert "skipped by size policy" not in coverage["excel-ppt-crosscheck"].detail
+
+    finding = next(
+        item
+        for item in result.findings
+        if item.finding_class is FindingClass.VALUE_CHANGED
+        and item.sheet == "Data"
+        and item.location == "A1"
+    )
     assert (
         "PowerPoint chart label 'chart[0]/Revenue/Jan-26' on slide 'Dashboard'"
         in finding.impacts

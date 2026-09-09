@@ -46,8 +46,11 @@ EDITOR_SECTIONS: dict[str, tuple[tuple[str, ...], ...]] = {
     "advanced": (
         ("excel", "ignore_sheets"),
         ("excel", "sheets"),
+        ("excel", "comparison_prerequisites"),
+        ("excel", "formula_engine"),
         ("excel", "members"),
         ("ppt",),
+        ("review_policy",),
     ),
 }
 

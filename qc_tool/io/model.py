@@ -58,6 +58,12 @@ class CellRecord:
     column: int  # 1-based
     value: CellValue
     formula: str | None = None
+    #: Canonical R1C1 text (``=``-prefixed, matching ``formula``'s own
+    #: convention), populated only when an adapter can supply it per
+    #: definition (currently: the native XLSB kernel). ``None`` means no
+    #: adapter-supplied R1C1 is available; consumers fall back to computing
+    #: it themselves from ``formula``.
+    formula_r1c1: str | None = None
     is_formula: bool | None = None
     number_format: str | None = None
     style_key: str | None = None
@@ -372,6 +378,46 @@ class ConditionalFormatDescriptor:
     style_detail: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class FormulaTextCoverage:
+    """Compact, coordinate-set-free formula-text completeness disclosure.
+
+    ``state`` starts at ``"none"`` (no external-engine formula text merged,
+    either because no adapter ran or because it was refused). A validated
+    merge with zero missing coordinates moves it to ``"complete"``, matching
+    the historical all-or-nothing meaning of ``formulas_available``. A
+    validated merge missing at least one expected coordinate moves it to
+    ``"partial"`` -- coordinate-aware comparison may still use whichever
+    pairs both sides actually merged, but dependency/circular/impact claims
+    and consistency checks over an incomplete region remain unavailable.
+    Any unexpected coordinate stays fatal before mutation and never produces
+    a ``"partial"`` result.
+    """
+
+    state: Literal["none", "complete", "partial"] = "none"
+    expected_count: int = 0
+    merged_count: int = 0
+    missing_count: int = 0
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalLinkReachability:
+    """Bounded, aggregate-only verdict for one workbook's passive links.
+
+    Never retains formula text, defined-name text, coordinates, or paths --
+    only counts and a boolean verdict. ``proven`` requires complete trusted
+    formula text plus a complete, bounded defined-name collection; a passive
+    link is only ever reported ``live=False`` when ``proven`` is also True.
+    """
+
+    proven: bool = False
+    live: bool = False
+    direct_reference_count: int = 0
+    transitive_reference_count: int = 0
+    detail: str = ""
+
+
 @dataclass(slots=True)
 class SheetSnapshot:
     name: str
@@ -409,6 +455,21 @@ class WorkbookSnapshot:
     conditional_format_style_detail: str = ""
     defined_name_scope_available: bool = False
     defined_name_scope_detail: str = ""
+    #: Whether XLSB per-cell number-format/date-system metadata (`xl/styles.bin`
+    #: cell-XF table plus the workbook date-system flag) was read completely.
+    #: Distinct from `styles_available`, which stays False for xlsb because
+    #: fonts/fills/borders and named cell styles remain unread.
+    number_formats_available: bool = False
+    number_format_detail: str = ""
+    #: XLSB-only completeness disclosure for the current external-engine
+    #: formula-text merge; OOXML formats leave this at its default ("none")
+    #: because `formulas_available` alone already proves complete text there.
+    formula_text_coverage: FormulaTextCoverage = field(
+        default_factory=FormulaTextCoverage
+    )
+    #: Set only when a passive external-workbook link was classified during
+    #: loading; `None` means no passive link was present to evaluate.
+    external_link_reachability: ExternalLinkReachability | None = None
     vba: VbaProjectScan = field(default_factory=VbaProjectScan)
     metadata: WorkbookMetadataScan = field(default_factory=WorkbookMetadataScan)
     sheets: list[SheetSnapshot] = field(default_factory=list)
@@ -426,6 +487,12 @@ class WorkbookSnapshot:
         default_factory=WorkbookWorkload,
         compare=False,
     )
+    #: Set only when `_xlsb_values_engine="auto"` resolved to the native
+    #: kernel but it then failed at runtime, so values decoding fell back to
+    #: pyxlsb; "" means no fallback occurred (native was not used, ran
+    #: cleanly, or was explicitly requested and failed closed instead of
+    #: falling back). Fixed, content-free text -- never a path or value.
+    values_engine_fallback_detail: str = ""
 
     @property
     def sheet_names(self) -> list[str]:

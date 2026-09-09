@@ -31,6 +31,7 @@ import difflib
 import hashlib
 import logging
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 
@@ -47,6 +48,7 @@ from qc_tool.excel.formula_tokens import (
     formula_reference_operands,
     tokenize_formula,
 )
+from qc_tool.excel.population import CandidateSpill
 from qc_tool.findings import (
     Finding,
     FindingClass,
@@ -119,6 +121,17 @@ def to_r1c1(formula: str, host_row: int, host_col: int) -> str:
         for t in tokens
     ]
     return "=" + "".join(rendered)
+
+
+def _normalize_formula(cell: CellRecord, row: int, col: int) -> str:
+    """R1C1 text for a cell: the adapter-supplied value when present
+    (currently only the native XLSB kernel, already validated per definition
+    -- see `qc_tool.io.native_formula._validated_r1c1_cells`), else computed
+    here from `cell.formula`.
+    """
+    if cell.formula_r1c1 is not None:
+        return cell.formula_r1c1
+    return to_r1c1(cell.formula or "", row, col)
 
 
 # --- wrapper detection ------------------------------------------------------
@@ -337,6 +350,115 @@ def _differs_only_by_extension(base_formula: str, curr_formula: str) -> bool:
     return extension_seen
 
 
+# --- telemetry ---------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class FormulaComparisonTelemetry:
+    """Aggregate-only counters/timers for one ``diff_workbook_formulas()`` call.
+
+    Every field is a count or a duration in seconds; no formula, sheet name,
+    coordinate, or defined name is ever recorded here. Passing an instance
+    changes no finding, ordering, or evidence -- it only accumulates these
+    counters as a side effect. The whole-function fields
+    (``error_scan_seconds``, ``paired_traversal_seconds``,
+    ``consistency_seconds``, ``extension_findings_seconds``) are INCLUSIVE of
+    every sub-step measured below them; they are wall-clock totals for that
+    function, not an exclusive residual.
+
+    ``complexity_assessment_seconds`` is the one exception to the "one
+    ``diff_workbook_formulas()`` call" framing above: ``run_qc()`` measures it
+    directly around its own ``assess_workbook_complexity()`` call, which runs
+    inside the same ``RunPhase.COMPARING_FORMULAS`` boundary but is not part
+    of ``diff_workbook_formulas()`` itself. It is included here so a
+    ``comparing_formulas`` phase-duration reconciliation has somewhere to put
+    that cost instead of leaving it as an unexplained residual
+    (plan-20260908-phase-b-guest-performance-followup.md).
+    """
+
+    error_scan_seconds: float = 0.0
+    error_scan_cells: int = 0
+
+    paired_traversal_seconds: float = 0.0
+    paired_pairs_considered: int = 0
+    #: Pairs whose formula text and host coordinates are both identical --
+    #: candidates for a same-position exact-text shortcut that would skip
+    #: normalization entirely.
+    exact_text_same_host_pairs: int = 0
+
+    normalization_calls: int = 0
+    normalization_seconds: float = 0.0
+    #: Hits/misses against the region-scoped current-side normalization memo
+    #: shared by paired and consistency checks (Step 2). A hit means
+    #: `normalization_calls`/`consistency_normalization_calls` counted only
+    #: the baseline-side (or first-seen) `to_r1c1` call, not a repeat.
+    memo_hits: int = 0
+    memo_misses: int = 0
+
+    consistency_seconds: float = 0.0
+    consistency_normalization_calls: int = 0
+    consistency_normalization_seconds: float = 0.0
+
+    wrapper_reference_seconds: float = 0.0
+    extension_seconds: float = 0.0
+    extension_findings_seconds: float = 0.0
+
+    finding_construction_seconds: float = 0.0
+
+    #: Populated by ``run_qc()``, not by this module -- see the class
+    #: docstring.
+    complexity_assessment_seconds: float = 0.0
+
+
+#: Bounded per-region so the memo's added RSS is small and predictable; a
+#: region larger than this recomputes past the cap instead of growing further.
+_CURRENT_NORMALIZATION_MEMO_CAP = 200_000
+
+
+class _CurrentNormalizationMemo:
+    """Region-scoped current-side R1C1 cache shared by paired and consistency
+    checks (Step 2 of plan-20260904-large_workbook-load-and-formula-compare.md).
+
+    Keyed by current coordinate only: within one `diff_workbook_formulas()`
+    call the current `WorkbookSnapshot` is read-only, so a given (row, column)
+    always holds the same formula text, and `to_r1c1` is a pure function of
+    (formula text, host row, host column) -- the cached value stays valid for
+    the memo's whole lifetime. Bounded; past the cap, `normalize()` still
+    returns the correct value by recomputing rather than ever skipping
+    analysis or growing unbounded.
+    """
+
+    __slots__ = ("_cap", "_values")
+
+    def __init__(self, cap: int = _CURRENT_NORMALIZATION_MEMO_CAP) -> None:
+        self._values: dict[tuple[int, int], str] = {}
+        self._cap = cap
+
+    def normalize(
+        self,
+        row: int,
+        column: int,
+        formula: str,
+        precomputed_r1c1: str | None = None,
+    ) -> tuple[str, bool]:
+        """Return ``(normalized, was_cache_hit)``.
+
+        ``precomputed_r1c1`` -- when given (an adapter-supplied
+        ``CellRecord.formula_r1c1``) -- is used directly on a cache miss
+        instead of calling `to_r1c1`.
+        """
+        key = (row, column)
+        cached = self._values.get(key)
+        if cached is not None:
+            return cached, True
+        value = precomputed_r1c1 if precomputed_r1c1 is not None else to_r1c1(
+            formula, row, column
+        )
+        if len(self._values) < self._cap:
+            self._values[key] = value
+        return value, False
+
+
 # --- error scan -------------------------------------------------------------
 
 
@@ -442,7 +564,7 @@ def _outlier_provenance(
     base_row, base_col = baseline_cell
     return (
         FindingProvenance.INHERITED
-        if to_r1c1(cell.formula or "", base_row, base_col) == pattern
+        if _normalize_formula(cell, base_row, base_col) == pattern
         else FindingProvenance.NEW
     )
 
@@ -565,8 +687,11 @@ def _error_findings(
     profile: DeliverableProfile | None,
     *,
     cycle: bool,
+    telemetry: FormulaComparisonTelemetry | None = None,
 ) -> list[Finding]:
     findings = []
+    scan_start = time.perf_counter()
+    scanned_cells = 0
     aligned = _aligned_regions(alignment) if cycle else {}
     for sheet in current.sheets:
         sheet_profile = profile.sheet_profile(sheet.name) if profile is not None else None
@@ -576,6 +701,7 @@ def _error_findings(
         for (row, col), cell in sorted(sheet.cells.items()):
             if _ignored(sheet_profile, row, col):
                 continue
+            scanned_cells += 1
             location = _ref(row, col)
             base_cell: CellRecord | None = None
             aligned_baseline = False
@@ -649,6 +775,9 @@ def _error_findings(
                     )
                 )
         _mark_columnar_error_populations(sheet, saved_error_findings)
+    if telemetry is not None:
+        telemetry.error_scan_seconds += time.perf_counter() - scan_start
+        telemetry.error_scan_cells += scanned_cells
     return findings
 
 
@@ -661,10 +790,15 @@ def _paired_cell_findings(
     region: RegionAlignment,
     *,
     compare_text: bool,
+    strict_text: bool,
     profile: SheetProfile | None,
+    telemetry: FormulaComparisonTelemetry | None = None,
+    current_memo: _CurrentNormalizationMemo | None = None,
+    candidate_sink: CandidateSpill | None = None,
 ) -> list[Finding]:
     findings = []
     sheet_name = curr_sheet.name
+    traversal_start = time.perf_counter()
     for (base_row, base_col), (curr_row, curr_col) in region.cell_pairs():
         base_cell = base_sheet.cells.get((base_row, base_col))
         curr_cell = curr_sheet.cells.get((curr_row, curr_col))
@@ -682,6 +816,7 @@ def _paired_cell_findings(
                 if base_cell is not None and base_cell.formula is not None
                 else "formula record"
             )
+            construct_start = time.perf_counter()
             if curr_cell is not None and curr_cell.value is not None:
                 findings.append(
                     Finding(
@@ -717,23 +852,77 @@ def _paired_cell_findings(
                         message=f"{sheet_name}!{location}: formula cleared or removed",
                     )
                 )
+            if telemetry is not None:
+                telemetry.finding_construction_seconds += (
+                    time.perf_counter() - construct_start
+                )
             continue
 
         if base_has_formula and curr_has_formula and compare_text:
             base_formula = base_cell.formula if base_cell is not None else None
             curr_formula = curr_cell.formula if curr_cell is not None else None
             if base_formula is None or curr_formula is None:
-                logger.warning(
-                    "%s!%s: formula text capability contradicted cell data",
-                    sheet_name,
-                    location,
-                )
+                if strict_text:
+                    logger.warning(
+                        "%s!%s: formula text capability contradicted cell data",
+                        sheet_name,
+                        location,
+                    )
+                # Under partial XLSB coverage, a has_formula cell with no merged
+                # text is an expected, already-counted coverage gap, not a bug.
                 continue
-            base_norm = to_r1c1(base_formula, base_row, base_col)
-            curr_norm = to_r1c1(curr_formula, curr_row, curr_col)
+            if telemetry is not None:
+                telemetry.paired_pairs_considered += 1
+            if (
+                base_row == curr_row
+                and base_col == curr_col
+                and base_formula == curr_formula
+            ):
+                # Identical text at the identical host position always
+                # normalizes identically -- to_r1c1 is a pure function of
+                # (formula text, host row, host column) -- so this pair can
+                # never produce a finding. Skip normalization entirely rather
+                # than normalizing both sides only to discover they match.
+                if telemetry is not None:
+                    telemetry.exact_text_same_host_pairs += 1
+                continue
+            norm_start = time.perf_counter()
+            base_r1c1 = base_cell.formula_r1c1 if base_cell is not None else None
+            base_norm = (
+                base_r1c1
+                if base_r1c1 is not None
+                else to_r1c1(base_formula, base_row, base_col)
+            )
+            calls = 0 if base_r1c1 is not None else 1
+            if current_memo is not None:
+                curr_r1c1 = curr_cell.formula_r1c1 if curr_cell is not None else None
+                curr_norm, memo_hit = current_memo.normalize(
+                    curr_row, curr_col, curr_formula, curr_r1c1
+                )
+                if telemetry is not None:
+                    if memo_hit:
+                        telemetry.memo_hits += 1
+                    else:
+                        telemetry.memo_misses += 1
+                calls += 0 if memo_hit else 1
+            else:
+                curr_r1c1 = curr_cell.formula_r1c1 if curr_cell is not None else None
+                curr_norm = (
+                    curr_r1c1
+                    if curr_r1c1 is not None
+                    else to_r1c1(curr_formula, curr_row, curr_col)
+                )
+                calls += 0 if curr_r1c1 is not None else 1
+            if telemetry is not None:
+                telemetry.normalization_seconds += time.perf_counter() - norm_start
+                telemetry.normalization_calls += calls
             if base_norm == curr_norm:
                 continue
+            ext_start = time.perf_counter()
             expected = _differs_only_by_extension(base_formula, curr_formula)
+            if telemetry is not None:
+                telemetry.extension_seconds += time.perf_counter() - ext_start
+            wrapper_start = time.perf_counter()
             wrapper = None if expected else detect_formula_wrapper(base_norm, curr_norm)
             evidence_tags: set[FindingEvidenceTag] = set()
             if wrapper is not None:
@@ -761,6 +950,10 @@ def _paired_cell_findings(
             else:
                 if current_references - baseline_references:
                     evidence_tags.add(FindingEvidenceTag.ADDED_REFERENCE)
+            if telemetry is not None:
+                telemetry.wrapper_reference_seconds += (
+                    time.perf_counter() - wrapper_start
+                )
             if expected:
                 wording = "formula range extended with new-cycle data"
             elif wrapper is not None:
@@ -769,30 +962,64 @@ def _paired_cell_findings(
                 ]
             else:
                 wording = "formula logic changed"
-            findings.append(
-                Finding(
+            expected_reason = (
+                FindingExpectedReason.CADENCE_EXTENSION if expected else None
+            )
+            subtype = _WRAPPER_SUBTYPES[wrapper.kind] if wrapper is not None else None
+            event_key = (
+                f"formula-wrapper:{wrapper.kind}:{wrapper.skeleton_key}"
+                if wrapper is not None
+                else ""
+            )
+            message = f"{sheet_name}!{location}: {wording}"
+            construct_start = time.perf_counter()
+            if candidate_sink is not None:
+                candidate = Finding(
                     artifact="excel",
                     finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
-                    expected_reason=(
-                        FindingExpectedReason.CADENCE_EXTENSION if expected else None
-                    ),
-                    subtype=(
-                        _WRAPPER_SUBTYPES[wrapper.kind] if wrapper is not None else None
-                    ),
-                    event_key=(
-                        f"formula-wrapper:{wrapper.kind}:{wrapper.skeleton_key}"
-                        if wrapper is not None
-                        else ""
-                    ),
+                    expected_reason=expected_reason,
+                    subtype=subtype,
+                    event_key=event_key,
                     evidence_tags=evidence_tags,
                     sheet=sheet_name,
                     location=location,
                     baseline_location=_ref(base_row, base_col),
                     baseline_value=base_formula,
                     current_value=curr_formula,
-                    message=f"{sheet_name}!{location}: {wording}",
+                    message=message,
                 )
-            )
+                candidate_sink.add(
+                    candidate,
+                    shape_before=hashlib.sha256(
+                        base_norm.encode("utf-8")
+                    ).hexdigest(),
+                    shape_after=hashlib.sha256(
+                        curr_norm.encode("utf-8")
+                    ).hexdigest(),
+                )
+            else:
+                findings.append(
+                    Finding(
+                        artifact="excel",
+                        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+                        expected_reason=expected_reason,
+                        subtype=subtype,
+                        event_key=event_key,
+                        evidence_tags=evidence_tags,
+                        sheet=sheet_name,
+                        location=location,
+                        baseline_location=_ref(base_row, base_col),
+                        baseline_value=base_formula,
+                        current_value=curr_formula,
+                        message=message,
+                    )
+                )
+            if telemetry is not None:
+                telemetry.finding_construction_seconds += (
+                    time.perf_counter() - construct_start
+                )
+    if telemetry is not None:
+        telemetry.paired_traversal_seconds += time.perf_counter() - traversal_start
     return findings
 
 
@@ -838,10 +1065,13 @@ def _consistency_findings(
     profile: SheetProfile | None,
     *,
     cycle: bool,
+    telemetry: FormulaComparisonTelemetry | None = None,
+    current_memo: _CurrentNormalizationMemo | None = None,
 ) -> list[Finding]:
     axes = _run_axes(region)
     if axes is None:
         return []
+    consistency_start = time.perf_counter()
     run_positions, cell_positions = axes
     pairs = _region_pairs(region)
     findings = []
@@ -854,10 +1084,39 @@ def _consistency_findings(
         ]
         if len(formula_cells) < _RUN_MIN_CELLS:
             continue
-        normalized = {
-            (row, col): to_r1c1(cell.formula or "", row, col)
-            for row, col, cell in formula_cells
-        }
+        if any(cell.formula is None for _, _, cell in formula_cells):
+            # Partial XLSB coverage cannot prove this run's dominant pattern;
+            # a complete run always has merged text for every formula cell,
+            # so this is a no-op once coverage is complete.
+            continue
+        norm_start = time.perf_counter()
+        normalized: dict[tuple[int, int], str] = {}
+        calls = 0
+        for row, col, cell in formula_cells:
+            formula = cell.formula or ""
+            if current_memo is not None:
+                value, memo_hit = current_memo.normalize(
+                    row, col, formula, cell.formula_r1c1
+                )
+                if telemetry is not None:
+                    if memo_hit:
+                        telemetry.memo_hits += 1
+                    else:
+                        telemetry.memo_misses += 1
+                calls += 0 if memo_hit else 1
+            else:
+                value = (
+                    cell.formula_r1c1
+                    if cell.formula_r1c1 is not None
+                    else to_r1c1(formula, row, col)
+                )
+                calls += 0 if cell.formula_r1c1 is not None else 1
+            normalized[(row, col)] = value
+        if telemetry is not None:
+            telemetry.consistency_normalization_seconds += (
+                time.perf_counter() - norm_start
+            )
+            telemetry.consistency_normalization_calls += calls
         patterns = Counter(normalized.values())
         dominant, dominant_count = patterns.most_common(1)[0]
         if dominant_count / len(formula_cells) <= _RUN_DOMINANCE:
@@ -882,6 +1141,7 @@ def _consistency_findings(
                 if cycle
                 else None
             )
+            construct_start = time.perf_counter()
             findings.append(
                 Finding(
                     artifact="excel",
@@ -898,6 +1158,12 @@ def _consistency_findings(
                     ),
                 )
             )
+            if telemetry is not None:
+                telemetry.finding_construction_seconds += (
+                    time.perf_counter() - construct_start
+                )
+    if telemetry is not None:
+        telemetry.consistency_seconds += time.perf_counter() - consistency_start
     return findings
 
 
@@ -905,10 +1171,13 @@ def _extension_findings(
     curr_sheet: SheetSnapshot,
     region: RegionAlignment,
     profile: SheetProfile | None,
+    *,
+    telemetry: FormulaComparisonTelemetry | None = None,
 ) -> list[Finding]:
     """Growth rows/columns must carry the formula pattern of their run."""
     current = region.current
     findings = []
+    ext_start = time.perf_counter()
 
     def check(
         growth: list[int], run_positions: list[int], paired: list[int], *, rows_grow: bool
@@ -954,6 +1223,8 @@ def _extension_findings(
         data_rows = [c for _, c in region.rows.pairs if c != header] + region.rows.growth
         paired_cols = [c for _, c in region.columns.pairs]
         check(region.columns.growth, sorted(data_rows), paired_cols, rows_grow=False)
+    if telemetry is not None:
+        telemetry.extension_findings_seconds += time.perf_counter() - ext_start
     return findings
 
 
@@ -971,6 +1242,30 @@ def formula_text_compatible(
     )
 
 
+def formula_text_comparable(
+    baseline: WorkbookSnapshot, current: WorkbookSnapshot
+) -> bool:
+    """Whether any paired cell's formula text may be compared at all.
+
+    Complete coverage on both sides (the historical, strict rule above) is
+    always comparable. Partial XLSB coverage is comparable too, provided
+    both sides still share the same non-empty formula-text provenance;
+    `_paired_cell_findings` skips any individual pair missing merged text on
+    either side, and `_consistency_findings` skips any run containing one.
+    OOXML sources never populate `formula_text_coverage` (it stays at its
+    default ``"none"``); they are already covered by the first branch below
+    because `formulas_available` is always True for them.
+    """
+    if formula_text_compatible(baseline, current):
+        return True
+    return bool(
+        baseline.formula_source
+        and baseline.formula_source == current.formula_source
+        and baseline.formula_text_coverage.state != "none"
+        and current.formula_text_coverage.state != "none"
+    )
+
+
 def diff_workbook_formulas(
     baseline: WorkbookSnapshot,
     current: WorkbookSnapshot,
@@ -979,12 +1274,17 @@ def diff_workbook_formulas(
     *,
     cycle: bool = True,
     cancellation_token: CancellationToken | None = None,
+    telemetry: FormulaComparisonTelemetry | None = None,
+    candidate_sink: CandidateSpill | None = None,
 ) -> list[Finding]:
-    findings = _error_findings(baseline, current, alignment, profile, cycle=cycle)
+    findings = _error_findings(
+        baseline, current, alignment, profile, cycle=cycle, telemetry=telemetry
+    )
     presence_pair = bool(
         baseline.formula_presence_available and current.formula_presence_available
     )
-    compare_text = formula_text_compatible(baseline, current)
+    compare_text = formula_text_comparable(baseline, current)
+    strict_text = formula_text_compatible(baseline, current)
     if not presence_pair:
         logger.info(
             "formula presence unavailable (%s/%s): formula QC limited to error values",
@@ -1007,13 +1307,20 @@ def diff_workbook_formulas(
             check_cancelled(cancellation_token)
             if region.low_confidence:
                 continue
+            # Fresh per region and discarded at the end of its iteration --
+            # bounded scope keeps its added RSS small and predictable.
+            current_memo = _CurrentNormalizationMemo()
             findings.extend(
                 _paired_cell_findings(
                     base_sheet,
                     curr_sheet,
                     region,
                     compare_text=compare_text,
+                    strict_text=strict_text,
                     profile=sheet_profile,
+                    telemetry=telemetry,
+                    current_memo=current_memo,
+                    candidate_sink=candidate_sink,
                 )
             )
             if compare_text:
@@ -1024,10 +1331,14 @@ def diff_workbook_formulas(
                         region,
                         sheet_profile,
                         cycle=cycle,
+                        telemetry=telemetry,
+                        current_memo=current_memo,
                     )
                 )
             findings.extend(
-                _extension_findings(curr_sheet, region, sheet_profile)
+                _extension_findings(
+                    curr_sheet, region, sheet_profile, telemetry=telemetry
+                )
             )
     return findings
 

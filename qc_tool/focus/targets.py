@@ -353,6 +353,16 @@ def encode_focus_targets_streaming(
     return f'{{"version": {FOCUS_SIDECAR_VERSION}, "targets": {{{body}}}}}'
 
 
+def _rule_for(finding: Finding) -> TargetRule:
+    """A population has no single-cell focus target regardless of class."""
+    if finding.population is not None:
+        return TargetRule.NONE
+    rule = FINDING_CLASS_RULES.get(finding.finding_class)
+    if rule is None:
+        raise FocusTargetContractError("finding class has no focus target rule")
+    return rule
+
+
 def focus_seeds_for_finding(
     finding: Finding,
     *,
@@ -365,9 +375,7 @@ def focus_seeds_for_finding(
     """
     if not finding.finding_id:
         raise FocusTargetContractError("focus targets need triaged finding ids")
-    rule = FINDING_CLASS_RULES.get(finding.finding_class)
-    if rule is None:
-        raise FocusTargetContractError("finding class has no focus target rule")
+    rule = _rule_for(finding)
     return tuple(
         seed
         for seed in _seeds_for(finding, rule)
@@ -384,9 +392,7 @@ def _iter_focus_seeds(
     for finding in findings:
         if not finding.finding_id:
             raise FocusTargetContractError("focus targets need triaged finding ids")
-        rule = FINDING_CLASS_RULES.get(finding.finding_class)
-        if rule is None:
-            raise FocusTargetContractError("finding class has no focus target rule")
+        rule = _rule_for(finding)
         seeds = tuple(
             seed
             for seed in _seeds_for(finding, rule)

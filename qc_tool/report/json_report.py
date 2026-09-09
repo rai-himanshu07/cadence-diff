@@ -73,6 +73,21 @@ def review_summary(
                 "bounding_range": summary.bounding_range,
                 "member_count": summary.member_count,
                 "finding_ids": list(summary.member_finding_ids),
+                "population": (
+                    {
+                        "member_count": first.population.member_count,
+                        "shape_before_digest": first.population.shape_before_digest,
+                        "shape_after_digest": first.population.shape_after_digest,
+                        "baseline_mode": first.population.membership.baseline_mode,
+                        "current_rectangles": list(
+                            first.population.membership.current_rectangles
+                        ),
+                        "first": first.population.first,
+                        "last": first.population.last,
+                    }
+                    if first is not None and first.population is not None
+                    else None
+                ),
             }
         )
     payload = {
@@ -122,8 +137,9 @@ def _payload_scaffold(
         and not result.package_manifest.is_legacy_projection
         else None
     )
+    has_population = any(finding.population is not None for finding in result.findings)
     extended_schema = include_review_summary or package_manifest is not None
-    schema_version = 2 if extended_schema else 1
+    schema_version = 3 if has_population else (2 if extended_schema else 1)
     payload = {
         "schema_version": schema_version,
         "schema": (

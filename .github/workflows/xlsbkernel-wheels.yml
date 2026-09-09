@@ -1,0 +1,88 @@
+name: xlsbkernel wheels
+
+# Builds the optional native XLSB kernel (native/xlsbkernel/) as its OWN,
+# separately-versioned wheel -- it is never published from this workflow and
+# is not a dependency of the main `cadence-diff` distribution's own build
+# (which stays on Hatchling, unaffected by anything here). This proves
+# Criterion 14's packaging bar: platform wheels build in CI for Linux x86_64
+# and Windows x64, and records them as workflow artifacts for manual
+# inspection or a future, separately-authorized publication step.
+#
+# Manually triggered only (no push/pull_request trigger) so it never runs
+# automatically; this session's approval covers writing this file, not
+# authorizing an actual execution (which needs a push).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Build wheel (Linux x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: native/xlsbkernel
+          target: x86_64
+          args: --release --out dist --find-interpreter
+          manylinux: auto
+
+      - name: Install and smoke-test the built wheel
+        run: |
+          python -m venv .kernel-smoke
+          .kernel-smoke/bin/pip install --disable-pip-version-check native/xlsbkernel/dist/*.whl
+          .kernel-smoke/bin/python -c "import xlsbkernel; print(xlsbkernel.__doc__ or 'imported ok')"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xlsbkernel-linux-x86_64
+          path: native/xlsbkernel/dist
+          if-no-files-found: error
+
+  windows:
+    name: Build wheel (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: native/xlsbkernel
+          target: x64
+          args: --release --out dist --find-interpreter
+
+      - name: Install and smoke-test the built wheel
+        shell: pwsh
+        run: |
+          python -m venv .kernel-smoke
+          $wheel = Get-ChildItem native/xlsbkernel/dist/*.whl | Select-Object -First 1
+          .kernel-smoke\Scripts\pip.exe install --disable-pip-version-check $wheel.FullName
+          .kernel-smoke\Scripts\python.exe -c "import xlsbkernel; print(xlsbkernel.__doc__ or 'imported ok')"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: xlsbkernel-windows-x64
+          path: native/xlsbkernel/dist
+          if-no-files-found: error

@@ -4,6 +4,7 @@ import datetime as dt
 import inspect
 import logging
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -33,7 +34,7 @@ from qc_tool.findings import (
     Severity,
 )
 from qc_tool.history.run_state import RunStateRecord, RunStateStore, RunStatus
-from qc_tool.history.store import RunHistory
+from qc_tool.history.store import RunHistory, RunRecord
 from qc_tool.progress import CancellationToken, ProgressEvent, RunCancelled, RunPhase
 from qc_tool.review import (
     ReviewGroup,
@@ -64,6 +65,8 @@ from qc_tool.ui.app import (
     _mapping_stats,
     _outcome_summary,
     _persist_expired_lan_config,
+    _population_members,
+    _population_source_roles,
     _profile_path,
     _queue_status_line,
     _relative_time,
@@ -89,7 +92,7 @@ from qc_tool.ui.guide import (
     PROFILE_CONTROLS_EXAMPLE,
     render_guide,
 )
-from qc_tool.ui.theme import CSS, page_frame
+from qc_tool.ui.theme import CSS, REVIEW_GROUPS_BODY_SLOT, page_frame
 from tests.conftest import fixture_profile
 from tests.test_review_series import series_oracle
 
@@ -207,6 +210,256 @@ def test_evidence_axes_cover_every_typed_axis() -> None:
     # Empty axes are dropped rather than rendered as blank rows.
     assert "waiver" not in axes
     assert "expected reason" not in axes
+
+
+def test_population_members_decodes_shift_mode_across_rectangles() -> None:
+    from qc_tool.findings import MembershipCodec, PopulationEvidence
+
+    finding = Finding(
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        sheet="Data",
+        location="B2:B4",
+        element="population",
+        message="3 cells share one population",
+        population=PopulationEvidence(
+            member_count=3,
+            membership=MembershipCodec(
+                current_rectangles=("B2:B4",),
+                baseline_mode="shift",
+                shift=(-1, 0),
+                member_count=3,
+            ),
+            first="B2",
+            last="B4",
+            shape_before_digest="a" * 64,
+            shape_after_digest="b" * 64,
+        ),
+    )
+
+    assert _population_members(finding) == [
+        ("B2", "B1"),
+        ("B3", "B2"),
+        ("B4", "B3"),
+    ]
+
+
+def test_population_members_returns_explicit_pairs_verbatim() -> None:
+    from qc_tool.findings import MembershipCodec, PopulationEvidence
+
+    finding = Finding(
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        sheet="Data",
+        location="B2:D2",
+        element="population",
+        message="2 cells share one population",
+        population=PopulationEvidence(
+            member_count=2,
+            membership=MembershipCodec(
+                current_rectangles=("B2:D2",),
+                baseline_mode="pairs",
+                pairs=(("B2", "A1"), ("D2", "C4")),
+                member_count=2,
+            ),
+            first="B2",
+            last="D2",
+            shape_before_digest="a" * 64,
+            shape_after_digest="b" * 64,
+        ),
+    )
+
+    assert _population_members(finding) == [("B2", "A1"), ("D2", "C4")]
+
+
+def test_population_members_returns_empty_for_atomic_findings() -> None:
+    finding = Finding(
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        sheet="Data",
+        location="B2",
+        message="value changed",
+    )
+
+    assert _population_members(finding) == []
+
+
+def test_population_members_page_matches_full_decode_across_rectangle_boundaries() -> None:
+    """Criterion 9: `population_members_page` must decode the exact same
+    members `population_members` would at every position -- including a
+    page that spans two rectangles -- without ever materializing the rest.
+    """
+    from qc_tool.findings import MembershipCodec, PopulationEvidence
+    from qc_tool.review import population_members, population_members_page
+
+    finding = Finding(
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        sheet="Data",
+        location="B2:B4,D2:D4",
+        element="population",
+        message="6 cells share one population",
+        population=PopulationEvidence(
+            member_count=6,
+            membership=MembershipCodec(
+                current_rectangles=("B2:B4", "D2:D4"),
+                baseline_mode="shift",
+                shift=(-1, 0),
+                member_count=6,
+            ),
+            first="B2",
+            last="D4",
+            shape_before_digest="a" * 64,
+            shape_after_digest="b" * 64,
+        ),
+    )
+    full = population_members(finding)
+    assert len(full) == 6
+
+    for start in range(0, 7):
+        for count in (1, 2, 3, 10):
+            assert population_members_page(finding, start, count) == full[start : start + count]
+
+    assert population_members_page(finding, 0, 0) == ()
+    assert population_members_page(finding, -1, 3) == ()
+
+
+def test_population_source_roles_for_primary_and_package_member() -> None:
+    primary = Finding(
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        sheet="Data",
+        location="B2",
+        message="value changed",
+    )
+    member = Finding(
+        artifact="excel",
+        artifact_member="unit1",
+        finding_class=FindingClass.VALUE_CHANGED,
+        sheet="Data",
+        location="B2",
+        message="value changed",
+    )
+
+    assert _population_source_roles(primary) == ("baseline_excel", "current_excel")
+    assert _population_source_roles(member) == (
+        "baseline_excel:unit1",
+        "current_excel:unit1",
+    )
+
+
+def _population_finding_and_record(
+    work_dir: Path,
+    baseline: Path,
+    current: Path,
+) -> tuple[Finding, RunRecord]:
+    from qc_tool.config.profile import PopulationPolicy, ReviewPolicy
+
+    profile = DeliverableProfile(
+        name="population-excerpts-pure",
+        review_policy=ReviewPolicy(
+            populations=PopulationPolicy(enabled=True, threshold=10)
+        ),
+    )
+    artifacts = perform_run(
+        work_dir,
+        {"baseline_excel": baseline, "current_excel": current},
+        {},
+        profile,
+    )
+    history = RunHistory(work_dir / "history.sqlite3")
+    record = history.get_run(artifacts.run_id)
+    assert record is not None
+    finding = next(f for f in record.findings if f.population is not None)
+    return finding, record
+
+
+def test_load_population_sample_excerpts_builds_baseline_and_current_grids(
+    tmp_path: Path,
+) -> None:
+    from qc_tool.ui.app import _load_population_sample_excerpts
+
+    baseline, current = _build_population_fixture(tmp_path)
+    finding, record = _population_finding_and_record(
+        tmp_path / "work", baseline, current
+    )
+
+    loaded = _load_population_sample_excerpts(finding, record)
+
+    assert loaded.disclosure == ""
+    assert loaded.excerpts
+    baseline_excerpt, current_excerpt = next(iter(loaded.excerpts.values()))
+    assert baseline_excerpt is not None
+    assert current_excerpt is not None
+
+
+def test_load_population_sample_excerpts_discloses_missing_path(
+    tmp_path: Path,
+) -> None:
+    from qc_tool.ui.app import _load_population_sample_excerpts
+
+    baseline, current = _build_population_fixture(tmp_path)
+    finding, record = _population_finding_and_record(
+        tmp_path / "work", baseline, current
+    )
+    current.unlink()
+
+    loaded = _load_population_sample_excerpts(finding, record)
+
+    assert loaded.excerpts == {}
+    assert "no longer at its recorded location" in loaded.disclosure
+
+
+def test_load_population_sample_excerpts_discloses_hash_mismatch(
+    tmp_path: Path,
+) -> None:
+    from qc_tool.ui.app import _load_population_sample_excerpts
+
+    baseline, current = _build_population_fixture(tmp_path)
+    finding, record = _population_finding_and_record(
+        tmp_path / "work", baseline, current
+    )
+    # Overwrite the recorded source in place so the path still exists but the
+    # content -- and therefore the hash -- no longer matches the run record.
+    current.write_bytes(baseline.read_bytes())
+
+    loaded = _load_population_sample_excerpts(finding, record)
+
+    assert loaded.excerpts == {}
+    assert "changed since this run recorded it" in loaded.disclosure
+
+
+def test_load_population_sample_excerpts_discloses_no_samples(
+    tmp_path: Path,
+) -> None:
+    from qc_tool.ui.app import _load_population_sample_excerpts
+
+    # An atomic finding (population is None) never has samples to load.
+    finding = Finding(
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        sheet="Data",
+        location="B2",
+        message="value changed",
+    )
+    record = RunRecord(
+        run_id=1,
+        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        profile="default",
+        mode=QCRunMode.CYCLE_COMPARISON,
+        files={},
+        file_hashes={},
+        counts={},
+        review_counts={},
+        disclosures=[],
+        verified_crosschecks=0,
+        report_paths={},
+    )
+
+    loaded = _load_population_sample_excerpts(finding, record)
+
+    assert loaded.excerpts == {}
+    assert loaded.disclosure == "no samples recorded"
 
 
 def test_profile_controls_guide_example_is_valid_yaml() -> None:
@@ -738,6 +991,7 @@ async def test_main_page_renders(user: User, tmp_path: Path) -> None:
     await user.should_see("Run QC")
     await user.should_see("Deliverable profile")
     await user.should_see("Override workbook workload refusals")
+    await user.should_see("Force full dependency indexing")
     await user.should_see("Current-file preflight")
     await user.should_see("Cycle comparison")
     await user.should_see("Final-package QC")
@@ -1280,6 +1534,48 @@ async def test_app_settings_are_discoverable_from_the_header(
 
 
 @pytest.mark.asyncio
+async def test_app_settings_report_and_clear_the_formula_cache(
+    user: User,
+    tmp_path: Path,
+) -> None:
+    from qc_tool.io.formula_cache import (
+        FormulaCacheKey,
+        FormulaExtractionCache,
+        coordinate_digest,
+    )
+    from qc_tool.io.formula_enrichment import FormulaExtraction
+    from qc_tool.io.xlsb_formula import XlsbFormulaScan
+
+    work_dir = tmp_path / "work"
+    scan = XlsbFormulaScan(formula_cells={"Data": frozenset({(1, 1)})})
+    cache = FormulaExtractionCache(work_dir / "formula-cache")
+    cache.store(
+        FormulaCacheKey(
+            package_sha256="a" * 64,
+            coordinate_digest=coordinate_digest(scan),
+            coordinate_count=scan.formula_count,
+            adapter_family="libreoffice",
+            adapter_fingerprint="libreoffice:test",
+        ),
+        FormulaExtraction(
+            formulas={"Data": {(1, 1): "=A2+1"}}, engine="test:1.0", detail="test"
+        ),
+    )
+    assert cache.status()["entry_count"] == 1
+
+    create_pages(work_dir)
+    await user.open("/")
+
+    user.find(marker="app-settings").click()
+    await user.should_see("Formula-extraction cache · 1 entries")
+    await user.should_see("Native formula engine")
+
+    user.find("Clear formula cache").click()
+    await user.should_see("Formula-extraction cache · 0 entries, 0 B")
+    assert cache.status()["entry_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_compare_page_remembers_manual_mode_selection(
     user: User,
     tmp_path: Path,
@@ -1380,6 +1676,221 @@ async def test_run_detail_page_not_found(user: User, tmp_path: Path) -> None:
     create_pages(tmp_path / "work")
     await user.open("/runs/999")
     await user.should_see("Run not found")
+
+
+@pytest.mark.asyncio
+async def test_population_finding_detail_shows_membership_summary(
+    user: User, tmp_path: Path
+) -> None:
+    """A population's review row renders the new membership evidence panel."""
+    from openpyxl import Workbook
+
+    from qc_tool.config.profile import PopulationPolicy, ReviewPolicy
+
+    def build(path: Path, *, multiplier: int) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Data"
+        sheet.append(["Input", "Output"])
+        for row in range(2, 21):  # 19 uniform formula changes
+            sheet.append([100, f"=A{row}*{multiplier}"])
+        workbook.save(path)
+
+    work_dir = tmp_path / "work"
+    baseline = tmp_path / "base.xlsx"
+    current = tmp_path / "curr.xlsx"
+    build(baseline, multiplier=2)
+    build(current, multiplier=3)
+    profile = DeliverableProfile(
+        name="population-ui",
+        review_policy=ReviewPolicy(
+            populations=PopulationPolicy(enabled=True, threshold=10)
+        ),
+    )
+    artifacts = perform_run(
+        work_dir,
+        {"baseline_excel": baseline, "current_excel": current},
+        {},
+        profile,
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    await user.should_see("Review queue")
+
+    group_table = next(
+        element
+        for element in user.find(kind=ui.table).elements
+        if "review-groups-table" in element.classes
+    )
+    population_row = next(
+        row for row in group_table.rows if row.get("class") == "formula_logic_changed"
+    )
+    _emit(group_table, "select", {"id": str(population_row["id"])})
+    await user.should_see("Population membership")
+    await user.should_see("19 cells")
+
+
+@pytest.mark.asyncio
+async def test_population_expand_members_pager_pages_every_member(
+    user: User, tmp_path: Path
+) -> None:
+    """"Expand members" decodes the codec and pages through all 19 cells."""
+    from openpyxl import Workbook
+
+    from qc_tool.config.profile import PopulationPolicy, ReviewPolicy
+
+    def build(path: Path, *, multiplier: int) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Data"
+        sheet.append(["Input", "Output"])
+        for row in range(2, 21):
+            sheet.append([100, f"=A{row}*{multiplier}"])
+        workbook.save(path)
+
+    work_dir = tmp_path / "work"
+    baseline = tmp_path / "base.xlsx"
+    current = tmp_path / "curr.xlsx"
+    build(baseline, multiplier=2)
+    build(current, multiplier=3)
+    profile = DeliverableProfile(
+        name="population-pager",
+        review_policy=ReviewPolicy(
+            populations=PopulationPolicy(enabled=True, threshold=10)
+        ),
+    )
+    artifacts = perform_run(
+        work_dir,
+        {"baseline_excel": baseline, "current_excel": current},
+        {},
+        profile,
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    group_table = next(
+        element
+        for element in user.find(kind=ui.table).elements
+        if "review-groups-table" in element.classes
+    )
+    population_row = next(
+        row for row in group_table.rows if row.get("class") == "formula_logic_changed"
+    )
+    _emit(group_table, "select", {"id": str(population_row["id"])})
+    await user.should_see("Population membership")
+
+    user.find("Expand members").click()
+    await user.should_see("19 total")
+    await user.should_see("Showing 1-19 of 19")
+    await user.should_see("B2")
+    await user.should_see("B20")
+
+
+def _build_population_fixture(
+    tmp_path: Path, *, multiplier_current: int = 3
+) -> tuple[Path, Path]:
+    from openpyxl import Workbook
+
+    def build(path: Path, *, multiplier: int) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Data"
+        sheet.append(["Input", "Output"])
+        for row in range(2, 21):  # 19 uniform formula changes
+            sheet.append([100, f"=A{row}*{multiplier}"])
+        workbook.save(path)
+
+    baseline = tmp_path / "base.xlsx"
+    current = tmp_path / "curr.xlsx"
+    build(baseline, multiplier=2)
+    build(current, multiplier=multiplier_current)
+    return baseline, current
+
+
+@pytest.mark.asyncio
+async def test_population_load_sample_excerpts_renders_grids(
+    user: User, tmp_path: Path
+) -> None:
+    """"Load sample excerpts" reopens the recorded sources and renders grids."""
+    from qc_tool.config.profile import PopulationPolicy, ReviewPolicy
+
+    work_dir = tmp_path / "work"
+    baseline, current = _build_population_fixture(tmp_path)
+    profile = DeliverableProfile(
+        name="population-excerpts",
+        review_policy=ReviewPolicy(
+            populations=PopulationPolicy(enabled=True, threshold=10)
+        ),
+    )
+    artifacts = perform_run(
+        work_dir,
+        {"baseline_excel": baseline, "current_excel": current},
+        {},
+        profile,
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    group_table = next(
+        element
+        for element in user.find(kind=ui.table).elements
+        if "review-groups-table" in element.classes
+    )
+    population_row = next(
+        row for row in group_table.rows if row.get("class") == "formula_logic_changed"
+    )
+    _emit(group_table, "select", {"id": str(population_row["id"])})
+    await user.should_see("Population membership")
+
+    user.find("Load sample excerpts").click()
+    # Criterion 9: excerpts now load via a disposable child process (real
+    # spawn + reimport + workbook load), noticeably slower than the old
+    # in-process call -- `should_see`'s default ~0.3s retry budget is not
+    # enough headroom for that, so give it more retries here.
+    await user.should_see("baseline", retries=50)
+    await user.should_see("current", retries=50)
+    await user.should_see("B2", retries=50)
+
+
+@pytest.mark.asyncio
+async def test_population_load_sample_excerpts_discloses_moved_source(
+    user: User, tmp_path: Path
+) -> None:
+    """A moved/deleted recorded source fails closed with a plain disclosure."""
+    from qc_tool.config.profile import PopulationPolicy, ReviewPolicy
+
+    work_dir = tmp_path / "work"
+    baseline, current = _build_population_fixture(tmp_path)
+    profile = DeliverableProfile(
+        name="population-excerpts-missing",
+        review_policy=ReviewPolicy(
+            populations=PopulationPolicy(enabled=True, threshold=10)
+        ),
+    )
+    artifacts = perform_run(
+        work_dir,
+        {"baseline_excel": baseline, "current_excel": current},
+        {},
+        profile,
+    )
+    current.unlink()  # source moves/disappears after the run recorded it
+
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    group_table = next(
+        element
+        for element in user.find(kind=ui.table).elements
+        if "review-groups-table" in element.classes
+    )
+    population_row = next(
+        row for row in group_table.rows if row.get("class") == "formula_logic_changed"
+    )
+    _emit(group_table, "select", {"id": str(population_row["id"])})
+    await user.should_see("Population membership")
+
+    user.find("Load sample excerpts").click()
+    await user.should_see("no longer at its recorded location")
 
 
 @pytest.mark.asyncio
@@ -2108,6 +2619,111 @@ def test_queue_sort_never_splits_a_series_from_its_children() -> None:
     assert "_sort_lens_entries(" in source
     assert "order: priority" in source
     assert "Reverse queue order" in source
+
+
+def test_review_count_column_renders_comma_grouped_and_stays_wide_and_nowrap() -> None:
+    """Client feedback: large `#` counts must never wrap/overflow, but the
+    underlying row value stays a plain int so findings-order sort (above) and
+    every other int(str(row["members"])) reader keep working unchanged."""
+    # exactly two <q-td key="members"> cells: the cluster-row template and the
+    # ordinary row/child template; both must format via JS toLocaleString.
+    assert REVIEW_GROUPS_BODY_SLOT.count('key="members"') == 2
+    assert REVIEW_GROUPS_BODY_SLOT.count(
+        "Number(props.row.members).toLocaleString('en-US')"
+    ) == 2
+    assert "{{ props.row.members }}" not in REVIEW_GROUPS_BODY_SLOT
+
+    fourth_column_rules = [
+        line
+        for line in CSS.splitlines()
+        if ".review-groups-table" in line and "nth-child(4)" in line
+    ]
+    assert fourth_column_rules, "the # column must have dedicated CSS rules"
+    assert any("white-space: nowrap" in line for line in fourth_column_rules)
+    widths = [
+        int(match.group(1))
+        for line in fourth_column_rules
+        if (match := re.search(r"width:\s*(\d+)%", line))
+    ]
+    # 1,234,567 (9 chars, monospace tabular-nums) needs real room at every
+    # supported desktop breakpoint, not the old 4%/6%.
+    assert widths and all(width >= 7 for width in widths)
+
+
+def test_run_qc_submission_is_single_flight() -> None:
+    """Client feedback: rapid repeated Run QC clicks must produce at most one
+    projection, one dialog, and one queued request, released only when the
+    owned request's RunStateRecord.is_active goes false (never a terminal
+    allowlist) or the analyst explicitly cancels the projection dialog."""
+    source = inspect.getsource(app_module.create_pages)
+    start_run_source = source.split("async def start_run() -> None:", 1)[1].split(
+        "def _open_projection_dialog(", 1
+    )[0]
+
+    # the guard is the very first statement, before any `await`, so a second
+    # concurrently scheduled click sees the lock before it can act
+    guard_line = start_run_source.strip().splitlines()[0]
+    assert guard_line == "if _run_ui_busy():"
+    assert "await" not in start_run_source.split(guard_line, 1)[0]
+
+    # phase transitions use is_active/ACTIVE_STATUSES semantics, never an
+    # enumerated terminal-status allowlist
+    assert '"phase": "idle"' in source
+    assert 'run_lock["phase"] = "projecting"' in start_run_source
+    assert 'run_lock["phase"] = "dialog"' in start_run_source
+    assert "if run_lock[\"request_id\"] == request_id:" in source
+    assert "_unlock_run()" in source
+    assert "record.is_active" in source
+    assert "ACTIVE_STATUSES" not in source  # terminality is never enumerated here
+
+    # the volume-projection dialog can only resolve via its own Cancel/Run
+    # buttons, so the lock always releases deterministically
+    dialog_source = source.split("def _open_projection_dialog(", 1)[1].split(
+        "def submit_run(", 1
+    )[0]
+    assert 'ui.dialog().props("persistent")' in dialog_source
+    assert "def cancel_dialog() -> None:" in dialog_source
+    assert "_unlock_run()" in dialog_source.split("def cancel_dialog", 1)[1]
+
+    # submit_run releases the lock on QueueBusyError and locks to "submitted"
+    # on success, so it is never left stuck in "projecting"/"dialog"
+    submit_run_source = source.split("def submit_run(", 1)[1]
+    assert 'run_lock["phase"] = "submitted"' in submit_run_source
+    busy_error_branch = submit_run_source.split("except QueueBusyError as exc:", 1)[1].split(
+        "run_lock", 1
+    )[0]
+    assert "_unlock_run()" in busy_error_branch
+
+
+def test_column_letters_normalizes_and_deduplicates() -> None:
+    from qc_tool.ui.app import _column_letters
+
+    assert _column_letters(" b, A;B ") == ["B", "A"]
+
+
+def test_ranked_block_opens_the_review_row_matching_dialog() -> None:
+    source = inspect.getsource(app_module.create_pages)
+    flat = " ".join(source.split())
+
+    assert "def _open_row_identity_setup(" in source
+    assert '"Review row matching"' in flat
+    assert '"QC paused"' in flat
+    assert '"Save rule and run QC"' in flat
+    assert "await start_run()" in source
+    assert "view_model_from_action(" in source
+    blocked_branch = source.split("elif record.status is RunStatus.BLOCKED:", 1)[1]
+    assert '== "row_identity_confirmation_required"' in blocked_branch
+    assert "_open_row_identity_setup(action, record.profile)" in blocked_branch
+
+
+def test_guide_describes_manual_prerequisites_and_ranked_setup() -> None:
+    from qc_tool.ui import guide
+
+    source = inspect.getsource(guide.render_guide)
+    assert "Prerequisite cells are manually pinned for both OOXML and XLSB" in source
+    assert "Ranked or sorted tables" in source
+    assert "QC then re-runs automatically" in source
+    assert "automatic dropdown suggestions are OOXML-only" not in source
 
 
 def test_mix_chips_are_quiet_and_allowed_to_wrap() -> None:

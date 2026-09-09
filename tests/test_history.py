@@ -583,6 +583,87 @@ def test_record_run_indexes_every_longitudinal_occurrence(tmp_path: Path) -> Non
     assert count is not None and count[0] == len(findings)
 
 
+def test_record_run_persists_resolved_formula_engines(tmp_path: Path) -> None:
+    """Criterion 5: the resolved formula-engine/adapter-fingerprint per excel
+    role must survive a history round trip, so Re-QC/carry-forward can later
+    disclose a cross-run engine change.
+    """
+    history = RunHistory(tmp_path / "history.sqlite3")
+    run_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            formula_engines={
+                "baseline_excel": "native-biff12:1.2.3",
+                "current_excel": "native-biff12:1.2.3",
+            },
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+
+    record = history.get_run(run_id)
+
+    assert record.formula_engines == {
+        "baseline_excel": "native-biff12:1.2.3",
+        "current_excel": "native-biff12:1.2.3",
+    }
+
+
+def test_legacy_run_without_formula_engines_defaults_to_an_empty_dict(
+    tmp_path: Path,
+) -> None:
+    """A row recorded before this disclosure existed migrates to `{}`, never
+    a crash or a guessed engine."""
+    database = tmp_path / "history.sqlite3"
+    history = RunHistory(database)
+    run_id = history.record_run(
+        QCRunResult(profile_name="fixture"), file_hashes={}, report_paths={}
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE runs SET formula_engines = '{}' WHERE id = ?", (run_id,)
+        )
+
+    assert history.get_run(run_id).formula_engines == {}
+
+
+def test_record_run_reports_fixed_code_subphase_timings(tmp_path: Path) -> None:
+    """Step 7 instrumentation: a diagnostic hook only -- optional, additive,
+    and never required for correctness (the omitted-callback path above
+    proves that)."""
+    history = RunHistory(tmp_path / "history.sqlite3")
+    findings = [
+        _longitudinal_finding("F1", location="A1"),
+        _longitudinal_finding("F2", location="A2"),
+    ]
+    observed: dict[str, float] = {}
+
+    def on_subphase(name: str, elapsed_seconds: float) -> None:
+        observed[name] = elapsed_seconds
+
+    history.record_run(
+        QCRunResult(profile_name="fixture", findings=findings),
+        file_hashes={},
+        report_paths={},
+        on_subphase=on_subphase,
+    )
+
+    expected_names = {
+        "main_pass",
+        "story_classify_and_replay",
+        "sqlite_write",
+        "storage_measurement",
+        "total",
+    }
+    assert set(observed) == expected_names
+    assert all(elapsed >= 0.0 for elapsed in observed.values())
+    # The subphases are strict subsets of the wall clock, not double-counted.
+    assert observed["total"] >= observed["main_pass"]
+    assert observed["total"] >= observed["story_classify_and_replay"]
+    assert observed["total"] >= observed["sqlite_write"]
+    assert observed["total"] >= observed["storage_measurement"]
+
+
 def test_indexed_dossier_reads_positions_without_iterating_runs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1554,3 +1635,50 @@ def test_volume_projection_flags_only_changed_sheets(
     assert sheet.title in projection.changed_sheets
 
     assert project_cycle_volume(baseline, tmp_path / "missing.xlsx") is None
+
+
+def test_legacy_annotation_lineage_migrates_to_versioned_many_to_one(
+    tmp_path: Path,
+) -> None:
+    """A pre-A4 strictly-1:1 `annotation_lineage` row survives the table
+    rebuild as one `relation=identity`, `outcome=inherited` row under the
+    new many-to-one shape -- a faithful reinterpretation, not data loss.
+    """
+    db_path = tmp_path / "history.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE annotation_lineage (
+                run_id INTEGER NOT NULL,
+                finding_id TEXT NOT NULL,
+                source_run_id INTEGER NOT NULL,
+                source_finding_id TEXT NOT NULL,
+                evidence_version INTEGER NOT NULL,
+                evidence_digest TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, finding_id)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO annotation_lineage VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (2, "N1", 1, "F1", 1, "a" * 64, "2026-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+
+    history = RunHistory(db_path)
+
+    lineage = history.get_annotation_lineage(2)["N1"]
+    assert len(lineage) == 1
+    row = lineage[0]
+    assert row.source_run_id == 1
+    assert row.source_finding_id == "F1"
+    assert row.relation.value == "identity"
+    assert row.outcome.value == "inherited"
+    assert row.evidence_version == 1
+    assert row.source_digest == "a" * 64
+    assert row.applied_at == "2026-01-01T00:00:00+00:00"
+
+    # Reopening an already-migrated database is a no-op, not a data loss.
+    reopened = RunHistory(db_path)
+    assert reopened.get_annotation_lineage(2)["N1"] == lineage

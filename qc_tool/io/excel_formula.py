@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -12,9 +13,11 @@ from pathlib import Path
 from typing import TypeAlias
 
 from qc_tool.io.formula_enrichment import (
+    ExtractedDefinedName,
     FormulaEnrichmentError,
     FormulaExtraction,
     FormulaMap,
+    bounded_defined_names,
     validate_formula_extraction,
 )
 from qc_tool.io.xlsb_formula import XlsbFormulaScan
@@ -24,6 +27,39 @@ DEFAULT_EXCEL_TIMEOUT_SECONDS = 300.0
 _WorkerRunner: TypeAlias = Callable[
     [Path, dict[str, object], float], FormulaExtraction
 ]
+
+
+def excel_adapter_fingerprint() -> str | None:
+    """A cheap Excel version probe for formula-cache keys, or None.
+
+    Launches only the Excel Application object -- never a workbook -- reads
+    its version, and quits immediately. Returns None (caching disabled for
+    this adapter) on any failure; never guessed, never raised.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import pythoncom  # pyright: ignore[reportMissingModuleSource]
+        import win32com.client  # pyright: ignore[reportMissingModuleSource]
+    except ImportError:
+        return None
+    app = None
+    try:
+        pythoncom.CoInitialize()
+        app = win32com.client.DispatchEx("Excel.Application")
+        version = str(app.Version)
+        build = str(getattr(app, "Build", "") or "")
+    except Exception:  # COM failures are broad and adapter-specific
+        return None
+    finally:
+        if app is not None:
+            with contextlib.suppress(Exception):
+                app.Quit()
+        with contextlib.suppress(Exception):
+            pythoncom.CoUninitialize()
+    if not version:
+        return None
+    return f"excel:{version}:{build}" if build else f"excel:{version}"
 
 
 def _write_private_windows_file(path: Path, data: bytes) -> None:
@@ -38,7 +74,7 @@ def _write_private_windows_file(path: Path, data: bytes) -> None:
 
 def _worker_request(work_dir: Path, scan: XlsbFormulaScan) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "parent_pid": os.getpid(),
         "input_path": str(work_dir / "input.xlsb"),
         "result_path": str(work_dir / "result.json"),
@@ -52,6 +88,41 @@ def _worker_request(work_dir: Path, scan: XlsbFormulaScan) -> dict[str, object]:
     }
 
 
+def _parse_defined_names(
+    payload: dict[str, object],
+) -> tuple[tuple[ExtractedDefinedName, ...], bool]:
+    """Parse the worker's bounded defined-name collection, failing soft.
+
+    Any malformed entry degrades to an empty, incomplete result rather than
+    raising -- defined-name reachability is independent of formula text, so
+    a defined-name problem never invalidates an otherwise valid extraction.
+    """
+    raw = payload.get("defined_names")
+    worker_complete = payload.get("defined_names_complete") is True
+    if not isinstance(raw, list):
+        return (), False
+    items: list[ExtractedDefinedName] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return (), False
+        name = entry.get("name")
+        target = entry.get("target")
+        sheet = entry.get("sheet")
+        hidden = entry.get("hidden")
+        if (
+            not isinstance(name, str)
+            or not isinstance(target, str)
+            or not (sheet is None or isinstance(sheet, str))
+            or not isinstance(hidden, bool)
+        ):
+            return (), False
+        items.append(
+            ExtractedDefinedName(name=name, target=target, sheet=sheet, hidden=hidden)
+        )
+    names, bounded_complete = bounded_defined_names(items)
+    return names, bounded_complete and worker_complete
+
+
 def _load_worker_result(path: Path) -> FormulaExtraction:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -59,7 +130,7 @@ def _load_worker_result(path: Path) -> FormulaExtraction:
         raise FormulaEnrichmentError("Excel formula worker returned no valid result") from exc
     if not isinstance(payload, dict):
         raise FormulaEnrichmentError("Excel formula worker result is not an object")
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") != 2:
         raise FormulaEnrichmentError("Excel formula worker returned an unknown schema")
     if payload.get("ok") is not True:
         detail = payload.get("error")
@@ -103,7 +174,14 @@ def _load_worker_result(path: Path) -> FormulaExtraction:
     detail = payload.get("detail")
     if not isinstance(engine, str) or not isinstance(detail, str):
         raise FormulaEnrichmentError("Excel formula worker omitted engine provenance")
-    return FormulaExtraction(formulas=formulas, engine=engine, detail=detail)
+    defined_names, defined_names_complete = _parse_defined_names(payload)
+    return FormulaExtraction(
+        formulas=formulas,
+        engine=engine,
+        detail=detail,
+        defined_names=defined_names,
+        defined_names_complete=defined_names_complete,
+    )
 
 
 def _status_identity(path: Path) -> tuple[int, float] | None:

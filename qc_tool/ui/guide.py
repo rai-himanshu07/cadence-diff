@@ -400,6 +400,35 @@ cadence-diff --data-dir "/path/to/qc-data"
                 )
 
             with _guide_section("start", "Start here"):
+                _callout(
+                    "Check prerequisites before you compare",
+                    "If the profile pins a scenario or selector cell (for example a "
+                    "dropdown-driven forecast case), baseline and current must show "
+                    "the exact same, non-blank value there. A mismatch blocks the run "
+                    "before any comparison, report, or history entry is produced: "
+                    "select the same scenario in both files, fully recalculate, save, "
+                    "then run again. Configure pins in a named profile's "
+                    "<strong>Comparison prerequisites</strong> (Excel, advanced "
+                    "section) as a sheet and cell for each selector that must match. "
+                    "Prerequisite cells are manually pinned for both OOXML and XLSB "
+                    "workbooks today.",
+                    warning=True,
+                )
+                _callout(
+                    "Ranked or sorted tables",
+                    "When a large positional block looks like the same records in a "
+                    "different order, QC pauses before creating mass cell-to-cell "
+                    "noise. Review row matching: pick the columns that match rows "
+                    "by (and, optionally, columns whose order-only values should "
+                    "be ignored), choose how duplicate identities are handled, and "
+                    "save the rule to a named profile. QC then re-runs automatically. "
+                    "Confirmed row order and rank ordinals are ignored; formulas, "
+                    "styles, structure, and other business values remain checked. "
+                    "If no safe identity can be proved automatically, add a "
+                    "<strong>Row identity rule</strong> under the sheet in Manage "
+                    "profiles or leave positional comparison unchanged.",
+                    warning=True,
+                )
                 _paragraph(
                     "A defensible run has four parts: select the mode that answers the "
                     "actual QC question, supply only the files that mode needs, review "
@@ -526,12 +555,24 @@ cadence-diff --data-dir "/path/to/qc-data"
                     "QC always reads saved values from the original XLSB. Before loading those "
                     "values, it counts retained cells, formulas, and binary worksheet bytes; "
                     "an oversized file is refused unless the workload override is deliberately "
-                    "enabled. Formula text is an additional capability: Windows can use "
-                    "installed desktop Excel, while Linux can use LibreOffice in a networkless "
-                    "sandbox. Formula text is accepted only when its cells exactly match an "
-                    "independent structural scan of the binary file. Missing tools, active or "
-                    "external content, timeouts, or mismatches fall back to formula-presence "
-                    "checks and are clearly reported as degraded. Saved values are still read.",
+                    "enabled. Formula text is an additional capability, read by one of three "
+                    "engines: a bundled native decoder (fastest, no external application), "
+                    "installed desktop Excel on Windows, or LibreOffice in a Linux networkless "
+                    "sandbox. A profile's <code>formula_engine</code> setting picks "
+                    "<code>native</code>, <code>excel</code>, <code>libreoffice</code>, or the "
+                    "default <code>auto</code> (native when available, otherwise the existing "
+                    "platform default). Formula text is accepted only when its cells exactly "
+                    "match an independent structural scan of the binary file. A missing engine, "
+                    "active or external content, timeouts, or mismatches fall back to "
+                    "formula-presence checks and are clearly reported as degraded -- a run never "
+                    "fails because of a formula-engine choice the current install cannot satisfy. "
+                    "Saved values are still read. A private, bounded cache remembers a "
+                    "workbook's extracted formula text so an unchanged file skips repeat "
+                    "extraction on its next QC run; the cache key includes which engine "
+                    "produced the entry, so switching engines never reuses a stale one, and a "
+                    "cache hit is revalidated against a fresh structural scan every time and "
+                    "never changes a finding. Report or clear it from Local app settings or "
+                    "<code>qc-tool formula-cache status|clear</code>.",
                     warning=True,
                 )
 
@@ -705,6 +746,21 @@ cadence-diff --data-dir "/path/to/qc-data"
                     "and does not make a workbook cheaper to load.",
                     warning=True,
                 )
+                _callout(
+                    "Dependency indexing has its own, separate size policy",
+                    "Above a documented formula-cell or projected-dependency threshold, "
+                    "dependency indexing is skipped for that run instead of attempted -- "
+                    "circular-reference detection, formula impacts, chart impacts, and "
+                    "PowerPoint chart impacts all degrade together, and every affected "
+                    "coverage row (and the exported reports) states the reason as "
+                    "\"skipped by size policy\". This is separate from, and does not require, "
+                    "Override workbook workload refusals: a workbook that already needed that "
+                    "override just to load and compare can still have its dependency indexing "
+                    "skipped, or forced back on, independently. Force full dependency indexing "
+                    "only when you have confirmed enough local memory and time -- it can be the "
+                    "most expensive phase of a large run.",
+                    warning=True,
+                )
                 _paragraph(
                     "When alignment cannot deterministically pair cells, the run records an "
                     "alignment trust manifest listing per-region paired counts, low-confidence "
@@ -811,6 +867,7 @@ cadence-diff --data-dir "/path/to/qc-data"
                         "Exports are regenerated from the reviewed state so comments and overrides are included.",
                         "Excel and HTML exports lead with semantic pattern groups while retaining every atomic finding; Excel links stay inside the report workbook.",
                         "On very large runs (over 50,000 findings) report files are not written at run time — the run becomes reviewable sooner, and <strong>Generate Excel/HTML report</strong> on the run page builds the file on demand, stores it with the run, and downloads it. Expect several minutes for a million-finding report; reviewing continues meanwhile.",
+                        "When group-first output is enabled on a profile, a large run of identical formula-logic or number-format changes is shown as one <strong>population</strong> item instead of one row per cell. Its detail shows the member count, the current-side cell ranges, and how baseline cells map to them; sample excerpts and a full member list are not available yet. A smaller or non-uniform group of the same class still reviews as ordinary atomic findings — nothing is silently combined.",
                     ]
                 )
                 _callout(
@@ -1067,6 +1124,11 @@ cadence-diff run --baseline-excel last.xlsx --current-excel this.xlsx \\
 # Overrides physical-size and formula-link safety refusals for this run
 cadence-diff run --current-excel unusually-large.xlsx --allow-large-workbooks
 
+# Forces full dependency indexing above the separate size policy that
+# otherwise skips circular/formula/chart/PowerPoint-chart impacts
+cadence-diff run --current-excel unusually-large.xlsx \\
+    --allow-dependency-indexing
+
 # Structural-only evidence
 cadence-diff fingerprint current.xlsx -o current.fingerprint.json
 
@@ -1199,6 +1261,15 @@ qc-tool network local --data-dir data"""
                             "Dependency coverage degraded",
                             "Review unsupported, invalid, or unparseable reference counts. A dynamic spill with no declared extent is unsupported, not guessed. Symbolic "
                             "aggregate references remain queryable and are disclosed separately.",
+                        ],
+                        [
+                            "Dependency indexing skipped by size policy",
+                            "Formula-cell count or projected dependencies crossed a documented "
+                            "threshold; circular detection, formula/chart/PowerPoint-chart "
+                            "impacts and their report evidence degrade together with this "
+                            "reason. Enable Force full dependency indexing only after confirming "
+                            "enough local memory and time -- distinct from Override workbook "
+                            "workload refusals.",
                         ],
                         ["Re-QC file not found", "Select the renamed or replacement artifact again"],                        ["Profile will not save", "Correct the validation message or run qc-tool lint"],
                         ["Strict privacy verification fails", "Resolve each reported package issue or share only a fingerprint"],

@@ -23,6 +23,7 @@ from qc_tool.engine import QCRunResult
 from qc_tool.excel.formulas import formula_token_diff
 from qc_tool.findings import Finding, FindingClass, Severity
 from qc_tool.findings_store import finding_by_id
+from qc_tool.review import population_summary_text
 from qc_tool.review_stream import (
     GroupSummary,
     counts_from_summaries,
@@ -58,6 +59,7 @@ class _HtmlMember(TypedDict):
     waiver: str
     formula_diff: list[dict]
     artifact_member: str
+    population: str
 
 
 @dataclass(slots=True)
@@ -159,6 +161,7 @@ def _html_member(finding: Finding) -> _HtmlMember:
             if finding.finding_class.value == "formula_logic_changed"
             else []
         ),
+        "population": population_summary_text(finding),
     }
 
 

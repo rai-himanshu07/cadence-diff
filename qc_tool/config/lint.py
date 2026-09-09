@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from openpyxl.utils import column_index_from_string
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 from qc_tool.config.profile import (
@@ -292,6 +293,36 @@ def lint_profile(
     # --- excel section -----------------------------------------------------
     for name in profile.excel.ignore_sheets:
         check_sheet_exists("excel.ignore_sheets", name)
+    for index, prerequisite in enumerate(profile.excel.comparison_prerequisites):
+        where = f"excel.comparison_prerequisites[{prerequisite.name or index}]"
+        check_sheet_exists(where, prerequisite.sheet)
+        try:
+            coordinate_to_tuple(prerequisite.cell)
+        except ValueError:
+            issues.append(
+                LintIssue(
+                    "error", where, f"{prerequisite.cell!r} is not a valid cell"
+                )
+            )
+        else:
+            if (
+                workbook is not None
+                and sheet_names is not None
+                and prerequisite.sheet in sheet_names
+            ):
+                cell = workbook.sheet(prerequisite.sheet).cell(prerequisite.cell)
+                if (
+                    cell is None
+                    or cell.value is None
+                    or (isinstance(cell.value, str) and not cell.value.strip())
+                ):
+                    issues.append(
+                        LintIssue(
+                            "warning",
+                            where,
+                            "prerequisite cell is blank in the selected workbook",
+                        )
+                    )
     for sheet_name, sheet_profile in profile.excel.sheets.items():
         where = f"excel.sheets[{sheet_name}]"
         check_sheet_exists(where, sheet_name)
@@ -416,7 +447,36 @@ def lint_profile(
                                 ),
                             )
                         )
-
+        for index, rule in enumerate(sheet_profile.row_identity_rules):
+            rule_where = f"{where}.row_identity_rules[{index}]"
+            try:
+                coordinate_to_tuple(rule.anchor_cell)
+            except ValueError:
+                issues.append(
+                    LintIssue(
+                        "error", rule_where, f"{rule.anchor_cell!r} is not a valid cell"
+                    )
+                )
+            for column in (*rule.identity_columns, *rule.ordinal_columns):
+                try:
+                    column_index_from_string(column)
+                except ValueError:
+                    issues.append(
+                        LintIssue(
+                            "error",
+                            rule_where,
+                            f"{column!r} is not a valid column letter",
+                        )
+                    )
+            overlap = set(rule.identity_columns) & set(rule.ordinal_columns)
+            if overlap:
+                issues.append(
+                    LintIssue(
+                        "error",
+                        rule_where,
+                        f"columns {sorted(overlap)} cannot be both identity and ordinal",
+                    )
+                )
     controls = profile.excel.controls
     for group_name, group in (
         ("required_ranges", controls.required_ranges),

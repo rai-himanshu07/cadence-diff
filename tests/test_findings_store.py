@@ -260,7 +260,7 @@ def test_trusted_constructor_equals_validation_on_every_field(
         "message", "impacts", "baseline_excerpt", "current_excerpt",
         "analyst_comment", "severity_overridden", "root_cause_key",
         "waiver_reason", "waiver_expires", "counterfactual_basis",
-        "series_anchor",
+        "series_anchor", "population",
     }
     assert set(Finding.model_fields) == known
 

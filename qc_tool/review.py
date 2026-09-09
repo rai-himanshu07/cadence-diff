@@ -6,12 +6,12 @@ import hashlib
 import json
 import re
 from collections import defaultdict, deque
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import TypeAlias
 
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.cell import coordinate_to_tuple
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 from qc_tool.excel.formula_tokens import tokenize_formula
 from qc_tool.findings import (
@@ -118,6 +118,116 @@ def finding_identity_key(finding: Finding) -> FindingIdentity:
     if finding.artifact_member != "primary":
         return (*base, finding.artifact_member)
     return base
+
+
+def requeue_identity_key(finding: Finding) -> FindingIdentity:
+    """Cross-run pairing identity for Re-QC delta and carry-forward only.
+
+    Populations use `population_identity_digest`, which excludes geometry
+    so member-set churn (a row inserted/deleted/permuted between runs) does
+    not break identity across runs (Criterion 5: identity stability).
+    Atomic findings keep the existing location-based `finding_identity_key`
+    unchanged. Do not use this for within-run grouping -- `review_stream.py`
+    and `build_review_groups` need the location-based key even for
+    populations, since a run only ever contains one instance of each.
+    """
+    if finding.population is not None:
+        return ("population", population_identity_digest(finding))
+    return finding_identity_key(finding)
+
+
+def _population_pairs(finding: Finding) -> Iterator[tuple[str, str]]:
+    """Shared core: yields every (current, baseline) pair one at a time.
+
+    Pairs mode already stores the explicit list. Shift mode enumerates every
+    cell in every current-side rectangle and applies the constant offset --
+    the same reconstruction the plan's membership codec guarantees exactly.
+    Iteration order is fixed (rectangle order, then row-major within each
+    rectangle) so a bounded page always names the same members regardless
+    of population size.
+    """
+    population = finding.population
+    if population is None:
+        return
+    membership = population.membership
+    if membership.baseline_mode == "pairs":
+        yield from membership.pairs or ()
+        return
+    dr, dc = membership.shift or (0, 0)
+    for rectangle in membership.current_rectangles:
+        min_col, min_row, max_col, max_row = range_boundaries(rectangle)
+        if min_col is None or min_row is None or max_col is None or max_row is None:
+            continue
+        for row in range(min_row, max_row + 1):
+            for col in range(min_col, max_col + 1):
+                current = f"{get_column_letter(col)}{row}"
+                baseline = f"{get_column_letter(col + dc)}{row + dr}"
+                yield (current, baseline)
+
+
+def population_members(finding: Finding) -> tuple[tuple[str, str], ...]:
+    """Decode a population's ENTIRE membership codec into (current, baseline)
+    pairs.
+
+    Materializes every member -- safe only when the caller already knows the
+    population is small (e.g. tests, or after checking `member_count`).
+    Prefer `population_members_iter` (streaming) or `population_members_page`
+    (bounded random access) for a population whose size is not already known
+    to be small; see Criterion 9.
+    """
+    return tuple(_population_pairs(finding))
+
+
+def population_members_iter(finding: Finding) -> Iterator[tuple[str, str]]:
+    """Streaming decode: O(1) extra memory regardless of population size.
+
+    For callers (e.g. carry-forward matching) that must visit every member
+    exactly once but never need more than the current member resident.
+    """
+    return _population_pairs(finding)
+
+
+def population_members_page(
+    finding: Finding, start: int, count: int
+) -> tuple[tuple[str, str], ...]:
+    """Decode only ``[start, start + count)`` members without ever
+    materializing the rest -- a UI pager stays bounded regardless of how
+    large the population is (Criterion 9).
+    """
+    if count <= 0 or start < 0:
+        return ()
+    population = finding.population
+    if population is None:
+        return ()
+    membership = population.membership
+    if membership.baseline_mode == "pairs":
+        return tuple((membership.pairs or ())[start : start + count])
+    dr, dc = membership.shift or (0, 0)
+    end = start + count
+    pairs: list[tuple[str, str]] = []
+    seen = 0
+    for rectangle in membership.current_rectangles:
+        min_col, min_row, max_col, max_row = range_boundaries(rectangle)
+        if min_col is None or min_row is None or max_col is None or max_row is None:
+            continue
+        width = max_col - min_col + 1
+        height = max_row - min_row + 1
+        rect_size = width * height
+        if seen + rect_size <= start:
+            seen += rect_size
+            continue
+        if seen >= end:
+            break
+        for offset in range(max(0, start - seen), min(rect_size, end - seen)):
+            row = min_row + offset // width
+            col = min_col + offset % width
+            current = f"{get_column_letter(col)}{row}"
+            baseline = f"{get_column_letter(col + dc)}{row + dr}"
+            pairs.append((current, baseline))
+        seen += rect_size
+        if seen >= end:
+            break
+    return tuple(pairs)
 
 
 def _coordinate(location: str | None) -> Coordinate | None:
@@ -537,6 +647,73 @@ def _pattern_key(finding: Finding) -> tuple[object, ...]:
     return (*base, finding.artifact_member) if finding.artifact_member != "primary" else base
 
 
+def population_key(finding: Finding, shape_pair: tuple[str, str]) -> tuple[object, ...]:
+    """Pre-story population identity/grouping key (group-first plan, A2).
+
+    ``_pattern_key`` minus ``evidence_tags`` -- story tagging sets additional
+    tags at finalize, so a value that changes afterward cannot be part of a
+    key decided beforehand -- with the transformation shape replaced by the
+    caller's exact digest pair (``shape_pair``). This is stricter than
+    ``_transformation_shape``'s token abstraction: two members are grouped
+    together only when their exact R1C1/format text is identical, per the
+    plan's Criterion 4.
+    """
+    severity = finding.severity or Severity.WARNING
+    population_event = (
+        finding.event_key
+        if finding.subtype is FindingSubtype.COLUMNAR_ERROR_POPULATION
+        else ""
+    )
+    base = (
+        finding.artifact,
+        finding.sheet or "",
+        finding.slide or "",
+        finding.slide_index or 0,
+        finding.baseline_slide_index or 0,
+        finding.finding_class.value,
+        severity.value,
+        finding.expected_growth,
+        finding.expected_reason.value if finding.expected_reason is not None else "",
+        finding.provenance.value if finding.provenance is not None else "",
+        finding.subtype.value if finding.subtype is not None else "",
+        finding.materiality.value if finding.materiality is not None else "",
+        (
+            finding.temporal_context.value
+            if finding.temporal_context is not None
+            else ""
+        ),
+        population_event,
+        shape_pair,
+        _baseline_translation_mode(finding),
+        finding.waiver_reason,
+        finding.waiver_expires,
+    )
+    return (*base, finding.artifact_member) if finding.artifact_member != "primary" else base
+
+
+def population_identity_digest(finding: Finding) -> str:
+    """Stable digest of a population finding's identity (group-first plan).
+
+    Identity = ``(artifact, finding_class, sheet, shape_before_digest,
+    shape_after_digest, artifact_member)`` -- narrower than
+    ``population_key`` (no severity/expected/provenance/subtype/materiality/
+    temporal/waiver state). Shared by ``Finding.root_cause_key`` and the
+    attestation v4 population manifest so both name the same population with
+    the same value.
+    """
+    assert finding.population is not None
+    payload = {
+        "artifact": finding.artifact,
+        "finding_class": finding.finding_class.value,
+        "sheet": finding.sheet,
+        "shape_before_digest": finding.population.shape_before_digest,
+        "shape_after_digest": finding.population.shape_after_digest,
+        "artifact_member": finding.artifact_member,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _pattern_group(key: tuple[object, ...], members: tuple[Finding, ...]) -> ReviewGroup:
     representative = members[0]
     coordinates = {
@@ -628,6 +805,23 @@ def format_ranges(
 def format_group_ranges(group: ReviewGroup, *, max_spans: int = 3) -> str:
     """Compact exact group geometry for human-facing tables."""
     return format_ranges(group.ranges, group.bounding_range, max_spans=max_spans)
+
+
+def population_summary_text(finding: Finding, *, max_spans: int = 3) -> str:
+    """One-line population summary shared by the UI panel and both reports."""
+    population = finding.population
+    if population is None:
+        return ""
+    membership = population.membership
+    mapping = (
+        f"shift {membership.shift}"
+        if membership.baseline_mode == "shift"
+        else f"{len(membership.pairs or ())} explicit baseline pairs"
+    )
+    ranges = format_ranges(
+        membership.current_rectangles, finding.location or "", max_spans=max_spans
+    )
+    return f"{population.member_count:,} cells; {ranges}; {mapping}"
 
 
 def apply_group_review(

@@ -211,7 +211,7 @@ unchanged — stories are a lens over the same findings.</div>
             <th>Baseline</th><th>Current</th><th>Message</th><th>Analyst comment</th>
             <th>Root cause</th><th>Waiver</th><th>Provenance</th><th>Subtype</th>
             <th>Materiality</th><th>Temporal context</th><th>Expected reason</th>
-            <th>Evidence tags</th></tr></thead>
+            <th>Evidence tags</th><th>Population</th></tr></thead>
           <tbody data-member-body="{{ group.group_id }}"></tbody>
         </table>
         <div class="member-pages" data-member-controls="{{ group.group_id }}">
@@ -309,6 +309,7 @@ unchanged — stories are a lens over the same findings.</div>
         textCell(row, member.temporal_context, 'mono');
         textCell(row, member.expected_reason, 'mono');
         textCell(row, member.evidence_tags, 'mono');
+        textCell(row, member.population, 'mono');
         body.appendChild(row);
       });
       label.textContent = `${start + 1}-${end} of ${members.length}`;

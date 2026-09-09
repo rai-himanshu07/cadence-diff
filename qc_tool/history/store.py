@@ -10,8 +10,10 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 import zipfile
 import zlib
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +28,7 @@ from qc_tool.config.profile import (
 from qc_tool.coverage import CoverageItem, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion
 from qc_tool.engine import QCRunResult
-from qc_tool.excel.align import AlignmentTrustManifest
+from qc_tool.excel.align import AlignmentTrustPayload, decode_alignment_trust_payload
 from qc_tool.findings import (
     Finding,
     NumericCounterfactualBasis,
@@ -69,7 +71,10 @@ from qc_tool.history.longitudinal import (
 from qc_tool.history.review_state import (
     FINDING_EVIDENCE_VERSION,
     AnnotationLineage,
+    AnnotationLineageOutcome,
+    AnnotationLineageRelation,
     CarryForwardCandidate,
+    PopulationCarryForwardCandidate,
     RunFinalizedError,
     RunSignoff,
     finding_evidence_digest,
@@ -133,6 +138,7 @@ CREATE TABLE IF NOT EXISTS runs (
     focus_targets TEXT NOT NULL DEFAULT '{}'
     ,profile_snapshot TEXT NOT NULL DEFAULT 'null'
     ,profile_sha256 TEXT NOT NULL DEFAULT ''
+    ,formula_engines TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS annotations (
     run_id INTEGER NOT NULL,
@@ -193,10 +199,12 @@ CREATE TABLE IF NOT EXISTS annotation_lineage (
     finding_id TEXT NOT NULL,
     source_run_id INTEGER NOT NULL,
     source_finding_id TEXT NOT NULL,
+    relation TEXT NOT NULL,
+    outcome TEXT NOT NULL,
     evidence_version INTEGER NOT NULL,
-    evidence_digest TEXT NOT NULL,
+    source_digest TEXT NOT NULL,
     applied_at TEXT NOT NULL,
-    PRIMARY KEY (run_id, finding_id)
+    PRIMARY KEY (run_id, finding_id, source_run_id, source_finding_id)
 );
 CREATE TABLE IF NOT EXISTS review_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -284,7 +292,69 @@ _MIGRATIONS = {
     ),
     #: NULL means "not yet measured" (legacy row); backfilled lazily.
     "storage_bytes": "ALTER TABLE runs ADD COLUMN storage_bytes INTEGER",
+    #: Resolved formula-engine/adapter-fingerprint per excel role; "" for
+    #: legacy runs recorded before this disclosure existed.
+    "formula_engines": (
+        "ALTER TABLE runs ADD COLUMN formula_engines TEXT NOT NULL DEFAULT '{}'"
+    ),
 }
+
+
+def _migrate_annotation_lineage_v2(conn: sqlite3.Connection) -> None:
+    """Rebuild a legacy strictly-1:1 `annotation_lineage` into the versioned
+    many-to-one shape (A4). SQLite cannot alter a table's primary key in
+    place, so this copies every legacy row forward, then replaces the table.
+
+    Every legacy row represents a clean, already-applied 1:1 carry, so each
+    becomes one `relation="identity"`, `outcome="inherited"` row under the
+    new shape -- a faithful, lossless reinterpretation, not a guess.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(annotation_lineage)")}
+    if "relation" in columns:
+        return  # already the new shape (new database, or already migrated)
+    legacy_rows = conn.execute(
+        "SELECT run_id, finding_id, source_run_id, source_finding_id,"
+        " evidence_version, evidence_digest, applied_at FROM annotation_lineage"
+    ).fetchall()
+    conn.execute("DROP TABLE annotation_lineage")
+    conn.execute(
+        """
+        CREATE TABLE annotation_lineage (
+            run_id INTEGER NOT NULL,
+            finding_id TEXT NOT NULL,
+            source_run_id INTEGER NOT NULL,
+            source_finding_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            evidence_version INTEGER NOT NULL,
+            source_digest TEXT NOT NULL,
+            applied_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, finding_id, source_run_id, source_finding_id)
+        )
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO annotation_lineage (
+            run_id, finding_id, source_run_id, source_finding_id,
+            relation, outcome, evidence_version, source_digest, applied_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                row["run_id"],
+                row["finding_id"],
+                row["source_run_id"],
+                row["source_finding_id"],
+                AnnotationLineageRelation.IDENTITY.value,
+                AnnotationLineageOutcome.INHERITED.value,
+                row["evidence_version"],
+                row["evidence_digest"],
+                row["applied_at"],
+            )
+            for row in legacy_rows
+        ],
+    )
 
 @dataclass(slots=True)
 class RunRecord:
@@ -328,9 +398,13 @@ class RunRecord:
     #: Aggregate digest of the private logical-series anchor sidecar; "" is a
     #: legacy run recorded before the sidecar existed.
     series_anchor_digest: str = ""
-    alignment_trust: AlignmentTrustManifest | None = None
+    alignment_trust: AlignmentTrustPayload | None = None
     #: Bytes this run occupies (database row + report files); None until measured.
     storage_bytes: int | None = None
+    #: Resolved formula-engine/adapter-fingerprint string per excel role
+    #: (e.g. "native-biff12:1.2.3"); "{}" for legacy runs or roles where
+    #: formula enrichment never ran.
+    formula_engines: dict[str, str] = field(default_factory=dict)
 
     def focus_sidecar(self) -> FocusTargetSidecar:
         """Decode the private sidecar on first focus use, never at row read.
@@ -527,6 +601,7 @@ class RunHistory:
             for column, statement in _MIGRATIONS.items():
                 if column not in existing:
                     conn.execute(statement)
+            _migrate_annotation_lineage_v2(conn)
             private_file(db_path)
 
     def _connect(self) -> sqlite3.Connection:
@@ -546,7 +621,20 @@ class RunHistory:
         rerun_of: int | None = None,
         focus_targets: dict[str, tuple[FocusTargetSeed, ...]] | str | None = None,
         profile_snapshot: DeliverableProfile | None = None,
+        on_subphase: Callable[[str, float], None] | None = None,
     ) -> int:
+        """Record one run. ``on_subphase(name, elapsed_seconds)`` -- when
+        given -- fires once per fixed-code subphase (``main_pass``,
+        ``story_classify_and_replay``, ``sqlite_write``,
+        ``storage_measurement``, ``total``); a diagnostic hook only, never
+        persisted and never required for correctness. Aggregate timings
+        only -- no path, cell value, or formula text ever reaches it.
+        """
+        def mark(name: str, start: float) -> None:
+            if on_subphase is not None:
+                on_subphase(name, time.perf_counter() - start)
+
+        total_start = time.perf_counter()
         started_at = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         counts = {sev.value: count for sev, count in result.counts.items()}
 
@@ -606,6 +694,7 @@ class RunHistory:
             first_ordinal += len(batch)
             batch.clear()
 
+        main_pass_start = time.perf_counter()
         for finding in record_pass():
             summary_accumulators.observe(finding)
             basis = finding.counterfactual_basis
@@ -649,6 +738,7 @@ class RunHistory:
             if len(batch) >= BLOCK_FINDINGS:
                 flush_block()
         flush_block()
+        mark("main_pass", main_pass_start)
 
         grouped = counts_from_summaries(summary_accumulators.review.finish())
         grouped_counts = {
@@ -664,9 +754,11 @@ class RunHistory:
             for severity, count in patterned.review_items.items()
         }
         story_counts: dict[str, dict[str, int]] = {}
+        story_start = time.perf_counter()
         stories = summary_accumulators.stories.finish(
             record_pass(), record_pass()
         )
+        mark("story_classify_and_replay", story_start)
         for story in stories:
             bucket = story_counts.setdefault(
                 story.kind.value, {"stories": 0, "members": 0}
@@ -692,6 +784,7 @@ class RunHistory:
         aggregate_digest = canonical_aggregate_digest(bases)
         series_digest = canonical_series_aggregate_digest(anchor_bindings)
 
+        sqlite_start = time.perf_counter()
         with self._connect() as conn:
             cursor = conn.execute(
                 """
@@ -702,10 +795,10 @@ class RunHistory:
                     mapping_suggestions, review_counts, pattern_review_counts,
                     story_counts, comparison_scope, package_manifest, focus_targets,
                     profile_snapshot, profile_sha256, counterfactual_digest,
-                    series_anchor_digest
+                    series_anchor_digest, formula_engines
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -755,6 +848,7 @@ class RunHistory:
                     profile_digest,
                     aggregate_digest,
                     series_digest,
+                    json.dumps(result.formula_engines),
                 ),
             )
             run_id = cursor.lastrowid
@@ -869,13 +963,17 @@ class RunHistory:
                     """,
                     anchor_rows,
                 )
+        mark("sqlite_write", sqlite_start)
         if run_id is None:  # pragma: no cover - sqlite always returns a rowid
             raise RuntimeError("sqlite did not return a run id")
+        storage_start = time.perf_counter()
         with self._connect() as conn:
             conn.execute(
                 "UPDATE runs SET storage_bytes = ? WHERE id = ?",
                 (self._measure_run_storage(conn, run_id), run_id),
             )
+        mark("storage_measurement", storage_start)
+        mark("total", total_start)
         logger.info("recorded QC run %d (%s)", run_id, result.profile_name)
         return run_id
 
@@ -1039,11 +1137,8 @@ class RunHistory:
             counterfactual_digest=row["counterfactual_digest"],
             series_anchor_digest=row["series_anchor_digest"],
             storage_bytes=row["storage_bytes"],
-            alignment_trust=(
-                AlignmentTrustManifest.model_validate(alignment_trust_payload)
-                if alignment_trust_payload is not None
-                else None
-            ),
+            alignment_trust=decode_alignment_trust_payload(alignment_trust_payload),
+            formula_engines=json.loads(row["formula_engines"]),
         )
 
     def list_runs(self, limit: int = 50, *, include_archived: bool = True) -> list[RunRecord]:
@@ -1404,22 +1499,34 @@ class RunHistory:
                 (run_id, finding_id, kind, profile_sha256, promoted_at),
             )
 
-    def get_annotation_lineage(self, run_id: int) -> dict[str, AnnotationLineage]:
+    def get_annotation_lineage(self, run_id: int) -> dict[str, tuple[AnnotationLineage, ...]]:
+        """Every lineage row for this run, grouped by current `finding_id`.
+
+        A finding may have many rows (a population absorbing many prior
+        atomic sources); each value is a tuple, never a single row, so
+        callers cannot silently drop sources by iterating `.values()`.
+        """
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM annotation_lineage WHERE run_id = ?", (run_id,)
+                "SELECT * FROM annotation_lineage WHERE run_id = ?"
+                " ORDER BY finding_id, source_finding_id",
+                (run_id,),
             ).fetchall()
-        return {
-            row["finding_id"]: AnnotationLineage(
-                finding_id=row["finding_id"],
-                source_run_id=row["source_run_id"],
-                source_finding_id=row["source_finding_id"],
-                evidence_version=row["evidence_version"],
-                evidence_digest=row["evidence_digest"],
-                applied_at=row["applied_at"],
+        grouped: dict[str, list[AnnotationLineage]] = defaultdict(list)
+        for row in rows:
+            grouped[row["finding_id"]].append(
+                AnnotationLineage(
+                    finding_id=row["finding_id"],
+                    source_run_id=row["source_run_id"],
+                    source_finding_id=row["source_finding_id"],
+                    relation=row["relation"],
+                    outcome=row["outcome"],
+                    evidence_version=row["evidence_version"],
+                    source_digest=row["source_digest"],
+                    applied_at=row["applied_at"],
+                )
             )
-            for row in rows
-        }
+        return {finding_id: tuple(lineages) for finding_id, lineages in grouped.items()}
 
     def get_counterfactual_bases(self, run_id: int) -> dict[str, NumericCounterfactualBasis]:
         with self._connect() as conn:
@@ -1582,13 +1689,14 @@ class RunHistory:
                 """
                 INSERT INTO annotation_lineage (
                     run_id, finding_id, source_run_id, source_finding_id,
-                    evidence_version, evidence_digest, applied_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id, finding_id) DO UPDATE SET
-                    source_run_id = excluded.source_run_id,
-                    source_finding_id = excluded.source_finding_id,
+                    relation, outcome, evidence_version, source_digest, applied_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, finding_id, source_run_id, source_finding_id)
+                DO UPDATE SET
+                    relation = excluded.relation,
+                    outcome = excluded.outcome,
                     evidence_version = excluded.evidence_version,
-                    evidence_digest = excluded.evidence_digest,
+                    source_digest = excluded.source_digest,
                     applied_at = excluded.applied_at
                 """,
                 [
@@ -1597,6 +1705,8 @@ class RunHistory:
                         candidate.finding_id,
                         source_run_id,
                         candidate.source_finding_id,
+                        AnnotationLineageRelation.IDENTITY.value,
+                        AnnotationLineageOutcome.INHERITED.value,
                         candidate.evidence_version,
                         candidate.evidence_digest,
                         applied_at,
@@ -1624,6 +1734,92 @@ class RunHistory:
                 ],
             )
         return len(candidates)
+
+    def apply_population_carry_forward(
+        self,
+        run_id: int,
+        source_run_id: int,
+        candidate: PopulationCarryForwardCandidate,
+    ) -> int:
+        """Apply one population's carried decision plus its full member
+        lineage. Only `outcome == inherited` is accepted -- every other
+        outcome means the sources disagreed, were incomplete, or were
+        unfinalized, so the analyst must decide fresh (Criterion 8: a
+        population accepts exactly one decision, never a silent merge).
+        """
+        if candidate.outcome is not AnnotationLineageOutcome.INHERITED:
+            raise ValueError(
+                f"population {candidate.finding_id!r} outcome "
+                f"{candidate.outcome.value!r} is not auto-appliable"
+            )
+        if not candidate.sources:
+            return 0
+        applied_at = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM run_signoffs WHERE run_id = ?", (run_id,)
+            ).fetchone():
+                raise RunFinalizedError(
+                    f"run #{run_id} is finalized; submit a Re-QC run to make corrections"
+                )
+            rerun = conn.execute(
+                "SELECT rerun_of FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if rerun is None:
+                raise KeyError(f"no QC run with id {run_id}")
+            if rerun["rerun_of"] != source_run_id:
+                raise ValueError("carry-forward source is not this run's direct predecessor")
+            conn.execute(
+                """
+                INSERT INTO annotations (run_id, finding_id, severity, comment, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, finding_id) DO UPDATE SET
+                    severity = excluded.severity,
+                    comment = excluded.comment,
+                    updated_at = excluded.updated_at
+                """,
+                (run_id, candidate.finding_id, candidate.severity, candidate.comment, applied_at),
+            )
+            conn.executemany(
+                """
+                INSERT INTO annotation_lineage (
+                    run_id, finding_id, source_run_id, source_finding_id,
+                    relation, outcome, evidence_version, source_digest, applied_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, finding_id, source_run_id, source_finding_id)
+                DO UPDATE SET
+                    relation = excluded.relation,
+                    outcome = excluded.outcome,
+                    evidence_version = excluded.evidence_version,
+                    source_digest = excluded.source_digest,
+                    applied_at = excluded.applied_at
+                """,
+                [
+                    (
+                        run_id,
+                        candidate.finding_id,
+                        source_run_id,
+                        source.source_finding_id,
+                        AnnotationLineageRelation.MEMBER.value,
+                        AnnotationLineageOutcome.INHERITED.value,
+                        FINDING_EVIDENCE_VERSION,
+                        source.source_digest,
+                        applied_at,
+                    )
+                    for source in candidate.sources
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO decision_origins (run_id, finding_id, origin, decided_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(run_id, finding_id) DO UPDATE SET
+                    origin = excluded.origin,
+                    decided_at = excluded.decided_at
+                """,
+                (run_id, candidate.finding_id, DecisionOrigin.CARRIED.value, applied_at),
+            )
+        return len(candidate.sources)
 
     @staticmethod
     def _bounded_session_end(started_at: dt.datetime, observed: dt.datetime) -> dt.datetime:
@@ -1719,9 +1915,14 @@ class RunHistory:
         return total
 
     def carried_annotation_count(self, run_id: int) -> int:
+        """Distinct findings carrying a decision -- not lineage row count,
+        since one population finding can have many member lineage rows.
+        """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) FROM annotation_lineage WHERE run_id = ?", (run_id,)
+                "SELECT COUNT(DISTINCT finding_id) FROM annotation_lineage"
+                " WHERE run_id = ?",
+                (run_id,),
             ).fetchone()
         return int(row[0]) if row is not None else 0
 

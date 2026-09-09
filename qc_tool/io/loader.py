@@ -12,6 +12,7 @@ scan. Platform adapters may enrich formula text later; cached values always
 remain those read from the original xlsb.
 """
 
+import functools
 import io
 import logging
 import posixpath
@@ -28,10 +29,11 @@ from openpyxl import load_workbook
 from openpyxl.cell.read_only import ReadOnlyCell
 from openpyxl.styles.numbers import is_date_format, is_timedelta_format
 from openpyxl.utils.cell import column_index_from_string, coordinate_to_tuple
-from openpyxl.utils.datetime import from_excel, from_ISO8601
+from openpyxl.utils.datetime import MAC_EPOCH, WINDOWS_EPOCH, from_excel, from_ISO8601
 from pyxlsb import open_workbook as open_xlsb
 
 from qc_tool.io.decrypt import open_decrypted
+from qc_tool.io.formula_cache import FormulaExtractionCache, extract_with_cache
 from qc_tool.io.formula_enrichment import (
     FormulaEnrichmentError,
     FormulaExtraction,
@@ -69,6 +71,11 @@ from qc_tool.io.vba import VbaProjectScan, VbaReadError, scan_vba_project
 from qc_tool.io.xlsb_formula import (
     XlsbFormulaScan,
     XlsbFormulaScanError,
+    XlsbStyleTable,
+    parse_worksheet_cell_styles,
+    parse_xlsb_date_system,
+    parse_xlsb_styles,
+    resolve_worksheet_targets,
     scan_xlsb_formulas,
 )
 from qc_tool.progress import CancellationToken, check_cancelled
@@ -206,9 +213,23 @@ def load_workbook_snapshot(
     password: str | None = None,
     allow_large_workbook: bool = False,
     _ooxml_loader: Literal["streaming", "oracle"] = "streaming",
+    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "pyxlsb",
+    formula_engine: Literal["native", "excel", "libreoffice", "auto"] = "auto",
+    _native_formula_compat_mode: bool = False,
     cancellation_token: CancellationToken | None = None,
+    formula_cache: FormulaExtractionCache | None = None,
 ) -> WorkbookSnapshot:
-    """Load any supported workbook into a snapshot without touching the source."""
+    """Load any supported workbook into a snapshot without touching the source.
+
+    ``formula_engine`` selects the XLSB formula-text adapter: ``native`` (the
+    compiled BIFF12 kernel), ``excel``/``libreoffice`` (the existing desktop
+    adapters), or ``auto`` (native when the kernel extension is importable,
+    else the existing platform default). Ignored for xlsx/xlsm, which never
+    need external formula-text enrichment. ``_native_formula_compat_mode`` is
+    a private, oracle-verification-only switch (plan Criterion 13(a)):
+    restricts the native engine's returned text to exactly the coordinates a
+    legacy engine also covers, for comparing against a legacy-engine oracle.
+    """
     check_cancelled(cancellation_token)
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES:
@@ -225,6 +246,10 @@ def load_workbook_snapshot(
             source_name=path.name,
             allow_large_workbook=allow_large_workbook,
             cancellation_token=cancellation_token,
+            formula_cache=formula_cache,
+            _xlsb_values_engine=_xlsb_values_engine,
+            formula_engine=formula_engine,
+            _native_formula_compat_mode=_native_formula_compat_mode,
         )
     loader = (
         _load_ooxml_streaming
@@ -1022,6 +1047,31 @@ def _xlsb_value(raw: object) -> CellValue:
     return str(raw)
 
 
+def _kernel_cell_value(num: float | None, boolean: bool | None, text: str | None) -> CellValue:
+    """Mirrors `_xlsb_value` for the native kernel's raw shape (exactly one of
+    `num`/`boolean`/`text` populated, matching pyxlsb's own `.v` convention --
+    see `qc_tool/io/native_kernel.py` and the B1 Execution Log entry).
+    """
+    if boolean is not None:
+        return boolean
+    if num is not None:
+        return num
+    if text is not None:
+        return _XLSB_ERRORS.get(text.lower(), text)
+    return None
+
+
+def _pyxlsb_sheet_cells(wb: Any, sheet_name: str) -> Iterator[tuple[int, int, CellValue]]:
+    """Yields `(row, column, value)` 0-based, skipping blanks -- the default
+    values engine, unchanged from before the native kernel existed.
+    """
+    with wb.get_sheet(sheet_name) as sheet:
+        for row in sheet.rows(sparse=True):
+            for cell in row:
+                if cell.v is not None:
+                    yield cell.r, cell.c, _xlsb_value(cell.v)
+
+
 def _scan_xlsb(data: bytes, source_name: str) -> tuple[XlsbFormulaScan | None, str]:
     try:
         return scan_xlsb_formulas(data), ""
@@ -1074,7 +1124,48 @@ def _assess_xlsb_workload(
     return workload
 
 
-def _extract_xlsb_formulas(data: bytes, formula_scan: XlsbFormulaScan) -> FormulaExtraction:
+def _resolve_formula_engine(
+    engine: Literal["native", "excel", "libreoffice", "auto"],
+) -> Literal["native", "excel", "libreoffice"]:
+    """``auto`` -> native when the kernel extension is importable, else the
+    existing platform default; any other value passes through unchanged.
+    """
+    if engine != "auto":
+        return engine
+    from qc_tool.io.native_formula import native_formula_available
+
+    if native_formula_available():
+        return "native"
+    if sys.platform == "win32":
+        return "excel"
+    if sys.platform.startswith("linux"):
+        return "libreoffice"
+    raise FormulaEnrichmentError(f"no XLSB formula adapter is configured for {sys.platform}")
+
+
+def _resolve_xlsb_values_engine(
+    engine: Literal["pyxlsb", "native", "auto"],
+) -> Literal["pyxlsb", "native"]:
+    """``auto`` -> native when the kernel extension is importable, else
+    ``pyxlsb``; any other value passes through unchanged. Mirrors
+    ``_resolve_formula_engine`` for the separate values-decoding axis; the
+    shipped default stays ``pyxlsb`` until guest evidence justifies changing
+    it (plan-20260908-phase-b-guest-performance-followup.md).
+    """
+    if engine != "auto":
+        return engine
+    from qc_tool.io.native_kernel import native_kernel_available
+
+    return "native" if native_kernel_available() else "pyxlsb"
+
+
+def _extract_with_legacy_platform_engine(
+    data: bytes, formula_scan: XlsbFormulaScan
+) -> FormulaExtraction:
+    """The pre-native platform default, called only to build the native
+    engine's compatibility-mode coordinate mask -- its own text is discarded,
+    never merged into a snapshot.
+    """
     if sys.platform == "win32":
         from qc_tool.io.excel_formula import extract_formulas_with_excel
 
@@ -1084,6 +1175,39 @@ def _extract_xlsb_formulas(data: bytes, formula_scan: XlsbFormulaScan) -> Formul
 
         return extract_formulas_with_libreoffice(data, formula_scan)
     raise FormulaEnrichmentError(f"no XLSB formula adapter is configured for {sys.platform}")
+
+
+def _extract_xlsb_formulas(
+    data: bytes,
+    formula_scan: XlsbFormulaScan,
+    *,
+    engine: Literal["native", "excel", "libreoffice"],
+    _native_compat_mode: bool = False,
+) -> FormulaExtraction:
+    if engine == "native":
+        from qc_tool.io.native_formula import (
+            extract_formulas_with_native_kernel,
+            restrict_formula_extraction,
+        )
+
+        extraction = extract_formulas_with_native_kernel(data, formula_scan)
+        if _native_compat_mode:
+            legacy = _extract_with_legacy_platform_engine(data, formula_scan)
+            extraction = restrict_formula_extraction(extraction, legacy.coordinates)
+        return extraction
+    if engine == "excel":
+        if sys.platform != "win32":
+            raise FormulaEnrichmentError("the 'excel' formula engine requires Windows")
+        from qc_tool.io.excel_formula import extract_formulas_with_excel
+
+        return extract_formulas_with_excel(data, formula_scan)
+    if engine == "libreoffice":
+        if not sys.platform.startswith("linux"):
+            raise FormulaEnrichmentError("the 'libreoffice' formula engine requires Linux")
+        from qc_tool.io.libreoffice_formula import extract_formulas_with_libreoffice
+
+        return extract_formulas_with_libreoffice(data, formula_scan)
+    raise FormulaEnrichmentError(f"unknown XLSB formula engine {engine!r}")
 
 
 def _xlsb_risks(formula_scan: XlsbFormulaScan | None) -> list[WorkbookRisk]:
@@ -1097,14 +1221,53 @@ def _xlsb_risks(formula_scan: XlsbFormulaScan | None) -> list[WorkbookRisk]:
     ]
 
 
+def _scan_xlsb_number_formats(
+    data: bytes, source_name: str
+) -> tuple[XlsbStyleTable, bool, bool, str]:
+    """Best-effort ``xl/styles.bin`` + date-system scan; never raises.
+
+    Returns ``(style_table, date1904, available, detail)``. Failure degrades
+    number-format coverage without ever touching a cached value.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            date1904 = parse_xlsb_date_system(archive.read("xl/workbook.bin"))
+            try:
+                styles_data = archive.read("xl/styles.bin")
+            except KeyError:
+                return XlsbStyleTable(), date1904, True, ""
+            return parse_xlsb_styles(styles_data), date1904, True, ""
+    except (XlsbFormulaScanError, zipfile.BadZipFile, KeyError) as exc:
+        logger.warning("%s: XLSB number-format scan failed: %s", source_name, exc)
+        return XlsbStyleTable(), False, False, f"Number-format scan failed: {exc}"
+
+
+def _sheet_cell_styles(
+    archive: zipfile.ZipFile, target: str | None, sheet_name: str
+) -> dict[tuple[int, int], int]:
+    """One worksheet's ``(row, column) -> cell-XF index``; empty on any failure."""
+    if target is None:
+        return {}
+    try:
+        return parse_worksheet_cell_styles(archive.read(target), sheet_name)
+    except (XlsbFormulaScanError, KeyError) as exc:
+        logger.warning("%s: XLSB per-cell style scan failed: %s", sheet_name, exc)
+        return {}
+
+
 def _load_xlsb(
     data: bytes,
     *,
     source_name: str,
     allow_large_workbook: bool = False,
     cancellation_token: CancellationToken | None = None,
+    formula_cache: FormulaExtractionCache | None = None,
+    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "pyxlsb",
+    formula_engine: Literal["native", "excel", "libreoffice", "auto"] = "auto",
+    _native_formula_compat_mode: bool = False,
 ) -> WorkbookSnapshot:
     check_cancelled(cancellation_token)
+    resolved_values_engine = _resolve_xlsb_values_engine(_xlsb_values_engine)
     formula_scan, scan_detail = _scan_xlsb(data, source_name)
     workload = (
         _assess_xlsb_workload(
@@ -1114,6 +1277,13 @@ def _load_xlsb(
         )
         if formula_scan is not None
         else WorkbookWorkload(format="xlsb", metrics_available=False)
+    )
+    style_table, date1904, number_formats_available, number_format_detail = (
+        _scan_xlsb_number_formats(data, source_name)
+    )
+    epoch = MAC_EPOCH if date1904 else WINDOWS_EPOCH
+    worksheet_targets = (
+        resolve_worksheet_targets(data) if number_formats_available else {}
     )
     snapshot = WorkbookSnapshot(
         source_name=source_name,
@@ -1135,11 +1305,58 @@ def _load_xlsb(
             "XLSB stores the workbook part as binary, so defined names and their "
             "scope cannot be read"
         ),
+        number_formats_available=number_formats_available,
+        number_format_detail=(
+            number_format_detail
+            if not number_formats_available
+            else "XLSB number formats and date-formatted numeric caches are typed"
+        ),
         intrinsic_risks=_xlsb_risks(formula_scan),
         workload=workload,
     )
     _apply_vba(snapshot, data)
-    with open_xlsb(io.BytesIO(data)) as wb:
+    native_values_by_sheet: dict[str, list[tuple[int, int, CellValue]]] = {}
+    if resolved_values_engine == "native":
+        from qc_tool.io.native_kernel import native_kernel_available, raw_values_report
+
+        if not native_kernel_available():
+            raise RuntimeError(
+                "_xlsb_values_engine='native' was requested but the native "
+                "xlsbkernel extension is not installed"
+            )
+        try:
+            native_values_by_sheet = {
+                sheet_name: [
+                    (row, col, _kernel_cell_value(num, boolean, text))
+                    for row, col, num, boolean, text in raw_cells
+                ]
+                for sheet_name, raw_cells in raw_values_report(data)
+            }
+        except (SystemExit, KeyboardInterrupt, GeneratorExit):
+            raise
+        except BaseException as exc:
+            if _xlsb_values_engine != "auto":
+                # An explicit (non-auto) request means the caller wants this
+                # exact engine or nothing; degrade formula-style, never
+                # silently substitute a different values engine.
+                raise RuntimeError(
+                    "_xlsb_values_engine='native' failed to decode this "
+                    f"workbook's values ({type(exc).__name__})"
+                ) from exc
+            resolved_values_engine = "pyxlsb"
+            native_values_by_sheet = {}
+            # Never log/include `exc`'s own text; the class name is safe.
+            snapshot.values_engine_fallback_detail = (
+                "native XLSB values engine failed "
+                f"({type(exc).__name__}); fell back to pyxlsb"
+            )
+            logger.warning(
+                "%s: %s", source_name, snapshot.values_engine_fallback_detail
+            )
+    with (
+        open_xlsb(io.BytesIO(data)) as wb,
+        zipfile.ZipFile(io.BytesIO(data)) as style_archive,
+    ):
         for sheet_name in wb.sheets:
             check_cancelled(cancellation_token)
             cells: dict[tuple[int, int], CellRecord] = {}
@@ -1149,21 +1366,49 @@ def _load_xlsb(
                 if formula_scan is not None
                 else frozenset()
             )
-            with wb.get_sheet(sheet_name) as sheet:
-                for row in sheet.rows(sparse=True):
-                    for cell in row:
-                        if cell.v is None:
-                            continue
-                        row_1 = cell.r + 1
-                        col_1 = cell.c + 1
-                        max_row = max(max_row, row_1)
-                        max_column = max(max_column, col_1)
-                        cells[(row_1, col_1)] = CellRecord(
-                            row=row_1,
-                            column=col_1,
-                            value=_xlsb_value(cell.v),
-                            is_formula=(row_1, col_1) in formula_cells,
+            # One sheet's coordinate -> cell-XF index at a time; discarded before
+            # the next sheet, so no whole-workbook style dictionary is ever held.
+            cell_styles = (
+                _sheet_cell_styles(
+                    style_archive, worksheet_targets.get(sheet_name), sheet_name
+                )
+                if number_formats_available
+                else {}
+            )
+            sheet_cells = (
+                iter(native_values_by_sheet.pop(sheet_name, []))
+                if resolved_values_engine == "native"
+                else _pyxlsb_sheet_cells(wb, sheet_name)
+            )
+            for cell_r, cell_c, value in sheet_cells:
+                row_1 = cell_r + 1
+                col_1 = cell_c + 1
+                max_row = max(max_row, row_1)
+                max_column = max(max_column, col_1)
+                number_format = None
+                xf_index = cell_styles.get((row_1, col_1))
+                if xf_index is not None:
+                    number_format = style_table.number_format(xf_index)
+                    if (
+                        number_format
+                        and isinstance(value, int | float)
+                        and not isinstance(value, bool)
+                        and is_date_format(number_format)
+                    ):
+                        converted = from_excel(
+                            value,
+                            epoch,
+                            timedelta=is_timedelta_format(number_format),
                         )
+                        if is_cell_value(converted):
+                            value = converted
+                cells[(row_1, col_1)] = CellRecord(
+                    row=row_1,
+                    column=col_1,
+                    value=value,
+                    is_formula=(row_1, col_1) in formula_cells,
+                    number_format=number_format,
+                )
             for row_1, col_1 in formula_cells.difference(cells):
                 cells[(row_1, col_1)] = CellRecord(
                     row=row_1,
@@ -1185,7 +1430,18 @@ def _load_xlsb(
     if formula_scan is not None and formula_scan.formula_count:
         check_cancelled(cancellation_token)
         try:
-            extraction = _extract_xlsb_formulas(data, formula_scan)
+            resolved_engine = _resolve_formula_engine(formula_engine)
+            extraction = extract_with_cache(
+                data,
+                formula_scan,
+                cache=formula_cache,
+                engine=resolved_engine,
+                extractor=functools.partial(
+                    _extract_xlsb_formulas,
+                    engine=resolved_engine,
+                    _native_compat_mode=_native_formula_compat_mode,
+                ),
+            )
             merge_formula_extraction(snapshot, formula_scan, extraction)
         except FormulaEnrichmentError as exc:
             logger.warning("%s: XLSB formula enrichment unavailable: %s", source_name, exc)

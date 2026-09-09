@@ -15,16 +15,47 @@ from typing import TypeAlias
 from openpyxl import load_workbook
 
 from qc_tool.io.formula_enrichment import (
+    ExtractedDefinedName,
     FormulaEnrichmentError,
     FormulaExtraction,
     FormulaMap,
+    bounded_defined_names,
     validate_formula_extraction,
 )
+from qc_tool.io.ooxml_names import scan_defined_names
 from qc_tool.io.xlsb_formula import XlsbFormulaScan
 from qc_tool.security import private_directory, private_file
 
 DEFAULT_CONVERSION_TIMEOUT_SECONDS = 300.0
 _Converter: TypeAlias = Callable[[Path, float], tuple[str, str]]
+
+
+def libreoffice_adapter_fingerprint() -> str | None:
+    """A cheap LibreOffice version probe for formula-cache keys, or None.
+
+    Never opens any workbook -- a bare ``--version`` invocation outside the
+    conversion sandbox. Returns None (caching disabled for this adapter) on
+    any failure; the real conversion path independently re-resolves and
+    re-checks the executable regardless of this result.
+    """
+    executable = shutil.which("libreoffice")
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15.0,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    version = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    return f"libreoffice:{version}" if version else None
 
 
 def _required_executable(name: str) -> str:
@@ -180,6 +211,29 @@ def _read_ooxml_formulas(path: Path) -> FormulaMap:
     return formulas
 
 
+def _extracted_defined_names(
+    data: bytes,
+) -> tuple[tuple[ExtractedDefinedName, ...], bool]:
+    """Reuse the OOXML defined-name scan on LibreOffice's converted output.
+
+    Returns ``(names, complete)``. ``complete`` is False when the scan could
+    not read the converted package, could not resolve every declared scope,
+    or `bounded_defined_names` dropped an entry -- reachability proof then
+    stays unavailable even though any collected names remain valid data.
+    """
+    scan = scan_defined_names(data)
+    if not scan.available:
+        return (), False
+    raw = [
+        ExtractedDefinedName(
+            name=item.name, target=item.target, sheet=item.sheet, hidden=item.hidden
+        )
+        for item in (*scan.workbook_scoped, *scan.sheet_scoped)
+    ]
+    names, bounded_complete = bounded_defined_names(raw)
+    return names, bounded_complete and scan.unresolved_scopes == 0
+
+
 def _extract_formulas_with_converter(
     data: bytes,
     scan: XlsbFormulaScan,
@@ -205,10 +259,14 @@ def _extract_formulas_with_converter(
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise FormulaEnrichmentError("LibreOffice did not produce the expected XLSX output")
         private_file(output_path)
+        output_bytes = output_path.read_bytes()
+        defined_names, defined_names_complete = _extracted_defined_names(output_bytes)
         extraction = FormulaExtraction(
             formulas=_read_ooxml_formulas(output_path),
             engine=engine,
             detail=detail,
+            defined_names=defined_names,
+            defined_names_complete=defined_names_complete,
         )
         validate_formula_extraction(scan, extraction)
         return extraction

@@ -80,9 +80,14 @@ def _read_formula_grid(
     target: Any,
     rows: int,
     columns: int,
-    sheet_name: str,
     com_error: type[BaseException],
-) -> list[list[str]]:
+) -> tuple[list[list[str | None]], int]:
+    """Read one rectangle's Formula2 text; unreadable cells become ``None``.
+
+    A cell without valid ``=``-prefixed Formula2 text (Excel could not expose
+    it for that one cell) degrades to a counted, missing coordinate instead
+    of failing every other cell in the same merged rectangle.
+    """
     try:
         raw_grid = target.Formula2
     except com_error as exc:
@@ -90,22 +95,65 @@ def _read_formula_grid(
             "this Excel build does not provide reliable Formula2 access"
         ) from exc
     grid = _grid(raw_grid, rows, columns)
-    formulas: list[list[str]] = []
+    formulas: list[list[str | None]] = []
     invalid_count = 0
     for values in grid:
-        formula_row: list[str] = []
+        formula_row: list[str | None] = []
         for formula in values:
             if isinstance(formula, str) and formula.startswith("="):
                 formula_row.append(formula)
             else:
+                formula_row.append(None)
                 invalid_count += 1
         formulas.append(formula_row)
-    if invalid_count:
-        raise RuntimeError(
-            f"Excel did not expose Formula2 for {invalid_count} requested formula "
-            f"cells in {sheet_name}"
-        )
-    return formulas
+    return formulas, invalid_count
+
+
+#: Bounds mirrored from `qc_tool.io.formula_enrichment` -- kept as local
+#: constants so this subprocess-spawned worker's import surface stays
+#: limited to stdlib plus pywin32; the parent process re-validates and caps
+#: again with the shared helper before trusting this worker's output.
+_MAX_DEFINED_NAMES = 10_000
+_MAX_DEFINED_NAME_TARGET_CHARS = 4_096
+
+
+def _collect_defined_names(workbook: Any) -> tuple[list[dict[str, object]], bool]:
+    """Best-effort workbook/worksheet-scoped defined-name collection via COM.
+
+    A per-name COM failure, a duplicate identity, an oversized target, or the
+    count cap marks the whole result incomplete rather than raising -- formula
+    text merges independently of defined-name reachability.
+    """
+    names: list[dict[str, object]] = []
+    seen: set[tuple[str, str | None]] = set()
+    complete = True
+    try:
+        collection = workbook.Names
+        iterator = iter(collection)
+    except Exception:
+        return [], False
+    for item in iterator:
+        try:
+            raw_name = str(item.Name)
+            target = str(item.RefersTo)
+            visible = bool(item.Visible)
+        except Exception:
+            complete = False
+            continue
+        sheet, _sep, local_name = raw_name.rpartition("!")
+        name = local_name or raw_name
+        scope = sheet or None
+        key = (name, scope)
+        if (
+            key in seen
+            or len(target) > _MAX_DEFINED_NAME_TARGET_CHARS
+            or len(names) >= _MAX_DEFINED_NAMES
+        ):
+            complete = False
+            continue
+        seen.add(key)
+        names.append({"name": name, "target": target, "sheet": scope, "hidden": not visible})
+    return names, complete
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -235,6 +283,7 @@ def _extract(request: dict[str, object]) -> dict[str, object]:
         build = str(app.Build)
         formulas: dict[str, list[dict[str, object]]] = {}
         extracted_count = 0
+        unreadable_count = 0
         for sheet_name, raw_coordinates in formula_cells.items():
             if not isinstance(sheet_name, str) or not isinstance(raw_coordinates, list):
                 raise RuntimeError("worker formula coordinate request is invalid")
@@ -254,15 +303,17 @@ def _extract(request: dict[str, object]) -> dict[str, object]:
             cells: list[dict[str, object]] = []
             for row_1, col_1, row_2, col_2 in _rectangles(coordinates):
                 target = sheet.Range(sheet.Cells(row_1, col_1), sheet.Cells(row_2, col_2))
-                grid = _read_formula_grid(
+                grid, invalid = _read_formula_grid(
                     target,
                     row_2 - row_1 + 1,
                     col_2 - col_1 + 1,
-                    sheet_name,
                     pywintypes.com_error,
                 )
+                unreadable_count += invalid
                 for row_offset, values in enumerate(grid):
                     for column_offset, formula in enumerate(values):
+                        if formula is None:
+                            continue
                         cells.append(
                             {
                                 "row": row_1 + row_offset,
@@ -273,16 +324,18 @@ def _extract(request: dict[str, object]) -> dict[str, object]:
                         extracted_count += 1
             if cells:
                 formulas[sheet_name] = cells
-        if extracted_count != expected_count:
-            raise RuntimeError(
-                f"Excel extracted {extracted_count} formulas; expected {expected_count}"
-            )
+        defined_names, defined_names_complete = _collect_defined_names(workbook)
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "ok": True,
             "engine": f"excel:{version}:{build}:formula2",
             "detail": f"Formula2 text extracted by Microsoft Excel {version} build {build}",
             "formulas": formulas,
+            "expected_count": expected_count,
+            "extracted_count": extracted_count,
+            "unreadable_count": unreadable_count,
+            "defined_names": defined_names,
+            "defined_names_complete": defined_names_complete,
         }
     finally:
         if workbook is not None:
@@ -303,13 +356,13 @@ def main() -> int:
     result_path: Path | None = None
     try:
         request = json.loads(sys.stdin.read())
-        if not isinstance(request, dict) or request.get("schema_version") != 1:
+        if not isinstance(request, dict) or request.get("schema_version") != 2:
             raise RuntimeError("invalid Excel formula worker request")
         result_path = Path(str(request["result_path"]))
         payload = _extract(request)
     except Exception as exc:
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
         }

@@ -212,6 +212,10 @@ def _formula_error_severity(finding: Finding) -> Severity | None:
 
 
 def assign_severity(finding: Finding, profile: DeliverableProfile | None = None) -> Severity:
+    """Pure function of typed attributes only -- the shared severity
+    projection producer-time candidates apply before grouping (both this
+    and `matches_waiver` read plain attributes, never other findings).
+    """
     if finding.expected_reason is not None:
         return Severity.EXPECTED
     if finding.expected_growth:  # legacy evidence without a typed reason
@@ -294,7 +298,8 @@ def expired_waiver_findings(
     ]
 
 
-def _matches_waiver(finding: Finding, waiver) -> bool:
+def matches_waiver(finding: Finding, waiver) -> bool:
+    """Public so producer-time candidates can share this exact check."""
     return (
         finding.finding_class is waiver.finding_class
         and finding.artifact_member == waiver.member
@@ -318,7 +323,7 @@ def assign_severities(
             (
                 waiver
                 for waiver in waivers
-                if waiver.expires >= today and _matches_waiver(finding, waiver)
+                if waiver.expires >= today and matches_waiver(finding, waiver)
             ),
             None,
         )

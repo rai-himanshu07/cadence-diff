@@ -183,6 +183,10 @@ def test_streaming_and_oracle_produce_equal_e2e_results(
         password: str | None = None,
         allow_large_workbook: bool = False,
         cancellation_token: CancellationToken | None = None,
+        formula_cache: Any = None,
+        formula_engine: Any = "auto",
+        _native_formula_compat_mode: bool = False,
+        _xlsb_values_engine: Any = "pyxlsb",
     ) -> Any:
         return loader_module.load_workbook_snapshot(
             path,
@@ -190,6 +194,10 @@ def test_streaming_and_oracle_produce_equal_e2e_results(
             allow_large_workbook=allow_large_workbook,
             _ooxml_loader="oracle",
             cancellation_token=cancellation_token,
+            formula_cache=formula_cache,
+            formula_engine=formula_engine,
+            _native_formula_compat_mode=_native_formula_compat_mode,
+            _xlsb_values_engine=_xlsb_values_engine,
         )
 
     monkeypatch.setattr(engine_module, "load_workbook_snapshot", load_oracle)

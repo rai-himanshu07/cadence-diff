@@ -10,13 +10,17 @@ from pathlib import Path
 import pytest
 
 from qc_tool import engine as engine_module
-from qc_tool.coverage import QCRunMode
+from qc_tool.coverage import CoverageState, QCRunMode
 from qc_tool.engine import run_qc
-from qc_tool.excel.workbook_risks import workbook_risk_findings
+from qc_tool.excel.workbook_risks import (
+    external_link_reachability_coverage,
+    workbook_risk_findings,
+)
 from qc_tool.findings import FindingClass, FindingProvenance, Severity
 from qc_tool.io.loader import _extract_ooxml_risks, load_workbook_snapshot
 from qc_tool.io.model import (
     CellRecord,
+    ExternalLinkReachability,
     SheetSnapshot,
     WorkbookRisk,
     WorkbookRiskKind,
@@ -29,6 +33,8 @@ from qc_tool.triage.rules import triage
 def _snapshot(
     source_name: str,
     risks: list[WorkbookRisk] | None = None,
+    *,
+    external_link_reachability: ExternalLinkReachability | None = None,
 ) -> WorkbookSnapshot:
     return WorkbookSnapshot(
         source_name=source_name,
@@ -40,6 +46,7 @@ def _snapshot(
         charts_available=False,
         interaction_rules_available=False,
         intrinsic_risks=risks or [],
+        external_link_reachability=external_link_reachability,
         sheets=[
             SheetSnapshot(
                 "Data",
@@ -222,3 +229,107 @@ def test_loaded_snapshots_expose_only_typed_intrinsic_risks(
 
     assert not hasattr(snapshot, "external_links")
     assert all(isinstance(risk, WorkbookRisk) for risk in snapshot.intrinsic_risks)
+
+
+# --- Step 4b: passive-link suppression requires proven reachability ------
+
+
+def _passive_snapshot(
+    *, external_link_reachability: ExternalLinkReachability | None
+) -> WorkbookSnapshot:
+    return _snapshot(
+        "current.xlsb",
+        [
+            WorkbookRisk(WorkbookRiskKind.EXTERNAL_WORKBOOK_LINK),
+            WorkbookRisk(WorkbookRiskKind.EXTERNAL_RELATIONSHIP),
+            WorkbookRisk(WorkbookRiskKind.VBA_PROJECT),
+        ],
+        external_link_reachability=external_link_reachability,
+    )
+
+
+def test_proven_inactive_passive_link_is_suppressed_from_findings() -> None:
+    current = _passive_snapshot(
+        external_link_reachability=ExternalLinkReachability(proven=True, live=False)
+    )
+
+    findings = workbook_risk_findings(current)
+
+    assert {finding.element for finding in findings} == {"vba_project"}
+
+
+def test_proven_live_passive_link_is_not_suppressed() -> None:
+    current = _passive_snapshot(
+        external_link_reachability=ExternalLinkReachability(
+            proven=True, live=True, direct_reference_count=1
+        )
+    )
+
+    findings = workbook_risk_findings(current)
+
+    assert {finding.element for finding in findings} == {
+        "external_workbook_link",
+        "external_relationship",
+        "vba_project",
+    }
+
+
+@pytest.mark.parametrize(
+    "reachability",
+    [None, ExternalLinkReachability(proven=False)],
+)
+def test_unproven_reachability_never_suppresses(
+    reachability: ExternalLinkReachability | None,
+) -> None:
+    current = _passive_snapshot(external_link_reachability=reachability)
+
+    findings = workbook_risk_findings(current)
+
+    assert {finding.element for finding in findings} == {
+        "external_workbook_link",
+        "external_relationship",
+        "vba_project",
+    }
+
+
+def test_reachability_coverage_checked_when_no_passive_risk() -> None:
+    current = _snapshot("current.xlsb", [WorkbookRisk(WorkbookRiskKind.VBA_PROJECT)])
+
+    item = external_link_reachability_coverage(current)
+
+    assert item.state is CoverageState.CHECKED
+    assert item.detail == ""
+
+
+def test_reachability_coverage_checked_when_proven_either_way() -> None:
+    inactive = _passive_snapshot(
+        external_link_reachability=ExternalLinkReachability(proven=True, live=False)
+    )
+    live = _passive_snapshot(
+        external_link_reachability=ExternalLinkReachability(proven=True, live=True)
+    )
+
+    assert external_link_reachability_coverage(inactive).state is CoverageState.CHECKED
+    assert external_link_reachability_coverage(live).state is CoverageState.CHECKED
+    assert "not used" in external_link_reachability_coverage(inactive).detail
+    assert "in use" in external_link_reachability_coverage(live).detail
+
+
+def test_reachability_coverage_degraded_when_unproven() -> None:
+    current = _passive_snapshot(external_link_reachability=None)
+
+    item = external_link_reachability_coverage(current)
+
+    assert item.state is CoverageState.DEGRADED
+    assert "cannot be proven" in item.detail
+
+
+def test_reachability_coverage_degrades_across_multiple_workbooks() -> None:
+    proven = _passive_snapshot(
+        external_link_reachability=ExternalLinkReachability(proven=True, live=False)
+    )
+    unproven = _passive_snapshot(external_link_reachability=None)
+
+    item = external_link_reachability_coverage(proven, unproven)
+
+    assert item.state is CoverageState.DEGRADED

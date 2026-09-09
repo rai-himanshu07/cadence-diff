@@ -11,11 +11,15 @@ import datetime as dt
 import logging
 import shutil
 import tempfile
+import time
 import weakref
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
+
+from openpyxl.utils import get_column_letter
 
 from qc_tool.availability import (
     availability_coverage,
@@ -37,13 +41,21 @@ from qc_tool.crosscheck.trace import (
     verify_mappings,
 )
 from qc_tool.excel.align import (
+    AlignmentRegionTrustV2,
     AlignmentTrustManifest,
+    AlignmentTrustManifestV2,
+    AlignmentTrustPayload,
     WorkbookAlignment,
     align_workbooks,
     build_alignment_trust_manifest,
+    promote_region_trust_to_v2,
 )
 from qc_tool.excel.charts import annotate_chart_impacts, chart_reference_coverage
-from qc_tool.excel.complexity import WorkbookComplexity, assess_workbook_complexity
+from qc_tool.excel.complexity import (
+    WorkbookComplexity,
+    assess_workbook_complexity,
+    dependency_index_skip_reason,
+)
 from qc_tool.excel.context import attach_current_excerpts, attach_excerpts
 from qc_tool.excel.controls import evaluate_controls
 from qc_tool.excel.dependency import (
@@ -63,13 +75,24 @@ from qc_tool.excel.diff_metadata import (
 from qc_tool.excel.diff_structure import diff_workbook_structure
 from qc_tool.excel.diff_values import iter_region_findings, region_range_sets
 from qc_tool.excel.diff_vba import diff_workbook_vba, vba_coverage
-from qc_tool.excel.formulas import diff_workbook_formulas, formula_text_compatible
+from qc_tool.excel.formulas import (
+    FormulaComparisonTelemetry,
+    diff_workbook_formulas,
+    formula_text_compatible,
+)
 from qc_tool.excel.interaction import (
     conditional_style_coverage,
     interaction_rule_coverage,
 )
+from qc_tool.excel.population import CandidateSpill, ClassPopulationStats, finalize_populations
 from qc_tool.excel.preflight import defined_name_scope_coverage, preflight_workbook
-from qc_tool.excel.workbook_risks import workbook_risk_findings
+from qc_tool.excel.prerequisites import check_comparison_prerequisites
+from qc_tool.excel.ranked_identity import detect_ranked_table_candidate
+from qc_tool.excel.regions import internal_period_band_suggestions
+from qc_tool.excel.workbook_risks import (
+    external_link_reachability_coverage,
+    workbook_risk_findings,
+)
 from qc_tool.findings import Finding, FindingClass, Severity
 from qc_tool.findings_store import (
     BLOCK_FINDINGS,
@@ -79,6 +102,7 @@ from qc_tool.findings_store import (
     merge_spill,
     write_finding_blocks,
 )
+from qc_tool.io.formula_cache import FormulaExtractionCache
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.model import WorkbookSnapshot
 from qc_tool.package import PackageArtifact, PackageManifest, PackageSide, paths_by_member
@@ -94,6 +118,14 @@ from qc_tool.progress import (
     RunPhase,
     check_cancelled,
     report_progress,
+)
+from qc_tool.review import requeue_identity_key
+from qc_tool.run_action import (
+    RankedTableEvidence,
+    RunActionItem,
+    RunActionReason,
+    RunActionRequired,
+    RunBlockedError,
 )
 from qc_tool.scope import ComparisonScope
 from qc_tool.story import StoryEvidenceCollector, annotate_story_evidence
@@ -124,6 +156,10 @@ def _load_excel_file(
     allow_large_workbooks: bool,
     cancellation_token: CancellationToken | None,
     on_progress: ProgressCallback | None,
+    formula_cache: FormulaExtractionCache | None = None,
+    formula_engine: Literal["native", "excel", "libreoffice", "auto"] = "auto",
+    _native_compat_mode: bool = False,
+    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "pyxlsb",
 ) -> WorkbookSnapshot:
     check_cancelled(cancellation_token)
     report_progress(on_progress, phase, total=1, detail=path.name)
@@ -132,6 +168,10 @@ def _load_excel_file(
         password=password,
         allow_large_workbook=allow_large_workbooks,
         cancellation_token=cancellation_token,
+        formula_cache=formula_cache,
+        formula_engine=formula_engine,
+        _native_formula_compat_mode=_native_compat_mode,
+        _xlsb_values_engine=_xlsb_values_engine,
     )
     check_cancelled(cancellation_token)
     report_progress(on_progress, phase, processed=1, total=1, detail=path.name)
@@ -205,6 +245,86 @@ def _complexity_coverage(complexity: WorkbookComplexity) -> CoverageItem:
             )
         ),
     )
+
+
+def _population_coverage(
+    finding_class: FindingClass, stats: ClassPopulationStats
+) -> CoverageItem:
+    """Per-class group-first disclosure: candidates, populations, replays."""
+    detail = (
+        f"{stats.candidates:,} cells summarised as {stats.populations:,} "
+        f"population(s)"
+    )
+    if stats.replayed:
+        detail += (
+            f"; {stats.replayed:,} replayed as atomic findings "
+            f"({stats.below_threshold:,} below threshold, "
+            f"{stats.over_cap:,} over the geometry cap, "
+            f"{stats.heterogeneous_evidence:,} with mixed evidence)"
+        )
+    return CoverageItem(
+        check_id=f"excel-population-{finding_class.value}",
+        label=f"Group-first populations ({finding_class.value})",
+        artifact="excel",
+        state=CoverageState.CHECKED,
+        findings=stats.candidates,
+        detail=detail,
+    )
+
+
+def _enrich_population_samples(
+    populations: list[Finding],
+    *,
+    current_workbook: WorkbookSnapshot | None,
+    dependency_graph: DependencyGraph | None,
+) -> None:
+    """Compute impacts for each population's <= 5 samples only, labelled with
+    their sample coordinate -- never the population's full downstream set.
+
+    Excerpts are deliberately not attached here (on-demand "Expand members"
+    is a later step); only impacts, which do not need cell records to be
+    resident, are computed.
+    """
+    for population in populations:
+        evidence = population.population
+        if evidence is None or not evidence.samples:
+            continue
+        sample_findings = [
+            Finding(
+                artifact=population.artifact,
+                artifact_member=population.artifact_member,
+                finding_class=population.finding_class,
+                sheet=population.sheet,
+                location=sample.current_location,
+                message="",
+            )
+            for sample in evidence.samples
+        ]
+        if dependency_graph is not None:
+            accumulator: ImpactAccumulator | None = ImpactAccumulator(dependency_graph)
+            accumulator.annotate(sample_findings)
+        else:
+            accumulator = None
+        if current_workbook is not None:
+            annotate_chart_impacts(sample_findings, current_workbook, dependency_graph)
+        if accumulator is not None:
+            accumulator.finalize(sample_findings)
+        else:
+            limit_impacts(sample_findings)
+        impacts = [
+            f"{sample.current_location}: {impact}"
+            for sample, finding in zip(evidence.samples, sample_findings, strict=True)
+            for impact in finding.impacts
+        ]
+        if impacts:
+            # `Finding.impacts` stays empty for population findings -- only
+            # the typed, explicitly-sampled field carries this evidence, so
+            # no renderer/story-evidence/priority signal can mistake a
+            # bounded 5-member sample for the population's full downstream
+            # set (Criterion 6).
+            population.population = evidence.model_copy(
+                update={"sampled_impacts": tuple(impacts)}
+            )
 
 
 def _enrich_retained_findings(
@@ -358,6 +478,90 @@ def _process_cycle_chunk(
     stream.add(retained)
 
 
+def _drain_cycle_batch(
+    batch: list[Finding],
+    *,
+    stream: _FindingStream,
+    profile: DeliverableProfile,
+    today: dt.date,
+    baseline_workbook: WorkbookSnapshot | None,
+    current_workbook: WorkbookSnapshot | None,
+    current_deck: DeckSnapshot | None,
+    dependency_graph: DependencyGraph | None,
+) -> None:
+    """Enrich and spill a non-value batch without retaining its full payload.
+
+    Formula findings were historically small, but partial XLSB text can make
+    them as large as the workbook's formula population. Clear each processed
+    slice in place so aliases such as ``formula_findings`` release their
+    Finding objects as soon as the bounded chunk reaches the spill.
+    """
+    for start in range(0, len(batch), BLOCK_FINDINGS):
+        end = min(start + BLOCK_FINDINGS, len(batch))
+        chunk = batch[start:end]
+        assign_severities(chunk, profile, today=today)
+        _enrich_retained_findings(
+            chunk,
+            baseline_workbook=baseline_workbook,
+            current_workbook=current_workbook,
+            current_deck=current_deck,
+            dependency_graph=dependency_graph,
+            crosscheck=profile.crosscheck,
+        )
+        stream.add(chunk)
+        for index in range(start, end):
+            batch[index] = None  # type: ignore[assignment]
+    batch.clear()
+
+
+def _buffer_cycle_batches(
+    batches: list[list[Finding]],
+    *,
+    profile: DeliverableProfile,
+    today: dt.date,
+    baseline_workbook: WorkbookSnapshot | None,
+    current_workbook: WorkbookSnapshot | None,
+    current_deck: DeckSnapshot | None,
+    dependency_graph: DependencyGraph | None,
+) -> tuple[FindingSequence | None, Path | None]:
+    """Enrich post-value findings now, replay them later in original order.
+
+    Clears every input batch in place after its payload reaches the compact
+    buffer; callers must not inspect ``batches`` afterward. This is the memory
+    contract that releases formula Finding objects before value production.
+    """
+    if not any(batches):
+        return None, None
+    directory = Path(tempfile.mkdtemp(prefix="qc-post-findings-"))
+
+    def payloads() -> Iterator[object]:
+        for batch in batches:
+            for start in range(0, len(batch), BLOCK_FINDINGS):
+                end = min(start + BLOCK_FINDINGS, len(batch))
+                chunk = batch[start:end]
+                assign_severities(chunk, profile, today=today)
+                _enrich_retained_findings(
+                    chunk,
+                    baseline_workbook=baseline_workbook,
+                    current_workbook=current_workbook,
+                    current_deck=current_deck,
+                    dependency_graph=dependency_graph,
+                    crosscheck=profile.crosscheck,
+                )
+                for finding in chunk:
+                    yield finding_payload(finding)
+                for index in range(start, end):
+                    batch[index] = None  # type: ignore[assignment]
+            batch.clear()
+
+    try:
+        container = write_finding_blocks(directory / "post.qcfb", payloads())
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return FindingSequence(container), directory
+
+
 def _run_value_parts(
     *,
     stream: _FindingStream,
@@ -372,6 +576,7 @@ def _run_value_parts(
     dependency_graph: DependencyGraph | None,
     cancellation_token: CancellationToken | None,
     on_progress: ProgressCallback | None,
+    candidate_sink: CandidateSpill | None = None,
 ) -> int:
     """Region-batched value diff with per-sheet memory release.
 
@@ -397,9 +602,9 @@ def _run_value_parts(
         base_sheet = baseline.sheet(sheet_name)
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name)
-        ignore, refresh = region_range_sets(sheet_profile)
         for region in regions:
             check_cancelled(cancellation_token)
+            ignore, refresh, value_only_ignore = region_range_sets(sheet_profile, region)
             chunk: list[Finding] = []
             for finding in iter_region_findings(
                 base_sheet,
@@ -411,6 +616,8 @@ def _run_value_parts(
                 sheet_profile=sheet_profile,
                 windows=windows,
                 run_acceptance=run_acceptance,
+                value_only_ignore=value_only_ignore,
+                candidate_sink=candidate_sink,
             ):
                 produced += 1
                 chunk.append(finding)
@@ -496,6 +703,11 @@ class QCRunResult:
     profile_name: str
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON
     files: dict[str, str] = field(default_factory=dict)  # role -> file name
+    #: Resolved formula-engine/adapter-fingerprint string (e.g.
+    #: "native-biff12:1.2.3") per excel role, when formula enrichment ran.
+    #: Persisted so Re-QC/carry-forward can disclose a cross-run engine
+    #: change instead of silently comparing evidence from two engines.
+    formula_engines: dict[str, str] = field(default_factory=dict)
     findings: Sequence[Finding] = field(default_factory=list)
     disclosures: list[str] = field(default_factory=list)
     coverage: list[CoverageItem] = field(default_factory=list)
@@ -503,7 +715,7 @@ class QCRunResult:
     mapping_suggestions: list[MappingSuggestion] = field(default_factory=list)
     verified_crosschecks: int = 0
     comparison_scope: ComparisonScope = field(default_factory=ComparisonScope)
-    alignment_trust: AlignmentTrustManifest | None = None
+    alignment_trust: AlignmentTrustPayload | None = None
     package_manifest: PackageManifest | None = None
     #: Filled by the streaming cycle path so `counts` never re-reads the store.
     severity_counts: dict[Severity, int] | None = None
@@ -551,7 +763,7 @@ def _memberize_coverage(
 def _memberize_excel_result(
     subresult: QCRunResult,
     member_id: str,
-) -> tuple[list[Finding], list[CoverageItem], AlignmentTrustManifest | None]:
+) -> tuple[list[Finding], list[CoverageItem], AlignmentTrustPayload | None]:
     findings: list[Finding] = []
     for finding in subresult.findings:
         if finding.artifact != "excel":
@@ -568,27 +780,64 @@ def _memberize_excel_result(
     )
     trust = subresult.alignment_trust
     if trust is not None and member_id != "primary":
-        trust = AlignmentTrustManifest(
-            regions=tuple(
-                region.model_copy(update={"artifact_member": member_id})
-                for region in trust.regions
-            ),
-            unpaired=tuple(
-                region.model_copy(update={"artifact_member": member_id})
-                for region in trust.unpaired
-            ),
-        )
+        if isinstance(trust, AlignmentTrustManifestV2):
+            trust = AlignmentTrustManifestV2(
+                regions=tuple(
+                    region.model_copy(update={"artifact_member": member_id})
+                    for region in trust.regions
+                ),
+                unpaired=tuple(
+                    region.model_copy(update={"artifact_member": member_id})
+                    for region in trust.unpaired
+                ),
+            )
+        else:
+            trust = AlignmentTrustManifest(
+                regions=tuple(
+                    region.model_copy(update={"artifact_member": member_id})
+                    for region in trust.regions
+                ),
+                unpaired=tuple(
+                    region.model_copy(update={"artifact_member": member_id})
+                    for region in trust.unpaired
+                ),
+            )
     return findings, coverage, trust
 
 
 def _merge_alignment_manifests(
-    manifests: list[AlignmentTrustManifest],
-) -> AlignmentTrustManifest | None:
+    manifests: list[AlignmentTrustPayload],
+) -> AlignmentTrustPayload | None:
     if not manifests:
         return None
-    return AlignmentTrustManifest(
+    if not any(isinstance(manifest, AlignmentTrustManifestV2) for manifest in manifests):
+        # Every manifest is V1: merge unchanged, byte-identical to before
+        # this feature existed.
+        v1_manifests = [
+            manifest
+            for manifest in manifests
+            if isinstance(manifest, AlignmentTrustManifest)
+        ]
+        return AlignmentTrustManifest(
+            regions=tuple(
+                region
+                for manifest in v1_manifests
+                for region in manifest.regions
+            ),
+            unpaired=tuple(
+                region
+                for manifest in v1_manifests
+                for region in manifest.unpaired
+            ),
+        )
+    # At least one member applied a confirmed identity rule: the merged
+    # manifest is V2, promoting any plain V1 member's regions to V2 shape
+    # with "unused" identity fields so every region lives in one place.
+    return AlignmentTrustManifestV2(
         regions=tuple(
             region
+            if isinstance(region, AlignmentRegionTrustV2)
+            else promote_region_trust_to_v2(region)
             for manifest in manifests
             for region in manifest.regions
         ),
@@ -598,6 +847,74 @@ def _merge_alignment_manifests(
             for region in manifest.unpaired
         ),
     )
+
+
+def _ranked_table_suggestions(
+    alignment: WorkbookAlignment,
+    baseline: WorkbookSnapshot,
+    current: WorkbookSnapshot,
+) -> list[RunActionItem]:
+    """Bounded, value-free evidence for every unconfigured positional block
+    region that looks like a ranked/sorted table under raw position.
+
+    Only regions that fell back to plain positional row alignment are
+    screened: a region with a confirmed ``RowIdentityRule`` already aligns by
+    ``"keys"`` (see ``qc_tool.excel.align._align_rows_by_identity``), so it is
+    never re-suggested once confirmed.
+    """
+    items: list[RunActionItem] = []
+    for sheet_name, regions in alignment.regions.items():
+        base_sheet = baseline.sheet(sheet_name)
+        curr_sheet = current.sheet(sheet_name)
+        for region in regions:
+            if region.current.orientation != "block":
+                continue
+            if region.rows.method != "positional" or region.low_confidence:
+                continue
+            candidate = detect_ranked_table_candidate(
+                base_sheet, curr_sheet, region.baseline, region.current
+            )
+            if candidate is None:
+                continue
+            anchor_cell = (
+                f"{get_column_letter(region.current.min_col)}{region.current.min_row}"
+            )
+            available_columns = tuple(
+                get_column_letter(column)
+                for column in range(region.current.min_col, region.current.max_col + 1)
+            )
+            data_row_count = region.current.max_row - region.current.min_row + 1
+            items.append(
+                RunActionItem(
+                    sheet=sheet_name,
+                    cell=anchor_cell,
+                    label=(
+                        "Possible ranked/sorted table: columns "
+                        + "+".join(candidate.column_letters)
+                    ),
+                    ranked_table_evidence=RankedTableEvidence(
+                        sheet=sheet_name,
+                        current_range=region.current.cell_range,
+                        data_row_count=data_row_count,
+                        available_columns=available_columns,
+                        suggested_identity_columns=candidate.column_letters,
+                        suggested_ordinal_columns=candidate.ordinal_column_letters,
+                        non_blank_coverage=candidate.non_blank_coverage,
+                        unique_ratio=candidate.unique_ratio,
+                        key_overlap=candidate.key_overlap,
+                        formula_ratio=candidate.formula_ratio,
+                        displaced_ratio=candidate.displaced_ratio,
+                        mismatch_reduction=candidate.mismatch_reduction,
+                        projected_positional_mismatches=(
+                            candidate.projected_positional_mismatches
+                        ),
+                        projected_avoided_mismatches=(
+                            candidate.projected_avoided_mismatches
+                        ),
+                    ),
+                )
+            )
+    return items
 
 
 def _apply_comparison_scope(
@@ -624,12 +941,14 @@ def _run_multi_package(
     passwords: dict[str, str],
     mode: QCRunMode,
     allow_large_workbooks: bool,
+    allow_dependency_indexing: bool = False,
     run_acceptance: NumericTolerance | None,
     compare_sheets: list[str] | None,
     compare_member_sheets: dict[str, tuple[str, ...]],
     compare_slides: list[int] | None,
     cancellation_token: CancellationToken | None,
     on_progress: ProgressCallback | None,
+    formula_cache: FormulaExtractionCache | None = None,
 ) -> QCRunResult:
     """Run existing single-artifact pipelines sequentially, then merge once."""
     paths_by_member(files, manifest)
@@ -677,7 +996,8 @@ def _run_multi_package(
     current_count = len(current_members)
     coverage: list[CoverageItem] = []
     disclosures: list[str] = []
-    trust_manifests: list[AlignmentTrustManifest] = []
+    trust_manifests: list[AlignmentTrustPayload] = []
+    formula_engines: dict[str, str] = {}
     current_deck_snapshot: DeckSnapshot | None = None
     package_reconciler: MultiPackageReconciler | None = None
     package_result = None
@@ -763,21 +1083,43 @@ def _run_multi_package(
             member_scope = compare_sheets
 
         if mode is QCRunMode.CYCLE_COMPARISON and baseline and current:
-            subresult = run_qc(
-                baseline_excel=files[baseline.role_key],
-                current_excel=files[current.role_key],
-                profile=projected_profile(member_id),
-                passwords=member_passwords(
-                    ("baseline_excel", baseline.role_key),
-                    ("current_excel", current.role_key),
-                ),
-                mode=QCRunMode.CYCLE_COMPARISON,
-                allow_large_workbooks=allow_large_workbooks,
-                run_acceptance=run_acceptance,
-                compare_sheets=member_scope,
-                cancellation_token=cancellation_token,
-                on_progress=on_progress,
-            )
+            try:
+                subresult = run_qc(
+                    baseline_excel=files[baseline.role_key],
+                    current_excel=files[current.role_key],
+                    profile=projected_profile(member_id),
+                    passwords=member_passwords(
+                        ("baseline_excel", baseline.role_key),
+                        ("current_excel", current.role_key),
+                    ),
+                    mode=QCRunMode.CYCLE_COMPARISON,
+                    allow_large_workbooks=allow_large_workbooks,
+                    allow_dependency_indexing=allow_dependency_indexing,
+                    run_acceptance=run_acceptance,
+                    compare_sheets=member_scope,
+                    cancellation_token=cancellation_token,
+                    on_progress=on_progress,
+                    formula_cache=formula_cache,
+                )
+            except RunBlockedError as blocked:
+                # The inner call always tags "primary"; attribute the
+                # mismatch to the actual package member before it propagates.
+                blocked.action_required.items = [
+                    item.model_copy(
+                        update={
+                            "member_id": member_id,
+                            "ranked_table_evidence": (
+                                item.ranked_table_evidence.model_copy(
+                                    update={"member_id": member_id}
+                                )
+                                if item.ranked_table_evidence is not None
+                                else None
+                            ),
+                        }
+                    )
+                    for item in blocked.action_required.items
+                ]
+                raise
             member_findings, member_coverage, member_trust = (
                 _memberize_excel_result(subresult, member_id)
             )
@@ -785,6 +1127,10 @@ def _run_multi_package(
             coverage.extend(member_coverage)
             if member_trust is not None:
                 trust_manifests.append(member_trust)
+            if engine := subresult.formula_engines.get("baseline_excel"):
+                formula_engines[baseline.role_key] = engine
+            if engine := subresult.formula_engines.get("current_excel"):
+                formula_engines[current.role_key] = engine
             disclosures.extend(
                 f"Excel member {member_id}: {detail}"
                 for detail in subresult.disclosures
@@ -805,6 +1151,7 @@ def _run_multi_package(
                 cancellation_token=cancellation_token,
                 on_progress=on_progress,
                 _snapshot_capture=capture,
+                formula_cache=formula_cache,
             )
             member_findings, member_coverage, _member_trust = (
                 _memberize_excel_result(subresult, member_id)
@@ -840,6 +1187,8 @@ def _run_multi_package(
                     )
             add_findings(member_findings)
             coverage.extend(member_coverage)
+            if engine := subresult.formula_engines.get("current_excel"):
+                formula_engines[current.role_key] = engine
             disclosures.extend(
                 f"Excel member {member_id}: {detail}"
                 for detail in subresult.disclosures
@@ -988,6 +1337,7 @@ def _run_multi_package(
         profile_name=profile.name,
         mode=mode,
         files={member.role_key: member.display_name for member in manifest.members},
+        formula_engines=formula_engines,
         disclosures=list(dict.fromkeys(disclosures)),
         coverage=coverage,
         package_manifest=manifest,
@@ -1030,12 +1380,17 @@ def run_qc(
     passwords: dict[str, str] | None = None,
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON,
     allow_large_workbooks: bool = False,
+    allow_dependency_indexing: bool = False,
     run_acceptance: NumericTolerance | None = None,
     compare_sheets: list[str] | None = None,
     compare_slides: list[int] | None = None,
     cancellation_token: CancellationToken | None = None,
     on_progress: ProgressCallback | None = None,
     _snapshot_capture: _SnapshotCapture | None = None,
+    formula_cache: FormulaExtractionCache | None = None,
+    _native_compat_mode: bool = False,
+    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "pyxlsb",
+    _formula_telemetry: FormulaComparisonTelemetry | None = None,
 ) -> QCRunResult:
     """Run a full QC comparison. ``passwords`` is keyed by file name.
 
@@ -1044,6 +1399,24 @@ def run_qc(
     findings (never suppressed). ``compare_sheets`` / ``compare_slides``
     narrow which sheets (by name) and slides (1-based index) may produce
     findings; files still load fully so cross-references keep resolving.
+    ``allow_dependency_indexing`` forces full dependency-graph indexing
+    (circular detection, formula/chart/PPT-chart impacts) above the
+    documented size policy that otherwise skips it with a disclosed
+    coverage reason; distinct from ``allow_large_workbooks``.
+    ``_native_compat_mode`` is a private, oracle-verification-only switch
+    (plan Criterion 13(a)): when the resolved XLSB formula engine is
+    ``native``, restricts its returned text to exactly the coordinates a
+    legacy engine also covers, for comparing against a legacy-engine oracle.
+    Never set by production callers; ignored for non-native engines.
+    ``_xlsb_values_engine`` is a private, diagnostic-only switch for the
+    separate values-decoding axis (plan-20260908-phase-b-guest-performance-
+    followup.md): ``"auto"``/``"native"`` route XLSB cell values through the
+    native kernel instead of pyxlsb. Never set by production callers; the
+    shipped default stays ``"pyxlsb"``. ``_formula_telemetry`` is a private,
+    diagnostic-only hook that accumulates ``FormulaComparisonTelemetry``
+    counters -- including the ``RunPhase.COMPARING_FORMULAS``-scoped
+    ``assess_workbook_complexity()`` cost -- for the same follow-up plan;
+    never set by production callers.
     """
     check_cancelled(cancellation_token)
     mode = QCRunMode(mode)
@@ -1094,12 +1467,14 @@ def run_qc(
                 passwords=passwords or {},
                 mode=mode,
                 allow_large_workbooks=allow_large_workbooks,
+                allow_dependency_indexing=allow_dependency_indexing,
                 run_acceptance=run_acceptance,
                 compare_sheets=compare_sheets,
                 compare_member_sheets=compare_member_sheets or {},
                 compare_slides=compare_slides,
                 cancellation_token=cancellation_token,
                 on_progress=on_progress,
+                formula_cache=formula_cache,
             )
     if mode is QCRunMode.CURRENT_FILE_PREFLIGHT:
         if baseline_excel is not None or baseline_ppt is not None:
@@ -1125,8 +1500,18 @@ def run_qc(
                 allow_large_workbooks=allow_large_workbooks,
                 cancellation_token=cancellation_token,
                 on_progress=on_progress,
+                formula_cache=formula_cache,
+                formula_engine=profile.excel.formula_engine,
+                _native_compat_mode=_native_compat_mode,
+                _xlsb_values_engine=_xlsb_values_engine,
             )
             result.files["current_excel"] = current_excel.name
+            if workbook.formula_source is not None:
+                result.formula_engines["current_excel"] = workbook.formula_source
+            if workbook.values_engine_fallback_detail:
+                result.disclosures.append(
+                    f"current_excel: {workbook.values_engine_fallback_detail}"
+                )
             report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)
             excel_preflight = preflight_workbook(
                 workbook,
@@ -1266,6 +1651,10 @@ def run_qc(
             allow_large_workbooks=allow_large_workbooks,
             cancellation_token=cancellation_token,
             on_progress=on_progress,
+            formula_cache=formula_cache,
+            formula_engine=profile.excel.formula_engine,
+            _native_compat_mode=_native_compat_mode,
+            _xlsb_values_engine=_xlsb_values_engine,
         )
         deck = _load_powerpoint_file(
             current_ppt,
@@ -1283,6 +1672,12 @@ def run_qc(
             "current_excel": current_excel.name,
             "current_ppt": current_ppt.name,
         }
+        if workbook.formula_source is not None:
+            result.formula_engines["current_excel"] = workbook.formula_source
+        if workbook.values_engine_fallback_detail:
+            result.disclosures.append(
+                f"current_excel: {workbook.values_engine_fallback_detail}"
+            )
         findings: list[Finding] = []
         report_progress(on_progress, RunPhase.ANALYZING_EXCEL, total=1)
         excel_preflight = preflight_workbook(
@@ -1383,11 +1778,16 @@ def run_qc(
     else:
         run_acceptance = None
     today = dt.date.today()
+    population_policy = profile.review_policy.populations
+    candidate_sink = (
+        CandidateSpill(profile, today) if population_policy.enabled else None
+    )
     pre_findings: list[Finding] = []
     post_batches: list[list[Finding]] = []
     current_workbook = None
     baseline_workbook: WorkbookSnapshot | None = None
     dependency_graph: DependencyGraph | None = None
+    dependency_skip_reason: str | None = None
     loaded_workbooks: list[WorkbookSnapshot] = []
     loaded_decks: list[DeckSnapshot] = []
     alignment: WorkbookAlignment | None = None
@@ -1422,6 +1822,10 @@ def run_qc(
             allow_large_workbooks=allow_large_workbooks,
             cancellation_token=cancellation_token,
             on_progress=on_progress,
+            formula_cache=formula_cache,
+            formula_engine=profile.excel.formula_engine,
+            _native_compat_mode=_native_compat_mode,
+            _xlsb_values_engine=_xlsb_values_engine,
         )
         curr_wb = _load_excel_file(
             current_excel,
@@ -1430,11 +1834,44 @@ def run_qc(
             allow_large_workbooks=allow_large_workbooks,
             cancellation_token=cancellation_token,
             on_progress=on_progress,
+            formula_cache=formula_cache,
+            formula_engine=profile.excel.formula_engine,
+            _native_compat_mode=_native_compat_mode,
+            _xlsb_values_engine=_xlsb_values_engine,
         )
         current_workbook = curr_wb
         loaded_workbooks.extend((base_wb, curr_wb))
+        if mode is QCRunMode.CYCLE_COMPARISON and profile is not None:
+            mismatches = check_comparison_prerequisites(
+                base_wb,
+                curr_wb,
+                profile.excel.comparison_prerequisites,
+            )
+            if mismatches:
+                raise RunBlockedError(
+                    RunActionRequired(
+                        reason=RunActionReason.COMPARISON_PREREQUISITE_MISMATCH,
+                        items=mismatches,
+                        message=(
+                            "Select the same scenario, fully recalculate, save, "
+                            "and Re-QC before comparing."
+                        ),
+                    )
+                )
         result.files["baseline_excel"] = baseline_excel.name
         result.files["current_excel"] = current_excel.name
+        if base_wb.formula_source is not None:
+            result.formula_engines["baseline_excel"] = base_wb.formula_source
+        if curr_wb.formula_source is not None:
+            result.formula_engines["current_excel"] = curr_wb.formula_source
+        if base_wb.values_engine_fallback_detail:
+            result.disclosures.append(
+                f"baseline_excel: {base_wb.values_engine_fallback_detail}"
+            )
+        if curr_wb.values_engine_fallback_detail:
+            result.disclosures.append(
+                f"current_excel: {curr_wb.values_engine_fallback_detail}"
+            )
         result.coverage.append(_workload_coverage(base_wb, curr_wb))
         risk_findings = workbook_risk_findings(curr_wb, base_wb)
         pre_findings.extend(risk_findings)
@@ -1448,6 +1885,7 @@ def run_qc(
                 detail="Structural package risk inventory compared across the pair",
             )
         )
+        result.coverage.append(external_link_reachability_coverage(base_wb, curr_wb))
         result.coverage.append(defined_name_scope_coverage(base_wb, curr_wb))
         vba_findings = diff_workbook_vba(base_wb, curr_wb)
         pre_findings.extend(vba_findings)
@@ -1515,7 +1953,55 @@ def run_qc(
                 detail="; ".join(details),
             )
         )
+        period_suggestions = []
+        for sheet_name, regions in alignment.regions.items():
+            period_suggestions.extend(
+                internal_period_band_suggestions(
+                    curr_wb.sheet(sheet_name),
+                    [region.current for region in regions],
+                )
+            )
+        suggestion_detail = "; ".join(
+            f"{item.sheet}!{item.region_range}: pin a {item.axis} period region "
+            f"at {'row' if item.axis == 'columns' else 'column'} {item.anchor} "
+            f"({item.period_count} periods)"
+            for item in period_suggestions[:8]
+        )
+        if len(period_suggestions) > 8:
+            suggestion_detail += (
+                f"; and {len(period_suggestions) - 8} more internal period bands"
+            )
+        result.coverage.append(
+            CoverageItem(
+                check_id="excel-period-axis-suggestions",
+                label="Internal period-axis profile suggestions",
+                artifact="excel",
+                state=(
+                    CoverageState.DEGRADED
+                    if period_suggestions
+                    else CoverageState.CHECKED
+                ),
+                detail=suggestion_detail,
+            )
+        )
         check_cancelled(cancellation_token)
+        if mode is QCRunMode.CYCLE_COMPARISON:
+            ranked_items = _ranked_table_suggestions(alignment, base_wb, curr_wb)
+            if ranked_items:
+                raise RunBlockedError(
+                    RunActionRequired(
+                        version=2,
+                        reason=RunActionReason.ROW_IDENTITY_CONFIRMATION_REQUIRED,
+                        items=ranked_items,
+                        message=(
+                            "One or more sheets look like a ranked or sorted "
+                            "table compared by raw position. Confirm a row "
+                            "identity (one or more columns) for each in the "
+                            "profile, or leave it unconfigured to keep "
+                            "comparing positionally, then re-run QC."
+                        ),
+                    )
+                )
         alignment_detail = (
             "Low-confidence key alignment skipped cell-level comparison for: "
             + ", ".join(alignment.low_confidence_regions)
@@ -1673,9 +2159,31 @@ def run_qc(
             alignment,
             profile,
             cancellation_token=cancellation_token,
+            candidate_sink=candidate_sink,
+            telemetry=_formula_telemetry,
         )
         check_cancelled(cancellation_token)
         post_batches.append(formula_findings)
+        # Measured while COMPARING_FORMULAS is still open (not
+        # INDEXING_DEPENDENCIES): on a large real workbook this cost-driver
+        # scan over every formula cell can itself run for minutes, dwarfing
+        # what remains of indexing once the size policy below skips the
+        # actual dependency-graph build -- keeping it here is what lets
+        # INDEXING_DEPENDENCIES measure only the work the policy can skip.
+        complexity_scan_start = time.perf_counter()
+        complexity = (
+            assess_workbook_complexity(
+                curr_wb,
+                allow_complex_workbook=allow_large_workbooks,
+                cancellation_token=cancellation_token,
+            )
+            if curr_wb.formulas_available
+            else None
+        )
+        if _formula_telemetry is not None:
+            _formula_telemetry.complexity_assessment_seconds += (
+                time.perf_counter() - complexity_scan_start
+            )
         report_progress(
             on_progress, RunPhase.COMPARING_FORMULAS, processed=1, total=1
         )
@@ -1708,26 +2216,43 @@ def run_qc(
                 ),
             )
         )
-        if curr_wb.formulas_available:
-            report_progress(on_progress, RunPhase.INDEXING_DEPENDENCIES, total=1)
-            complexity = assess_workbook_complexity(
-                curr_wb,
-                allow_complex_workbook=allow_large_workbooks,
-                cancellation_token=cancellation_token,
-            )
+        if complexity is not None:
             result.coverage.append(_complexity_coverage(complexity))
-            dependency_graph = build_dependency_graph(
-                curr_wb,
-                cancellation_token=cancellation_token,
+            report_progress(on_progress, RunPhase.INDEXING_DEPENDENCIES, total=1)
+            dependency_skip_reason = dependency_index_skip_reason(
+                complexity,
+                allow_dependency_indexing=allow_dependency_indexing,
             )
-            dependency_state = dependency_graph.coverage_state
-            dependency_detail = dependency_graph.coverage_detail
-            circular = detect_circular_references(
-                dependency_graph,
-                cancellation_token=cancellation_token,
-            )
-            post_batches.append(list(circular.findings))
-            circular_coverage = circular.coverage
+            if dependency_skip_reason is None:
+                dependency_graph = build_dependency_graph(
+                    curr_wb,
+                    cancellation_token=cancellation_token,
+                )
+                dependency_state = dependency_graph.coverage_state
+                dependency_detail = dependency_graph.coverage_detail
+                circular = detect_circular_references(
+                    dependency_graph,
+                    cancellation_token=cancellation_token,
+                )
+                post_batches.append(list(circular.findings))
+                circular_coverage = circular.coverage
+            else:
+                dependency_state = CoverageState.DEGRADED
+                dependency_detail = (
+                    "Dependency indexing, formula impact tracing, and "
+                    f"chart-impact tracing skipped by size policy: "
+                    f"{dependency_skip_reason}"
+                )
+                circular_coverage = CoverageItem(
+                    check_id="excel-circular-references",
+                    label="Circular formula references",
+                    artifact="excel",
+                    state=CoverageState.DEGRADED,
+                    detail=(
+                        f"Circular-reference detection skipped by size policy: "
+                        f"{dependency_skip_reason}"
+                    ),
+                )
             report_progress(
                 on_progress, RunPhase.INDEXING_DEPENDENCIES, processed=1, total=1
             )
@@ -1946,9 +2471,9 @@ def run_qc(
                 label="Excel to PowerPoint mappings",
                 artifact="package",
                 state=(
-                    CoverageState.CHECKED
-                    if current_deck.charts_available
-                    else CoverageState.DEGRADED
+                    CoverageState.DEGRADED
+                    if not current_deck.charts_available or dependency_skip_reason
+                    else CoverageState.CHECKED
                 ),
                 findings=len(crosscheck.findings),
                 detail=(
@@ -1957,6 +2482,12 @@ def run_qc(
                         ""
                         if current_deck.charts_available
                         else "; visible native chart labels unavailable"
+                    )
+                    + (
+                        f"; PowerPoint chart-impact tracing skipped by size "
+                        f"policy: {dependency_skip_reason}"
+                        if dependency_skip_reason
+                        else ""
                     )
                 ),
             )
@@ -1996,29 +2527,40 @@ def run_qc(
     )
     if disclosure := validated_scope.disclosure():
         result.disclosures.append(disclosure)
-    pre_findings = validated_scope.filter_findings(pre_findings)
-    post_batches = [
-        validated_scope.filter_findings(batch) for batch in post_batches
-    ]
-
-    # Non-values findings are bounded; assign severities and enrich them
-    # BEFORE the part loop so their excerpts see every sheet's cells.
-    report_progress(on_progress, RunPhase.QUERYING_IMPACTS, total=1)
-    held = [*pre_findings, *(f for batch in post_batches for f in batch)]
-    assign_severities(held, profile, today=today)
-    _enrich_retained_findings(
-        held,
-        baseline_workbook=baseline_workbook,
-        current_workbook=current_workbook,
-        current_deck=current_deck,
-        dependency_graph=dependency_graph,
-        crosscheck=profile.crosscheck,
-    )
-    report_progress(on_progress, RunPhase.QUERYING_IMPACTS, processed=1, total=1)
+    pre_findings[:] = validated_scope.filter_findings(pre_findings)
+    for batch in post_batches:
+        batch[:] = validated_scope.filter_findings(batch)
 
     stream = _FindingStream()
+    buffered_post: FindingSequence | None = None
+    buffered_post_dir: Path | None = None
     try:
-        stream.add(pre_findings)
+        # Enrich non-values before the part loop so excerpts still see every
+        # sheet, but drain in bounded chunks: partial XLSB formula findings are
+        # no longer assumed to be a small population.
+        report_progress(on_progress, RunPhase.QUERYING_IMPACTS, total=1)
+        _drain_cycle_batch(
+            pre_findings,
+            stream=stream,
+            profile=profile,
+            today=today,
+            baseline_workbook=baseline_workbook,
+            current_workbook=current_workbook,
+            current_deck=current_deck,
+            dependency_graph=dependency_graph,
+        )
+        buffered_post, buffered_post_dir = _buffer_cycle_batches(
+            post_batches,
+            profile=profile,
+            today=today,
+            baseline_workbook=baseline_workbook,
+            current_workbook=current_workbook,
+            current_deck=current_deck,
+            dependency_graph=dependency_graph,
+        )
+        report_progress(
+            on_progress, RunPhase.QUERYING_IMPACTS, processed=1, total=1
+        )
         if (
             alignment is not None
             and baseline_workbook is not None
@@ -2037,11 +2579,39 @@ def run_qc(
                 dependency_graph=dependency_graph,
                 cancellation_token=cancellation_token,
                 on_progress=on_progress,
+                candidate_sink=candidate_sink,
             )
             if values_coverage is not None:
                 values_coverage.findings = produced
-        for batch in post_batches:
-            stream.add(batch)
+        if candidate_sink is not None:
+            outcome = finalize_populations(
+                candidate_sink, population_policy, validated_scope
+            )
+            for finding_class, class_stats in outcome.stats.items():
+                result.coverage.append(_population_coverage(finding_class, class_stats))
+            if outcome.replay_findings:
+                assign_severities(outcome.replay_findings, profile, today=today)
+                _enrich_retained_findings(
+                    outcome.replay_findings,
+                    baseline_workbook=baseline_workbook,
+                    current_workbook=current_workbook,
+                    current_deck=current_deck,
+                    dependency_graph=dependency_graph,
+                    crosscheck=profile.crosscheck,
+                )
+                stream.add(outcome.replay_findings)
+            if outcome.population_findings:
+                _enrich_population_samples(
+                    outcome.population_findings,
+                    current_workbook=current_workbook,
+                    dependency_graph=dependency_graph,
+                )
+                stream.add(outcome.population_findings)
+        if buffered_post is not None:
+            stream.add(buffered_post.iter_trusted())
+            if buffered_post_dir is not None:
+                shutil.rmtree(buffered_post_dir, ignore_errors=True)
+                buffered_post_dir = None
         expired = expired_waiver_findings(profile, today)
         assign_severities(expired, profile, today=today)
         stream.add(expired)
@@ -2049,6 +2619,10 @@ def run_qc(
         sequence, severity_counts = stream.finalize()
     except BaseException:
         stream.abort()
+        if candidate_sink is not None:
+            candidate_sink.abort()
+        if buffered_post_dir is not None:
+            shutil.rmtree(buffered_post_dir, ignore_errors=True)
         raise
     result.findings = sequence
     result.severity_counts = severity_counts
@@ -2070,29 +2644,37 @@ class FindingsDelta:
     persisting: int
 
 
-def _identity_key(finding: Finding) -> tuple[str, ...]:
-    return (
-        finding.artifact,
-        finding.finding_class.value,
-        finding.sheet or "",
-        finding.slide or "",
-        finding.location or finding.baseline_location or "",
-        finding.element or "",
-    )
-
-
 def compare_findings(
     previous: Sequence[Finding], current: Sequence[Finding]
 ) -> FindingsDelta:
-    """Match findings by identity (not by id) to compute a fix-progress delta."""
-    previous_keys = {
-        _identity_key(f) for f in previous if f.severity is not Severity.EXPECTED
-    }
-    current_keys = {
-        _identity_key(f) for f in current if f.severity is not Severity.EXPECTED
-    }
-    return FindingsDelta(
-        resolved=len(previous_keys - current_keys),
-        new=len(current_keys - previous_keys),
-        persisting=len(previous_keys & current_keys),
+    """Match findings by identity (not by id) to compute a fix-progress delta.
+
+    Uses `requeue_identity_key`, which pairs populations by their shape
+    digest rather than location -- member-set churn (a row inserted or
+    removed between runs) does not turn a persisting population into a
+    spurious resolved+new pair (Criterion 5).
+
+    Uses multiset (Counter) semantics, not set membership: two distinct
+    findings that happen to share one identity key (e.g. two populations
+    split only by waiver/severity, which `population_identity_digest`
+    deliberately excludes) must not collapse into a single set entry --
+    losing one of two same-identity findings between runs must still count
+    as one resolved, not be hidden because the key was still present
+    (Criterion 8).
+    """
+    previous_counts = Counter(
+        requeue_identity_key(f) for f in previous if f.severity is not Severity.EXPECTED
     )
+    current_counts = Counter(
+        requeue_identity_key(f) for f in current if f.severity is not Severity.EXPECTED
+    )
+    resolved = 0
+    persisting = 0
+    for key, previous_count in previous_counts.items():
+        current_count = current_counts.get(key, 0)
+        resolved += max(0, previous_count - current_count)
+        persisting += min(previous_count, current_count)
+    new = 0
+    for key, current_count in current_counts.items():
+        new += max(0, current_count - previous_counts.get(key, 0))
+    return FindingsDelta(resolved=resolved, new=new, persisting=persisting)

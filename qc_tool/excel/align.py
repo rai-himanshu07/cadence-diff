@@ -23,9 +23,11 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Literal
 
+from openpyxl.utils import column_index_from_string
+from openpyxl.utils.cell import coordinate_to_tuple
 from pydantic import BaseModel, Field
 
-from qc_tool.config.profile import DeliverableProfile
+from qc_tool.config.profile import DeliverableProfile, RowIdentityRule, SheetProfile
 from qc_tool.excel.periods import Period, is_period_after, is_period_label, parse_period
 from qc_tool.excel.regions import TableRegion, detect_regions
 from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot
@@ -55,6 +57,15 @@ class AxisAlignment:
     growth: list[int] = field(default_factory=list)  # current indices, expected
     method: Literal["keys", "positional"] = "keys"
     low_confidence_fallback: bool = False
+    #: Confirmed-identity fields (Step 6). Unused (empty/zero/None) for every
+    #: axis alignment except rows produced by ``_align_rows_by_identity``.
+    identity_columns: tuple[str, ...] = ()
+    ordinal_columns: tuple[str, ...] = ()
+    duplicate_policy: Literal["skip", "occurrence", "position"] | None = None
+    matched_unique_rows: int = 0
+    skipped_duplicate_groups: int = 0
+    skipped_duplicate_rows: int = 0
+    reordered_rows: int = 0
 
 
 @dataclass(slots=True)
@@ -147,12 +158,94 @@ class AlignmentTrustManifest(BaseModel):
     model_config = {"frozen": True}
 
 
+class AlignmentRegionTrustV2(BaseModel):
+    """Adds confirmed composite-identity disclosure (Step 6) to V1's shape."""
+
+    version: Literal[2] = 2
+    artifact_member: str = Field(default="primary", min_length=1)
+    sheet: str = Field(min_length=1)
+    region_id: str = Field(min_length=1)
+    baseline_range: str = Field(min_length=1)
+    current_range: str = Field(min_length=1)
+    row: AlignmentAxisTrust
+    column: AlignmentAxisTrust
+    comparable_cell_pairs: int = Field(ge=0)
+    skipped_low_confidence_cells: int = Field(ge=0)
+    low_confidence: bool
+    #: "Unused" defaults (empty/zero/None) for every region that did not
+    #: apply a confirmed ``RowIdentityRule``.
+    identity_columns: tuple[str, ...] = ()
+    ordinal_columns: tuple[str, ...] = ()
+    duplicate_policy: Literal["skip", "occurrence", "position"] | None = None
+    matched_unique_rows: int = Field(default=0, ge=0)
+    skipped_duplicate_groups: int = Field(default=0, ge=0)
+    skipped_duplicate_rows: int = Field(default=0, ge=0)
+    reordered_rows: int = Field(default=0, ge=0)
+
+    model_config = {"frozen": True}
+
+
+class AlignmentTrustManifestV2(BaseModel):
+    version: Literal[2] = 2
+    regions: tuple[AlignmentRegionTrustV2, ...] = ()
+    unpaired: tuple[AlignmentUnpairedRegion, ...] = ()
+
+    model_config = {"frozen": True}
+
+
+#: Either shape a stored alignment-trust payload may take. New ordinary runs
+#: keep writing V1 unchanged; a run that applies any confirmed row identity
+#: rule writes V2. V1 rows are never normalized or rewritten as V2.
+AlignmentTrustPayload = AlignmentTrustManifest | AlignmentTrustManifestV2
+
+
+def decode_alignment_trust_payload(payload: object) -> AlignmentTrustPayload | None:
+    """Version-dispatched decoder for a stored alignment-trust JSON payload."""
+    if payload is None:
+        return None
+    if isinstance(payload, dict) and payload.get("version") == 2:
+        return AlignmentTrustManifestV2.model_validate(payload)
+    return AlignmentTrustManifest.model_validate(payload)
+
+
+def promote_region_trust_to_v2(region: AlignmentRegionTrust) -> AlignmentRegionTrustV2:
+    """Upgrade a V1 region record to V2 shape with "unused" identity fields.
+
+    Used when merging package-member manifests where at least one member
+    applied a confirmed identity rule (V2) and another did not (V1).
+    """
+    return AlignmentRegionTrustV2(
+        artifact_member=region.artifact_member,
+        sheet=region.sheet,
+        region_id=region.region_id,
+        baseline_range=region.baseline_range,
+        current_range=region.current_range,
+        row=region.row,
+        column=region.column,
+        comparable_cell_pairs=region.comparable_cell_pairs,
+        skipped_low_confidence_cells=region.skipped_low_confidence_cells,
+        low_confidence=region.low_confidence,
+    )
+
+
 def build_alignment_trust_manifest(
     alignment: WorkbookAlignment,
     artifact_member: str = "primary",
-) -> AlignmentTrustManifest:
-    """Build factual, deterministic region correspondence metadata."""
-    regions: list[AlignmentRegionTrust] = []
+) -> AlignmentTrustPayload:
+    """Build factual, deterministic region correspondence metadata.
+
+    Writes V1 (unchanged shape/bytes) unless at least one region applied a
+    confirmed ``RowIdentityRule`` (``rows.duplicate_policy is not None``), in
+    which case the whole manifest is built as V2 so every region's identity
+    disclosure lives in one place.
+    """
+    needs_v2 = any(
+        region.rows.duplicate_policy is not None
+        for region_list in alignment.regions.values()
+        for region in region_list
+    )
+    regions_v1: list[AlignmentRegionTrust] = []
+    regions_v2: list[AlignmentRegionTrustV2] = []
     for sheet_name in sorted(alignment.regions.keys()):
         region_list = alignment.regions[sheet_name]
         for region in region_list:
@@ -177,21 +270,44 @@ def build_alignment_trust_manifest(
             )
             comparable_cell_pairs = row_pairs * col_pairs
             skipped = comparable_cell_pairs if region.low_confidence else 0
-            regions.append(
-                AlignmentRegionTrust(
-                    version=1,
-                    artifact_member=artifact_member,
-                    sheet=sheet_name,
-                    region_id=region.current.region_id,
-                    baseline_range=region.baseline.cell_range,
-                    current_range=region.current.cell_range,
-                    row=row_trust,
-                    column=col_trust,
-                    comparable_cell_pairs=comparable_cell_pairs,
-                    skipped_low_confidence_cells=skipped,
-                    low_confidence=bool(region.low_confidence),
+            if needs_v2:
+                regions_v2.append(
+                    AlignmentRegionTrustV2(
+                        artifact_member=artifact_member,
+                        sheet=sheet_name,
+                        region_id=region.current.region_id,
+                        baseline_range=region.baseline.cell_range,
+                        current_range=region.current.cell_range,
+                        row=row_trust,
+                        column=col_trust,
+                        comparable_cell_pairs=comparable_cell_pairs,
+                        skipped_low_confidence_cells=skipped,
+                        low_confidence=bool(region.low_confidence),
+                        identity_columns=region.rows.identity_columns,
+                        ordinal_columns=region.rows.ordinal_columns,
+                        duplicate_policy=region.rows.duplicate_policy,
+                        matched_unique_rows=region.rows.matched_unique_rows,
+                        skipped_duplicate_groups=region.rows.skipped_duplicate_groups,
+                        skipped_duplicate_rows=region.rows.skipped_duplicate_rows,
+                        reordered_rows=region.rows.reordered_rows,
+                    )
                 )
-            )
+            else:
+                regions_v1.append(
+                    AlignmentRegionTrust(
+                        version=1,
+                        artifact_member=artifact_member,
+                        sheet=sheet_name,
+                        region_id=region.current.region_id,
+                        baseline_range=region.baseline.cell_range,
+                        current_range=region.current.cell_range,
+                        row=row_trust,
+                        column=col_trust,
+                        comparable_cell_pairs=comparable_cell_pairs,
+                        skipped_low_confidence_cells=skipped,
+                        low_confidence=bool(region.low_confidence),
+                    )
+                )
 
     unpaired: list[AlignmentUnpairedRegion] = []
     def unpaired_key(region: TableRegion) -> tuple[str, str, str]:
@@ -221,7 +337,11 @@ def build_alignment_trust_manifest(
             )
         )
 
-    return AlignmentTrustManifest(regions=tuple(regions), unpaired=tuple(unpaired))
+    if needs_v2:
+        return AlignmentTrustManifestV2(
+            regions=tuple(regions_v2), unpaired=tuple(unpaired)
+        )
+    return AlignmentTrustManifest(regions=tuple(regions_v1), unpaired=tuple(unpaired))
 
 
 
@@ -493,15 +613,168 @@ def _block_labels_overlap(
     return bool(total) and len(baseline & current) / total >= _MIN_BLOCK_LABEL_OVERLAP
 
 
+def _matching_row_identity_rule(
+    sheet_profile: SheetProfile | None, region: TableRegion
+) -> RowIdentityRule | None:
+    """The first confirmed rule whose anchor cell falls inside ``region``.
+
+    Matching by anchor cell (not region id) lets a rule keep applying across
+    ordinary row growth, which shifts a region's ``max_row`` every cycle.
+    """
+    if sheet_profile is None:
+        return None
+    for rule in sheet_profile.row_identity_rules:
+        try:
+            anchor_row, anchor_col = coordinate_to_tuple(rule.anchor_cell)
+        except ValueError:
+            continue
+        if (
+            region.min_row <= anchor_row <= region.max_row
+            and region.min_col <= anchor_col <= region.max_col
+        ):
+            return rule
+    return None
+
+
+def _identity_key_component(value: object) -> object:
+    if isinstance(value, str):
+        return value.strip().casefold()
+    return value
+
+
+def _identity_row_keys(
+    sheet: SheetSnapshot, region: TableRegion, columns: list[int]
+) -> dict[int, tuple[object, ...]]:
+    """Row -> composite identity key. A row with any blank component is
+    excluded entirely -- it is never guessed at, only left unmatched."""
+    keys: dict[int, tuple[object, ...]] = {}
+    for row in range(region.min_row, region.max_row + 1):
+        parts: list[object] = []
+        blank = False
+        for col in columns:
+            cell = sheet.cells.get((row, col))
+            value = None if cell is None else cell.value
+            if value is None or (isinstance(value, str) and not value.strip()):
+                blank = True
+                break
+            parts.append(_identity_key_component(value))
+        if not blank:
+            keys[row] = tuple(parts)
+    return keys
+
+
+def _align_rows_by_identity(
+    base_sheet: SheetSnapshot,
+    curr_sheet: SheetSnapshot,
+    base_region: TableRegion,
+    curr_region: TableRegion,
+    rule: RowIdentityRule,
+) -> AxisAlignment:
+    """Composite-key row alignment for one analyst-confirmed rule.
+
+    Unique keys on both sides always align by identity. Ambiguous (duplicated)
+    keys are skipped by default -- excluded from pairs/deleted/inserted/growth
+    entirely and disclosed via the trust manifest's skipped counts -- unless
+    ``duplicate_policy`` selects an explicit ``occurrence`` (Nth appearance of
+    a key on each side, in row order) or ``position`` (remaining unmatched
+    rows on each side, paired in row order regardless of key) fallback.
+
+    Identity rows are rarely period-valued, so unmatched current rows are
+    always classified as insertions here, never as expected cadence growth.
+    """
+    identity_columns = [
+        column_index_from_string(letter) for letter in rule.identity_columns
+    ]
+    base_keys = _identity_row_keys(base_sheet, base_region, identity_columns)
+    curr_keys = _identity_row_keys(curr_sheet, curr_region, identity_columns)
+
+    base_rows_by_key: dict[tuple[object, ...], list[int]] = {}
+    for row, key in sorted(base_keys.items()):
+        base_rows_by_key.setdefault(key, []).append(row)
+    curr_rows_by_key: dict[tuple[object, ...], list[int]] = {}
+    for row, key in sorted(curr_keys.items()):
+        curr_rows_by_key.setdefault(key, []).append(row)
+
+    alignment = AxisAlignment(
+        method="keys",
+        identity_columns=tuple(rule.identity_columns),
+        ordinal_columns=tuple(rule.ordinal_columns),
+        duplicate_policy=rule.duplicate_policy,
+    )
+    matched_base: set[int] = set()
+    matched_current: set[int] = set()
+    ambiguous_keys: set[tuple[object, ...]] = set()
+
+    for key in sorted(base_rows_by_key.keys() | curr_rows_by_key.keys(), key=repr):
+        base_rows = base_rows_by_key.get(key, [])
+        curr_rows = curr_rows_by_key.get(key, [])
+        if len(base_rows) == 1 and len(curr_rows) == 1:
+            alignment.pairs.append((base_rows[0], curr_rows[0]))
+            alignment.matched_unique_rows += 1
+            matched_base.add(base_rows[0])
+            matched_current.add(curr_rows[0])
+        elif base_rows and curr_rows:
+            # Present on both sides, with at least one side duplicated:
+            # genuinely ambiguous, needs duplicate_policy to resolve.
+            ambiguous_keys.add(key)
+        # else: this identity exists on only one side, at any count. That is
+        # never ambiguous -- every one of those rows simply has no
+        # counterpart, so they stay unmatched here and the remainder loop
+        # below classifies each as a deletion or insertion.
+
+    if rule.duplicate_policy == "occurrence":
+        for key in sorted(ambiguous_keys, key=repr):
+            base_rows = base_rows_by_key.get(key, [])
+            curr_rows = curr_rows_by_key.get(key, [])
+            for base_row, curr_row in zip(base_rows, curr_rows, strict=False):
+                alignment.pairs.append((base_row, curr_row))
+                matched_base.add(base_row)
+                matched_current.add(curr_row)
+                if base_row != curr_row:
+                    alignment.reordered_rows += 1
+    elif rule.duplicate_policy == "position":
+        leftover_base = sorted(row for row in base_keys if row not in matched_base)
+        leftover_curr = sorted(row for row in curr_keys if row not in matched_current)
+        for base_row, curr_row in zip(leftover_base, leftover_curr, strict=False):
+            alignment.pairs.append((base_row, curr_row))
+            matched_base.add(base_row)
+            matched_current.add(curr_row)
+            if base_row != curr_row:
+                alignment.reordered_rows += 1
+    else:  # "skip" (default): ambiguous groups never paired, coverage degrades.
+        skipped_base = {row for key in ambiguous_keys for row in base_rows_by_key.get(key, [])}
+        skipped_curr = {row for key in ambiguous_keys for row in curr_rows_by_key.get(key, [])}
+        alignment.skipped_duplicate_groups = len(ambiguous_keys)
+        alignment.skipped_duplicate_rows = len(skipped_base) + len(skipped_curr)
+        matched_base |= skipped_base
+        matched_current |= skipped_curr
+
+    alignment.pairs.sort()
+    for row in range(base_region.min_row, base_region.max_row + 1):
+        if row not in matched_base:
+            alignment.deleted.append(row)
+    for row in range(curr_region.min_row, curr_region.max_row + 1):
+        if row in matched_current:
+            continue
+        alignment.inserted.append(row)
+    return alignment
+
+
 def _align_block(
     base_sheet: SheetSnapshot,
     curr_sheet: SheetSnapshot,
     base_region: TableRegion,
     curr_region: TableRegion,
+    sheet_profile: SheetProfile | None = None,
 ) -> RegionAlignment:
+    rule = _matching_row_identity_rule(sheet_profile, curr_region)
     label_base = [base_region.key_col or base_region.min_col]
     label_curr = [curr_region.key_col or curr_region.min_col]
-    if (
+    if rule is not None:
+        rows = _align_rows_by_identity(
+            base_sheet, curr_sheet, base_region, curr_region, rule
+        )
+    elif (
         _block_labels_are_stable(base_sheet, base_region)
         and _block_labels_are_stable(curr_sheet, curr_region)
         and _block_labels_overlap(
@@ -534,13 +807,14 @@ def align_regions(
     curr_sheet: SheetSnapshot,
     base_region: TableRegion,
     curr_region: TableRegion,
+    sheet_profile: SheetProfile | None = None,
 ) -> RegionAlignment:
     orientation = curr_region.orientation
     if orientation == "long":
         return _align_long(base_sheet, curr_sheet, base_region, curr_region)
     if orientation == "wide":
         return _align_wide(base_sheet, curr_sheet, base_region, curr_region)
-    return _align_block(base_sheet, curr_sheet, base_region, curr_region)
+    return _align_block(base_sheet, curr_sheet, base_region, curr_region, sheet_profile)
 
 
 # --- workbook alignment ---------------------------------------------------
@@ -654,7 +928,7 @@ def align_workbooks(
         result.unpaired_baseline_regions.extend(unpaired_base)
         result.unpaired_current_regions.extend(unpaired_curr)
         region_alignments = [
-            align_regions(base_sheet, curr_sheet, base_region, curr_region)
+            align_regions(base_sheet, curr_sheet, base_region, curr_region, sheet_profile)
             for base_region, curr_region in pairs
         ]
         result.regions[sheet_name] = region_alignments

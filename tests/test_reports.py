@@ -134,6 +134,96 @@ def test_excel_report_keeps_formula_text_inert(tmp_path: Path) -> None:
     assert findings["O2"].data_type == "s"
 
 
+def test_excel_report_population_column(tmp_path: Path) -> None:
+    from qc_tool.findings import MembershipCodec, PopulationEvidence
+
+    result = QCRunResult(profile_name="test")
+    result.findings = [
+        Finding(
+            artifact="excel",
+            finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+            severity=Severity.WARNING,
+            sheet="Data",
+            location="B2:B20",
+            baseline_location="B2:B20",
+            element="population",
+            message="19 cells share one population",
+            population=PopulationEvidence(
+                member_count=19,
+                membership=MembershipCodec(
+                    current_rectangles=("B2:B20",),
+                    baseline_mode="shift",
+                    shift=(0, 0),
+                    member_count=19,
+                ),
+                first="B2",
+                last="B20",
+                shape_before_digest="a" * 64,
+                shape_after_digest="b" * 64,
+            ),
+        ),
+        Finding(
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            severity=Severity.CRITICAL,
+            sheet="Data",
+            location="C1",
+            baseline_value="1",
+            current_value="2",
+            message="value changed",
+        ),
+    ]
+    path = tmp_path / "population.xlsx"
+
+    write_excel_report(result, path)
+
+    workbook = load_workbook(path)
+    findings = workbook["Findings"]
+    assert findings["A1"].value == "ID"
+    header_row = [cell.value for cell in findings[1]]
+    assert header_row[-1] == "Population"
+    assert findings.cell(row=2, column=len(header_row)).value == (
+        "19 cells; B2:B20; shift (0, 0)"
+    )
+    assert findings.cell(row=3, column=len(header_row)).value in (None, "")
+
+
+def test_html_report_population_column(tmp_path: Path) -> None:
+    from qc_tool.findings import MembershipCodec, PopulationEvidence
+
+    result = QCRunResult(profile_name="test")
+    result.findings = [
+        Finding(
+            artifact="excel",
+            finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+            severity=Severity.WARNING,
+            sheet="Data",
+            location="B2:B20",
+            baseline_location="B2:B20",
+            element="population",
+            message="19 cells share one population",
+            population=PopulationEvidence(
+                member_count=19,
+                membership=MembershipCodec(
+                    current_rectangles=("B2:B20",),
+                    baseline_mode="shift",
+                    shift=(0, 0),
+                    member_count=19,
+                ),
+                first="B2",
+                last="B20",
+                shape_before_digest="a" * 64,
+                shape_after_digest="b" * 64,
+            ),
+        )
+    ]
+
+    html = render_html_report(result)
+
+    assert "<th>Population</th>" in html
+    assert "19 cells; B2:B20; shift (0, 0)" in html
+
+
 def test_html_report_contents(qc_result: QCRunResult, tmp_path: Path) -> None:
     path = tmp_path / "report.html"
     write_html_report(qc_result, path)
@@ -282,6 +372,51 @@ def test_scalar_json_v1_matches_shipped_schema_keys(qc_result: QCRunResult) -> N
     assert set(schema["required"]) <= set(payload)
 
 
+def test_population_finding_json_uses_v3_and_matches_shipped_schema_keys() -> None:
+    """Criterion 7: schema v3 is used wherever a population finding appears
+    -- in a plain scalar run, not only a true-package run -- and every
+    payload key stays a subset of the shipped schema's declared properties.
+    """
+    from qc_tool.findings import MembershipCodec, PopulationEvidence
+
+    result = QCRunResult(
+        profile_name="fixture",
+        findings=[
+            Finding(
+                artifact="excel",
+                finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+                severity=Severity.WARNING,
+                sheet="Data",
+                location="B2:B20",
+                element="population",
+                message="19 cells share one population",
+                population=PopulationEvidence(
+                    member_count=19,
+                    membership=MembershipCodec(
+                        current_rectangles=("B2:B20",),
+                        baseline_mode="shift",
+                        shift=(0, 0),
+                        member_count=19,
+                    ),
+                    first="B2",
+                    last="B20",
+                    shape_before_digest="a" * 64,
+                    shape_after_digest="b" * 64,
+                ),
+            )
+        ],
+    )
+
+    payload = result_payload(result)
+    schema_path = Path(__file__).parents[1] / "qc_tool/report/findings-v3.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 3
+    assert payload["schema"].endswith("findings-v3.json")
+    assert set(payload) <= set(schema["properties"])
+    assert set(schema["required"]) <= set(payload)
+
+
 def test_multi_member_excel_report_has_package_and_member_columns(
     tmp_path: Path,
 ) -> None:
@@ -414,7 +549,7 @@ def test_findings_continue_onto_follow_on_sheets_past_the_row_cap(
     assert workbook["Findings (3)"].max_row == 2
     # Each continuation sheet keeps headers and its own filter range.
     assert workbook["Findings (2)"]["A1"].value == "ID"
-    assert workbook["Findings (2)"].auto_filter.ref == "A1:T3"
+    assert workbook["Findings (2)"].auto_filter.ref == "A1:U3"
     # Review-group links resolve into the continuation sheet that holds the row.
     review = workbook["Review Groups"]
     locations: set[str] = set()

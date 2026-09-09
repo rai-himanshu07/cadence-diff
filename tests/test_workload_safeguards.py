@@ -13,8 +13,10 @@ from qc_tool.coverage import CoverageState
 from qc_tool.engine import _workload_coverage, run_qc
 from qc_tool.excel import complexity as complexity_module
 from qc_tool.excel.complexity import (
+    WorkbookComplexity,
     WorkbookComplexityError,
     assess_workbook_complexity,
+    dependency_index_skip_reason,
 )
 from qc_tool.io.model import (
     CellRecord,
@@ -117,6 +119,43 @@ def test_complexity_reports_every_planned_cost_driver() -> None:
     assert not complexity.degraded
 
 
+def test_complexity_reuses_the_cost_of_cells_sharing_an_adapter_r1c1_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two cells with DIFFERENT A1 text (so `formula_pattern_key()` would
+    treat them as unrelated) but the SAME adapter-supplied `formula_r1c1`
+    (as a native-complete shared/array formula group's members would carry)
+    must still only pay `_formula_cost()`'s own work once, while both
+    cells' contributions are fully counted in the summed totals.
+    """
+    calls = 0
+    real_formula_cost = complexity_module._formula_cost
+
+    def counting_formula_cost(formula: str) -> complexity_module._FormulaCost:
+        nonlocal calls
+        calls += 1
+        return real_formula_cost(formula)
+
+    monkeypatch.setattr(complexity_module, "_formula_cost", counting_formula_cost)
+
+    cells = {
+        (2, 2): CellRecord(
+            2, 2, 1, formula="=SUM(A1:A10)", formula_r1c1="=SUM(R[-1]C[-1]:R[8]C[-1])"
+        ),
+        (3, 2): CellRecord(
+            3, 2, 1, formula="=SUM(A2:A11)", formula_r1c1="=SUM(R[-1]C[-1]:R[8]C[-1])"
+        ),
+    }
+
+    complexity = assess_workbook_complexity(_snapshot(cells))
+
+    assert calls == 1
+    assert complexity.formula_count == 2
+    assert complexity.reference_operands == 2
+    assert complexity.resolved_range_cells == 20
+    assert complexity.projected_concrete_edges == 18
+
+
 def test_warning_thresholds_degrade_without_refusing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -190,6 +229,82 @@ def test_sliding_ranges_stay_below_the_dependency_refusal_limit() -> None:
     assert any(
         "projected cell dependencies 239,976,000" in reason
         for reason in complexity.warning_reasons
+    )
+
+
+def test_dependency_index_proceeds_below_the_formula_cell_limit() -> None:
+    cells = {(1, 2): CellRecord(1, 2, 1, formula="=A1")}
+    complexity = assess_workbook_complexity(_snapshot(cells))
+
+    assert dependency_index_skip_reason(complexity) is None
+
+
+def test_dependency_index_skips_above_the_formula_cell_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(complexity_module, "DEPENDENCY_FORMULA_CELLS_MAX", 2)
+    cells = {
+        (row, 2): CellRecord(row, 2, 1, formula="=A1") for row in range(1, 4)
+    }
+    complexity = assess_workbook_complexity(_snapshot(cells))
+
+    reason = dependency_index_skip_reason(complexity)
+
+    assert reason == "3 formula cells >= dependency indexing limit 2"
+
+
+def test_dependency_index_skips_above_the_projected_edge_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # projected_concrete_edges alone, well below assess_workbook_complexity's
+    # own refusal limit, must still trip the (independent) dependency-index
+    # gate once it crosses the documented threshold -- construct the
+    # complexity result directly so this test isn't also fighting the other
+    # gate's raise.
+    monkeypatch.setattr(
+        complexity_module,
+        "_COMPLEXITY_LIMITS",
+        (("projected_concrete_edges", 10, 1_000, "projected cell dependencies"),),
+    )
+    complexity = WorkbookComplexity(projected_concrete_edges=1_000)
+
+    reason = dependency_index_skip_reason(complexity)
+
+    assert reason == (
+        "1,000 projected cell dependencies >= dependency indexing limit 1,000"
+    )
+
+
+def test_dependency_index_skip_falls_back_when_the_edge_limit_is_monkeypatched_away(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _COMPLEXITY_LIMITS without a projected_concrete_edges entry must not
+    # break the dependency-index gate -- it falls back to the documented
+    # production default instead of raising.
+    monkeypatch.setattr(
+        complexity_module,
+        "_COMPLEXITY_LIMITS",
+        (("formula_count", 2, 100, "formula cells"),),
+    )
+    cells = {(1, 2): CellRecord(1, 2, 1, formula="=A1")}
+    complexity = assess_workbook_complexity(_snapshot(cells))
+
+    assert dependency_index_skip_reason(complexity) is None
+
+
+def test_dependency_index_override_is_distinct_from_the_workload_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(complexity_module, "DEPENDENCY_FORMULA_CELLS_MAX", 1)
+    cells = {
+        (row, 2): CellRecord(row, 2, 1, formula="=A1") for row in range(1, 3)
+    }
+    complexity = assess_workbook_complexity(_snapshot(cells))
+
+    assert dependency_index_skip_reason(complexity) is not None
+    assert (
+        dependency_index_skip_reason(complexity, allow_dependency_indexing=True)
+        is None
     )
 
 

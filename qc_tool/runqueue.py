@@ -70,6 +70,7 @@ class RunRequest:
     #: Role -> display filename shown in queue surfaces.
     display_files: dict[str, str]
     allow_large_workbooks: bool = False
+    allow_dependency_indexing: bool = False
     acceptance_absolute: float = 0.0
     acceptance_relative: float = 0.0
     #: Analyst comparison scope; None/empty = everything.
@@ -90,6 +91,7 @@ class _ActiveJob:
     terminal_status: RunStatus | None = None
     run_id: int | None = None
     error: str = ""
+    action_required: dict[str, Any] | None = None
     phases: list[dict[str, Any]] = field(default_factory=list)
     cancel_deadline: float | None = None
     terminated: bool = False
@@ -357,7 +359,7 @@ class RunQueueManager:
                 detail=str(message.get("detail", "")),
             )
             return
-        if kind not in {"result", "cancelled", "error"}:
+        if kind not in {"result", "cancelled", "error", "blocked"}:
             logger.warning("discarding an unsupported QC worker message")
             return
         phases = message.get("phases")
@@ -367,6 +369,12 @@ class RunQueueManager:
             job.run_id = int(message.get("run_id", 0)) or None
         elif kind == "cancelled":
             job.terminal_status = RunStatus.CANCELLED
+        elif kind == "blocked":
+            job.terminal_status = RunStatus.BLOCKED
+            action_required = message.get("action_required")
+            job.action_required = (
+                action_required if isinstance(action_required, dict) else {}
+            )
         else:
             job.terminal_status = RunStatus.FAILED
             job.error = sanitize_error(str(message.get("error", "")))
@@ -416,13 +424,20 @@ class RunQueueManager:
         self._stop_process(job)
         self._release(job)
         try:
-            self.store.finish(
-                job.request.request_id,
-                status,
-                run_id=job.run_id,
-                error=job.error,
-                phases=job.phases,
-            )
+            if status is RunStatus.BLOCKED:
+                self.store.finalize_blocked(
+                    job.request.request_id,
+                    job.action_required or {},
+                    phases=job.phases,
+                )
+            else:
+                self.store.finish(
+                    job.request.request_id,
+                    status,
+                    run_id=job.run_id,
+                    error=job.error,
+                    phases=job.phases,
+                )
         finally:
             # The slot is released even if the terminal write fails.
             with self._lock:

@@ -1,5 +1,7 @@
 """Signed QC attestation bundle and tamper detection."""
 
+import hashlib
+import hmac
 import json
 import os
 import zipfile
@@ -171,6 +173,154 @@ def test_v3_verifier_rejects_package_input_role_mismatch(
 
     assert not verification.valid
     assert any(issue.code == "package-inputs" for issue in verification.issues)
+
+
+def test_attestation_discloses_resolved_formula_engines(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """Criterion 5: the manifest carries the resolved formula-engine per
+    excel role at every schema version -- a purely informational,
+    always-present disclosure, not a new signed feature.
+    """
+    result = QCRunResult(
+        profile_name="signed",
+        formula_engines={
+            "baseline_excel": "libreoffice:24.2.4.2",
+            "current_excel": "native-biff12:1.2.3",
+        },
+    )
+    bundle = create_attestation(
+        tmp_path / "engines.qca",
+        result=result,
+        profile=fixture_profile(),
+        input_files={"current_excel": fixture_dir / "current.xlsx"},
+        report_paths={},
+        key=b"e" * 32,
+    )
+
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+
+    assert manifest["run"]["formula_engines"] == {
+        "baseline_excel": "libreoffice:24.2.4.2",
+        "current_excel": "native-biff12:1.2.3",
+    }
+    assert verify_attestation(bundle, key=b"e" * 32).valid
+
+
+def _population_finding_for_signoff_test():
+    from qc_tool.findings import Finding, FindingClass, MembershipCodec, PopulationEvidence
+
+    return Finding(
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        sheet="Data",
+        location="B2:B16",
+        element="population",
+        message="15 cells summarised as one population",
+        population=PopulationEvidence(
+            member_count=15,
+            membership=MembershipCodec(
+                current_rectangles=("B2:B16",),
+                baseline_mode="shift",
+                shift=(-1, 0),
+                member_count=15,
+            ),
+            first="B2",
+            last="B16",
+            shape_before_digest="a" * 64,
+            shape_after_digest="b" * 64,
+        ),
+    )
+
+
+def test_v4_verifier_still_validates_a_malformed_signoff_alongside_a_population(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """Criterion 10: schema_version reflects the HIGHEST tier feature
+    present, not an exclusive mode -- a v4 (population) bundle can ALSO
+    carry a sign-off, and that sign-off must still be validated, not
+    silently skipped because the bundle's schema_version is 4, not 2.
+    """
+    result = QCRunResult(profile_name="pop", findings=[_population_finding_for_signoff_test()])
+    key = b"s" * 32
+    bundle = create_attestation(
+        tmp_path / "pop-signoff.qca",
+        result=result,
+        profile=fixture_profile(),
+        input_files={"current_excel": fixture_dir / "current.xlsx"},
+        report_paths={},
+        key=key,
+        signoff=AttestationSignoff(
+            finalized_at="2026-09-09T00:00:00+00:00",
+            review_state_digest="review-state",
+        ),
+    )
+
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        members = {
+            name: archive.read(name) for name in archive.namelist() if name != "manifest.json"
+        }
+
+    assert manifest["schema_version"] == 4
+    assert "signoff" in manifest
+    del manifest["signoff"]["review_state_digest"]  # now malformed
+
+    unsigned = {k: v for k, v in manifest.items() if k != "signature"}
+    payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    manifest["signature"]["value"] = hmac.new(key, payload, hashlib.sha256).hexdigest()
+
+    tampered = tmp_path / "tampered-signoff.qca"
+    with zipfile.ZipFile(tampered, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+    verification = verify_attestation(tampered, key=key)
+
+    assert not verification.valid
+    assert any(issue.code == "signoff" for issue in verification.issues)
+
+
+def test_v4_verifier_rejects_an_unsupported_lineage_version(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    """Criterion 10: `lineage_version` is validated, not merely disclosed."""
+    result = QCRunResult(profile_name="pop", findings=[_population_finding_for_signoff_test()])
+    key = b"l" * 32
+    bundle = create_attestation(
+        tmp_path / "lineage.qca",
+        result=result,
+        profile=fixture_profile(),
+        input_files={"current_excel": fixture_dir / "current.xlsx"},
+        report_paths={},
+        key=key,
+    )
+
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        members = {
+            name: archive.read(name) for name in archive.namelist() if name != "manifest.json"
+        }
+
+    assert manifest["lineage_version"] == 2
+    manifest["lineage_version"] = 99
+
+    unsigned = {k: v for k, v in manifest.items() if k != "signature"}
+    payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    manifest["signature"]["value"] = hmac.new(key, payload, hashlib.sha256).hexdigest()
+
+    tampered = tmp_path / "tampered-lineage.qca"
+    with zipfile.ZipFile(tampered, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+    verification = verify_attestation(tampered, key=key)
+
+    assert not verification.valid
+    assert any(issue.code == "lineage-version" for issue in verification.issues)
 
 
 def test_headless_attestation_cli(fixture_dir: Path, tmp_path: Path) -> None:

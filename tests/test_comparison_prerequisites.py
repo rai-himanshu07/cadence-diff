@@ -1,0 +1,229 @@
+"""Step 5: cycle-comparison prerequisites (Acceptance Criterion 7).
+
+A configured selector/scenario cell must be present, non-blank, and exactly
+equal between baseline and current before any alignment, diffing, reports,
+or history proceed. A mismatch raises one bounded, value-free
+`RunBlockedError` instead of producing noisy or misleading findings.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from openpyxl import Workbook
+
+from qc_tool.config.profile import (
+    ComparisonPrerequisite,
+    DeliverableProfile,
+    ExcelMemberProfile,
+    ExcelProfile,
+    default_profile,
+)
+from qc_tool.coverage import QCRunMode
+from qc_tool.engine import run_qc
+from qc_tool.package import PackageArtifact, PackageManifest, PackageMember, PackageSide
+from qc_tool.run_action import RunActionReason, RunBlockedError
+
+
+def _book(path: Path, scenario: str | None) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.title = "Config"
+    sheet["A1"] = "Scenario"
+    sheet["B2"] = scenario
+    workbook.save(path)
+
+
+def _profile_with_prerequisite() -> DeliverableProfile:
+    return DeliverableProfile(
+        name="prereq",
+        excel=ExcelProfile(
+            comparison_prerequisites=[
+                ComparisonPrerequisite(name="Scenario", sheet="Config", cell="B2")
+            ]
+        ),
+    )
+
+
+def test_matching_prerequisite_does_not_block(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _book(baseline, "Base Case")
+    _book(current, "Base Case")
+
+    result = run_qc(
+        baseline_excel=baseline,
+        current_excel=current,
+        profile=_profile_with_prerequisite(),
+        mode=QCRunMode.CYCLE_COMPARISON,
+    )
+
+    assert result is not None
+
+
+def test_mismatched_prerequisite_blocks_before_analysis(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _book(baseline, "Base Case")
+    _book(current, "Upside Case")
+
+    with pytest.raises(RunBlockedError) as excinfo:
+        run_qc(
+            baseline_excel=baseline,
+            current_excel=current,
+            profile=_profile_with_prerequisite(),
+            mode=QCRunMode.CYCLE_COMPARISON,
+        )
+
+    action = excinfo.value.action_required
+    assert action.reason is RunActionReason.COMPARISON_PREREQUISITE_MISMATCH
+    assert [item.sheet for item in action.items] == ["Config"]
+    assert [item.cell for item in action.items] == ["B2"]
+    assert action.items[0].label == "Scenario"
+    assert "recalculate" in action.message.lower()
+    # The bounded payload never carries the actual cell values.
+    serialized = action.model_dump_json()
+    assert "Base Case" not in serialized
+    assert "Upside Case" not in serialized
+
+
+def test_blank_prerequisite_cell_blocks(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _book(baseline, "   ")  # whitespace-only: a real stored cell, still blank
+    _book(current, "Base Case")
+
+    with pytest.raises(RunBlockedError) as excinfo:
+        run_qc(
+            baseline_excel=baseline,
+            current_excel=current,
+            profile=_profile_with_prerequisite(),
+            mode=QCRunMode.CYCLE_COMPARISON,
+        )
+
+    assert "blank" in excinfo.value.action_required.items[0].detail
+
+
+def test_missing_sheet_blocks(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    workbook = Workbook()
+    active = workbook.active
+    assert active is not None
+    active.title = "Other"
+    workbook.save(baseline)
+    _book(current, "Base Case")
+
+    with pytest.raises(RunBlockedError) as excinfo:
+        run_qc(
+            baseline_excel=baseline,
+            current_excel=current,
+            profile=_profile_with_prerequisite(),
+            mode=QCRunMode.CYCLE_COMPARISON,
+        )
+
+    assert "missing" in excinfo.value.action_required.items[0].detail
+
+
+def test_no_prerequisites_configured_never_blocks(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _book(baseline, "Base Case")
+    _book(current, "Upside Case")  # would mismatch if a prerequisite existed
+
+    result = run_qc(
+        baseline_excel=baseline,
+        current_excel=current,
+        profile=default_profile(),
+        mode=QCRunMode.CYCLE_COMPARISON,
+    )
+
+    assert result is not None
+
+
+def _package_member(
+    member_id: str, side: PackageSide, display_name: str
+) -> PackageMember:
+    return PackageMember(
+        member_id=member_id,
+        side=side,
+        artifact=PackageArtifact.EXCEL,
+        display_name=display_name,
+    )
+
+
+def test_multi_member_package_attributes_the_blocked_member(tmp_path: Path) -> None:
+    baseline_primary = tmp_path / "baseline_primary.xlsx"
+    current_primary = tmp_path / "current_primary.xlsx"
+    baseline_ops = tmp_path / "baseline_ops.xlsx"
+    current_ops = tmp_path / "current_ops.xlsx"
+    _book(baseline_primary, "Base Case")
+    _book(current_primary, "Base Case")
+    _book(baseline_ops, "Base Case")
+    _book(current_ops, "Upside Case")  # the mismatch lives on member "ops"
+
+    prerequisite = [
+        ComparisonPrerequisite(name="Scenario", sheet="Config", cell="B2")
+    ]
+    profile = DeliverableProfile(
+        name="prereq-pkg",
+        excel=ExcelProfile(
+            members={
+                "primary": ExcelMemberProfile(comparison_prerequisites=prerequisite),
+                "ops": ExcelMemberProfile(comparison_prerequisites=prerequisite),
+            }
+        ),
+    )
+    manifest = PackageManifest(
+        members=(
+            _package_member("primary", PackageSide.BASELINE, "baseline_primary.xlsx"),
+            _package_member("primary", PackageSide.CURRENT, "current_primary.xlsx"),
+            _package_member("ops", PackageSide.BASELINE, "baseline_ops.xlsx"),
+            _package_member("ops", PackageSide.CURRENT, "current_ops.xlsx"),
+        )
+    )
+    files = {
+        "baseline_excel": baseline_primary,
+        "current_excel": current_primary,
+        "baseline_excel:ops": baseline_ops,
+        "current_excel:ops": current_ops,
+    }
+
+    with pytest.raises(RunBlockedError) as excinfo:
+        run_qc(
+            package_manifest=manifest,
+            package_files=files,
+            profile=profile,
+            mode=QCRunMode.CYCLE_COMPARISON,
+        )
+
+    assert excinfo.value.action_required.items[0].member_id == "ops"
+
+
+def test_perform_run_writes_no_history_or_reports_when_blocked(tmp_path: Path) -> None:
+    from qc_tool.history.store import RunHistory
+    from qc_tool.run_service import perform_run
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _book(baseline, "Base Case")
+    _book(current, "Upside Case")
+
+    with pytest.raises(RunBlockedError):
+        perform_run(
+            work_dir,
+            {"baseline_excel": baseline, "current_excel": current},
+            {},
+            _profile_with_prerequisite(),
+            mode=QCRunMode.CYCLE_COMPARISON,
+        )
+
+    history_db = work_dir / "history.sqlite3"
+    if history_db.exists():
+        assert RunHistory(history_db).list_runs() == []
+    runs_dir = work_dir / "runs"
+    assert not runs_dir.exists() or not any(runs_dir.iterdir())

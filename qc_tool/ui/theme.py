@@ -239,6 +239,9 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .profile-editor-actions { position: sticky; bottom: -1px; z-index: 2;
   background: var(--panel); border-top: 1px solid var(--line);
   padding: 0.65rem 0 0.2rem; width: 100%; }
+.rankedtable-actions { position: sticky; bottom: -1px; z-index: 2;
+  background: var(--panel); border-top: 1px solid var(--line);
+  padding: 0.65rem 0 0.2rem; width: 100%; }
 .preline { white-space: pre-line; overflow-wrap: anywhere; }
 
 /* formula token diff */
@@ -399,14 +402,17 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
    Fixed layout also needs an explicit table width or it shrinks to the sum
    of resolved column widths and strands the pane's right edge. */
 .review-groups-table .q-table { table-layout: fixed; width: 100%; }
-.review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 16%; }
-.review-groups-table th:nth-child(2), .review-groups-table td:nth-child(2) { width: 16%; }
-.review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 25%; }
-.review-groups-table th:nth-child(4), .review-groups-table td:nth-child(4) { width: 4%; }
+.review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 15%; }
+.review-groups-table th:nth-child(2), .review-groups-table td:nth-child(2) { width: 15%; }
+.review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 23%; }
+/* wide enough for a comma-grouped 7-digit count (e.g. 1,234,567) without
+   wrapping or overflowing at any supported desktop viewport */
+.review-groups-table th:nth-child(4), .review-groups-table td:nth-child(4) { width: 10%; }
 /* the # header is one glyph plus a sort icon; wrapping puts them on two lines */
-.review-groups-table th:nth-child(4) { white-space: nowrap; }
+.review-groups-table th:nth-child(4),
+.review-groups-table td:nth-child(4) { white-space: nowrap; }
 .review-groups-table th:nth-child(5), .review-groups-table td:nth-child(5) {
-  width: 39%; min-width: 0; }
+  width: 37%; min-width: 0; }
 /* fixed layout leaves no slack, so headers must wrap instead of colliding */
 .findings-table thead th { white-space: normal; }
 .findings-table .mono { font-family: var(--font-mono); font-size: var(--fs-meta); }
@@ -686,10 +692,11 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
   .review-groups-table th:nth-child(2),
   .review-groups-table td:nth-child(2) { display: none; }
   /* room for three 3-digit severity chips on one line */
-  .review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 21%; }
-  .review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 28%; }
-  .review-groups-table th:nth-child(4), .review-groups-table td:nth-child(4) { width: 6%; }
-  .review-groups-table th:nth-child(5), .review-groups-table td:nth-child(5) { width: 45%; }
+  .review-groups-table th:nth-child(1), .review-groups-table td:nth-child(1) { width: 19%; }
+  .review-groups-table th:nth-child(3), .review-groups-table td:nth-child(3) { width: 26%; }
+  /* narrower viewport still needs full room for a comma-grouped 7-digit count */
+  .review-groups-table th:nth-child(4), .review-groups-table td:nth-child(4) { width: 13%; }
+  .review-groups-table th:nth-child(5), .review-groups-table td:nth-child(5) { width: 42%; }
   .reviewclass-inline { display: inline; }
   .review-groups-table .sevtext { white-space: nowrap; }
 }
@@ -900,7 +907,8 @@ REVIEW_GROUPS_BODY_SLOT = """
     :title="props.row.where + ' ' + props.row.location">{{
     props.row.where }}<span v-if="props.row.where"> · </span
     ><span class="mono">{{ props.row.location }}</span></q-td>
-  <q-td key="members" :props="props" class="groupcount">{{ props.row.members }}</q-td>
+  <q-td key="members" :props="props" class="groupcount">{{
+    Number(props.row.members).toLocaleString('en-US') }}</q-td>
   <q-td key="message" :props="props">{{ props.row.message }}
     <span v-if="props.row.reviewed" class="reviewed"
       :title="props.row.reviewed + ' of ' + props.row.reviewable_members + ' reviewed'"
@@ -942,7 +950,8 @@ REVIEW_GROUPS_BODY_SLOT = """
     :title="props.row.where + ' ' + props.row.location">{{
     props.row.where }}<span v-if="props.row.where && props.row.location"> · </span
     ><span class="mono">{{ props.row.location }}</span></q-td>
-  <q-td key="members" :props="props" class="groupcount">{{ props.row.members }}</q-td>
+  <q-td key="members" :props="props" class="groupcount">{{
+    Number(props.row.members).toLocaleString('en-US') }}</q-td>
   <q-td key="message" :props="props"><span class="reviewclass-inline">{{
     props.row.class.replace(/_/g, ' ') }}</span>{{ props.row.message }}
     <span v-if="props.row.reviewed" class="reviewed"

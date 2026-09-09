@@ -82,6 +82,7 @@ _RISKY_RELATIONSHIP_KINDS = {
     "customui": PackageRiskKind.CUSTOM_OFFICE_UI,
     "dialogsheet": PackageRiskKind.DIALOG_SHEET,
     "externallink": PackageRiskKind.EXTERNAL_DATA,
+    "externallinklongpath": PackageRiskKind.EXTERNAL_DATA,
     "externallinkpath": PackageRiskKind.EXTERNAL_DATA,
     "macrosheet": PackageRiskKind.MACRO_SHEET,
     "oleobject": PackageRiskKind.EMBEDDED_OLE,

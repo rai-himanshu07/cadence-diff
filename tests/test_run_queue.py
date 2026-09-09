@@ -8,6 +8,7 @@ import json
 import multiprocessing as mp
 import os
 import queue as queue_module
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -15,6 +16,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import pydantic
 import pytest
 
 if TYPE_CHECKING:
@@ -26,6 +28,16 @@ from qc_tool.coverage import QCRunMode
 from qc_tool.history.run_state import RunStateStore, RunStatus
 from qc_tool.history.store import RunHistory
 from qc_tool.package import PackageManifest
+from qc_tool.run_action import (
+    MAX_RANKED_TABLE_AVAILABLE_COLUMNS,
+    MAX_RUN_ACTION_ITEMS,
+    MAX_RUN_ACTION_MESSAGE_CHARS,
+    MAX_RUN_ACTION_SHEET_CHARS,
+    RankedTableEvidence,
+    RunActionItem,
+    RunActionReason,
+    RunActionRequired,
+)
 from qc_tool.runqueue import (
     QueueBusyError,
     RunQueueManager,
@@ -37,6 +49,7 @@ from qc_tool.worker import (
     IPC_QUEUE_CAPACITY,
     OwnedCancellationFlag,
     _deliver,
+    blocked_message,
     cancelled_message,
     error_message,
     progress_message,
@@ -108,6 +121,67 @@ def _failing_worker(payload, credentials, events, cancel_flag) -> None:
     events.put(
         error_message(
             sanitize_error(RuntimeError("cannot read /private/uploads/quarter.xlsx")),
+            [],
+        )
+    )
+
+
+def _blocked_worker(payload, credentials, events, cancel_flag) -> None:
+    events.put(
+        blocked_message(
+            {
+                "version": 1,
+                "reason": "comparison_prerequisite_mismatch",
+                "items": [
+                    {
+                        "member_id": "primary",
+                        "sheet": "Config",
+                        "cell": "B2",
+                        "label": "Scenario",
+                        "detail": "baseline and current do not have the same value",
+                    }
+                ],
+                "message": "Select the same scenario, recalculate, save, and Re-QC.",
+            },
+            [],
+        )
+    )
+
+
+def _ranked_table_blocked_worker(payload, credentials, events, cancel_flag) -> None:
+    events.put(
+        blocked_message(
+            {
+                "version": 2,
+                "reason": "row_identity_confirmation_required",
+                "items": [
+                    {
+                        "member_id": "ops",
+                        "sheet": "Panel",
+                        "cell": "A1",
+                        "label": "Possible ranked/sorted table: columns B",
+                        "ranked_table_evidence": {
+                            "version": 2,
+                            "member_id": "ops",
+                            "sheet": "Panel",
+                            "current_range": "A1:E6001",
+                            "data_row_count": 6001,
+                            "available_columns": ["A", "B", "C", "D", "E"],
+                            "suggested_identity_columns": ["B"],
+                            "suggested_ordinal_columns": ["A"],
+                            "non_blank_coverage": 0.999,
+                            "unique_ratio": 0.998,
+                            "key_overlap": 0.95,
+                            "formula_ratio": 0.0,
+                            "displaced_ratio": 1.0,
+                            "mismatch_reduction": 0.995,
+                            "projected_positional_mismatches": 500_000,
+                            "projected_avoided_mismatches": 497_500,
+                        },
+                    }
+                ],
+                "message": "One or more sheets look like a ranked or sorted table.",
+            },
             [],
         )
     )
@@ -253,6 +327,59 @@ def test_ipc_envelope_round_trips_versioned_primitives_only() -> None:
         "cancelled",
         "error",
     }
+
+
+def test_blocked_action_payload_is_bounded_before_ipc() -> None:
+    action = RunActionRequired(
+        reason=RunActionReason.ROW_IDENTITY_CONFIRMATION_REQUIRED,
+        items=[
+            RunActionItem(sheet="S" * 500, cell="A1", label=f"candidate {index}")
+            for index in range(MAX_RUN_ACTION_ITEMS + 5)
+        ],
+        message="M" * (MAX_RUN_ACTION_MESSAGE_CHARS + 20),
+    )
+
+    assert len(action.items) == MAX_RUN_ACTION_ITEMS
+    assert action.omitted_items == 5
+    assert len(action.items[0].sheet) == MAX_RUN_ACTION_SHEET_CHARS
+    assert len(action.message) == MAX_RUN_ACTION_MESSAGE_CHARS
+    message = blocked_message(action.model_dump(mode="json"), [])
+    assert len(message["action_required"]["items"]) == MAX_RUN_ACTION_ITEMS
+
+
+def test_ranked_table_evidence_is_bounded_before_ipc() -> None:
+    """The nested v2 evidence payload is bounded the same way its parent
+    ``RunActionItem`` is -- an oversized ``available_columns`` list never
+    reaches IPC/history (truncated, since a genuinely wide ranked table is
+    plausible); an oversized identity/ordinal suggestion list is rejected
+    outright (the detector itself never emits more than a handful, so
+    exceeding 12 signals a bug, not legitimate wide data)."""
+    evidence = RankedTableEvidence(
+        sheet="S" * 500,
+        current_range="R" * 200,
+        available_columns=tuple(
+            f"C{i}" for i in range(MAX_RANKED_TABLE_AVAILABLE_COLUMNS + 10)
+        ),
+        suggested_identity_columns=("B",),
+        suggested_ordinal_columns=("A",),
+    )
+    assert len(evidence.sheet) == MAX_RUN_ACTION_SHEET_CHARS
+    assert len(evidence.current_range) == 64
+    assert len(evidence.available_columns) == MAX_RANKED_TABLE_AVAILABLE_COLUMNS
+
+    with pytest.raises(pydantic.ValidationError):
+        RankedTableEvidence(suggested_identity_columns=tuple(f"I{i}" for i in range(20)))
+
+    action = RunActionRequired(
+        version=2,
+        reason=RunActionReason.ROW_IDENTITY_CONFIRMATION_REQUIRED,
+        items=[
+            RunActionItem(sheet="Panel", cell="A1", ranked_table_evidence=evidence)
+        ],
+    )
+    message = blocked_message(action.model_dump(mode="json"), [])
+    encoded_evidence = message["action_required"]["items"][0]["ranked_table_evidence"]
+    assert len(encoded_evidence["available_columns"]) == MAX_RANKED_TABLE_AVAILABLE_COLUMNS
 
 
 def test_sanitize_error_keeps_one_bounded_line_without_paths() -> None:
@@ -507,6 +634,64 @@ def test_reported_failures_are_sanitized_before_persistence(
     assert "/private/" not in record.error
 
 
+def test_blocked_worker_message_reaches_a_terminal_non_active_state(
+    make_manager: ManagerFactory,
+) -> None:
+    manager = make_manager(_blocked_worker)
+    request = _request(manager)
+    manager.submit(request)
+
+    record = manager.wait(request.request_id)
+
+    assert record.status is RunStatus.BLOCKED
+    assert not record.is_active
+    assert record.run_id is None
+    assert record.error == ""
+    assert record.action_required is not None
+    assert record.action_required["reason"] == "comparison_prerequisite_mismatch"
+    items = record.action_required["items"]
+    assert isinstance(items, list)
+    first_item = items[0]
+    assert isinstance(first_item, dict)
+    assert first_item["sheet"] == "Config"
+
+    # A blocked run releases the single worker slot for the next request.
+    other = _request(manager)
+    manager.submit(other)
+    assert manager.wait(other.request_id).status is RunStatus.BLOCKED
+
+
+def test_ranked_table_v2_evidence_round_trips_through_the_queue_and_history(
+    make_manager: ManagerFactory,
+) -> None:
+    """A v2 blocked payload's nested ``ranked_table_evidence`` survives the
+    worker -> queue -> ``RunStateStore`` round trip byte-for-byte, and the
+    typed model still validates it back out (Step 8's persistence gate)."""
+    manager = make_manager(_ranked_table_blocked_worker)
+    request = _request(manager)
+    manager.submit(request)
+
+    record = manager.wait(request.request_id)
+
+    assert record.status is RunStatus.BLOCKED
+    assert record.action_required is not None
+    assert record.action_required["version"] == 2
+    items = record.action_required["items"]
+    assert isinstance(items, list)
+    item = items[0]
+    assert isinstance(item, dict)
+    assert item["member_id"] == "ops"
+    evidence = item["ranked_table_evidence"]
+    assert isinstance(evidence, dict)
+    assert evidence["data_row_count"] == 6001
+    assert evidence["suggested_identity_columns"] == ["B"]
+
+    # The typed model still accepts the round-tripped dict.
+    action = RunActionRequired.model_validate(record.action_required)
+    assert action.items[0].ranked_table_evidence is not None
+    assert action.items[0].ranked_table_evidence.data_row_count == 6001
+
+
 # --- privacy and restart -----------------------------------------------------
 
 
@@ -677,6 +862,95 @@ def test_restart_orphans_incomplete_requests_and_never_resumes_them(
         assert "stale-request" not in log
     finally:
         manager.shutdown()
+
+
+def test_finalize_blocked_is_terminal_non_active_and_assigns_no_run_id(
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "blocked"
+    work_dir.mkdir()
+    store = RunStateStore(work_dir / "history.sqlite3")
+    record = store.enqueue(
+        "blocked-request",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        files={"current_excel": "current.xlsx"},
+        queue_position=0,
+    )
+    store.mark_starting(record.request_id)
+
+    action_required = {
+        "version": 1,
+        "reason": "comparison_prerequisite_mismatch",
+        "items": [
+            {
+                "member_id": "primary",
+                "sheet": "Config",
+                "cell": "B2",
+                "label": "Scenario",
+                "detail": "baseline and current do not have the same prerequisite value",
+            }
+        ],
+        "message": "Select the same scenario, fully recalculate, save, and Re-QC.",
+    }
+    store.finalize_blocked(record.request_id, action_required)
+
+    blocked = store.get(record.request_id)
+    assert blocked is not None
+    assert blocked.status is RunStatus.BLOCKED
+    assert not blocked.is_active
+    assert blocked.run_id is None
+    assert blocked.finished_at is not None
+    assert blocked.action_required == action_required
+
+
+def test_run_state_migrates_a_legacy_table_missing_action_required(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE run_state (
+                request_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                queue_position INTEGER NOT NULL DEFAULT 0,
+                mode TEXT NOT NULL,
+                profile TEXT NOT NULL,
+                files TEXT NOT NULL DEFAULT '{}',
+                phase TEXT NOT NULL DEFAULT '',
+                processed INTEGER NOT NULL DEFAULT 0,
+                total INTEGER NOT NULL DEFAULT 0,
+                detail TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT '',
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                run_id INTEGER,
+                error TEXT NOT NULL DEFAULT '',
+                phases TEXT NOT NULL DEFAULT '[]'
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO run_state (
+                request_id, created_at, status, mode, profile
+            ) VALUES (
+                'legacy-row', '2026-01-01T00:00:00', 'succeeded',
+                'cycle_comparison', 'fixture'
+            )
+            """
+        )
+
+    store = RunStateStore(db_path)
+    with sqlite3.connect(db_path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(run_state)")}
+    assert "action_required" in columns
+
+    legacy = store.get("legacy-row")
+    assert legacy is not None
+    assert legacy.action_required is None
 
 
 # --- progress, telemetry, backpressure ---------------------------------------

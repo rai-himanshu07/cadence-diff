@@ -9,6 +9,7 @@ localhost; sources are read-only. The visual language lives in
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime as dt
 import html
@@ -29,6 +30,7 @@ from nicegui import app, events, ui
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
 
+from qc_tool.config.editor import source_sha256
 from qc_tool.config.lint import lint_profile
 from qc_tool.config.profile import (
     CrosscheckMapping,
@@ -58,6 +60,11 @@ from qc_tool.coverage import (
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings
 from qc_tool.excel.formulas import formula_token_diff
+from qc_tool.excel.population_excerpt_worker import (
+    PopulationExcerptRequest,
+    PopulationExcerpts,
+    run_population_excerpt_worker,
+)
 from qc_tool.findings import (
     Finding,
     FindingClass,
@@ -71,10 +78,19 @@ from qc_tool.focus.model import FocusTargetSeed
 from qc_tool.focus.protocol import FocusOutcome
 from qc_tool.focus.service import ROLE_LABELS as FOCUS_ROLE_LABELS
 from qc_tool.focus.service import BindReport, FocusService, TokenRejection
-from qc_tool.history.carry_forward import apply_carry_forward, preview_carry_forward
+from qc_tool.history.carry_forward import (
+    apply_carry_forward,
+    apply_population_carry_forward,
+    preview_carry_forward,
+)
+from qc_tool.history.review_state import AnnotationLineageOutcome
 from qc_tool.history.run_state import RunStateRecord, RunStatus
 from qc_tool.history.store import RunHistory, RunRecord, export_runs_archive, sha256_file
-from qc_tool.io.loader import load_workbook_snapshot
+from qc_tool.io.formula_cache import FormulaExtractionCache
+from qc_tool.io.loader import (
+    load_workbook_snapshot,
+)
+from qc_tool.io.native_formula import native_adapter_fingerprint
 from qc_tool.io.peek import peek_sheet_names, peek_slide_titles
 from qc_tool.launcher import (
     HEALTH_PATH,
@@ -103,6 +119,8 @@ from qc_tool.review import (
     count_pattern_groups,
     format_group_ranges,
     format_ranges,
+    population_members,
+    population_members_page,
     prioritize_review,
 )
 from qc_tool.review_series import (
@@ -160,6 +178,14 @@ from qc_tool.triage.preview import (
 )
 from qc_tool.ui.guide import render_guide
 from qc_tool.ui.profile_editor import ProfileEditorController, open_profile_editor
+from qc_tool.ui.ranked_table_dialog import (
+    DUPLICATE_POLICIES,
+    DUPLICATE_POLICY_COPY,
+    DialogViewModel,
+    DuplicatePolicy,
+    apply_view_model,
+    view_model_from_action,
+)
 from qc_tool.ui.theme import (
     COL_RESIZE_JS,
     FINDINGS_BODY_SLOT,
@@ -303,6 +329,7 @@ class SessionState:
     profile_name: str = "default"
     mode: QCRunMode = QCRunMode.CURRENT_FILE_PREFLIGHT
     allow_large_workbooks: bool = False
+    allow_dependency_indexing: bool = False
     acceptance_absolute: float = 0.0
     acceptance_percent: float = 0.0  # analyst-facing percent; engine gets a fraction
     selected_sheets: set[str] = field(default_factory=set)
@@ -370,6 +397,18 @@ def _safe_upload_name(raw_name: str) -> str:
 def _profile_path(profiles_dir: Path, name: str) -> Path:
     """Resolve a validated profile name inside the managed profile directory."""
     return profile_path(profiles_dir, name)
+
+
+def _column_letters(raw: str) -> list[str]:
+    """Normalized, de-duplicated Excel column letters from one UI field."""
+    result: list[str] = []
+    for token in re.split(r"[\s,;+]+", raw.upper().strip()):
+        if not token:
+            continue
+        column_index_from_string(token)
+        if token not in result:
+            result.append(token)
+    return result
 
 
 def _storage_secret(work_dir: Path) -> str:
@@ -1601,6 +1640,12 @@ def _evidence_axes(finding: Finding) -> list[tuple[str, str]]:
         ("baseline", finding.baseline_value or ""),
         ("current", finding.current_value or ""),
         ("element", finding.element or ""),
+        (
+            "population",
+            f"{finding.population.member_count:,} cells"
+            if finding.population is not None
+            else "",
+        ),
         ("provenance", finding.provenance.value if finding.provenance else ""),
         ("subtype", finding.subtype.value if finding.subtype else ""),
         ("materiality", finding.materiality.value if finding.materiality else ""),
@@ -2005,6 +2050,208 @@ def _render_style_key_diff(finding: Finding) -> None:
         ).classes("hint")
 
 
+def _population_members(finding: Finding) -> list[tuple[str, str]]:
+    """Decode a population's membership codec into (current, baseline) pairs.
+
+    Thin UI-facing wrapper: the pure decode logic is shared with cross-run
+    lineage pairing via `qc_tool.review.population_members` (A4).
+    """
+    return list(population_members(finding))
+
+
+_POPULATION_MEMBER_COLUMNS = [
+    {"name": "current", "label": "Current", "field": "current", "sortable": True},
+    {"name": "baseline", "label": "Baseline", "field": "baseline", "sortable": True},
+]
+
+
+def _open_population_members_dialog(finding: Finding) -> None:
+    """Page through every population member, decoding only the active page.
+
+    Criterion 9: never materializes the full membership list -- a bounded
+    `population_members_page` call decodes exactly the rows this page shows,
+    regardless of how large the population is.
+    """
+    member_count = finding.population.member_count if finding.population else 0
+    page_size = 50
+    page = {"index": 0}
+    with ui.dialog() as dialog, ui.card().classes("memberscard"):
+        with ui.row().classes("items-baseline gap-3 w-full"):
+            ui.label(f"{finding.sheet or ''} population members").classes("runhead")
+            ui.label(f"{member_count:,} total").classes("runmeta")
+        member_table = (
+            ui.table(
+                columns=_POPULATION_MEMBER_COLUMNS,
+                rows=[],
+                row_key="current",
+                pagination=page_size,
+            )
+            .classes("findings-table members-table")
+            .props("flat dense hide-bottom")
+        )
+
+        def refresh_page() -> None:
+            start = page["index"] * page_size
+            end = min(start + page_size, member_count)
+            page_pairs = population_members_page(finding, start, page_size)
+            member_table.rows = [
+                {"current": current, "baseline": baseline}
+                for current, baseline in page_pairs
+            ]
+            member_table.update()
+            page_label.set_text(f"Showing {start + 1:,}-{end:,} of {member_count:,}")
+            previous_button.set_enabled(page["index"] > 0)
+            next_button.set_enabled(end < member_count)
+
+        def previous_page() -> None:
+            page["index"] = max(0, page["index"] - 1)
+            refresh_page()
+
+        def next_page() -> None:
+            page["index"] += 1
+            refresh_page()
+
+        with ui.row().classes("items-center gap-2 w-full"):
+            previous_button = ui.button(
+                icon="chevron_left", on_click=previous_page
+            ).props("flat round dense aria-label='Previous page'")
+            page_label = ui.label().classes("hint")
+            next_button = ui.button(
+                icon="chevron_right", on_click=next_page
+            ).props("flat round dense aria-label='Next page'")
+            ui.space()
+            ui.button("Close", on_click=dialog.close).props("no-caps flat dense")
+        refresh_page()
+    dialog.open()
+
+
+def _population_source_roles(finding: Finding) -> tuple[str, str]:
+    """The (baseline, current) `RunRecord.file_paths` role keys for a finding."""
+    member = finding.artifact_member
+    if member == "primary":
+        return "baseline_excel", "current_excel"
+    return f"baseline_excel:{member}", f"current_excel:{member}"
+
+
+def _load_population_sample_excerpts(
+    finding: Finding, record: RunRecord
+) -> PopulationExcerpts:
+    """Reopen this run's recorded sources and build sample excerpts.
+
+    Delegates the actual reopen (a full workbook load) to a disposable child
+    process (`qc_tool.excel.population_excerpt_worker`) so the UI server's
+    own process never holds a full large-workbook snapshot (Criterion 9).
+    Fails closed with a plain disclosure -- never touching the run's own
+    findings -- when a source has moved, changed since the run, needs a
+    password the run history never retained, is too large to reopen, or the
+    worker times out. Runs in a worker thread; callers must not call this on
+    the event loop.
+
+    Cheap checks (recorded path present, file exists, hash matches) run here
+    in the parent before ever spawning the child -- only a source that is
+    actually going to be loaded pays subprocess overhead; a moved/changed
+    source fails fast exactly as it did before this delegated to a worker.
+    """
+    population = finding.population
+    if population is None or not population.samples:
+        return PopulationExcerpts(disclosure="no samples recorded")
+    if finding.sheet is None:
+        return PopulationExcerpts(disclosure="population has no sheet recorded")
+    baseline_role, current_role = _population_source_roles(finding)
+    paths: dict[str, str] = {}
+    for role, side in ((baseline_role, "baseline"), (current_role, "current")):
+        stored = record.file_paths.get(role)
+        if not stored:
+            return PopulationExcerpts(
+                disclosure=f"the run did not record a {side} source path"
+            )
+        path = Path(stored)
+        if not path.exists():
+            return PopulationExcerpts(
+                disclosure=f"{side} source is no longer at its recorded location"
+            )
+        expected_hash = record.file_hashes.get(role)
+        if expected_hash and sha256_file(path) != expected_hash:
+            return PopulationExcerpts(
+                disclosure=f"{side} source changed since this run recorded it"
+            )
+        paths[side] = stored
+    request = PopulationExcerptRequest(
+        baseline_path=paths["baseline"],
+        current_path=paths["current"],
+        baseline_hash=record.file_hashes.get(baseline_role, ""),
+        current_hash=record.file_hashes.get(current_role, ""),
+        sheet=finding.sheet,
+        samples=tuple(
+            (sample.current_location, sample.baseline_location)
+            for sample in population.samples
+        ),
+    )
+    return run_population_excerpt_worker(request)
+
+
+def _render_population_summary(finding: Finding) -> None:
+    """Group-first population evidence: count, shape, membership, samples.
+
+    The full member list is available via the codec-decoded "Expand
+    members" pager. Sample excerpts load on demand -- see
+    `render_population_excerpt_action`, wired in by the run-detail page
+    (only there `history`/`run_id` are available to reopen recorded
+    sources).
+    """
+    population = finding.population
+    if population is None:
+        return
+    membership = population.membership
+    baseline_mapping = (
+        f"constant offset {membership.shift}"
+        if membership.baseline_mode == "shift"
+        else f"{len(membership.pairs or ())} explicit baseline pairs"
+    )
+    with ui.expansion("Population membership", value=True).props("dense"):
+        with ui.element("div").classes("detailgrid"):
+            for key, value in (
+                ("members", f"{population.member_count:,} cells"),
+                (
+                    "current range",
+                    format_ranges(
+                        membership.current_rectangles, finding.location or ""
+                    ),
+                ),
+                ("baseline mapping", baseline_mapping),
+                ("first · last", f"{population.first} · {population.last}"),
+            ):
+                ui.label(key).classes("dk")
+                ui.label(value).classes("dv mono")
+        if population.samples:
+            with ui.element("div").classes("detailgrid"):
+                for sample in population.samples:
+                    ui.label(sample.current_location).classes("dk mono")
+                    ui.label(
+                        f"baseline {sample.baseline_location}"
+                        if sample.baseline_location
+                        else ""
+                    ).classes("dv mono")
+        if population.sampled_impacts:
+            ui.label(
+                f"Impacts for {len(population.samples)} sampled member(s) "
+                "only -- not the population's full downstream set:"
+            ).classes("dv note")
+            with ui.element("div").classes("detailgrid"):
+                for impact in population.sampled_impacts:
+                    ui.label("sampled").classes("dk mono")
+                    ui.label(impact).classes("dv mono")
+        ui.button(
+            "Expand members",
+            on_click=lambda: _open_population_members_dialog(finding),
+        ).classes("ghostbtn").props("no-caps flat dense")
+        ui.label(
+            f"Showing {len(population.samples)} sample"
+            f"{'s' if len(population.samples) != 1 else ''} of "
+            f"{population.member_count:,} members above."
+        ).classes("hint")
+
+
 def _render_evidence_body(finding: Finding) -> None:
     """Typed evidence axes and context grids for one finding, in the caller's slot."""
     with ui.element("div").classes("detailgrid"):
@@ -2013,6 +2260,8 @@ def _render_evidence_body(finding: Finding) -> None:
             ui.label(value).classes("dv")
     if finding.finding_class is FindingClass.STYLE_CHANGED:
         _render_style_key_diff(finding)
+    if finding.population is not None:
+        _render_population_summary(finding)
     # For formula logic changes, render a token-level diff expansion when available
     if (
         finding.finding_class is FindingClass.FORMULA_LOGIC_CHANGED
@@ -2548,6 +2797,40 @@ def _render_result_view(
                             ui.label("No prior decisions have identical evidence.").classes(
                                 "lede"
                             )
+                        if preview.populations:
+                            ui.label("Populations").classes("dk")
+                        for pop_candidate in preview.populations:
+                            outcome_label = pop_candidate.outcome.value.replace("_", " ")
+                            with ui.row().classes("items-center gap-2 w-full"):
+                                ui.label(
+                                    f"{pop_candidate.finding_id} · "
+                                    f"{pop_candidate.matched_member_count}/"
+                                    f"{pop_candidate.member_count} members · "
+                                    f"{outcome_label}"
+                                ).classes("note")
+                                if (
+                                    pop_candidate.outcome
+                                    is AnnotationLineageOutcome.INHERITED
+                                ):
+
+                                    def apply_population(
+                                        finding_id: str = pop_candidate.finding_id,
+                                    ) -> None:
+                                        try:
+                                            count = apply_population_carry_forward(
+                                                history, run_id, finding_id
+                                            )
+                                        except Exception as exc:
+                                            ui.notify(str(exc), type="negative")
+                                            return
+                                        dialog.close()
+                                        ui.notify(f"Applied {count} member decisions")
+                                        ui.navigate.reload()
+
+                                    ui.button(
+                                        f"Apply {pop_candidate.severity or 'note only'}",
+                                        on_click=apply_population,
+                                    ).classes("ghostbtn").props("no-caps flat dense")
 
                         def apply_selected() -> None:
                             if not selected:
@@ -3412,6 +3695,18 @@ def _render_result_view(
                                     "inserted_cols": r.column.inserted,
                                     "growth_cols": r.column.growth,
                                     "low_confidence": r.low_confidence,
+                                    "identity_columns": "+".join(
+                                        getattr(r, "identity_columns", ())
+                                    ),
+                                    "ordinal_columns": "+".join(
+                                        getattr(r, "ordinal_columns", ())
+                                    ),
+                                    "duplicate_policy": (
+                                        getattr(r, "duplicate_policy", None) or ""
+                                    ),
+                                    "skipped_duplicate_rows": getattr(
+                                        r, "skipped_duplicate_rows", 0
+                                    ),
                                 }
                             )
                         if rows:
@@ -3444,6 +3739,13 @@ def _render_result_view(
                                             ("inserted_cols", "Ins cols"),
                                             ("growth_cols", "Growth cols"),
                                             ("low_confidence", "Low confidence"),
+                                            ("identity_columns", "Identity columns"),
+                                            ("ordinal_columns", "Ordinal columns"),
+                                            ("duplicate_policy", "Duplicate policy"),
+                                            (
+                                                "skipped_duplicate_rows",
+                                                "Skipped duplicate rows",
+                                            ),
                                         )
                                     ],
                                     rows=rows,
@@ -4200,6 +4502,8 @@ def _render_result_view(
                 # representative; members are chosen in the affected dialog.
                 if focus_actions is not None and group.member_count == 1:
                     focus_actions(member)
+                if group.member_count == 1 and member.population is not None:
+                    render_population_excerpt_action(member)
                 if (
                     group.member_count == 1
                     and history is not None
@@ -4300,6 +4604,8 @@ def _render_result_view(
                         render_longitudinal(member)
                         if focus_actions is not None:
                             focus_actions(member)
+                        if member.population is not None:
+                            render_population_excerpt_action(member)
                         if (
                             history is not None
                             and run_id is not None
@@ -4474,6 +4780,60 @@ def _render_result_view(
             button_label,
             on_click=lambda: open_promotion_dialog(finding),
         ).classes("ghostbtn").props("flat no-caps dense")
+
+    def render_population_excerpt_action(finding: Finding) -> None:
+        """Button that reopens this run's recorded sources on demand and
+        builds sample excerpts -- only available where `history`/`run_id`
+        are known, since reopening needs the run's own recorded paths.
+        """
+        if history is None or run_id is None or finding.population is None:
+            return
+        active_history = history
+        active_run_id = run_id
+        results_box = ui.element("div").classes("detailgrid")
+
+        async def load() -> None:
+            button.set_enabled(False)
+            ui.notify("Reopening the run's recorded source files...")
+            try:
+                record = await asyncio.to_thread(active_history.get_run, active_run_id)
+                loaded = await asyncio.to_thread(
+                    _load_population_sample_excerpts, finding, record
+                )
+            except Exception:
+                logger.exception("population excerpt load failed")
+                ui.notify(
+                    "Could not load sample excerpts; see the server log.",
+                    type="negative",
+                )
+                button.set_enabled(True)
+                return
+            results_box.clear()
+            if loaded.disclosure:
+                ui.notify(loaded.disclosure, type="warning")
+                with results_box:
+                    ui.label(loaded.disclosure).classes("hint")
+            else:
+                ui.notify("Sample excerpts loaded", type="positive")
+                with results_box:
+                    for location, (baseline_excerpt, current_excerpt) in (
+                        loaded.excerpts.items()
+                    ):
+                        ui.label(location).classes("dk mono")
+                        with ui.row().classes("gap-3 flex-wrap items-start w-full"):
+                            if baseline_excerpt is not None:
+                                ui.html(
+                                    _context_grid_html(baseline_excerpt, "baseline")
+                                )
+                            if current_excerpt is not None:
+                                ui.html(
+                                    _context_grid_html(current_excerpt, "current")
+                                )
+            button.set_enabled(True)
+
+        button = ui.button("Load sample excerpts", on_click=load).classes(
+            "ghostbtn"
+        ).props("no-caps flat dense")
 
     def persist_group_review(
         group: ReviewGroup,
@@ -5547,6 +5907,34 @@ def create_pages(
                 except Exception:
                     logger.exception("desktop-shortcut-status-failed")
                     ui.label("Desktop shortcut status is unavailable.").classes("notecard")
+            ui.separator()
+            formula_cache = FormulaExtractionCache(work_dir / "formula-cache")
+            cache_status = formula_cache.status()
+            cache_label = ui.label(
+                f"Formula-extraction cache · {cache_status['entry_count']} entries, "
+                f"{_format_bytes(cache_status['total_bytes'])}"
+            ).classes("runhead")
+            ui.label(
+                "Skips repeat external-engine XLSB formula extraction for an "
+                "unchanged workbook. Clearing it changes no finding -- only "
+                "removes this performance shortcut."
+            ).classes("note")
+
+            def clear_formula_cache() -> None:
+                removed = formula_cache.clear()
+                cache_label.set_text("Formula-extraction cache · 0 entries, 0 B")
+                ui.notify(f"Cleared {removed} formula-cache entr{'y' if removed == 1 else 'ies'}")
+
+            ui.button("Clear formula cache", on_click=clear_formula_cache).classes(
+                "ghostbtn"
+            ).props("flat no-caps")
+            native_fingerprint = native_adapter_fingerprint()
+            ui.label(
+                f"Native formula engine: {native_fingerprint}"
+                if native_fingerprint
+                else "Native formula engine: not installed (profiles set to "
+                "native or auto fall back to the existing Excel/LibreOffice adapters)"
+            ).classes("note")
             ui.button("Close", on_click=dialog.close).props("flat no-caps")
         dialog.open()
 
@@ -6215,6 +6603,12 @@ def create_pages(
                     state.allow_large_workbooks = bool(e.value)
                     refresh_readiness()
 
+                def on_allow_dependency_indexing(
+                    e: events.ValueChangeEventArguments,
+                ) -> None:
+                    state.allow_dependency_indexing = bool(e.value)
+                    refresh_readiness()
+
                 ui.number(
                     label="Accept ± value",
                     value=0,
@@ -6245,6 +6639,18 @@ def create_pages(
                     "for every workbook in this run. Use only after reading the "
                     "refusal reason and confirming enough local memory; workload "
                     "coverage will be degraded."
+                )
+                ui.checkbox(
+                    "Force full dependency indexing",
+                    value=False,
+                    on_change=on_allow_dependency_indexing,
+                ).tooltip(
+                    "Above a documented formula-count/reference-cost size "
+                    "policy, dependency indexing (circular detection, "
+                    "formula/chart/PowerPoint-chart impacts) is skipped with a "
+                    "disclosed coverage reason instead of attempted. Check this "
+                    "to force it anyway; distinct from the workload override "
+                    "above and can cost significant time and memory."
                 )
 
             with (
@@ -6498,6 +6904,8 @@ def create_pages(
                     ]
                     if state.allow_large_workbooks:
                         details.append("workbook workload refusals overridden")
+                    if state.allow_dependency_indexing:
+                        details.append("dependency indexing size policy overridden")
                     cautions = _input_cautions(state)
                     if cautions:
                         details.insert(0, "check inputs — " + "; ".join(cautions))
@@ -6508,15 +6916,32 @@ def create_pages(
                         add="caution" if cautions and not blockers else "",
                         remove="" if cautions and not blockers else "caution",
                     )
-                    run_button.set_enabled(not blockers)
+                    run_button.set_enabled(not blockers and not _run_ui_busy())
                     for button in extra_run_buttons:
-                        button.set_enabled(not blockers)
+                        button.set_enabled(not blockers and not _run_ui_busy())
 
                 queue_signature: dict[str, tuple[tuple[str, str], ...]] = {"value": ()}
                 own_requests: set[str] = set()
                 # Requests this page observed while active, including ones a
                 # different tab submitted, so a refresh still reports the outcome.
                 watched_requests: set[str] = set()
+
+                # Single-flight submission lock: idle -> projecting -> dialog ->
+                # submitted. Set synchronously (no `await` before the first
+                # assignment) so a second rapid click sees a locked phase before
+                # any concurrently scheduled task can act. Released only when the
+                # owned request's RunStateRecord.is_active becomes false (never an
+                # enumerated terminal-status list) or the analyst explicitly cancels
+                # the volume-projection dialog.
+                run_lock: dict[str, str | None] = {"phase": "idle", "request_id": None}
+
+                def _run_ui_busy() -> bool:
+                    return run_lock["phase"] != "idle"
+
+                def _unlock_run() -> None:
+                    run_lock["phase"] = "idle"
+                    run_lock["request_id"] = None
+                    refresh_readiness()
 
                 def announce(record: RunStateRecord) -> None:
                     if record.status is RunStatus.SUCCEEDED and record.run_id:
@@ -6545,6 +6970,42 @@ def create_pages(
                             "submit it again",
                             type="warning",
                         )
+                    elif record.status is RunStatus.BLOCKED:
+                        action = record.action_required or {}
+                        if (
+                            action.get("reason")
+                            == "row_identity_confirmation_required"
+                            and _open_row_identity_setup(action, record.profile)
+                        ):
+                            return
+                        raw_items = action.get("items")
+                        items = raw_items if isinstance(raw_items, list) else []
+                        locations = "; ".join(
+                            (
+                                f"[{item['member_id']}] "
+                                if isinstance(item.get("member_id"), str)
+                                and item.get("member_id") != "primary"
+                                else ""
+                            )
+                            + f"{item.get('sheet', '')}!{item.get('cell', '')}"
+                            + (f" ({item['label']})" if item.get("label") else "")
+                            for item in items
+                            if isinstance(item, dict)
+                        )
+                        raw_message = action.get("message")
+                        message = (
+                            raw_message
+                            if isinstance(raw_message, str) and raw_message
+                            else "This run cannot proceed as configured."
+                        )
+                        raw_omitted = action.get("omitted_items", 0)
+                        omitted = raw_omitted if isinstance(raw_omitted, int) else 0
+                        omitted_note = f"; and {omitted} more" if omitted else ""
+                        ui.notify(
+                            f"{message} {locations}{omitted_note}".strip(),
+                            type="warning",
+                            multi_line=True,
+                        )
                     else:
                         ui.notify(
                             f"QC run failed: {record.error or 'unknown error'}",
@@ -6572,7 +7033,7 @@ def create_pages(
                                     ),
                                 ).classes("ghostbtn").props("flat no-caps dense")
                     watched_requests.update(record.request_id for record in pending)
-                    spinner.visible = any(
+                    spinner.visible = _run_ui_busy() or any(
                         record.request_id in own_requests for record in pending
                     )
                     for request_id in sorted(watched_requests):
@@ -6582,10 +7043,16 @@ def create_pages(
                         watched_requests.discard(request_id)
                         announce(record)
                         own_requests.discard(request_id)
+                        if run_lock["request_id"] == request_id:
+                            _unlock_run()
 
                 ui.timer(0.5, refresh_queue)
 
                 async def start_run() -> None:
+                    if _run_ui_busy():
+                        # single-flight: a request is already projecting, showing
+                        # its dialog, or queued/running — ignore the extra click.
+                        return
                     blockers = _run_blockers(
                         state.mode,
                         state.files,
@@ -6596,41 +7063,58 @@ def create_pages(
                     if blockers:
                         ui.notify("; ".join(blockers), type="warning")
                         return
-                    RunHistory(work_dir / "history.sqlite3").pause_review_sessions()
-                    files = _files_for_mode(state.mode, state.files)
+                    run_lock["phase"] = "projecting"
+                    refresh_readiness()
+                    spinner.visible = True
                     try:
-                        profile = load_profile_by_name(profiles_dir, state.profile_name)
-                    except Exception as exc:
-                        ui.notify(f"Profile failed to load: {exc}", type="negative")
-                        return
-                    try:
-                        manifest = PackageManifest.from_role_files(files)
-                    except ValueError as exc:
-                        ui.notify(str(exc), type="negative")
-                        return
-                    state.package_manifest = manifest
-
-                    # Projected diff volume: warn before a monster comparison
-                    # starts and offer scoping to the sheets that changed.
-                    if (
-                        state.mode is QCRunMode.CYCLE_COMPARISON
-                        and "baseline_excel" in files
-                        and "current_excel" in files
-                        and not state.selected_sheets
-                    ):
-                        projection = await asyncio.to_thread(
-                            project_cycle_volume,
-                            files["baseline_excel"],
-                            files["current_excel"],
-                        )
-                        if (
-                            projection is not None
-                            and projection.projected_max_findings
-                            > REPORT_DEFER_FINDINGS
-                        ):
-                            _open_projection_dialog(projection, files, profile, manifest)
+                        RunHistory(work_dir / "history.sqlite3").pause_review_sessions()
+                        files = _files_for_mode(state.mode, state.files)
+                        try:
+                            profile = load_profile_by_name(profiles_dir, state.profile_name)
+                        except Exception as exc:
+                            ui.notify(f"Profile failed to load: {exc}", type="negative")
                             return
-                    submit_run(files, profile, manifest)
+                        try:
+                            manifest = PackageManifest.from_role_files(files)
+                        except ValueError as exc:
+                            ui.notify(str(exc), type="negative")
+                            return
+                        state.package_manifest = manifest
+
+                        # Projected diff volume: warn before a monster comparison
+                        # starts and offer scoping to the sheets that changed.
+                        if (
+                            state.mode is QCRunMode.CYCLE_COMPARISON
+                            and "baseline_excel" in files
+                            and "current_excel" in files
+                            and not state.selected_sheets
+                        ):
+                            projection = await asyncio.to_thread(
+                                project_cycle_volume,
+                                files["baseline_excel"],
+                                files["current_excel"],
+                            )
+                            if (
+                                projection is not None
+                                and projection.projected_max_findings
+                                > REPORT_DEFER_FINDINGS
+                            ):
+                                run_lock["phase"] = "dialog"
+                                _open_projection_dialog(
+                                    projection, files, profile, manifest
+                                )
+                                return
+                        submit_run(files, profile, manifest)
+                    except Exception:
+                        logger.exception("Run QC submission failed unexpectedly")
+                        ui.notify(
+                            "Run QC could not start; see the server log",
+                            type="negative",
+                        )
+                        return
+                    finally:
+                        if run_lock["phase"] == "projecting":
+                            _unlock_run()
 
                 def _open_projection_dialog(
                     projection: VolumeProjection,
@@ -6641,7 +7125,10 @@ def create_pages(
                     minutes = max(1, projection.projected_max_findings // 20_000)
                     picked: set[str] = set()
                     boxes: dict[str, ui.checkbox] = {}
-                    with ui.dialog() as dialog, ui.card().classes(
+                    # Persistent: only the explicit Cancel/Run buttons below may
+                    # resolve this dialog, so the single-flight lock (already set
+                    # to "dialog" by the caller) always releases deterministically.
+                    with ui.dialog().props("persistent") as dialog, ui.card().classes(
                         "w-[42rem] max-w-full"
                     ):
                         ui.label("This looks like a very large comparison").classes(
@@ -6725,6 +7212,10 @@ def create_pages(
                             dialog.close()
                             submit_run(files, profile, manifest)
 
+                        def cancel_dialog() -> None:
+                            dialog.close()
+                            _unlock_run()
+
                         with ui.row().classes("items-center gap-2"):
                             run_selected = ui.button(
                                 "Run selected sheets", on_click=run_picked
@@ -6733,7 +7224,7 @@ def create_pages(
                             ui.button(
                                 "Run everything", on_click=run_everything
                             ).classes("ghostbtn").props("no-caps flat")
-                            ui.button("Cancel", on_click=dialog.close).props(
+                            ui.button("Cancel", on_click=cancel_dialog).props(
                                 "flat no-caps"
                             )
                     dialog.open()
@@ -6758,6 +7249,7 @@ def create_pages(
                             if value
                         },
                         allow_large_workbooks=state.allow_large_workbooks,
+                        allow_dependency_indexing=state.allow_dependency_indexing,
                         acceptance_absolute=max(state.acceptance_absolute, 0.0),
                         acceptance_relative=max(state.acceptance_percent, 0.0) / 100.0,
                         compare_sheets=(
@@ -6784,7 +7276,10 @@ def create_pages(
                         record = queue_manager.submit(request, credentials)
                     except QueueBusyError as exc:
                         ui.notify(str(exc), type="warning")
+                        _unlock_run()
                         return
+                    run_lock["phase"] = "submitted"
+                    run_lock["request_id"] = request.request_id
                     own_requests.add(request.request_id)
                     watched_requests.add(request.request_id)
                     ui.notify(
@@ -6804,6 +7299,277 @@ def create_pages(
 
             update_mode_surface()
             refresh_readiness()
+
+            def _open_row_identity_setup(
+                action: dict[str, object], source_profile: str
+            ) -> bool:
+                """Review Row Matching: one flat, task-focused dialog for every
+                unconfirmed ranked/sorted-table region a blocked run raised
+                (Criteria 12-15). Regions and destination validity gate the
+                primary action; column selection is chip-based from each
+                region's own bounded ``available_columns`` for a v2 item, with
+                a free-text fallback for a legacy v1 item (Criterion 11)."""
+                opened_path = (
+                    None
+                    if source_profile == "default"
+                    else _profile_path(profiles_dir, source_profile)
+                )
+                opened_hash = (
+                    source_sha256(opened_path)
+                    if opened_path is not None and opened_path.exists()
+                    else None
+                )
+                opened_exists = opened_path is not None and opened_path.exists()
+                view_model = view_model_from_action(
+                    action,
+                    source_profile=source_profile,
+                    opened_hash=opened_hash,
+                    opened_source_existed=opened_exists,
+                )
+                if view_model is None:
+                    return False
+
+                dialog_state: dict[str, DialogViewModel] = {"view_model": view_model}
+                region_controls: list[dict[str, Any]] = []
+
+                def _refresh_validation() -> None:
+                    vm = dialog_state["view_model"]
+                    destination_errors = vm.destination_errors()
+                    profile_name_input.props(
+                        f"error={'true' if destination_errors else 'false'} "
+                        f'error-message="{destination_errors[0] if destination_errors else ""}"'
+                    )
+                    destination_note.set_text(
+                        ""
+                        if destination_errors
+                        else (
+                            "Creates a new profile"
+                            if vm.is_creating_profile
+                            else f"Updates {vm.profile_name.strip()!r}"
+                        )
+                    )
+                    for index, controls in enumerate(region_controls):
+                        region = vm.regions[index]
+                        errors = region.errors()
+                        for widget in controls["column_widgets"]:
+                            widget.props(
+                                f"error={'true' if errors else 'false'} "
+                                f'error-message="{errors[0] if errors else ""}"'
+                            )
+                        icon = "check_circle" if region.is_valid else "error"
+                        controls["tab"].props(f"icon={icon}")
+                    save_button.set_enabled(vm.is_valid)
+
+                def _on_profile_name_change(event: events.ValueChangeEventArguments) -> None:
+                    dialog_state["view_model"] = dialog_state["view_model"].with_profile_name(
+                        str(event.value or "")
+                    )
+                    _refresh_validation()
+
+                def _on_columns_change(
+                    index: int,
+                    *,
+                    identity: list[str] | None = None,
+                    ordinal: list[str] | None = None,
+                ) -> None:
+                    region = dialog_state["view_model"].regions[index]
+                    updated = region.with_columns(
+                        identity=(
+                            tuple(identity)
+                            if identity is not None
+                            else region.identity_columns
+                        ),
+                        ordinal=(
+                            tuple(ordinal)
+                            if ordinal is not None
+                            else region.ordinal_columns
+                        ),
+                    )
+                    dialog_state["view_model"] = dialog_state["view_model"].with_region(
+                        index, updated
+                    )
+                    _refresh_validation()
+
+                def _on_duplicate_policy_change(index: int, policy: DuplicatePolicy) -> None:
+                    region = dialog_state["view_model"].regions[index]
+                    dialog_state["view_model"] = dialog_state["view_model"].with_region(
+                        index, region.with_duplicate_policy(policy)
+                    )
+
+                with ui.dialog().props("persistent") as dialog, ui.card().classes(
+                    "w-[46rem] max-w-[96vw] max-h-[92vh] overflow-y-auto"
+                ):
+                    with ui.row().classes("items-baseline justify-between w-full"):
+                        ui.label("Review row matching").classes("runhead")
+                        ui.label("QC paused").classes("hint")
+                    ui.label(
+                        "One or more sheets look like a ranked or sorted table "
+                        "compared by raw position. This is a suggestion, not "
+                        "proof -- review the evidence for each table below "
+                        "before confirming. Physical row order and any ordinal "
+                        "values you ignore are never compared again; formulas, "
+                        "styles, structure, and other business values stay "
+                        "fully checked."
+                    ).classes("note")
+
+                    destination_note = ui.label().classes("hint")
+                    profile_name_input = (
+                        ui.input(
+                            "Save to profile",
+                            value=view_model.profile_name,
+                            placeholder=(
+                                "Enter a new named profile"
+                                if not view_model.opened_profile_name
+                                else "Profile name"
+                            ),
+                            on_change=_on_profile_name_change,
+                        )
+                        .classes("w-full")
+                        .props(
+                            "outlined dense autofocus"
+                            if view_model.initial_focus_target == "profile_name"
+                            else "outlined dense"
+                        )
+                    )
+
+                    region_count = view_model.region_count
+                    with ui.tabs().props("dense").classes("w-full") as region_tabs:
+                        tabs = [
+                            ui.tab(
+                                f"region-{index}",
+                                label=f"{index + 1} of {region_count} \u00b7 {region.label}",
+                            )
+                            for index, region in enumerate(view_model.regions)
+                        ]
+                    with ui.tab_panels(region_tabs, value="region-0").classes("w-full"):
+                        for index, region in enumerate(view_model.regions):
+                            with ui.tab_panel(f"region-{index}"):
+                                column_widgets: list[Any] = []
+                                ui.label(region.noise_summary).classes("note")
+                                if region.available_columns:
+                                    identity_select = ui.select(
+                                        options=list(region.available_columns),
+                                        multiple=True,
+                                        value=list(region.identity_columns),
+                                        label="Match rows by",
+                                        on_change=lambda e, i=index: _on_columns_change(
+                                            i, identity=list(e.value or [])
+                                        ),
+                                    ).props("use-chips outlined dense").classes("w-full")
+                                    ordinal_select = ui.select(
+                                        options=list(region.available_columns),
+                                        multiple=True,
+                                        value=list(region.ordinal_columns),
+                                        label="Ignore order-only values in",
+                                        on_change=lambda e, i=index: _on_columns_change(
+                                            i, ordinal=list(e.value or [])
+                                        ),
+                                    ).props("use-chips outlined dense").classes("w-full")
+                                    column_widgets = [identity_select, ordinal_select]
+                                else:
+                                    identity_input = ui.input(
+                                        "Match rows by (column letters)",
+                                        value=", ".join(region.identity_columns),
+                                        on_change=lambda e, i=index: _on_columns_change(
+                                            i, identity=_column_letters(str(e.value or ""))
+                                        ),
+                                    ).props("outlined dense").classes("w-full")
+                                    ordinal_input = ui.input(
+                                        "Ignore order-only values in (column letters)",
+                                        value=", ".join(region.ordinal_columns),
+                                        on_change=lambda e, i=index: _on_columns_change(
+                                            i, ordinal=_column_letters(str(e.value or ""))
+                                        ),
+                                    ).props("outlined dense").classes("w-full")
+                                    column_widgets = [identity_input, ordinal_input]
+                                ui.radio(
+                                    {
+                                        policy: DUPLICATE_POLICY_COPY[policy][0]
+                                        for policy in DUPLICATE_POLICIES
+                                    },
+                                    value=region.duplicate_policy,
+                                    on_change=lambda e, i=index: _on_duplicate_policy_change(
+                                        i, cast(DuplicatePolicy, e.value)
+                                    ),
+                                ).props("dense").classes("w-full")
+                                for policy in DUPLICATE_POLICIES:
+                                    label, consequence, risk = DUPLICATE_POLICY_COPY[policy]
+                                    with ui.element("div").classes("note w-full"):
+                                        ui.label(f"{label} \u2014 {risk}").classes("dk")
+                                        ui.label(consequence).classes("hint")
+                                with ui.expansion("Why QC paused", icon="help_outline").classes(
+                                    "w-full"
+                                ):
+                                    ui.label(region.why_paused_detail).classes("hint")
+                                region_controls.append(
+                                    {"tab": tabs[index], "column_widgets": column_widgets}
+                                )
+
+                    async def save_rules() -> None:
+                        vm = dialog_state["view_model"]
+                        if not vm.is_valid:
+                            _refresh_validation()
+                            return
+                        target_name = vm.profile_name.strip()
+                        target_path = _profile_path(profiles_dir, target_name)
+                        current_exists = target_path.exists()
+                        current_hash = (
+                            source_sha256(target_path) if current_exists else None
+                        )
+                        if vm.has_profile_conflict(
+                            current_hash=current_hash, current_exists=current_exists
+                        ):
+                            ui.notify(
+                                f"Profile {target_name!r} changed while this dialog "
+                                "was open; reopen it and try again",
+                                type="warning",
+                                multi_line=True,
+                            )
+                            return
+                        try:
+                            base_profile = (
+                                load_profile(target_path)
+                                if current_exists
+                                else new_profile(target_name)
+                            )
+                            workbook_count = max(
+                                1,
+                                sum(
+                                    role == "current_excel"
+                                    or role.startswith("current_excel:")
+                                    for role in state.files
+                                ),
+                            )
+                            profile = apply_view_model(
+                                base_profile, vm, workbook_count=workbook_count
+                            )
+                            save_profile(profile, target_path)
+                        except (OSError, ValueError) as exc:
+                            ui.notify(str(exc), type="warning", multi_line=True)
+                            return
+                        options = list_profiles(profiles_dir)
+                        profile_select.options = options
+                        profile_select.value = target_name
+                        profile_select.update()
+                        state.profile_name = target_name
+                        refresh_readiness()
+                        dialog.close()
+                        ui.notify(
+                            f"Saved row matching to profile {target_name!r}; Re-QC started"
+                        )
+                        await start_run()
+
+                    with ui.row().classes("items-center gap-2 rankedtable-actions"):
+                        save_button = ui.button(
+                            "Save rule and run QC", on_click=save_rules
+                        ).classes("runbtn").props("no-caps")
+                        ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                _refresh_validation()
+                if view_model.initial_focus_target == "region_identity" and region_controls:
+                    with contextlib.suppress(Exception):
+                        region_controls[0]["column_widgets"][0].run_method("focus")
+                dialog.open()
+                return True
 
             results = ui.column().classes("w-full")
 

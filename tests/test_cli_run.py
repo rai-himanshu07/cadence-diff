@@ -139,6 +139,109 @@ def test_run_records_history(fixture_dir: Path, tmp_path: Path) -> None:
     assert runs[0].files["current_excel"] == "current.xlsx"
 
 
+def test_blocked_prerequisite_returns_exit_code_three(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from openpyxl import Workbook
+
+    from qc_tool.config.profile import (
+        ComparisonPrerequisite,
+        DeliverableProfile,
+        ExcelProfile,
+        save_profile,
+    )
+
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    for path, scenario in ((baseline, "Base Case"), (current, "Upside Case")):
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Config"
+        sheet["B2"] = scenario
+        workbook.save(path)
+
+    profile = DeliverableProfile(
+        name="prereq",
+        excel=ExcelProfile(
+            comparison_prerequisites=[
+                ComparisonPrerequisite(name="Scenario", sheet="Config", cell="B2")
+            ]
+        ),
+    )
+    profile_path = tmp_path / "prereq.yaml"
+    save_profile(profile, profile_path)
+    data_dir = tmp_path / "data"
+
+    code = _run(
+        [
+            "--baseline-excel", str(baseline),
+            "--current-excel", str(current),
+            "--data-dir", str(data_dir),
+            "--profile", str(profile_path),
+        ]
+    )
+
+    assert code == 3
+    err = capsys.readouterr().err
+    assert "blocked:" in err
+    assert "Config!B2" in err
+    assert "Base Case" not in err
+    assert "Upside Case" not in err
+    history_db = data_dir / "history.sqlite3"
+    assert not history_db.exists() or RunHistory(history_db).list_runs() == []
+
+
+def test_population_summary_line_printed_when_policy_enabled(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from openpyxl import Workbook
+
+    from qc_tool.config.profile import (
+        DeliverableProfile,
+        PopulationPolicy,
+        ReviewPolicy,
+        save_profile,
+    )
+
+    def build(path: Path, *, multiplier: int) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Data"
+        sheet.append(["Input", "Output"])
+        for row in range(2, 21):  # 19 uniform formula changes
+            sheet.append([100, f"=A{row}*{multiplier}"])
+        workbook.save(path)
+
+    baseline = tmp_path / "base.xlsx"
+    current = tmp_path / "curr.xlsx"
+    build(baseline, multiplier=2)
+    build(current, multiplier=3)
+    profile = DeliverableProfile(
+        name="population-cli",
+        review_policy=ReviewPolicy(
+            populations=PopulationPolicy(enabled=True, threshold=10)
+        ),
+    )
+    profile_path = tmp_path / "population.yaml"
+    save_profile(profile, profile_path)
+
+    code = _run(
+        [
+            "--baseline-excel", str(baseline),
+            "--current-excel", str(current),
+            "--data-dir", str(tmp_path / "data"),
+            "--profile", str(profile_path),
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert code in (0, 1, 2)
+    assert "populations (formula_logic_changed):" in out
+    assert "19 cells summarised as 1 population" in out
+
+
 def test_repeatable_current_workbook_flag_records_member_manifest_and_v2_json(
     fixture_dir: Path,
     tmp_path: Path,

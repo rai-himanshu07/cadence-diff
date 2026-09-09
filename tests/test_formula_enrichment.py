@@ -10,29 +10,36 @@ from typing import Any
 
 import pytest
 from openpyxl import Workbook
+from openpyxl.workbook.defined_name import DefinedName
 
 import qc_tool.io.libreoffice_formula as libreoffice_formula_module
 from qc_tool.io.excel_formula import (
     _load_worker_result,
+    _parse_defined_names,
     _terminate_owned_excel,
     extract_formulas_with_excel,
 )
 from qc_tool.io.excel_formula_worker import (
+    _collect_defined_names,
     _grid,
     _read_formula_grid,
     _rectangles,
     _set_manual_calculation,
 )
 from qc_tool.io.formula_enrichment import (
+    ExtractedDefinedName,
     FormulaEnrichmentError,
     FormulaExtraction,
+    bounded_defined_names,
+    classify_external_reachability,
+    compute_formula_text_coverage,
     merge_formula_extraction,
 )
 from qc_tool.io.libreoffice_formula import (
     _convert_with_libreoffice,
     _extract_formulas_with_converter,
 )
-from qc_tool.io.model import CellRecord, SheetSnapshot, WorkbookSnapshot
+from qc_tool.io.model import CellRecord, FormulaTextCoverage, SheetSnapshot, WorkbookSnapshot
 from qc_tool.io.xlsb_formula import XlsbFormulaScan
 
 
@@ -59,6 +66,7 @@ def _scan(*, risky: tuple[str, ...] = ()) -> XlsbFormulaScan:
     return XlsbFormulaScan(
         formula_cells={"Data": frozenset({(1, 1)})},
         risky_features=risky,
+        blocking_features=risky,
     )
 
 
@@ -77,6 +85,35 @@ def test_merge_preserves_original_cached_value() -> None:
     assert cell.formula == "=20+22" and cell.has_formula
     assert snapshot.formulas_available
     assert snapshot.formula_source == "test-engine"
+    assert snapshot.formula_text_coverage.state == "complete"
+    assert snapshot.formula_text_coverage.missing_count == 0
+
+
+def test_merge_sets_formula_r1c1_when_the_adapter_supplies_it() -> None:
+    snapshot = _snapshot()
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=20+22"}},
+        engine="test-engine",
+        detail="test extraction",
+        formulas_r1c1={"Data": {(1, 1): "=20+22"}},
+    )
+
+    merge_formula_extraction(snapshot, _scan(), extraction)
+
+    assert snapshot.sheet("Data").cells[(1, 1)].formula_r1c1 == "=20+22"
+
+
+def test_merge_leaves_formula_r1c1_none_when_the_adapter_never_supplies_it() -> None:
+    snapshot = _snapshot()
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=20+22"}},
+        engine="test-engine",
+        detail="test extraction",
+    )
+
+    merge_formula_extraction(snapshot, _scan(), extraction)
+
+    assert snapshot.sheet("Data").cells[(1, 1)].formula_r1c1 is None
 
 
 def test_coordinate_mismatch_fails_before_mutation() -> None:
@@ -92,6 +129,332 @@ def test_coordinate_mismatch_fails_before_mutation() -> None:
 
     assert snapshot.sheet("Data").cells[(1, 1)].formula is None
     assert not snapshot.formulas_available
+    # Fatal rejection happens before any mutation, including coverage state.
+    assert snapshot.formula_text_coverage.state == "none"
+
+
+# --- Step 4b: partial formula-text coverage -------------------------------
+
+
+def _two_cell_snapshot() -> WorkbookSnapshot:
+    return WorkbookSnapshot(
+        source_name="source.xlsb",
+        file_format="xlsb",
+        formulas_available=False,
+        styles_available=False,
+        formula_presence_available=True,
+        sheets=[
+            SheetSnapshot(
+                name="Data",
+                visibility="visible",
+                max_row=2,
+                max_column=1,
+                cells={
+                    (1, 1): CellRecord(1, 1, 42.0, is_formula=True),
+                    (2, 1): CellRecord(2, 1, 7.0, is_formula=True),
+                },
+            )
+        ],
+    )
+
+
+def _two_cell_scan(*, passive: tuple[str, ...] = ()) -> XlsbFormulaScan:
+    return XlsbFormulaScan(
+        formula_cells={"Data": frozenset({(1, 1), (2, 1)})},
+        passive_features=passive,
+    )
+
+
+def test_missing_coordinate_is_tolerated_as_partial_coverage() -> None:
+    snapshot = _two_cell_snapshot()
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=20+22"}},
+        engine="test-engine",
+        detail="test extraction",
+    )
+
+    merge_formula_extraction(snapshot, _two_cell_scan(), extraction)
+
+    merged = snapshot.sheet("Data").cells[(1, 1)]
+    missing = snapshot.sheet("Data").cells[(2, 1)]
+    assert merged.formula == "=20+22" and merged.value == 42.0
+    assert missing.formula is None and missing.is_formula and missing.value == 7.0
+    assert not snapshot.formulas_available  # historical meaning: complete only
+    coverage = snapshot.formula_text_coverage
+    assert coverage.state == "partial"
+    assert coverage.expected_count == 2
+    assert coverage.merged_count == 1
+    assert coverage.missing_count == 1
+
+
+def test_formula_text_coverage_transitions_none_complete_partial() -> None:
+    assert FormulaTextCoverage().state == "none"
+
+    scan = _two_cell_scan()
+    complete = compute_formula_text_coverage(
+        scan,
+        FormulaExtraction(
+            formulas={"Data": {(1, 1): "=1", (2, 1): "=2"}}, engine="e", detail="d"
+        ),
+    )
+    assert complete.state == "complete"
+    assert complete.missing_count == 0
+
+    partial = compute_formula_text_coverage(
+        scan,
+        FormulaExtraction(formulas={"Data": {(1, 1): "=1"}}, engine="e", detail="d"),
+    )
+    assert partial.state == "partial"
+    assert partial.missing_count == 1
+
+
+def test_bounded_defined_names_drops_duplicates_and_oversized_targets() -> None:
+    names = [
+        ExtractedDefinedName(name="A", target="Sheet1!$A$1"),
+        ExtractedDefinedName(name="A", target="Sheet1!$B$1"),  # duplicate identity
+        ExtractedDefinedName(name="B", target="x" * 5000),  # oversized target
+        ExtractedDefinedName(name="C", target="Sheet1!$C$1"),
+    ]
+
+    bounded, complete = bounded_defined_names(names)
+
+    assert [item.name for item in bounded] == ["A", "C"]
+    assert complete is False
+
+
+def test_bounded_defined_names_reports_complete_when_nothing_dropped() -> None:
+    names = [ExtractedDefinedName(name="A", target="Sheet1!$A$1")]
+
+    bounded, complete = bounded_defined_names(names)
+
+    assert bounded == tuple(names)
+    assert complete is True
+
+
+def test_reachability_unproven_when_coverage_is_partial() -> None:
+    coverage = FormulaTextCoverage(
+        state="partial", expected_count=2, merged_count=1, missing_count=1
+    )
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=1"}},
+        engine="e",
+        detail="d",
+        defined_names=(ExtractedDefinedName(name="External1", target="[1]Sheet1!A1"),),
+        defined_names_complete=True,
+    )
+
+    verdict = classify_external_reachability(extraction, coverage)
+
+    assert verdict.proven is False
+    assert verdict.live is False
+
+
+def test_reachability_unproven_when_defined_names_incomplete() -> None:
+    coverage = FormulaTextCoverage(
+        state="complete", expected_count=1, merged_count=1, missing_count=0
+    )
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=1"}},
+        engine="e",
+        detail="d",
+        defined_names=(),
+        defined_names_complete=False,
+    )
+
+    verdict = classify_external_reachability(extraction, coverage)
+
+    assert verdict.proven is False
+
+
+def test_reachability_proven_inactive_stale_unused_name() -> None:
+    coverage = FormulaTextCoverage(
+        state="complete", expected_count=2, merged_count=2, missing_count=0
+    )
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=SUM(A2:A10)", (2, 1): "=A1*2"}},
+        engine="e",
+        detail="d",
+        defined_names=(ExtractedDefinedName(name="StaleExternal", target="[1]Sheet1!A1"),),
+        defined_names_complete=True,
+    )
+
+    verdict = classify_external_reachability(extraction, coverage)
+
+    assert verdict.proven is True
+    assert verdict.live is False
+    assert verdict.direct_reference_count == 0
+    assert verdict.transitive_reference_count == 0
+
+
+def test_reachability_proven_live_direct_external_reference() -> None:
+    coverage = FormulaTextCoverage(
+        state="complete", expected_count=1, merged_count=1, missing_count=0
+    )
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "='[1]Sheet1'!A1"}},
+        engine="e",
+        detail="d",
+        defined_names_complete=True,
+    )
+
+    verdict = classify_external_reachability(extraction, coverage)
+
+    assert verdict.proven is True
+    assert verdict.live is True
+    assert verdict.direct_reference_count == 1
+    assert verdict.transitive_reference_count == 0
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        "='[Other.xlsx]Sheet1'!A1",
+        "='file:///C:/reports/other.xlsx'#$Sheet1.A1",
+    ],
+)
+def test_reachability_recognizes_named_file_and_url_external_syntax(
+    formula: str,
+) -> None:
+    coverage = FormulaTextCoverage(
+        state="complete", expected_count=1, merged_count=1, missing_count=0
+    )
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): formula}},
+        engine="e",
+        detail="d",
+        defined_names_complete=True,
+    )
+
+    verdict = classify_external_reachability(extraction, coverage)
+
+    assert verdict.proven is True
+    assert verdict.live is True
+    assert verdict.direct_reference_count == 1
+
+
+def test_reachability_proven_live_transitive_named_reference() -> None:
+    coverage = FormulaTextCoverage(
+        state="complete", expected_count=1, merged_count=1, missing_count=0
+    )
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=LiveExternalName+1"}},
+        engine="e",
+        detail="d",
+        defined_names=(
+            ExtractedDefinedName(name="LiveExternalName", target="[1]Sheet1!A1"),
+        ),
+        defined_names_complete=True,
+    )
+
+    verdict = classify_external_reachability(extraction, coverage)
+
+    assert verdict.proven is True
+    assert verdict.live is True
+    assert verdict.direct_reference_count == 0
+    assert verdict.transitive_reference_count == 1
+
+
+def test_reachability_closes_over_defined_name_alias_chain() -> None:
+    coverage = FormulaTextCoverage(
+        state="complete", expected_count=1, merged_count=1, missing_count=0
+    )
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=LocalAlias+1"}},
+        engine="e",
+        detail="d",
+        defined_names=(
+            ExtractedDefinedName(name="ExternalSeed", target="[1]Sheet1!A1"),
+            ExtractedDefinedName(name="WorkbookAlias", target="=ExternalSeed"),
+            ExtractedDefinedName(name="LocalAlias", target="=WorkbookAlias"),
+        ),
+        defined_names_complete=True,
+    )
+
+    verdict = classify_external_reachability(extraction, coverage)
+
+    assert verdict.proven is True
+    assert verdict.live is True
+    assert verdict.direct_reference_count == 0
+    assert verdict.transitive_reference_count == 1
+
+
+def test_reachability_is_unproven_above_name_closure_bound() -> None:
+    from qc_tool.io.formula_enrichment import MAX_REACHABILITY_DEFINED_NAMES
+
+    coverage = FormulaTextCoverage(
+        state="complete", expected_count=1, merged_count=1, missing_count=0
+    )
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=1"}},
+        engine="e",
+        detail="d",
+        defined_names=tuple(
+            ExtractedDefinedName(name=f"Name{index}", target="=1")
+            for index in range(MAX_REACHABILITY_DEFINED_NAMES + 1)
+        ),
+        defined_names_complete=True,
+    )
+
+    verdict = classify_external_reachability(extraction, coverage)
+
+    assert verdict.proven is False
+
+
+def test_name_matcher_matches_per_name_search_exactly() -> None:
+    """The single-alternation matcher must agree with the per-name regex everywhere."""
+    from qc_tool.io.formula_enrichment import _compile_name_matcher, _references_name
+
+    names = {"Rate", "Rate.FX", "rate_2", "A+B", "x[1]", "Ext(1)", "SUM", "a.b.c", "Z"}
+    texts = [
+        "=Rate*2",
+        "=rate.fx+1",
+        "=RATE_2",
+        "=Rate2",
+        "=SUM(A1:A3)",
+        "=MySUM(1)",
+        "=SUMX",
+        "='A+B'!C1",
+        "=A+B",
+        "=x[1]",
+        "=Ext(1)",
+        "=a.b.c-a.b",
+        "=Z",
+        "=ZZ",
+        "=1.Z",
+        "=Q!Z1",
+        "",
+        "=",
+    ]
+    matcher = _compile_name_matcher(names)
+    assert matcher is not None
+    for text in texts:
+        expected = any(_references_name(text, name) for name in names)
+        assert (matcher.search(text) is not None) is expected, text
+    assert _compile_name_matcher(set()) is None
+
+
+def test_merge_computes_reachability_only_when_scan_has_passive_features() -> None:
+    snapshot = _two_cell_snapshot()
+    extraction = FormulaExtraction(
+        formulas={"Data": {(1, 1): "=20+22", (2, 1): "=1"}},
+        engine="test-engine",
+        detail="test extraction",
+        defined_names_complete=True,
+    )
+
+    merge_formula_extraction(
+        snapshot, _two_cell_scan(passive=("external workbook links",)), extraction
+    )
+
+    assert snapshot.external_link_reachability is not None
+    assert snapshot.external_link_reachability.proven is True
+    assert snapshot.external_link_reachability.live is False
+
+    snapshot_no_passive = _two_cell_snapshot()
+    merge_formula_extraction(snapshot_no_passive, _two_cell_scan(), extraction)
+
+    assert snapshot_no_passive.external_link_reachability is None
+
 
 
 def test_libreoffice_adapter_reads_formula_only_and_checks_parity() -> None:
@@ -308,13 +671,15 @@ def test_excel_formula_rectangles_and_shapes() -> None:
         def HasFormula(self) -> object:
             raise AssertionError("HasFormula must not gate Formula2 extraction")
 
-    assert _read_formula_grid(FormulaRange(), 1, 2, "Data", FakeComError) == [
-        ["=A1", "=B1"]
-    ]
+    assert _read_formula_grid(FormulaRange(), 1, 2, FakeComError) == (
+        [["=A1", "=B1"]],
+        0,
+    )
 
     FormulaRange.Formula2 = (("=A1", 42),)
-    with pytest.raises(RuntimeError, match="1 requested formula cells"):
-        _read_formula_grid(FormulaRange(), 1, 2, "Data", FakeComError)
+    grid, invalid_count = _read_formula_grid(FormulaRange(), 1, 2, FakeComError)
+    assert grid == [["=A1", None]]
+    assert invalid_count == 1
 
 
 def test_excel_manual_calculation_retries_with_a_guard_workbook() -> None:
@@ -416,3 +781,90 @@ def test_excel_worker_result_validation_fails_closed(
 
     with pytest.raises(FormulaEnrichmentError):
         _load_worker_result(path)
+
+
+# --- Step 4b: defined-name collection (Windows worker + LibreOffice reuse) --
+
+
+def test_collect_defined_names_splits_scope_and_bounds_duplicates() -> None:
+    class Name:
+        def __init__(self, name: str, refers_to: str, visible: bool = True) -> None:
+            self.Name = name
+            self.RefersTo = refers_to
+            self.Visible = visible
+
+    names = [
+        Name("Workbook1", "=Sheet1!$A$1"),
+        Name("Sheet1!Local1", "=Sheet1!$B$1", visible=False),
+        Name("Workbook1", "=Sheet1!$C$1"),  # duplicate identity
+    ]
+
+    class FakeWorkbook:
+        Names = names
+
+    collected, complete = _collect_defined_names(FakeWorkbook())
+
+    assert collected == [
+        {"name": "Workbook1", "target": "=Sheet1!$A$1", "sheet": None, "hidden": False},
+        {"name": "Local1", "target": "=Sheet1!$B$1", "sheet": "Sheet1", "hidden": True},
+    ]
+    assert complete is False  # the duplicate identity was dropped
+
+
+def test_collect_defined_names_degrades_on_com_failure_without_raising() -> None:
+    class FakeWorkbook:
+        @property
+        def Names(self) -> object:
+            raise RuntimeError("COM call failed")
+
+    collected, complete = _collect_defined_names(FakeWorkbook())
+
+    assert collected == []
+    assert complete is False
+
+
+def test_parse_defined_names_success_path() -> None:
+    payload: dict[str, object] = {
+        "defined_names": [
+            {"name": "A", "target": "=Sheet1!$A$1", "sheet": None, "hidden": False},
+        ],
+        "defined_names_complete": True,
+    }
+
+    names, complete = _parse_defined_names(payload)
+
+    assert names == (ExtractedDefinedName(name="A", target="=Sheet1!$A$1"),)
+    assert complete is True
+
+
+def test_parse_defined_names_degrades_on_malformed_entry() -> None:
+    payload: dict[str, object] = {
+        "defined_names": [{"name": "A", "target": 42, "sheet": None, "hidden": False}],
+        "defined_names_complete": True,
+    }
+
+    names, complete = _parse_defined_names(payload)
+
+    assert names == ()
+    assert complete is False
+
+
+def test_parse_defined_names_absent_key_degrades_quietly() -> None:
+    names, complete = _parse_defined_names({})
+
+    assert names == ()
+    assert complete is False
+
+
+def test_libreoffice_extracted_defined_names_reuses_ooxml_scan(tmp_path: Path) -> None:
+    workbook = Workbook()
+    workbook.defined_names["Global1"] = DefinedName("Global1", attr_text="Sheet!$A$1")
+    path = tmp_path / "converted.xlsx"
+    workbook.save(path)
+
+    names, complete = libreoffice_formula_module._extracted_defined_names(
+        path.read_bytes()
+    )
+
+    assert complete is True
+    assert names == (ExtractedDefinedName(name="Global1", target="Sheet!$A$1"),)

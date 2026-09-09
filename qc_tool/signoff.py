@@ -184,7 +184,8 @@ def finalize_run(
     digest = review_state_digest(record, accepted)
     lineages = [
         lineage.model_dump(mode="json")
-        for lineage in history.get_annotation_lineage(run_id).values()
+        for lineages in history.get_annotation_lineage(run_id).values()
+        for lineage in lineages
     ]
     signoff_evidence = AttestationSignoff(
         finalized_at=finalized_at,

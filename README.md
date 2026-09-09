@@ -381,6 +381,26 @@ deliverable pairs with a ground-truth defect manifest, and the E2E suite
 asserts both directions — every seeded defect detected, and no finding
 without a seeded cause.
 
+### Optional native XLSB kernel
+
+`native/xlsbkernel/` is an optional Rust/PyO3 accelerator that speeds up XLSB
+value and formula decoding. It is its **own, separately versioned package**
+(`xlsbkernel`, built with maturin) — it is never a build- or install-time
+dependency of `cadence-diff`, which stays on Hatchling and installs and runs
+identically whether or not it is present. Build and install it locally with:
+
+```bash
+conda run -n cadence-diff-dev maturin build --release -m native/xlsbkernel/Cargo.toml
+conda run -n cadence-diff-dev pip install native/xlsbkernel/target/wheels/xlsbkernel-*.whl
+```
+
+or, for iterative development, `maturin develop --release` from inside
+`native/xlsbkernel/`. Set a profile's `formula_engine` to `native` (or leave
+it `auto`, the default, which prefers native when importable) to use it; when
+absent, XLSB formula/value handling falls back to the existing Excel-COM
+(Windows) or LibreOffice (Linux) adapters exactly as before, with the
+fallback disclosed in run coverage.
+
 ### Layout
 
 ```
@@ -402,6 +422,8 @@ qc_tool/
   ui/          NiceGUI app (loopback only) + theme
                packaged operator guide at /guide
   engine.py    run orchestration
+native/
+  xlsbkernel/  optional Rust/PyO3 XLSB decoder accelerator (own package)
 ```
 
 ## Publishing (maintainers)

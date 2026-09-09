@@ -8,6 +8,7 @@ import datetime as dt
 import logging
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from qc_tool.config.profile import DeliverableProfile, NumericTolerance
 from qc_tool.coverage import QCRunMode
 from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings, run_qc
 from qc_tool.history.store import RunHistory
+from qc_tool.io.formula_cache import FormulaExtractionCache
 from qc_tool.package import PackageManifest, paths_by_member
 from qc_tool.progress import (
     CancellationToken,
@@ -60,6 +62,7 @@ def perform_run(
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON,
     rerun_of: int | None = None,
     allow_large_workbooks: bool = False,
+    allow_dependency_indexing: bool = False,
     acceptance_absolute: float = 0.0,
     acceptance_relative: float = 0.0,
     compare_sheets: list[str] | None = None,
@@ -69,11 +72,19 @@ def perform_run(
     package_manifest: PackageManifest | dict[str, object] | None = None,
     compare_member_sheets: dict[str, tuple[str, ...]] | None = None,
     write_reports: bool = False,
+    on_subphase: Callable[[str, float], None] | None = None,
+    formula_cache_enabled: bool = True,
 ) -> RunArtifacts:
     """Run QC, record the run in history, and defer reports to on-demand.
 
     Reports are generated from the run page when actually needed;
     ``write_reports=True`` (the CLI) writes them eagerly at run time.
+    ``on_subphase(name, elapsed_seconds)`` -- when given -- is a diagnostic
+    hook passed straight through to ``RunHistory.record_run``; production
+    callers never need it. ``formula_cache_enabled`` (default True) owns a
+    private, bounded XLSB formula-extraction cache at
+    ``work_dir/formula-cache``; disabling it changes no finding, only
+    whether repeat external-engine extraction is skipped.
     """
     if acceptance_absolute < 0 or acceptance_relative < 0:
         raise ValueError("acceptance thresholds cannot be negative")
@@ -100,6 +111,11 @@ def perform_run(
     file_hashes = hash_run_files(files, cancellation_token=cancellation_token)
     reject_duplicate_bytes(mode, files, file_hashes)
 
+    formula_cache = (
+        FormulaExtractionCache(work_dir / "formula-cache")
+        if formula_cache_enabled
+        else None
+    )
     result = run_qc(
         baseline_excel=files.get("baseline_excel"),
         current_excel=files.get("current_excel"),
@@ -109,6 +125,7 @@ def perform_run(
         passwords=credentials,
         mode=mode,
         allow_large_workbooks=allow_large_workbooks,
+        allow_dependency_indexing=allow_dependency_indexing,
         run_acceptance=run_acceptance,
         compare_sheets=compare_sheets,
         compare_slides=compare_slides,
@@ -120,6 +137,7 @@ def perform_run(
         },
         cancellation_token=cancellation_token,
         on_progress=on_progress,
+        formula_cache=formula_cache,
     )
     check_cancelled(cancellation_token)
     verify_run_file_hashes(
@@ -189,6 +207,7 @@ def perform_run(
             file_paths={role: str(path) for role, path in files.items()},
             rerun_of=rerun_of,
             profile_snapshot=profile,
+            on_subphase=on_subphase,
         )
         recorded = True
         report_progress(

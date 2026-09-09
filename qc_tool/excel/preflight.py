@@ -40,7 +40,10 @@ from qc_tool.excel.interaction import (
 from qc_tool.excel.periods import Period, is_period_after, parse_period
 from qc_tool.excel.references import ReferenceStatus, resolve_reference
 from qc_tool.excel.regions import TableRegion, detect_regions
-from qc_tool.excel.workbook_risks import workbook_risk_findings
+from qc_tool.excel.workbook_risks import (
+    external_link_reachability_coverage,
+    workbook_risk_findings,
+)
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot, display_cell_value
 from qc_tool.progress import CancellationToken, check_cancelled
@@ -445,6 +448,7 @@ def preflight_workbook(
         )
     )
     result.coverage.append(defined_name_scope_coverage(workbook))
+    result.coverage.append(external_link_reachability_coverage(workbook))
     result.coverage.append(vba_coverage(workbook))
     result.findings.extend(external_connection_findings(workbook))
     result.coverage.append(comment_coverage(workbook))

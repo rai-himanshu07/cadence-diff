@@ -67,6 +67,23 @@ def error_message(error: str, phases: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def blocked_message(
+    action_required: dict[str, Any], phases: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """A terminal, non-failure outcome: the run cannot proceed as configured.
+
+    ``action_required`` is the bounded, primitive-only
+    ``RunActionRequired.model_dump(mode="json")`` payload -- never a value,
+    formula, or path.
+    """
+    return {
+        "v": ENVELOPE_VERSION,
+        "kind": "blocked",
+        "action_required": action_required,
+        "phases": phases,
+    }
+
+
 _LEADING_PUNCTUATION = "'\"([<"
 _TRAILING_PUNCTUATION = "'\").,;:)]>"
 
@@ -157,6 +174,7 @@ def worker_main(
         RunCancelled,
         RunPhase,
     )
+    from qc_tool.run_action import RunBlockedError
     from qc_tool.run_service import perform_run
 
     telemetry = PhaseTelemetry()
@@ -193,6 +211,7 @@ def worker_main(
             mode=QCRunMode(payload["mode"]),
             rerun_of=payload["rerun_of"],
             allow_large_workbooks=bool(payload["allow_large_workbooks"]),
+            allow_dependency_indexing=bool(payload["allow_dependency_indexing"]),
             acceptance_absolute=float(payload.get("acceptance_absolute", 0.0)),
             acceptance_relative=float(payload.get("acceptance_relative", 0.0)),
             compare_sheets=list(payload.get("compare_sheets") or []) or None,
@@ -206,6 +225,10 @@ def worker_main(
         )
     except RunCancelled:
         message = cancelled_message(telemetry.as_payload())
+    except RunBlockedError as blocked:
+        message = blocked_message(
+            blocked.action_required.model_dump(mode="json"), telemetry.as_payload()
+        )
     except Exception as exc:  # analyst-facing failure, never an unreported crash
         error = sanitize_error(exc)
         telemetry.fail(last_phase, error)

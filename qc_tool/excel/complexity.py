@@ -113,7 +113,7 @@ def assess_workbook_complexity(
             len(workbook.data_validations) + len(workbook.conditional_formats)
         )
     )
-    costs: dict[FormulaPatternKey, _FormulaCost] = {}
+    costs: dict[FormulaPatternKey | str, _FormulaCost] = {}
     for sheet in workbook.sheets:
         check_cancelled(cancellation_token)
         for index, cell in enumerate(sheet.cells.values(), start=1):
@@ -126,11 +126,24 @@ def assess_workbook_complexity(
             if "let(" in lowered or "lambda(" in lowered:
                 complexity.lexical_formula_count += 1
             try:
-                pattern = formula_pattern_key(cell.formula)
-                cost = costs.get(pattern)
+                # An adapter-supplied canonical R1C1 (native-complete XLSB)
+                # is already position-independent, so cells sharing one
+                # produce an identical _formula_cost() regardless of which
+                # cell's own text computed it -- reusing it as the cache key
+                # skips formula_pattern_key()'s tokenization on every cache
+                # hit, which real-LARGE_WORKBOOK-scale telemetry showed dominating this
+                # scan's cost (plan-20260908-phase-b-guest-performance-
+                # followup.md). Falls back to the original pattern key
+                # exactly as before when no adapter R1C1 is available.
+                key: FormulaPatternKey | str = (
+                    cell.formula_r1c1
+                    if cell.formula_r1c1 is not None
+                    else formula_pattern_key(cell.formula)
+                )
+                cost = costs.get(key)
                 if cost is None:
                     cost = _formula_cost(cell.formula)
-                    costs[pattern] = cost
+                    costs[key] = cost
             except Exception:  # malformed formulas cost nothing to index
                 continue
             complexity.reference_operands += cost.operands
@@ -157,3 +170,56 @@ def assess_workbook_complexity(
         complexity.override_used = True
     complexity.warning_reasons = tuple(warnings)
     return complexity
+
+
+#: Above this many formula cells, dependency indexing (the graph build behind
+#: circular detection and formula/chart/PPT-chart impact tracing) is skipped
+#: by size policy rather than attempted. Distinct from -- and independent of
+#: -- the refusal limits above: a workbook that already needed
+#: ``allow_complex_workbook`` just to be analysed at all can still be
+#: size-gated here, with its own override.
+DEPENDENCY_FORMULA_CELLS_MAX = 500_000
+
+
+def _refusal_limit(attribute: str, *, default: int) -> int:
+    """Read a refusal limit from ``_COMPLEXITY_LIMITS`` by attribute name.
+
+    Falls back to ``default`` if a caller (a test, typically) has
+    monkeypatched ``_COMPLEXITY_LIMITS`` to a shape that omits ``attribute``,
+    so the dependency size gate never breaks a test that is only exercising
+    the unrelated refusal gate above.
+    """
+    for name, _warn_limit, refuse_limit, _label in _COMPLEXITY_LIMITS:
+        if name == attribute:
+            return refuse_limit
+    return default
+
+
+def dependency_index_skip_reason(
+    complexity: WorkbookComplexity,
+    *,
+    allow_dependency_indexing: bool = False,
+) -> str | None:
+    """Decide whether dependency indexing should be skipped for this run.
+
+    Returns a disclosed, human-readable reason to skip when a documented
+    threshold is crossed, or ``None`` when indexing should proceed. Reuses
+    ``complexity``'s already-measured cost drivers -- no second pass over the
+    workbook. ``allow_dependency_indexing`` is a distinct override from
+    ``allow_complex_workbook``: forcing entry past the refusal gate above
+    does not by itself force full dependency indexing too.
+    """
+    if allow_dependency_indexing:
+        return None
+    if complexity.formula_count >= DEPENDENCY_FORMULA_CELLS_MAX:
+        return (
+            f"{complexity.formula_count:,} formula cells >= dependency "
+            f"indexing limit {DEPENDENCY_FORMULA_CELLS_MAX:,}"
+        )
+    edge_limit = _refusal_limit("projected_concrete_edges", default=250_000_000)
+    if complexity.projected_concrete_edges >= edge_limit:
+        return (
+            f"{complexity.projected_concrete_edges:,} projected cell "
+            f"dependencies >= dependency indexing limit {edge_limit:,}"
+        )
+    return None

@@ -23,7 +23,7 @@ from qc_tool.io.decrypt import (
     PasswordRequiredError,
     is_encrypted,
 )
-from qc_tool.io.formula_enrichment import FormulaExtraction
+from qc_tool.io.formula_enrichment import ExtractedDefinedName, FormulaExtraction
 from qc_tool.io.loader import (
     OOXMLWorkloadError,
     UnsupportedFormatError,
@@ -37,6 +37,8 @@ from qc_tool.io.loader import (
     load_workbook_snapshot,
 )
 from qc_tool.io.model import display_cell_value, serialize_cell_value
+from qc_tool.io.native_formula import native_formula_available
+from qc_tool.io.native_kernel import native_kernel_available
 from qc_tool.io.ooxml_worksheet import (
     OOXMLMetadataError,
     WorkbookMetadata,
@@ -55,7 +57,7 @@ from qc_tool.io.xlsb_formula import (
     XlsbWorksheetMetrics,
 )
 from tests.fixtures.manifest_schema import FixtureManifest
-from tests.fixtures.xlsb_writer import _record, write_xlsb
+from tests.fixtures.xlsb_writer import StyledCell, _record, write_xlsb
 
 
 def _sha256(path: Path) -> str:
@@ -1016,6 +1018,9 @@ def test_xlsb_snapshot(fixture_dir: Path, manifest: FixtureManifest) -> None:
     assert snap.file_format == "xlsb"
     assert not snap.formulas_available and not snap.styles_available
     assert snap.formula_presence_available
+    # No xl/styles.bin in this fixture: the scan succeeds but finds nothing to
+    # type, so every cell keeps its original cached value unchanged.
+    assert snap.number_formats_available is True
     assert snap.sheet_names == ["Long_Monthly"]
 
     sheet = snap.sheet("Long_Monthly")
@@ -1032,6 +1037,372 @@ def test_xlsb_snapshot(fixture_dir: Path, manifest: FixtureManifest) -> None:
     assert snap.workload.format == "xlsb"
     assert snap.workload.cell_count == len(sheet.cells)
     assert "BIFF12" in snap.workload.detail
+
+
+@pytest.mark.skipif(
+    not native_kernel_available(),
+    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+)
+def test_xlsb_native_values_engine_matches_pyxlsb(fixture_dir: Path) -> None:
+    """Criterion 10 (plan-20260906): the native kernel's values path must be
+    indistinguishable from pyxlsb's for every cell -- type, value AND
+    number_format, on a real generated fixture (not just the isolated Rust
+    unit-level probe in artifacts/kernel-experiments-20260906/).
+    """
+    path = fixture_dir / "current.xlsb"
+    default_snap = load_workbook_snapshot(path)
+    native_snap = load_workbook_snapshot(path, _xlsb_values_engine="native")
+
+    assert native_snap.sheet_names == default_snap.sheet_names
+    for sheet_name in default_snap.sheet_names:
+        default_sheet = default_snap.sheet(sheet_name)
+        native_sheet = native_snap.sheet(sheet_name)
+        assert native_sheet.max_row == default_sheet.max_row
+        assert native_sheet.max_column == default_sheet.max_column
+        assert set(native_sheet.cells) == set(default_sheet.cells)
+        for key, default_cell in default_sheet.cells.items():
+            native_cell = native_sheet.cells[key]
+            assert type(native_cell.value) is type(default_cell.value)
+            assert native_cell.value == default_cell.value
+            assert native_cell.number_format == default_cell.number_format
+            assert native_cell.is_formula == default_cell.is_formula
+
+
+def test_xlsb_native_values_engine_raises_a_clear_error_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fixture_dir: Path
+) -> None:
+    """Deterministic regardless of whether this environment actually has the
+    extension built -- forces the unavailable path so the fallback contract
+    (never silently guess) is provable without depending on local state.
+    """
+    import qc_tool.io.native_kernel as native_kernel_module
+
+    monkeypatch.setattr(native_kernel_module, "_xlsbkernel", None)
+    with pytest.raises(RuntimeError, match="native xlsbkernel"):
+        load_workbook_snapshot(fixture_dir / "current.xlsb", _xlsb_values_engine="native")
+
+
+@pytest.mark.skipif(
+    not native_kernel_available(),
+    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+)
+def test_xlsb_values_engine_auto_prefers_native_when_available(fixture_dir: Path) -> None:
+    """plan-20260908-phase-b-guest-performance-followup.md: `"auto"` must
+    resolve identically to an explicit `"native"` request whenever the kernel
+    extension is importable, without changing the shipped `"pyxlsb"` default.
+    """
+    path = fixture_dir / "current.xlsb"
+    auto_snap = load_workbook_snapshot(path, _xlsb_values_engine="auto")
+    native_snap = load_workbook_snapshot(path, _xlsb_values_engine="native")
+
+    assert auto_snap.sheet_names == native_snap.sheet_names
+    for sheet_name in native_snap.sheet_names:
+        auto_sheet = auto_snap.sheet(sheet_name)
+        native_sheet = native_snap.sheet(sheet_name)
+        assert set(auto_sheet.cells) == set(native_sheet.cells)
+        for key, native_cell in native_sheet.cells.items():
+            auto_cell = auto_sheet.cells[key]
+            assert type(auto_cell.value) is type(native_cell.value)
+            assert auto_cell.value == native_cell.value
+            assert auto_cell.number_format == native_cell.number_format
+
+
+def test_xlsb_values_engine_auto_degrades_to_pyxlsb_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch, fixture_dir: Path
+) -> None:
+    """Unlike an explicit `"native"` request (which raises hard when the
+    extension is missing, above), `"auto"` must silently degrade to
+    `"pyxlsb"` -- deterministic regardless of whether this environment
+    actually has the extension built.
+    """
+    import qc_tool.io.native_kernel as native_kernel_module
+
+    monkeypatch.setattr(native_kernel_module, "_xlsbkernel", None)
+    path = fixture_dir / "current.xlsb"
+
+    auto_snap = load_workbook_snapshot(path, _xlsb_values_engine="auto")
+    pyxlsb_snap = load_workbook_snapshot(path, _xlsb_values_engine="pyxlsb")
+
+    assert auto_snap.sheet_names == pyxlsb_snap.sheet_names
+    for sheet_name in pyxlsb_snap.sheet_names:
+        assert set(auto_snap.sheet(sheet_name).cells) == set(
+            pyxlsb_snap.sheet(sheet_name).cells
+        )
+
+
+def test_xlsb_values_engine_auto_falls_back_to_pyxlsb_on_a_runtime_failure(
+    monkeypatch: pytest.MonkeyPatch, fixture_dir: Path
+) -> None:
+    """Criterion 19: `auto` must degrade to pyxlsb not only when the kernel
+    is absent at resolution time (above) but also when it is present yet
+    fails at runtime (a decode bug, or a converted Rust panic) -- the
+    fallback must be indistinguishable in outcome from the kernel never
+    having been installed, with a fixed, content-free disclosure.
+    """
+    import qc_tool.io.native_kernel as native_kernel_module
+
+    def _broken_report(data: bytes):
+        raise RuntimeError("synthetic native values decode failure")
+
+    monkeypatch.setattr(native_kernel_module, "native_kernel_available", lambda: True)
+    monkeypatch.setattr(native_kernel_module, "raw_values_report", _broken_report)
+    path = fixture_dir / "current.xlsb"
+
+    auto_snap = load_workbook_snapshot(path, _xlsb_values_engine="auto")
+    pyxlsb_snap = load_workbook_snapshot(path, _xlsb_values_engine="pyxlsb")
+
+    assert auto_snap.sheet_names == pyxlsb_snap.sheet_names
+    for sheet_name in pyxlsb_snap.sheet_names:
+        assert set(auto_snap.sheet(sheet_name).cells) == set(
+            pyxlsb_snap.sheet(sheet_name).cells
+        )
+    assert auto_snap.values_engine_fallback_detail != ""
+    assert "RuntimeError" in auto_snap.values_engine_fallback_detail
+    assert pyxlsb_snap.values_engine_fallback_detail == ""
+
+
+def test_xlsb_values_engine_explicit_native_raises_instead_of_falling_back(
+    monkeypatch: pytest.MonkeyPatch, fixture_dir: Path
+) -> None:
+    """Unlike `auto` (above), an explicit `\"native\"` request means the
+    caller wants this exact engine or nothing -- a runtime failure must
+    fail closed, never silently substitute pyxlsb.
+    """
+    import qc_tool.io.native_kernel as native_kernel_module
+
+    def _broken_report(data: bytes):
+        raise RuntimeError("synthetic native values decode failure")
+
+    monkeypatch.setattr(native_kernel_module, "native_kernel_available", lambda: True)
+    monkeypatch.setattr(native_kernel_module, "raw_values_report", _broken_report)
+
+    with pytest.raises(RuntimeError, match="native"):
+        load_workbook_snapshot(
+            fixture_dir / "current.xlsb", _xlsb_values_engine="native"
+        )
+
+
+# --- B3: XLSB formula-engine selection --------------------------------------
+
+
+@pytest.mark.skipif(
+    not native_formula_available(),
+    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+)
+def test_xlsb_native_formula_engine_dispatches_through_load_workbook_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Wiring proof, not a rendering-correctness proof (that is B0/B1/B2's
+    real-LARGE_WORKBOOK-file evidence): a real load with ``formula_engine="native"``
+    must reach the native adapter, set `formula_source` to a
+    ``native-biff12:`` engine string, and never raise -- even for a cell the
+    kernel could not decode (the synthetic writer's formula records carry no
+    real Ptg token stream, so this exercises the graceful partial-coverage
+    path, not full-text parity).
+    """
+    path = tmp_path / "native-engine.xlsb"
+    write_xlsb(path, {"Data": [[StyledCell(1.0), StyledCell(2.0, is_formula=True)]]})
+
+    snapshot = load_workbook_snapshot(path, formula_engine="native")
+
+    assert snapshot.formula_source is not None
+    assert snapshot.formula_source.startswith("native-biff12:")
+
+
+def test_xlsb_formula_engine_auto_prefers_native_when_available(tmp_path: Path) -> None:
+    path = tmp_path / "auto-engine.xlsb"
+    write_xlsb(path, {"Data": [[StyledCell(1.0)]]})  # no formulas: engine never runs
+
+    snapshot = load_workbook_snapshot(path, formula_engine="auto")
+
+    # No formula cells at all -- engine choice is moot, but must never raise.
+    assert snapshot.formula_presence_available
+
+
+def test_xlsb_formula_engine_explicit_wrong_platform_degrades_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """An engine this platform cannot run (e.g. Excel-COM on Linux) is a
+    formula-adapter failure like any other -- it degrades to
+    formula-presence-only checks, it never fails the whole load.
+    """
+    path = tmp_path / "wrong-platform.xlsb"
+    write_xlsb(path, {"Data": [[StyledCell(1.0), StyledCell(2.0, is_formula=True)]]})
+
+    snapshot = load_workbook_snapshot(path, formula_engine="excel")
+
+    assert snapshot.formula_source is None
+    assert not snapshot.formulas_available
+    assert "Formula presence checked" in (snapshot.formula_detail or "")
+
+
+def test_xlsb_native_formula_engine_unavailable_degrades_gracefully(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unlike `_xlsb_values_engine` (values are required, so an explicit
+    ``native`` request that cannot be honoured raises hard), formula TEXT is
+    an established best-effort enrichment: an explicit ``formula_engine=
+    "native"`` request the environment cannot satisfy must degrade the same
+    way a missing Excel/LibreOffice adapter already does, never crash the run.
+    """
+    import qc_tool.io.native_formula as native_formula_module
+
+    monkeypatch.setattr(native_formula_module, "_xlsbkernel", None)
+    path = tmp_path / "native-unavailable.xlsb"
+    write_xlsb(path, {"Data": [[StyledCell(1.0), StyledCell(2.0, is_formula=True)]]})
+
+    snapshot = load_workbook_snapshot(path, formula_engine="native")
+
+    assert snapshot.formula_source is None
+    assert not snapshot.formulas_available
+    assert "xlsbkernel" in (snapshot.formula_detail or "")
+
+
+@pytest.mark.skipif(
+    not native_formula_available(),
+    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+)
+def test_formula_cache_keys_differ_by_resolved_engine(tmp_path: Path) -> None:
+    """Switching `formula_engine` must never reuse a cached entry produced by
+    a different engine -- a stale cross-engine hit would silently swap which
+    adapter's text a run actually uses. ``native`` and ``libreoffice`` both
+    run for real on this dev box, so both genuinely populate the cache.
+    """
+    from qc_tool.io.formula_cache import FormulaExtractionCache
+
+    path = tmp_path / "cache-key.xlsb"
+    write_xlsb(path, {"Data": [[StyledCell(1.0), StyledCell(2.0, is_formula=True)]]})
+    cache = FormulaExtractionCache(tmp_path / "formula-cache")
+
+    load_workbook_snapshot(path, formula_engine="native", formula_cache=cache)
+    assert cache.status()["entry_count"] == 1
+    load_workbook_snapshot(path, formula_engine="libreoffice", formula_cache=cache)
+    assert cache.status()["entry_count"] == 2  # a distinct entry, not a stale hit
+
+    # Re-running either engine again is a cache hit, not a third entry.
+    load_workbook_snapshot(path, formula_engine="native", formula_cache=cache)
+    load_workbook_snapshot(path, formula_engine="libreoffice", formula_cache=cache)
+    assert cache.status()["entry_count"] == 2
+
+
+def test_xlsb_native_compat_mode_restricts_to_legacy_engine_coordinates(
+    tmp_path: Path,
+) -> None:
+    """Private, oracle-only switch (plan Criterion 13(a)): combined with
+    ``formula_engine="native"`` it must not raise regardless of whether the
+    kernel or the legacy engine actually decoded any text for this fixture.
+    """
+    path = tmp_path / "compat-mode.xlsb"
+    write_xlsb(path, {"Data": [[StyledCell(1.0), StyledCell(2.0, is_formula=True)]]})
+
+    snapshot = load_workbook_snapshot(
+        path, formula_engine="native", _native_formula_compat_mode=True
+    )
+
+    assert snapshot.formula_presence_available
+
+
+def test_xlsb_typed_formula_backed_date_beside_an_untouched_percent_row(
+    tmp_path: Path,
+) -> None:
+    """Client-cited scenario: a formula-cached numeric serial with a custom
+    date-formatted XF must become a real date, while an adjacent
+    percentage-formatted row stays a plain float."""
+    path = tmp_path / "dates.xlsb"
+    write_xlsb(
+        path,
+        {
+            "Data": [
+                [StyledCell(0.4557, xf_index=1)],  # A1: percent row
+                [StyledCell(46023.0, xf_index=2, is_formula=True)],  # A2: date row
+            ]
+        },
+        cell_xfs=[0, 9, 165],  # 0=General, 9=builtin 0%, 165=custom
+        custom_formats={165: "mmm-yy"},
+    )
+
+    snap = load_workbook_snapshot(path)
+
+    assert snap.number_formats_available is True
+    sheet = snap.sheet("Data")
+    percent_cell = sheet.cell("A1")
+    assert percent_cell is not None
+    assert percent_cell.value == 0.4557  # untouched: not a date format
+    assert percent_cell.number_format == "0%"
+
+    date_cell = sheet.cell("A2")
+    assert date_cell is not None
+    assert date_cell.number_format == "mmm-yy"
+    assert date_cell.is_formula is True
+    assert date_cell.value == dt.datetime(2026, 1, 1)  # excel serial 46023, 1900 epoch
+
+    if native_kernel_available():
+        # Same fixture (percent float + formula-cached date via a custom XF)
+        # through the native values engine must agree exactly -- date
+        # conversion is unchanged shared code either way, but this proves it
+        # end to end rather than by inspection alone.
+        native_snap = load_workbook_snapshot(path, _xlsb_values_engine="native")
+        native_sheet = native_snap.sheet("Data")
+        native_percent = native_sheet.cell("A1")
+        assert native_percent is not None
+        assert native_percent.value == percent_cell.value
+        assert native_percent.number_format == percent_cell.number_format
+        native_date = native_sheet.cell("A2")
+        assert native_date is not None
+        assert native_date.value == date_cell.value
+        assert native_date.number_format == date_cell.number_format
+        assert native_date.is_formula == date_cell.is_formula
+
+
+def test_xlsb_1904_epoch_shifts_the_typed_date(tmp_path: Path) -> None:
+    path = tmp_path / "dates-1904.xlsb"
+    write_xlsb(
+        path,
+        {"Data": [[StyledCell(46023.0, xf_index=1)]]},
+        date1904=True,
+        cell_xfs=[0, 14],  # builtin mm-dd-yy
+    )
+
+    snap = load_workbook_snapshot(path)
+
+    cell = snap.sheet("Data").cell("A1")
+    assert cell is not None
+    assert isinstance(cell.value, dt.datetime)
+    assert cell.value != dt.datetime(2026, 1, 1)  # would be the 1900-epoch answer
+
+    if native_kernel_available():
+        native_cell = (
+            load_workbook_snapshot(path, _xlsb_values_engine="native").sheet("Data").cell("A1")
+        )
+        assert native_cell is not None
+        assert native_cell.value == cell.value
+
+
+def test_xlsb_malformed_styles_degrades_coverage_without_changing_values(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "malformed-styles.xlsb"
+    write_xlsb(
+        path,
+        {"Data": [[StyledCell(46023.0, xf_index=1)]]},
+        cell_xfs=[0, 165],
+        custom_formats={165: "mmm-yy"},
+    )
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/styles.bin"] = parts["xl/styles.bin"][:-1]  # truncate
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, content in parts.items():
+            archive.writestr(name, content)
+
+    snap = load_workbook_snapshot(path)
+
+    assert snap.number_formats_available is False
+    assert "Number-format scan failed" in snap.number_format_detail
+    cell = snap.sheet("Data").cell("A1")
+    assert cell is not None
+    assert cell.value == 46023.0  # cached value is never guessed or dropped
+    assert cell.number_format is None
 
 
 def test_xlsb_scan_failure_preserves_cached_values_and_marks_metrics_unavailable(
@@ -1123,7 +1494,7 @@ def test_xlsb_enrichment_preserves_original_cached_value(
         for name, data in parts.items():
             archive.writestr(name, data)
 
-    def fake_extract(data: bytes, scan: object) -> FormulaExtraction:
+    def fake_extract(data: bytes, scan: object, **_kwargs: object) -> FormulaExtraction:
         return FormulaExtraction(
             formulas={"Data": {(1, 1): "=40+2"}},
             engine="libreoffice:test",
@@ -1139,6 +1510,114 @@ def test_xlsb_enrichment_preserves_original_cached_value(
     assert cell.formula == "=40+2" and cell.has_formula
     assert snapshot.formulas_available
     assert snapshot.formula_source == "libreoffice:test"
+
+
+def _two_formula_cell_sheet() -> bytes:
+    sheet = bytearray()
+    sheet += _record(biff12.WORKSHEET)
+    sheet += _record(biff12.DIMENSION, struct.pack("<IIII", 0, 1, 0, 0))
+    sheet += _record(biff12.SHEETDATA)
+    for row in (0, 1):
+        sheet += _record(biff12.ROW, row.to_bytes(4, "little"))
+        formula_payload = (
+            (0).to_bytes(4, "little")
+            + (0).to_bytes(4, "little")
+            + struct.pack("<d", 42.0 + row)
+            + b"\x00\x00"
+            + (0).to_bytes(4, "little")
+        )
+        sheet += _record(biff12.FORMULA_FLOAT, formula_payload)
+    sheet += _record(biff12.SHEETDATA_END)
+    sheet += _record(biff12.WORKSHEET_END)
+    return bytes(sheet)
+
+
+def test_xlsb_partial_enrichment_merges_available_text_without_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "partial.xlsb"
+    write_xlsb(path, {"Data": [[1.0]]})
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    parts["xl/worksheets/sheet1.bin"] = _two_formula_cell_sheet()
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
+
+    def fake_extract(data: bytes, scan: object, **_kwargs: object) -> FormulaExtraction:
+        # Only the first of two scanned formula coordinates is returned.
+        return FormulaExtraction(
+            formulas={"Data": {(1, 1): "=40+2"}},
+            engine="libreoffice:test",
+            detail="test formula adapter",
+        )
+
+    monkeypatch.setattr(loader_module, "_extract_xlsb_formulas", fake_extract)
+
+    snapshot = load_workbook_snapshot(path)
+
+    merged = snapshot.sheet("Data").cells[(1, 1)]
+    missing = snapshot.sheet("Data").cells[(2, 1)]
+    assert merged.formula == "=40+2" and merged.value == 42.0
+    assert missing.formula is None and missing.is_formula and missing.value == 43.0
+    assert not snapshot.formulas_available  # partial, not complete
+    coverage = snapshot.formula_text_coverage
+    assert coverage.state == "partial"
+    assert coverage.expected_count == 2
+    assert coverage.merged_count == 1
+    assert coverage.missing_count == 1
+
+
+def test_xlsb_reachability_proven_inactive_for_unreferenced_passive_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "passive-link.xlsb"
+    write_xlsb(path, {"Data": [[1.0]]})
+    with zipfile.ZipFile(path) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    sheet = bytearray()
+    sheet += _record(biff12.WORKSHEET)
+    sheet += _record(biff12.DIMENSION, struct.pack("<IIII", 0, 0, 0, 0))
+    sheet += _record(biff12.SHEETDATA)
+    sheet += _record(biff12.ROW, (0).to_bytes(4, "little"))
+    formula_payload = (
+        (0).to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + struct.pack("<d", 42.0)
+        + b"\x00\x00"
+        + (0).to_bytes(4, "little")
+    )
+    sheet += _record(biff12.FORMULA_FLOAT, formula_payload)
+    sheet += _record(biff12.SHEETDATA_END)
+    sheet += _record(biff12.WORKSHEET_END)
+    parts["xl/worksheets/sheet1.bin"] = bytes(sheet)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in parts.items():
+            archive.writestr(name, data)
+    # Appended after the rewrite so it is never part of the replaced parts dict.
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("xl/externalLinks/externalLink1.xml", b"<externalLink/>")
+
+    def fake_extract(data: bytes, scan: object, **_kwargs: object) -> FormulaExtraction:
+        return FormulaExtraction(
+            formulas={"Data": {(1, 1): "=40+2"}},
+            engine="libreoffice:test",
+            detail="test formula adapter",
+            defined_names=(
+                ExtractedDefinedName(name="UnrelatedInternal", target="Data!$A$1"),
+            ),
+            defined_names_complete=True,
+        )
+
+    monkeypatch.setattr(loader_module, "_extract_xlsb_formulas", fake_extract)
+
+    snapshot = load_workbook_snapshot(path)
+
+    assert snapshot.formulas_available
+    reachability = snapshot.external_link_reachability
+    assert reachability is not None
+    assert reachability.proven is True
+    assert reachability.live is False
 
 
 def test_encrypted_workbook(fixture_dir: Path, manifest: FixtureManifest) -> None:

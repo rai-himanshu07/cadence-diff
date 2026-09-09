@@ -18,6 +18,8 @@ from qc_tool.findings import (
     FindingSubtype,
     FindingTemporalContext,
     Materiality,
+    MembershipCodec,
+    PopulationEvidence,
     Severity,
 )
 from qc_tool.history.store import RunHistory
@@ -182,6 +184,56 @@ def test_direct_review_summary_remains_v3_without_alignment_trust() -> None:
 
     assert summary["summary_version"] == 3
     assert "alignment_trust" not in summary
+
+
+def test_review_summary_group_carries_population_evidence_when_present() -> None:
+    membership = MembershipCodec(
+        current_rectangles=("B2:B20",),
+        baseline_mode="shift",
+        shift=(-1, 0),
+        member_count=19,
+    )
+    population_finding = Finding(
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        severity=Severity.WARNING,
+        sheet="Data",
+        location="B2:B20",
+        baseline_location="B1:B19",
+        element="population",
+        message="19 cells summarised as one population",
+        population=PopulationEvidence(
+            member_count=19,
+            membership=membership,
+            first="B2",
+            last="B20",
+            shape_before_digest="a" * 64,
+            shape_after_digest="b" * 64,
+        ),
+    )
+    result = QCRunResult(
+        profile_name="surfaces", findings=triage([population_finding])
+    )
+
+    summary = review_summary(result)
+
+    assert summary["summary_version"] == 3  # additive field, no version bump needed
+    [group] = summary["groups"]
+    assert group["population"] == {
+        "member_count": 19,
+        "shape_before_digest": "a" * 64,
+        "shape_after_digest": "b" * 64,
+        "baseline_mode": "shift",
+        "current_rectangles": ["B2:B20"],
+        "first": "B2",
+        "last": "B20",
+    }
+
+
+def test_review_summary_group_population_is_none_for_atomic_findings() -> None:
+    summary = review_summary(_result())
+
+    assert all(group["population"] is None for group in summary["groups"])
 
 
 def test_review_summary_v4_carries_exact_alignment_trust(qc_result) -> None:

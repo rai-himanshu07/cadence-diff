@@ -302,6 +302,70 @@ class SeriesAnchorV2(BaseModel):
 SeriesAnchor = SeriesAnchorV1 | SeriesAnchorV2
 
 
+class MembershipCodec(BaseModel):
+    """Dual-sided population membership: current rectangles + baseline pairing.
+
+    ``shift`` mode covers a constant ``(dr, dc)`` offset shared by every
+    member (positional/translated alignment); ``pairs`` mode covers the
+    general case with an explicit ``(current, baseline)`` list. Exact
+    ``(baseline, current)`` reconstruction from either mode is a unit-tested
+    invariant, not merely documented behavior.
+    """
+
+    version: Literal[1] = 1
+    current_rectangles: tuple[str, ...] = Field(default=(), max_length=2000)
+    baseline_mode: Literal["shift", "pairs"]
+    shift: tuple[int, int] | None = None
+    pairs: tuple[tuple[str, str], ...] | None = Field(default=None, max_length=50_000)
+    member_count: int = Field(ge=1)
+
+    model_config = {"frozen": True}
+
+    @model_validator(mode="after")
+    def validate_mode_fields(self) -> Self:
+        if self.baseline_mode == "shift" and self.shift is None:
+            raise ValueError("shift mode requires a shift offset")
+        if self.baseline_mode == "pairs" and not self.pairs:
+            raise ValueError("pairs mode requires a non-empty explicit pairs list")
+        return self
+
+
+class PopulationSample(BaseModel):
+    """One sampled member used for impacts/story/excerpt evidence only."""
+
+    current_location: str = Field(min_length=1)
+    baseline_location: str | None = None
+
+    model_config = {"frozen": True}
+
+
+class PopulationEvidence(BaseModel):
+    """Group-first population evidence: membership, samples, shape digests.
+
+    Root cause, story context, and impacts for a population follow the
+    explicit population-level rules (root cause = the population identity
+    key; impacts/story/excerpts come from ``samples`` only, labelled
+    ``sampled``) rather than claiming full per-member atomic evidence.
+    """
+
+    version: Literal[1] = 1
+    member_count: int = Field(ge=1)
+    membership: MembershipCodec
+    first: str = Field(min_length=1)
+    last: str = Field(min_length=1)
+    samples: tuple[PopulationSample, ...] = Field(default=(), max_length=5)
+    shape_before_digest: str = Field(min_length=1)
+    shape_after_digest: str = Field(min_length=1)
+    #: Impacts computed for `samples` ONLY -- never the population's full
+    #: downstream set. Kept distinct from `Finding.impacts` (which stays
+    #: empty for population findings) so no renderer, story-evidence signal,
+    #: or priority score can mistake a bounded sample for exhaustive
+    #: downstream impacts.
+    sampled_impacts: tuple[str, ...] = Field(default=())
+
+    model_config = {"frozen": True}
+
+
 class Finding(BaseModel):
     finding_id: str = ""  # assigned when a run collects findings
     artifact: str  # "excel" | "ppt" | "crosscheck"
@@ -362,6 +426,11 @@ class Finding(BaseModel):
         default=None, exclude=True
     )
 
+    #: Group-first population evidence. None means atomic (the legacy,
+    #: always-on default). When set, ``element`` is "population" and
+    #: ``location`` is the bounding range of the current-side rectangles.
+    population: PopulationEvidence | None = None
+
     @model_validator(mode="after")
     def derive_expected_growth(self) -> Self:
         if self.expected_reason is not None:
@@ -417,6 +486,39 @@ class Finding(BaseModel):
                 SeriesAnchorV2 if anchor.get("version") == 2 else SeriesAnchorV1
             )
             data["series_anchor"] = anchor_model.model_construct(**anchor)
+        population = data.get("population")
+        if isinstance(population, dict):
+            membership = population["membership"]
+            data["population"] = PopulationEvidence.model_construct(
+                **{
+                    **population,
+                    "membership": MembershipCodec.model_construct(
+                        **{
+                            **membership,
+                            "current_rectangles": tuple(
+                                membership.get("current_rectangles", ())
+                            ),
+                            "shift": (
+                                tuple(membership["shift"])
+                                if membership.get("shift") is not None
+                                else None
+                            ),
+                            "pairs": (
+                                tuple(
+                                    tuple(pair) for pair in membership["pairs"]
+                                )
+                                if membership.get("pairs") is not None
+                                else None
+                            ),
+                        }
+                    ),
+                    "samples": tuple(
+                        PopulationSample.model_construct(**sample)
+                        for sample in population.get("samples", ())
+                    ),
+                    "sampled_impacts": tuple(population.get("sampled_impacts", ())),
+                }
+            )
         finding = cls.model_construct(**data)
         if finding.expected_reason is not None:
             finding.expected_growth = True

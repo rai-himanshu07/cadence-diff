@@ -9,9 +9,11 @@ import pytest
 from pydantic import ValidationError
 
 from qc_tool.config.profile import (
+    ComparisonPrerequisite,
     DeliverableProfile,
     ExcelMemberProfile,
     ExcelProfile,
+    RowIdentityRule,
     SheetProfile,
     excel_profile_for_member,
     profile_for_excel_member,
@@ -210,6 +212,109 @@ def test_empty_contract_id_preserves_canonical_profile_hash() -> None:
     explicit = DeliverableProfile(name="monthly", contract_id="")
 
     assert profile_sha256(implicit) == profile_sha256(explicit)
+
+
+def test_empty_comparison_prerequisites_preserve_canonical_profile_hash() -> None:
+    implicit = DeliverableProfile(name="monthly")
+    explicit = DeliverableProfile(
+        name="monthly", excel=ExcelProfile(comparison_prerequisites=[])
+    )
+
+    assert profile_sha256(implicit) == profile_sha256(explicit)
+    # Regression pin: fails if any new field ever changes this default hash.
+    assert (
+        profile_sha256(implicit)
+        == "e7259f869ad0381dad15d726fab606b2c7438f9c8cf9fa9332596f75dfa1ace2"
+    )
+
+
+def test_empty_row_identity_rules_preserve_canonical_profile_hash() -> None:
+    implicit_sheet = DeliverableProfile(
+        name="monthly", excel=ExcelProfile(sheets={"Data": SheetProfile()})
+    )
+    explicit_empty = DeliverableProfile(
+        name="monthly",
+        excel=ExcelProfile(sheets={"Data": SheetProfile(row_identity_rules=[])}),
+    )
+
+    assert profile_sha256(implicit_sheet) == profile_sha256(explicit_empty)
+
+
+def test_new_profile_rules_reject_malformed_locations_at_model_boundary() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ComparisonPrerequisite(name="Scenario", sheet="Config", cell="not-a-cell")
+    with pytest.raises(ValidationError):
+        RowIdentityRule(anchor_cell="A1", identity_columns=["?"])
+    with pytest.raises(ValidationError):
+        RowIdentityRule(
+            anchor_cell="A1",
+            identity_columns=["B"],
+            ordinal_columns=["b"],
+        )
+
+
+def test_comparison_prerequisites_project_into_a_package_member() -> None:
+    profile = DeliverableProfile(
+        name="pkg",
+        excel=ExcelProfile(
+            members={
+                "ops": ExcelMemberProfile(
+                    comparison_prerequisites=[
+                        ComparisonPrerequisite(
+                            name="Scenario", sheet="Config", cell="B2"
+                        )
+                    ]
+                )
+            }
+        ),
+    )
+
+    projected = profile_for_excel_member(profile, "ops", 2)
+
+    assert [item.name for item in projected.excel.comparison_prerequisites] == [
+        "Scenario"
+    ]
+
+
+def test_empty_formula_engine_preserves_canonical_profile_hash() -> None:
+    implicit = DeliverableProfile(name="monthly")
+    explicit_default = DeliverableProfile(
+        name="monthly", excel=ExcelProfile(formula_engine="auto")
+    )
+
+    assert profile_sha256(implicit) == profile_sha256(explicit_default)
+    # Same regression pin as test_empty_comparison_prerequisites_preserve_
+    # canonical_profile_hash: fails if formula_engine's default ever leaks
+    # into the canonical JSON.
+    assert (
+        profile_sha256(implicit)
+        == "e7259f869ad0381dad15d726fab606b2c7438f9c8cf9fa9332596f75dfa1ace2"
+    )
+
+
+def test_formula_engine_projects_into_a_package_member() -> None:
+    profile = DeliverableProfile(
+        name="pkg",
+        excel=ExcelProfile(
+            members={"ops": ExcelMemberProfile(formula_engine="native")}
+        ),
+    )
+
+    projected = profile_for_excel_member(profile, "ops", 2)
+
+    assert projected.excel.formula_engine == "native"
+
+
+def test_unscoped_formula_engine_is_ambiguous_for_multi_workbook_package() -> None:
+    profile = DeliverableProfile(
+        name="monthly",
+        excel=ExcelProfile(formula_engine="native"),
+    )
+
+    with pytest.raises(ValueError, match="ambiguous for this package"):
+        excel_profile_for_member(profile, "ops", workbook_count=2)
 
 
 MODULES = [

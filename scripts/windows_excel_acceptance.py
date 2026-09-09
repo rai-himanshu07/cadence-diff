@@ -101,6 +101,55 @@ def _dacl_summary(path: Path, *, expected_flags: int) -> dict[str, object]:
     }
 
 
+def _probe_pipeline(xlsb_path: Path) -> dict[str, object]:
+    """Run the real production path end to end: load, extract via the live
+    Excel worker, merge, and classify -- schema v2, partial coverage,
+    defined names, and external-link reachability all flow through here
+    exactly as the shipped app would use them. Aggregate-only: no formula
+    text, defined-name text, sheet name, or cell value is ever retained.
+    """
+    from qc_tool.io.loader import load_workbook_snapshot
+
+    before_hash = _sha256(xlsb_path.read_bytes())
+    started = time.monotonic()
+    snapshot = load_workbook_snapshot(xlsb_path, allow_large_workbook=True)
+    elapsed_seconds = round(time.monotonic() - started, 3)
+    after_hash = _sha256(xlsb_path.read_bytes())
+    source_unchanged = before_hash == after_hash
+
+    coverage = snapshot.formula_text_coverage
+    reachability = snapshot.external_link_reachability
+    passed = bool(
+        source_unchanged
+        and snapshot.formula_presence_available
+        and coverage.state in {"complete", "partial"}
+    )
+    return {
+        "elapsed_seconds": elapsed_seconds,
+        "source_unchanged": source_unchanged,
+        "formula_presence_available": snapshot.formula_presence_available,
+        "formulas_available": snapshot.formulas_available,
+        "formula_source": snapshot.formula_source,
+        "coverage_state": coverage.state,
+        "coverage_expected_count": coverage.expected_count,
+        "coverage_merged_count": coverage.merged_count,
+        "coverage_missing_count": coverage.missing_count,
+        "reachability_proven": (
+            None if reachability is None else reachability.proven
+        ),
+        "reachability_live": (
+            None if reachability is None else reachability.live
+        ),
+        "reachability_direct_count": (
+            None if reachability is None else reachability.direct_reference_count
+        ),
+        "reachability_transitive_count": (
+            None if reachability is None else reachability.transitive_reference_count
+        ),
+        "passed": passed,
+    }
+
+
 def _probe_dacl(data: bytes) -> dict[str, object]:
     import win32con  # pyright: ignore[reportMissingModuleSource]
 
@@ -398,7 +447,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=float, default=2.0)
     parser.add_argument(
         "--probe",
-        choices=("all", "dacl", "timeout", "parent-death"),
+        choices=("all", "dacl", "timeout", "parent-death", "pipeline"),
         default="all",
     )
     return parser
@@ -451,6 +500,8 @@ def _run_acceptance(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
                 probes[probe_name] = _probe_timeout(
                     data, scan, timeout_seconds=args.timeout_seconds
                 )
+            elif probe_name == "pipeline":
+                probes[probe_name] = _probe_pipeline(args.xlsb)
             else:
                 probes[probe_name] = _probe_parent_death(data, scan)
         except Exception as exc:

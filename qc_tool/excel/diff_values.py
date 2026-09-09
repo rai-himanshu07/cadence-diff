@@ -30,6 +30,7 @@ from qc_tool.excel.materiality import (
     temporal_contexts,
 )
 from qc_tool.excel.periods import is_period_after, parse_period
+from qc_tool.excel.population import CandidateSpill
 from qc_tool.excel.regions import TableRegion, period_positions
 from qc_tool.findings import (
     Finding,
@@ -201,6 +202,8 @@ def diff_region_values(
     sheet_profile: SheetProfile | None,
     windows: RestatementWindows | None = None,
     run_acceptance: NumericTolerance | None = None,
+    value_only_ignore: _RangeSet | None = None,
+    candidate_sink: CandidateSpill | None = None,
 ) -> list[Finding]:
     return list(
         iter_region_value_findings(
@@ -213,6 +216,8 @@ def diff_region_values(
             sheet_profile=sheet_profile,
             windows=windows,
             run_acceptance=run_acceptance,
+            value_only_ignore=value_only_ignore,
+            candidate_sink=candidate_sink,
         )
     )
 
@@ -228,8 +233,16 @@ def iter_region_value_findings(
     sheet_profile: SheetProfile | None,
     windows: RestatementWindows | None = None,
     run_acceptance: NumericTolerance | None = None,
+    value_only_ignore: _RangeSet | None = None,
+    candidate_sink: CandidateSpill | None = None,
 ) -> Iterator[Finding]:
-    """Yield the region's cell-level findings in production order."""
+    """Yield the region's cell-level findings in production order.
+
+    ``ignore`` (profile ``ignore_ranges``) suppresses every finding for a
+    cell -- unchanged. ``value_only_ignore`` (confirmed ``RowIdentityRule``
+    ordinal columns) suppresses only the cached-value comparison below;
+    number-format and style findings for that same cell stay fully active.
+    """
     sheet_name = curr_sheet.name
     refresh_block = _is_refresh_block(base_sheet, curr_sheet, region)
     recency_windows = windows if windows is not None else RestatementWindows()
@@ -259,6 +272,9 @@ def iter_region_value_findings(
             continue
         if (curr_row, curr_col) in ignore:
             continue
+        value_changed_suppressed = (
+            value_only_ignore is not None and (curr_row, curr_col) in value_only_ignore
+        )
         location = _ref(curr_row, curr_col)
         baseline_location = _ref(base_row, base_col)
 
@@ -268,7 +284,8 @@ def iter_region_value_findings(
         curr_is_formula = curr_cell is not None and curr_cell.formula is not None
 
         if (
-            not base_is_formula
+            not value_changed_suppressed
+            and not base_is_formula
             and not curr_is_formula
             and _values_differ(base_cell, curr_cell, tolerance)
             and not (
@@ -415,16 +432,33 @@ def iter_region_value_findings(
                 and curr_cell.number_format is not None
                 and base_cell.number_format != curr_cell.number_format
             ):
-                yield Finding(
-                    artifact="excel",
-                    finding_class=FindingClass.NUMBER_FORMAT_CHANGED,
-                    sheet=sheet_name,
-                    location=location,
-                    baseline_location=baseline_location,
-                    baseline_value=base_cell.number_format,
-                    current_value=curr_cell.number_format,
-                    message=f"{sheet_name}!{location}: number format changed",
-                )
+                if candidate_sink is not None:
+                    candidate = Finding(
+                        artifact="excel",
+                        finding_class=FindingClass.NUMBER_FORMAT_CHANGED,
+                        sheet=sheet_name,
+                        location=location,
+                        baseline_location=baseline_location,
+                        baseline_value=base_cell.number_format,
+                        current_value=curr_cell.number_format,
+                        message=f"{sheet_name}!{location}: number format changed",
+                    )
+                    candidate_sink.add(
+                        candidate,
+                        shape_before=base_cell.number_format,
+                        shape_after=curr_cell.number_format,
+                    )
+                else:
+                    yield Finding(
+                        artifact="excel",
+                        finding_class=FindingClass.NUMBER_FORMAT_CHANGED,
+                        sheet=sheet_name,
+                        location=location,
+                        baseline_location=baseline_location,
+                        baseline_value=base_cell.number_format,
+                        current_value=curr_cell.number_format,
+                        message=f"{sheet_name}!{location}: number format changed",
+                    )
             if (
                 base_cell.style_key is not None
                 and curr_cell.style_key is not None
@@ -698,6 +732,8 @@ def iter_region_findings(
     sheet_profile: SheetProfile | None,
     windows: RestatementWindows | None = None,
     run_acceptance: NumericTolerance | None = None,
+    value_only_ignore: _RangeSet | None = None,
+    candidate_sink: CandidateSpill | None = None,
 ) -> Iterator[Finding]:
     """One aligned region's full production: values, then row/column events."""
     if region.low_confidence:
@@ -713,6 +749,8 @@ def iter_region_findings(
         sheet_profile=sheet_profile,
         windows=windows,
         run_acceptance=run_acceptance,
+        value_only_ignore=value_only_ignore,
+        candidate_sink=candidate_sink,
     )
     region_id = region.current.region_id
     yield from _axis_findings(
@@ -735,11 +773,31 @@ def iter_region_findings(
 
 def region_range_sets(
     sheet_profile: SheetProfile | None,
-) -> tuple[_RangeSet, _RangeSet]:
-    """The (ignore, refresh) range sets a sheet's regions diff against."""
+    region: RegionAlignment | None = None,
+) -> tuple[_RangeSet, _RangeSet, _RangeSet]:
+    """The (ignore, refresh, value_only_ignore) range sets one region diffs
+    against.
+
+    ``ignore`` (profile ``ignore_ranges``) suppresses every finding for a
+    cell, unchanged. When ``region`` applied a confirmed ``RowIdentityRule``
+    with ordinal columns (see
+    ``qc_tool.excel.align._align_rows_by_identity``), their current-side
+    cells populate ``value_only_ignore`` instead: ordinal values are
+    display-only rank markers, so only their cached-value comparison is
+    suppressed there -- number-format and style findings, and all formula
+    checks (a separate pass), remain fully active.
+    """
+    value_only_ranges: list[str] = []
+    if region is not None and region.rows.ordinal_columns:
+        curr = region.current
+        value_only_ranges.extend(
+            f"{letter}{curr.min_row}:{letter}{curr.max_row}"
+            for letter in region.rows.ordinal_columns
+        )
     return (
         _RangeSet(sheet_profile.ignore_ranges if sheet_profile else []),
         _RangeSet(sheet_profile.refresh_ranges if sheet_profile else []),
+        _RangeSet(value_only_ranges),
     )
 
 
@@ -760,9 +818,9 @@ def diff_workbook_values(
         base_sheet = baseline.sheet(sheet_name)
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name) if profile else None
-        ignore, refresh = region_range_sets(sheet_profile)
         for region in regions:
             check_cancelled(cancellation_token)
+            ignore, refresh, value_only_ignore = region_range_sets(sheet_profile, region)
             findings.extend(
                 iter_region_findings(
                     base_sheet,
@@ -774,6 +832,7 @@ def diff_workbook_values(
                     sheet_profile=sheet_profile,
                     windows=windows,
                     run_acceptance=run_acceptance,
+                    value_only_ignore=value_only_ignore,
                 )
             )
     return findings

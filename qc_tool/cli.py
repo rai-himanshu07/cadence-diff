@@ -7,7 +7,8 @@ supports local numeric scrambling or strict verified redaction,
 `fingerprint` emits structural-only JSON, and `lint` validates a profile.
 
 Exit codes: 0 ok · 1 usage/runtime error · 2 findings at/above the
---fail-on threshold (run) or lint errors (lint).
+--fail-on threshold (run) or lint errors (lint) · 3 the run is blocked and
+needs an analyst action before it can proceed (run).
 """
 
 import argparse
@@ -22,6 +23,7 @@ from platformdirs import user_data_dir
 
 from qc_tool import __version__
 from qc_tool.package import MEMBER_ID_PATTERN, PackageManifest
+from qc_tool.run_action import RunActionRequired
 from qc_tool.security import private_directory
 
 _SUBCOMMANDS = {
@@ -36,6 +38,7 @@ _SUBCOMMANDS = {
     "verify-attestation",
     "network",
     "lint",
+    "formula-cache",
 }
 _MODE_ALIASES = {
     "cycle": "cycle_comparison",
@@ -354,6 +357,17 @@ def _run_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-dependency-indexing",
+        action="store_true",
+        help=(
+            "force full dependency-graph indexing (circular detection, "
+            "formula/chart/PowerPoint-chart impacts) above the documented "
+            "size policy that otherwise skips it with a disclosed coverage "
+            "reason; distinct from --allow-large-workbooks and can cost "
+            "significant time and memory"
+        ),
+    )
+    parser.add_argument(
         "--accept-absolute",
         type=float,
         default=0.0,
@@ -532,6 +546,36 @@ def _parse_slide_list(raw: str) -> list[int] | None:
     return sorted(indexes) or None
 
 
+def _print_blocked_action(action: RunActionRequired) -> None:
+    """Render a blocked run's action-required payload to stderr.
+
+    Prefers each item's typed v2 ``ranked_table_evidence`` when present;
+    falls back to the flat v1 ``detail`` sentence for the comparison-
+    prerequisite reason and for any legacy stored payload predating v2.
+    Names the package member whenever it is not ``"primary"`` (Criterion 17).
+    """
+    print(f"blocked: {action.message}", file=sys.stderr)
+    for item in action.items:
+        member = f" [member={item.member_id}]" if item.member_id != "primary" else ""
+        label = f" ({item.label})" if item.label else ""
+        evidence = item.ranked_table_evidence
+        if evidence is not None:
+            identity = ",".join(evidence.suggested_identity_columns) or "none"
+            ordinal = ",".join(evidence.suggested_ordinal_columns) or "none"
+            print(
+                f"  {item.sheet}!{item.cell}{member}{label}: "
+                f"{evidence.data_row_count:,} rows, "
+                f"{len(evidence.available_columns)} columns available, "
+                f"suggested identity={identity}, ordinal={ordinal}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"  {item.sheet}!{item.cell}{member}{label}: {item.detail}",
+                file=sys.stderr,
+            )
+
+
 def _cmd_run(args: list[str]) -> int:
     ns = _run_parser().parse_args(args)
     if ns.accept_absolute < 0 or ns.accept_percent < 0:
@@ -619,22 +663,29 @@ def _cmd_run(args: list[str]) -> int:
 
         on_progress = print_progress
 
-    artifacts = perform_run(
-        data_dir,
-        files,
-        passwords,
-        profile,
-        mode=QCRunMode(mode_value),
-        allow_large_workbooks=ns.allow_large_workbooks,
-        acceptance_absolute=ns.accept_absolute,
-        acceptance_relative=ns.accept_percent / 100.0,
-        compare_sheets=_parse_sheet_list(ns.sheets),
-        compare_slides=_parse_slide_list(ns.slides),
-        package_manifest=PackageManifest.from_role_files(files),
-        compare_member_sheets=dict(compare_member_sheets),
-        on_progress=on_progress,
-        write_reports=True,  # CLI is batch: the report files ARE the output
-    )
+    from qc_tool.run_action import RunBlockedError
+
+    try:
+        artifacts = perform_run(
+            data_dir,
+            files,
+            passwords,
+            profile,
+            mode=QCRunMode(mode_value),
+            allow_large_workbooks=ns.allow_large_workbooks,
+            allow_dependency_indexing=ns.allow_dependency_indexing,
+            acceptance_absolute=ns.accept_absolute,
+            acceptance_relative=ns.accept_percent / 100.0,
+            compare_sheets=_parse_sheet_list(ns.sheets),
+            compare_slides=_parse_slide_list(ns.slides),
+            package_manifest=PackageManifest.from_role_files(files),
+            compare_member_sheets=dict(compare_member_sheets),
+            on_progress=on_progress,
+            write_reports=True,  # CLI is batch: the report files ARE the output
+        )
+    except RunBlockedError as blocked:
+        _print_blocked_action(blocked.action_required)
+        return 3
     result = artifacts.result
 
     print(f"mode: {result.mode.value}   profile: {result.profile_name}")
@@ -677,6 +728,13 @@ def _cmd_run(args: list[str]) -> int:
         for item in result.coverage:
             states[item.state.value] = states.get(item.state.value, 0) + 1
         print("coverage:", "  ".join(f"{k}={v}" for k, v in sorted(states.items())))
+    population_items = [
+        item
+        for item in result.coverage
+        if item.check_id.startswith("excel-population-")
+    ]
+    for item in population_items:
+        print(f"populations ({item.check_id.removeprefix('excel-population-')}):", item.detail)
     if result.mapping_coverage is not None:
         mc = result.mapping_coverage
         print(
@@ -1210,6 +1268,55 @@ def _cmd_lint(args: list[str]) -> int:
 # --- dispatch -----------------------------------------------------------------------
 
 
+# --- dispatch -----------------------------------------------------------------------
+
+
+def _formula_cache_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=f"{_program_name()} formula-cache",
+        description=(
+            "Report or clear the private, bounded XLSB formula-extraction "
+            "cache used to skip repeat external-engine conversion. Cache "
+            "hit/miss never changes a finding -- clearing it only removes a "
+            "performance shortcut."
+        ),
+    )
+    parser.add_argument("action", choices=["status", "clear"])
+    parser.add_argument("--data-dir", type=Path, default=None)
+    return parser
+
+
+def _cmd_formula_cache(args: list[str]) -> int:
+    ns = _formula_cache_parser().parse_args(args)
+    from qc_tool.io.formula_cache import FormulaExtractionCache
+    from qc_tool.io.native_formula import native_adapter_fingerprint
+
+    data_dir = ns.data_dir or default_data_dir()
+    cache = FormulaExtractionCache(data_dir / "formula-cache")
+    if ns.action == "clear":
+        removed = cache.clear()
+        plural = "y" if removed == 1 else "ies"
+        print(f"formula-cache: cleared {removed} entr{plural}")
+        return 0
+    status = cache.status()
+    total_mib = status["total_bytes"] / (1024 * 1024)
+    cap_gib = cache.max_total_bytes / (1024 * 1024 * 1024)
+    print(
+        f"formula-cache: {status['entry_count']} entries, {total_mib:.1f} MiB "
+        f"(bounded to {cache.max_entries} entries / {cap_gib:.1f} GiB)"
+    )
+    fingerprint = native_adapter_fingerprint()
+    if fingerprint:
+        print(f"native formula engine: {fingerprint}")
+    else:
+        print(
+            "native formula engine: not installed (falls back to the existing "
+            "Excel/LibreOffice adapters)"
+        )
+    return 0
+
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:]) if argv is None else list(argv)
     if args and args[0] in _SUBCOMMANDS:
@@ -1228,6 +1335,7 @@ def main(argv: list[str] | None = None) -> int:
         "verify-attestation": _cmd_verify_attestation,
         "network": _cmd_network,
         "lint": _cmd_lint,
+        "formula-cache": _cmd_formula_cache,
     }
     try:
         return handlers[command](rest)

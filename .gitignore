@@ -17,6 +17,12 @@ htmlcov/
 .venv/
 venv/
 
+# rust / native extension build output (native/xlsbkernel/) — never commit
+# compiled artifacts; Cargo.lock IS committed for reproducible builds
+native/*/target/
+*.so
+*.pyd
+
 # generated artifacts — never commit deliverables, fixtures, reports, or run data
 tests/fixtures/generated/
 runs/

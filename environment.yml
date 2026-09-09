@@ -33,3 +33,7 @@ dependencies:
   - pip
   - pip:
       - "pywin32>=306; sys_platform == 'win32'"
+      # Builds the optional native XLSB kernel (native/xlsbkernel/, Rust/PyO3;
+      # `maturin develop --release` from that directory); not a runtime
+      # dependency of the shipped package -- see pyproject.toml's note.
+      - "maturin>=1.5,<2"
