@@ -19,6 +19,8 @@
     "context_included": {"type": "boolean"},
     "mode": {"type": "string"},
     "profile": {"type": "string"},
+    "requested_output_mode": {"type": "string"},
+    "resolved_output_policy": {"type": ["object", "null"]},
     "comparison_scope": {"type": "object"},
     "files": {"type": "object", "additionalProperties": {"type": "string"}},
     "counts": {"type": "object", "additionalProperties": {"type": "integer"}},

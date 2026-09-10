@@ -19,7 +19,7 @@ from openpyxl.utils import get_column_letter
 import qc_tool.run_service as run_service
 import qc_tool.ui.app as app_module
 from qc_tool.config.profile import DeliverableProfile, save_profile
-from qc_tool.coverage import MappingCoverage, QCRunMode
+from qc_tool.coverage import FindingOutputMode, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import (
@@ -70,6 +70,7 @@ from qc_tool.ui.app import (
     _profile_path,
     _queue_status_line,
     _relative_time,
+    _rerun_delta,
     _review_group_rows,
     _role_requirement,
     _run_blockers,
@@ -1444,7 +1445,7 @@ async def test_inputs_render_as_baseline_and_current_panels(
     await user.should_see("the cycle you are signing off")
     await user.should_not_see("the previous cycle you compare against")
 
-    mode_toggle = next(iter(user.find(kind=ui.toggle).elements))
+    mode_toggle = next(iter(user.find(marker="mode-toggle").elements))
     model_update = next(
         listener.type
         for listener in mode_toggle._event_listeners.values()
@@ -1585,7 +1586,7 @@ async def test_compare_page_remembers_manual_mode_selection(
     await user.open("/")
     await user.should_see("Current-file preflight — cannot run yet")
 
-    mode_toggle = next(iter(user.find(kind=ui.toggle).elements))
+    mode_toggle = next(iter(user.find(marker="mode-toggle").elements))
     model_update = next(
         listener.type
         for listener in mode_toggle._event_listeners.values()
@@ -2000,6 +2001,204 @@ async def test_reqc_offers_explicit_prior_decision_preview(
     await user.should_see("1 exact reusable")
     await user.should_see("source run was not finalized")
     await user.should_see("N1 · info")
+
+
+def test_rerun_delta_discloses_atomic_to_decision_mode_change(tmp_path: Path) -> None:
+    """Criterion 5: a naive resolved/new comparison across an output-mode
+    change compares disjoint identity spaces (location-keyed atomics vs
+    shape-digest-keyed populations) -- it must be suppressed and disclosed,
+    not silently shown as noise.
+    """
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    atomic_findings = [
+        Finding(
+            finding_id="A1",
+            artifact="excel",
+            finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+            severity=Severity.WARNING,
+            sheet="Data",
+            location="B2",
+            baseline_value="=A1",
+            current_value="=A1+1",
+            message="changed",
+        ),
+        Finding(
+            finding_id="A2",
+            artifact="excel",
+            finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+            severity=Severity.WARNING,
+            sheet="Data",
+            location="B3",
+            baseline_value="=A2",
+            current_value="=A2+1",
+            message="changed",
+        ),
+    ]
+    previous_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=atomic_findings,
+            requested_output_mode=FindingOutputMode.ATOMIC,
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    current_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=atomic_findings,
+            requested_output_mode=FindingOutputMode.DECISION,
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+    )
+    record = history.get_run(current_id)
+
+    delta, note = _rerun_delta(history, record)
+
+    assert delta is None
+    assert "output mode changed" in note
+    assert "Atomic" in note and "Decision" in note
+
+
+def test_rerun_delta_discloses_decision_to_atomic_mode_change(tmp_path: Path) -> None:
+    """Same disclosure, reversed direction (decision -> atomic)."""
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    finding = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        sheet="Data",
+        location="B2",
+        baseline_value="1",
+        current_value="2",
+        message="changed",
+    )
+    previous_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding],
+            requested_output_mode=FindingOutputMode.DECISION,
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    current_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding],
+            requested_output_mode=FindingOutputMode.ATOMIC,
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+    )
+    record = history.get_run(current_id)
+
+    delta, note = _rerun_delta(history, record)
+
+    assert delta is None
+    assert "output mode changed" in note
+    assert "Decision" in note and "Atomic" in note
+
+
+def test_rerun_delta_still_compares_normally_within_the_same_output_mode(
+    tmp_path: Path,
+) -> None:
+    """Same-mode reruns keep the real resolved/new/persisting comparison --
+    the mode check must not suppress the ordinary, correct case.
+    """
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    finding = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        sheet="Data",
+        location="B2",
+        baseline_value="1",
+        current_value="2",
+        message="changed",
+    )
+    previous_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding],
+            requested_output_mode=FindingOutputMode.ATOMIC,
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    current_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding.model_copy(update={"finding_id": "N1"})],
+            requested_output_mode=FindingOutputMode.ATOMIC,
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+    )
+    record = history.get_run(current_id)
+
+    delta, note = _rerun_delta(history, record)
+
+    assert note == ""
+    assert delta is not None
+    assert delta.persisting == 1
+    assert delta.resolved == 0
+    assert delta.new == 0
+
+
+@pytest.mark.asyncio
+async def test_reqc_page_discloses_output_mode_change_instead_of_a_delta_banner(
+    user: User, tmp_path: Path
+) -> None:
+    """End-to-end: the results page shows the disclosure note, not a
+    misleading resolved/new banner, when Re-QC changed output mode."""
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    finding = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        sheet="Data",
+        location="B2",
+        baseline_value="1",
+        current_value="2",
+        message="changed",
+    )
+    previous = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding],
+            requested_output_mode=FindingOutputMode.ATOMIC,
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    current = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding.model_copy(update={"finding_id": "N1"})],
+            requested_output_mode=FindingOutputMode.DECISION,
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous,
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{current}")
+
+    await user.should_see("output mode changed")
+    await user.should_not_see("resolved")
+    await user.should_not_see("new ·")
 
 
 @pytest.mark.asyncio

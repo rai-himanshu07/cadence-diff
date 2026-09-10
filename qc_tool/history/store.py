@@ -22,10 +22,11 @@ from pydantic import ValidationError
 
 from qc_tool.config.profile import (
     DeliverableProfile,
+    ResolvedOutputPolicy,
     canonical_profile_json,
     profile_sha256,
 )
-from qc_tool.coverage import CoverageItem, MappingCoverage, QCRunMode
+from qc_tool.coverage import CoverageItem, FindingOutputMode, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion
 from qc_tool.engine import QCRunResult
 from qc_tool.excel.align import AlignmentTrustPayload, decode_alignment_trust_payload
@@ -297,6 +298,17 @@ _MIGRATIONS = {
     "formula_engines": (
         "ALTER TABLE runs ADD COLUMN formula_engines TEXT NOT NULL DEFAULT '{}'"
     ),
+    #: Run-level finding-output contract (plan-20260910); "profile" and
+    #: "null" (no resolved policy recorded) for any run committed before
+    #: this pair of columns existed -- exactly today's behavior.
+    "requested_output_mode": (
+        "ALTER TABLE runs ADD COLUMN requested_output_mode TEXT "
+        "NOT NULL DEFAULT 'profile'"
+    ),
+    "resolved_output_policy": (
+        "ALTER TABLE runs ADD COLUMN resolved_output_policy TEXT "
+        "NOT NULL DEFAULT 'null'"
+    ),
 }
 
 
@@ -405,6 +417,13 @@ class RunRecord:
     #: (e.g. "native-biff12:1.2.3"); "{}" for legacy runs or roles where
     #: formula enrichment never ran.
     formula_engines: dict[str, str] = field(default_factory=dict)
+    #: Run-level finding-output contract request (plan-20260910); "profile"
+    #: for any run recorded before this contract existed -- exactly today's
+    #: legacy behavior.
+    requested_output_mode: FindingOutputMode = FindingOutputMode.PROFILE
+    #: The effective population policy this run actually used, and why;
+    #: `None` for any run recorded before this contract existed.
+    resolved_output_policy: ResolvedOutputPolicy | None = None
 
     def focus_sidecar(self) -> FocusTargetSidecar:
         """Decode the private sidecar on first focus use, never at row read.
@@ -781,8 +800,54 @@ class RunHistory:
         )
         # New runs bind even an empty eligible population. Legacy rows retain
         # the migration default "", which lets the UI distinguish the states.
-        aggregate_digest = canonical_aggregate_digest(bases)
-        series_digest = canonical_series_aggregate_digest(anchor_bindings)
+        # Each basis/anchor's model_dump(mode="json") is computed exactly
+        # once here and reused for both its own sidecar row and the
+        # aggregate digest -- previously recomputed 2-3x per item (once via
+        # canonical_aggregate_digest/canonical_series_aggregate_digest here,
+        # again for the row payload below, again inside canonical_basis_
+        # digest/canonical_series_anchor_digest), the dominant real cost of
+        # this phase at large finding counts.
+        base_rows: list[tuple[object, ...]] = []
+        aggregate_payloads: dict[str, object] = {}
+        for finding_id, basis in sorted(bases.items()):
+            payload = basis.model_dump(mode="json")
+            payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            base_rows.append((finding_id, basis.version, payload_json, digest))
+            aggregate_payloads[finding_id] = payload
+        aggregate_digest = hashlib.sha256(
+            json.dumps(
+                aggregate_payloads, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+
+        anchor_rows: list[tuple[object, ...]] = []
+        series_payloads: dict[str, object] = {}
+        for finding_id, (member, location, anchor) in sorted(anchor_bindings.items()):
+            anchor_payload = anchor.model_dump(mode="json")
+            anchor_payload_json = json.dumps(
+                anchor_payload, sort_keys=True, separators=(",", ":")
+            )
+            binding_payload = {
+                "finding_id": finding_id,
+                "artifact_member": member,
+                "location": location,
+                "anchor": anchor_payload,
+            }
+            row_digest = hashlib.sha256(
+                json.dumps(
+                    binding_payload, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            anchor_rows.append(
+                (finding_id, anchor.version, anchor_payload_json, row_digest)
+            )
+            series_payloads[finding_id] = binding_payload
+        series_digest = hashlib.sha256(
+            json.dumps(
+                series_payloads, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
 
         sqlite_start = time.perf_counter()
         with self._connect() as conn:
@@ -795,10 +860,11 @@ class RunHistory:
                     mapping_suggestions, review_counts, pattern_review_counts,
                     story_counts, comparison_scope, package_manifest, focus_targets,
                     profile_snapshot, profile_sha256, counterfactual_digest,
-                    series_anchor_digest, formula_engines
+                    series_anchor_digest, formula_engines,
+                    requested_output_mode, resolved_output_policy
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -849,6 +915,12 @@ class RunHistory:
                     aggregate_digest,
                     series_digest,
                     json.dumps(result.formula_engines),
+                    result.requested_output_mode.value,
+                    json.dumps(
+                        result.resolved_output_policy.model_dump(mode="json")
+                        if result.resolved_output_policy is not None
+                        else None
+                    ),
                 ),
             )
             run_id = cursor.lastrowid
@@ -908,22 +980,6 @@ class RunHistory:
                 )
             # Insert private counterfactual bases sidecar rows
             if run_id is not None and bases:
-                base_rows: list[tuple[object, ...]] = []
-                for finding_id, basis in sorted(bases.items()):
-                    payload = basis.model_dump(mode="json")
-                    base_rows.append(
-                        (
-                            run_id,
-                            finding_id,
-                            basis.version,
-                            json.dumps(
-                                payload,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ),
-                            canonical_basis_digest(basis),
-                        )
-                    )
                 conn.executemany(
                     """
                     INSERT INTO counterfactual_bases (
@@ -931,29 +987,10 @@ class RunHistory:
                     )
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    base_rows,
+                    [(run_id, *row) for row in base_rows],
                 )
             # Insert private logical-series anchor sidecar rows
             if run_id is not None and anchor_bindings:
-                anchor_rows: list[tuple[object, ...]] = []
-                for finding_id, (member, location, anchor) in sorted(
-                    anchor_bindings.items()
-                ):
-                    anchor_rows.append(
-                        (
-                            run_id,
-                            finding_id,
-                            anchor.version,
-                            json.dumps(
-                                anchor.model_dump(mode="json"),
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ),
-                            canonical_series_anchor_digest(
-                                finding_id, member, location, anchor
-                            ),
-                        )
-                    )
                 conn.executemany(
                     """
                     INSERT INTO series_anchor_sidecars (
@@ -961,7 +998,7 @@ class RunHistory:
                     )
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    anchor_rows,
+                    [(run_id, *row) for row in anchor_rows],
                 )
         mark("sqlite_write", sqlite_start)
         if run_id is None:  # pragma: no cover - sqlite always returns a rowid
@@ -1139,6 +1176,17 @@ class RunHistory:
             storage_bytes=row["storage_bytes"],
             alignment_trust=decode_alignment_trust_payload(alignment_trust_payload),
             formula_engines=json.loads(row["formula_engines"]),
+            requested_output_mode=FindingOutputMode(row["requested_output_mode"]),
+            resolved_output_policy=(
+                ResolvedOutputPolicy.model_validate(resolved_output_policy_payload)
+                if (
+                    resolved_output_policy_payload := json.loads(
+                        row["resolved_output_policy"]
+                    )
+                )
+                is not None
+                else None
+            ),
         )
 
     def list_runs(self, limit: int = 50, *, include_archived: bool = True) -> list[RunRecord]:

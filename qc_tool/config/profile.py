@@ -20,6 +20,7 @@ import yaml
 from openpyxl.utils.cell import column_index_from_string, coordinate_to_tuple
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from qc_tool.coverage import FindingOutputMode
 from qc_tool.findings import FindingClass, Materiality, Severity
 from qc_tool.package import MEMBER_ID_PATTERN
 from qc_tool.security import private_directory, private_file
@@ -388,6 +389,71 @@ class ReviewPolicy(BaseModel):
 
     version: Literal[1] = 1
     populations: PopulationPolicy = Field(default_factory=PopulationPolicy)
+
+
+#: Version of the conservative built-in population policy `decision` mode
+#: falls back to when a profile does not itself already enable populations.
+#: Bump only when the built-in snapshot's fields change; an explicit
+#: profile policy is never affected by this constant.
+DECISION_MODE_POLICY_VERSION = 1
+
+
+class ResolvedOutputPolicy(BaseModel):
+    """Versioned, persisted record of exactly which population policy one
+    run actually used, and why -- kept separate from `profile_sha256` so a
+    profile's canonical hash never changes because of a run-level
+    output-mode choice.
+    """
+
+    version: Literal[1] = 1
+    output_mode: FindingOutputMode
+    populations: PopulationPolicy
+    #: ``"profile"``: the profile's own explicit, already-enabled policy.
+    #: ``"decision_built_in"``: decision mode's conservative default because
+    #: the profile did not itself enable populations.
+    #: ``"atomic_forced"``: atomic mode always disables populations.
+    source: Literal["profile", "decision_built_in", "atomic_forced"]
+
+    model_config = {"frozen": True}
+
+
+def resolve_output_policy(
+    output_mode: FindingOutputMode, review_policy: ReviewPolicy
+) -> ResolvedOutputPolicy:
+    """Resolve the effective population policy for one run.
+
+    ``profile`` returns the policy exactly as persisted (today's behavior,
+    unchanged). ``atomic`` always disables populations, regardless of the
+    profile -- the forensic/compatibility lane. ``decision`` forces
+    populations on: the profile's own explicit policy is honored exactly
+    when it already enables populations, otherwise a versioned conservative
+    built-in snapshot (``PopulationPolicy(enabled=True)``, i.e. every other
+    field at its documented conservative default) is used instead. Never
+    mutates ``review_policy`` or its owning profile.
+    """
+    if output_mode is FindingOutputMode.ATOMIC:
+        return ResolvedOutputPolicy(
+            output_mode=output_mode,
+            populations=PopulationPolicy(enabled=False),
+            source="atomic_forced",
+        )
+    if output_mode is FindingOutputMode.DECISION:
+        if review_policy.populations.enabled:
+            return ResolvedOutputPolicy(
+                output_mode=output_mode,
+                populations=review_policy.populations,
+                source="profile",
+            )
+        return ResolvedOutputPolicy(
+            output_mode=output_mode,
+            populations=PopulationPolicy(enabled=True),
+            source="decision_built_in",
+        )
+    return ResolvedOutputPolicy(
+        output_mode=output_mode,
+        populations=review_policy.populations,
+        source="profile",
+    )
 
 
 class DeliverableProfile(BaseModel):

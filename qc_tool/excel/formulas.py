@@ -33,7 +33,7 @@ import logging
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from openpyxl.formula.tokenizer import TokenizerError
 from openpyxl.utils import get_column_letter
@@ -408,6 +408,161 @@ class FormulaComparisonTelemetry:
     #: Populated by ``run_qc()``, not by this module -- see the class
     #: docstring.
     complexity_assessment_seconds: float = 0.0
+
+    #: Hits/misses against an optional ``FormulaPairAnalysisMemo`` (Step 5 of
+    #: plan-20260910). A hit means the extension/wrapper/reference-delta
+    #: analysis for this changed pair's canonical key was reused, not
+    #: recomputed -- so a growing hit share directly explains a shrinking
+    #: ``extension_seconds``/``wrapper_reference_seconds``.
+    pair_analysis_memo_hits: int = 0
+    pair_analysis_memo_misses: int = 0
+
+
+@dataclass(slots=True)
+class PairKeyTelemetry:
+    """Aggregate-only diagnostic for the changed-formula-pair classification
+    hot path (plan-20260910): whether a candidate memoization key -- the
+    canonical ``(baseline_r1c1, current_r1c1)`` pair -- would be safe to
+    cache. A private, in-memory map from that key to the single
+    classification signature seen so far lives only for this object's
+    lifetime; the public surface (``changed_pairs``, ``distinct_pair_keys``,
+    ``classification_conflicts``, ``frequency_histogram()``) never exposes a
+    key, a formula, a sheet name, or a coordinate -- only bounded counts.
+    Passing an instance changes no finding, ordering, or evidence.
+    """
+
+    changed_pairs: int = 0
+    _signatures: dict[tuple[str, str], tuple[object, ...]] = field(
+        default_factory=dict, repr=False
+    )
+    _occurrences: dict[tuple[str, str], int] = field(default_factory=dict, repr=False)
+    _conflicted_keys: set[tuple[str, str]] = field(default_factory=set, repr=False)
+
+    def observe(
+        self, base_norm: str, curr_norm: str, signature: tuple[object, ...]
+    ) -> None:
+        """Record one changed pair's canonical key and classification.
+
+        ``signature`` must be a hashable tuple built only from bounded,
+        already-computed classification facts (extension flag, wrapper kind/
+        exactness, sorted evidence-tag values, event skeleton) -- never raw
+        formula text.
+        """
+        self.changed_pairs += 1
+        key = (base_norm, curr_norm)
+        self._occurrences[key] = self._occurrences.get(key, 0) + 1
+        existing = self._signatures.get(key)
+        if existing is None:
+            self._signatures[key] = signature
+        elif existing != signature:
+            self._conflicted_keys.add(key)
+
+    @property
+    def distinct_pair_keys(self) -> int:
+        return len(self._signatures)
+
+    @property
+    def classification_conflicts(self) -> int:
+        """Distinct pair keys that produced 2+ different classification
+        signatures across their occurrences -- the exact condition that
+        would make memoizing on this key unsafe (plan Criterion 15).
+        """
+        return len(self._conflicted_keys)
+
+    def frequency_histogram(self) -> dict[str, int]:
+        """Distinct-key counts bucketed by occurrence count -- never the
+        keys, a formula, or a coordinate themselves.
+        """
+        buckets = {"1": 0, "2-4": 0, "5-9": 0, "10-24": 0, "25+": 0}
+        for count in self._occurrences.values():
+            if count == 1:
+                buckets["1"] += 1
+            elif count <= 4:
+                buckets["2-4"] += 1
+            elif count <= 9:
+                buckets["5-9"] += 1
+            elif count <= 24:
+                buckets["10-24"] += 1
+            else:
+                buckets["25+"] += 1
+        return buckets
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaPairAnalysis:
+    """Immutable wrapper-shape classification of one changed aligned formula
+    pair, keyed by the canonical ``(baseline_r1c1, current_r1c1)`` pair.
+
+    Every field here is derived ONLY from ``detect_formula_wrapper(base_norm,
+    curr_norm)`` -- a pure function of the normalized pair itself, nothing
+    else -- which is what makes reusing one analysis across every occurrence
+    of the same canonical pair safe (plan-20260910, Step 5).
+
+    Deliberately EXCLUDED: the "expected" (range-extension) flag and the
+    ADDED_REFERENCE evidence tag. Both are computed from the pair's RAW
+    (pre-normalization) formula text (``_differs_only_by_extension`` and
+    ``formula_reference_operands`` respectively), so neither is a pure
+    function of ``(base_norm, curr_norm)`` alone -- two different raw-text
+    occurrences of the identical R1C1 shape can legitimately disagree on
+    either. Caching them here was a real, confirmed bug (found during
+    plan-20260910 Step 8 guest validation: a real-data conflict probe using
+    ``PairKeyTelemetry`` found exactly one canonical key whose occurrences
+    disagreed on ADDED_REFERENCE). Both are now always recomputed fresh, on
+    every occurrence, regardless of this cache's hit/miss state -- see
+    ``_paired_cell_findings``'s own control flow.
+    """
+
+    wrapper_kind: str | None
+    wrapper_exact: bool | None
+    event_key: str
+
+
+#: Bounded so the memo's added RSS stays within the plan's 128 MiB budget.
+#: Measured empirically (not guessed): a representative dict entry -- a
+#: ``(base_r1c1, curr_r1c1)`` string-pair key plus its ``FormulaPairAnalysis``
+#: -- costs ~330 bytes deep (CPython 3.11, `sys.getsizeof` recursive
+#: measurement over a 5,000-entry synthetic batch with realistic R1C1 text).
+#: 128 MiB / 330 bytes is ~405K entries; this cap keeps a ~2.7x safety margin
+#: for dict growth/resize overhead and longer real-world R1C1 strings than
+#: the synthetic sample used to measure it.
+_FORMULA_PAIR_ANALYSIS_MEMO_CAP = 150_000
+
+
+class FormulaPairAnalysisMemo:
+    """Bounded cache from a canonical ``(baseline_r1c1, current_r1c1)`` pair
+    to its ``FormulaPairAnalysis`` -- skips re-running wrapper detection
+    (full tokenization plus structural argument-boundary matching) for a
+    pair whose normalized text was already classified once.
+
+    Only the wrapper-shape result is cached here: it is a pure function of
+    ``(base_norm, curr_norm)`` alone (``detect_formula_wrapper`` takes only
+    the normalized strings as input), so reusing it across every occurrence
+    of the same canonical pair is safe regardless of the pairs' raw text.
+    The "expected" (range-extension) flag and the ADDED_REFERENCE evidence
+    tag are NOT cached here -- see ``FormulaPairAnalysis``'s own docstring
+    for why they are unsafe to memoize on this key and are always
+    recomputed fresh instead. Passing an instance changes no finding,
+    ordering, or evidence, only whether the wrapper-detection cost is
+    recomputed or reused.
+    """
+
+    __slots__ = ("_cap", "_values")
+
+    def __init__(self, cap: int = _FORMULA_PAIR_ANALYSIS_MEMO_CAP) -> None:
+        self._values: dict[tuple[str, str], FormulaPairAnalysis] = {}
+        self._cap = cap
+
+    def get(self, base_norm: str, curr_norm: str) -> FormulaPairAnalysis | None:
+        return self._values.get((base_norm, curr_norm))
+
+    def put(
+        self, base_norm: str, curr_norm: str, analysis: FormulaPairAnalysis
+    ) -> None:
+        if len(self._values) < self._cap:
+            self._values[(base_norm, curr_norm)] = analysis
+
+    def __len__(self) -> int:
+        return len(self._values)
 
 
 #: Bounded per-region so the memo's added RSS is small and predictable; a
@@ -795,6 +950,8 @@ def _paired_cell_findings(
     telemetry: FormulaComparisonTelemetry | None = None,
     current_memo: _CurrentNormalizationMemo | None = None,
     candidate_sink: CandidateSpill | None = None,
+    pair_key_telemetry: PairKeyTelemetry | None = None,
+    pair_analysis_memo: FormulaPairAnalysisMemo | None = None,
 ) -> list[Finding]:
     findings = []
     sheet_name = curr_sheet.name
@@ -918,19 +1075,69 @@ def _paired_cell_findings(
                 telemetry.normalization_calls += calls
             if base_norm == curr_norm:
                 continue
+            # `expected` and the ADDED_REFERENCE evidence tag are both
+            # computed from RAW (pre-normalization) formula text, so they
+            # are NOT a pure function of the (base_norm, curr_norm) cache
+            # key -- two different occurrences of the identical R1C1 shape
+            # can legitimately disagree on either (confirmed empirically on
+            # real data: plan-20260910 Step 8 guest validation found exactly
+            # one such key with a genuine ADDED_REFERENCE conflict across
+            # its occurrences). Only wrapper_kind/wrapper_exact/event_key
+            # are a pure function of the key (detect_formula_wrapper takes
+            # only base_norm/curr_norm as input) and are safe to memoize;
+            # `expected` and the reference-added check are always
+            # recomputed fresh below, on every occurrence, regardless of
+            # cache hit/miss.
             ext_start = time.perf_counter()
             expected = _differs_only_by_extension(base_formula, curr_formula)
             if telemetry is not None:
                 telemetry.extension_seconds += time.perf_counter() - ext_start
-            wrapper_start = time.perf_counter()
-            wrapper = None if expected else detect_formula_wrapper(base_norm, curr_norm)
             evidence_tags: set[FindingEvidenceTag] = set()
-            if wrapper is not None:
-                evidence_tags.add(
-                    FindingEvidenceTag.EXACT_WRAPPER
-                    if wrapper.exact
-                    else FindingEvidenceTag.SHAPE_WRAPPER
+            wrapper_start = time.perf_counter()
+            if expected:
+                wrapper_kind = None
+                wrapper_exact = None
+                event_key = ""
+            else:
+                cached_analysis = (
+                    pair_analysis_memo.get(base_norm, curr_norm)
+                    if pair_analysis_memo is not None
+                    else None
                 )
+                if cached_analysis is not None:
+                    if telemetry is not None:
+                        telemetry.pair_analysis_memo_hits += 1
+                    wrapper_kind = cached_analysis.wrapper_kind
+                    wrapper_exact = cached_analysis.wrapper_exact
+                    event_key = cached_analysis.event_key
+                else:
+                    if pair_analysis_memo is not None and telemetry is not None:
+                        telemetry.pair_analysis_memo_misses += 1
+                    wrapper = detect_formula_wrapper(base_norm, curr_norm)
+                    wrapper_kind = wrapper.kind if wrapper is not None else None
+                    wrapper_exact = wrapper.exact if wrapper is not None else None
+                    event_key = (
+                        f"formula-wrapper:{wrapper.kind}:{wrapper.skeleton_key}"
+                        if wrapper is not None
+                        else ""
+                    )
+                    if pair_analysis_memo is not None:
+                        pair_analysis_memo.put(
+                            base_norm,
+                            curr_norm,
+                            FormulaPairAnalysis(
+                                wrapper_kind=wrapper_kind,
+                                wrapper_exact=wrapper_exact,
+                                event_key=event_key,
+                            ),
+                        )
+                if wrapper_kind is not None:
+                    assert wrapper_exact is not None
+                    evidence_tags.add(
+                        FindingEvidenceTag.EXACT_WRAPPER
+                        if wrapper_exact
+                        else FindingEvidenceTag.SHAPE_WRAPPER
+                    )
             try:
                 baseline_references = {
                     operand.value.casefold()
@@ -956,21 +1163,31 @@ def _paired_cell_findings(
                 )
             if expected:
                 wording = "formula range extended with new-cycle data"
-            elif wrapper is not None:
+            elif wrapper_kind is not None:
+                assert wrapper_exact is not None
                 wording = "formula logic changed" + _WRAPPER_NOTES[
-                    (wrapper.kind, wrapper.exact)
+                    (wrapper_kind, wrapper_exact)
                 ]
             else:
                 wording = "formula logic changed"
             expected_reason = (
                 FindingExpectedReason.CADENCE_EXTENSION if expected else None
             )
-            subtype = _WRAPPER_SUBTYPES[wrapper.kind] if wrapper is not None else None
-            event_key = (
-                f"formula-wrapper:{wrapper.kind}:{wrapper.skeleton_key}"
-                if wrapper is not None
-                else ""
+            subtype = (
+                _WRAPPER_SUBTYPES[wrapper_kind] if wrapper_kind is not None else None
             )
+            if pair_key_telemetry is not None:
+                # Observe only the portion FormulaPairAnalysisMemo actually
+                # caches (wrapper_kind/wrapper_exact/event_key) -- `expected`
+                # and the ADDED_REFERENCE tag are always freshly computed
+                # now (see the comment above), so including them here would
+                # make every real workload show spurious "conflicts" for
+                # values that were never claimed to be cacheable.
+                pair_key_telemetry.observe(
+                    base_norm,
+                    curr_norm,
+                    (wrapper_kind, wrapper_exact, event_key),
+                )
             message = f"{sheet_name}!{location}: {wording}"
             construct_start = time.perf_counter()
             if candidate_sink is not None:
@@ -1276,6 +1493,8 @@ def diff_workbook_formulas(
     cancellation_token: CancellationToken | None = None,
     telemetry: FormulaComparisonTelemetry | None = None,
     candidate_sink: CandidateSpill | None = None,
+    pair_key_telemetry: PairKeyTelemetry | None = None,
+    pair_analysis_memo: FormulaPairAnalysisMemo | None = None,
 ) -> list[Finding]:
     findings = _error_findings(
         baseline, current, alignment, profile, cycle=cycle, telemetry=telemetry
@@ -1321,6 +1540,8 @@ def diff_workbook_formulas(
                     telemetry=telemetry,
                     current_memo=current_memo,
                     candidate_sink=candidate_sink,
+                    pair_key_telemetry=pair_key_telemetry,
+                    pair_analysis_memo=pair_analysis_memo,
                 )
             )
             if compare_text:

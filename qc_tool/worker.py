@@ -166,7 +166,7 @@ def worker_main(
 ) -> None:
     """Execute one QC request and report exactly one terminal message."""
     from qc_tool.config.profile import DeliverableProfile
-    from qc_tool.coverage import QCRunMode
+    from qc_tool.coverage import FindingOutputMode, QCRunMode
     from qc_tool.progress import (
         CancellationToken,
         PhaseTelemetry,
@@ -209,6 +209,7 @@ def worker_main(
             credentials,
             DeliverableProfile.model_validate(payload["profile"]),
             mode=QCRunMode(payload["mode"]),
+            output_mode=FindingOutputMode(payload.get("requested_output_mode", "profile")),
             rerun_of=payload["rerun_of"],
             allow_large_workbooks=bool(payload["allow_large_workbooks"]),
             allow_dependency_indexing=bool(payload["allow_dependency_indexing"]),

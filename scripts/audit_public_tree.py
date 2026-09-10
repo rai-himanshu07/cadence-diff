@@ -12,6 +12,8 @@ _ALLOWED_FILES = {
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/publish.yml",
+    ".github/workflows/xlsbkernel-wheels.yml",
+    "CHANGELOG.md",
     "LICENSE",
     "README.md",
     "SECURITY.md",
@@ -21,11 +23,14 @@ _ALLOWED_FILES = {
     "scripts/audit_distributions.py",
     "scripts/audit_dependencies.py",
     "scripts/audit_public_tree.py",
+    "scripts/formula_phase_diagnostic.py",
     "scripts/windows_excel_acceptance.py",
     "scripts/windows_focus_acceptance.py",
     "scripts/windows_office_discovery.py",
+    "scripts/windows_large_workbook_throughput_acceptance.py",
+    "scripts/xlsb_load_locality_diagnostic.py",
 }
-_ALLOWED_PREFIXES = ("qc_tool/", "tests/")
+_ALLOWED_PREFIXES = ("qc_tool/", "tests/", "native/xlsbkernel/")
 _PRIVATE_SUFFIXES = {
     ".db",
     ".key",

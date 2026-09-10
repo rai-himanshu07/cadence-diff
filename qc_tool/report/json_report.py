@@ -149,6 +149,12 @@ def _payload_scaffold(
         "context_included": include_context,
         "mode": result.mode.value,
         "profile": result.profile_name,
+        "requested_output_mode": result.requested_output_mode.value,
+        "resolved_output_policy": (
+            result.resolved_output_policy.model_dump(mode="json")
+            if result.resolved_output_policy is not None
+            else None
+        ),
         "comparison_scope": result.comparison_scope.model_dump(
             mode="json",
             exclude_none=True,

@@ -30,10 +30,18 @@ from qc_tool.config.profile import (
     CrosscheckProfile,
     DeliverableProfile,
     NumericTolerance,
+    ResolvedOutputPolicy,
     default_profile,
     profile_for_excel_member,
+    resolve_output_policy,
 )
-from qc_tool.coverage import CoverageItem, CoverageState, MappingCoverage, QCRunMode
+from qc_tool.coverage import (
+    CoverageItem,
+    CoverageState,
+    FindingOutputMode,
+    MappingCoverage,
+    QCRunMode,
+)
 from qc_tool.crosscheck.package import MultiPackageReconciler, reconcile_package
 from qc_tool.crosscheck.trace import (
     MappingSuggestion,
@@ -77,6 +85,7 @@ from qc_tool.excel.diff_values import iter_region_findings, region_range_sets
 from qc_tool.excel.diff_vba import diff_workbook_vba, vba_coverage
 from qc_tool.excel.formulas import (
     FormulaComparisonTelemetry,
+    FormulaPairAnalysisMemo,
     diff_workbook_formulas,
     formula_text_compatible,
 )
@@ -159,7 +168,7 @@ def _load_excel_file(
     formula_cache: FormulaExtractionCache | None = None,
     formula_engine: Literal["native", "excel", "libreoffice", "auto"] = "auto",
     _native_compat_mode: bool = False,
-    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "pyxlsb",
+    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "auto",
 ) -> WorkbookSnapshot:
     check_cancelled(cancellation_token)
     report_progress(on_progress, phase, total=1, detail=path.name)
@@ -702,6 +711,12 @@ def _pair_formula_disclosure(
 class QCRunResult:
     profile_name: str
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON
+    #: Run-level finding-output contract (plan-20260910): which population
+    #: policy this run actually used, and why. ``PROFILE``/``None`` for any
+    #: result built outside the versioned output-mode contract (e.g. a
+    #: directly-constructed test fixture).
+    requested_output_mode: FindingOutputMode = FindingOutputMode.PROFILE
+    resolved_output_policy: ResolvedOutputPolicy | None = None
     files: dict[str, str] = field(default_factory=dict)  # role -> file name
     #: Resolved formula-engine/adapter-fingerprint string (e.g.
     #: "native-biff12:1.2.3") per excel role, when formula enrichment ran.
@@ -940,6 +955,7 @@ def _run_multi_package(
     profile: DeliverableProfile,
     passwords: dict[str, str],
     mode: QCRunMode,
+    output_mode: FindingOutputMode,
     allow_large_workbooks: bool,
     allow_dependency_indexing: bool = False,
     run_acceptance: NumericTolerance | None,
@@ -1050,6 +1066,7 @@ def _run_multi_package(
             profile=profile.model_copy(update={"waivers": []}, deep=True),
             passwords=member_passwords(("current_ppt", current.role_key)),
             mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+            output_mode=output_mode,
             compare_slides=compare_slides,
             cancellation_token=cancellation_token,
             on_progress=on_progress,
@@ -1093,6 +1110,7 @@ def _run_multi_package(
                         ("current_excel", current.role_key),
                     ),
                     mode=QCRunMode.CYCLE_COMPARISON,
+                    output_mode=output_mode,
                     allow_large_workbooks=allow_large_workbooks,
                     allow_dependency_indexing=allow_dependency_indexing,
                     run_acceptance=run_acceptance,
@@ -1146,6 +1164,7 @@ def _run_multi_package(
                 profile=projected_profile(member_id),
                 passwords=member_passwords(("current_excel", current.role_key)),
                 mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+                output_mode=output_mode,
                 allow_large_workbooks=allow_large_workbooks,
                 compare_sheets=member_scope,
                 cancellation_token=cancellation_token,
@@ -1240,6 +1259,7 @@ def _run_multi_package(
                 ("current_ppt", current.role_key),
             ),
             mode=QCRunMode.CYCLE_COMPARISON,
+            output_mode=output_mode,
             compare_slides=compare_slides,
             cancellation_token=cancellation_token,
             on_progress=on_progress,
@@ -1258,6 +1278,7 @@ def _run_multi_package(
             profile=profile.model_copy(update={"waivers": []}, deep=True),
             passwords=member_passwords(("current_ppt", current.role_key)),
             mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+            output_mode=output_mode,
             compare_slides=compare_slides,
             cancellation_token=cancellation_token,
             on_progress=on_progress,
@@ -1336,6 +1357,8 @@ def _run_multi_package(
     result = QCRunResult(
         profile_name=profile.name,
         mode=mode,
+        requested_output_mode=output_mode,
+        resolved_output_policy=resolve_output_policy(output_mode, profile.review_policy),
         files={member.role_key: member.display_name for member in manifest.members},
         formula_engines=formula_engines,
         disclosures=list(dict.fromkeys(disclosures)),
@@ -1379,6 +1402,7 @@ def run_qc(
     compare_member_sheets: dict[str, tuple[str, ...]] | None = None,
     passwords: dict[str, str] | None = None,
     mode: QCRunMode = QCRunMode.CYCLE_COMPARISON,
+    output_mode: FindingOutputMode = FindingOutputMode.PROFILE,
     allow_large_workbooks: bool = False,
     allow_dependency_indexing: bool = False,
     run_acceptance: NumericTolerance | None = None,
@@ -1389,7 +1413,7 @@ def run_qc(
     _snapshot_capture: _SnapshotCapture | None = None,
     formula_cache: FormulaExtractionCache | None = None,
     _native_compat_mode: bool = False,
-    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "pyxlsb",
+    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "auto",
     _formula_telemetry: FormulaComparisonTelemetry | None = None,
 ) -> QCRunResult:
     """Run a full QC comparison. ``passwords`` is keyed by file name.
@@ -1408,18 +1432,29 @@ def run_qc(
     ``native``, restricts its returned text to exactly the coordinates a
     legacy engine also covers, for comparing against a legacy-engine oracle.
     Never set by production callers; ignored for non-native engines.
-    ``_xlsb_values_engine`` is a private, diagnostic-only switch for the
-    separate values-decoding axis (plan-20260908-phase-b-guest-performance-
-    followup.md): ``"auto"``/``"native"`` route XLSB cell values through the
-    native kernel instead of pyxlsb. Never set by production callers; the
-    shipped default stays ``"pyxlsb"``. ``_formula_telemetry`` is a private,
-    diagnostic-only hook that accumulates ``FormulaComparisonTelemetry``
+    ``_xlsb_values_engine`` selects the values-decoding engine for XLSB
+    workbooks (plan-20260908-phase-b-guest-performance-followup.md /
+    plan-20260909 Step 11): ``"auto"`` (the production default) prefers the
+    native kernel when the optional extension is importable and falls back
+    to ``pyxlsb`` with a disclosed, content-free reason on any native
+    runtime failure; ``"native"``/``"pyxlsb"`` force one engine explicitly
+    and are diagnostic-only (a forced ``"native"`` raises instead of falling
+    back). ``_formula_telemetry`` is a private, diagnostic-only hook that
+    accumulates ``FormulaComparisonTelemetry``
     counters -- including the ``RunPhase.COMPARING_FORMULAS``-scoped
     ``assess_workbook_complexity()`` cost -- for the same follow-up plan;
-    never set by production callers.
+    never set by production callers. ``output_mode`` (plan-20260910) is the
+    run-level finding-output contract: ``profile`` (default) resolves
+    population output exactly as the profile's own ``review_policy``
+    persists it; ``decision`` forces population output on (the profile's
+    own explicit policy when it already enables one, else a versioned
+    conservative built-in policy); ``atomic`` forces population output off
+    regardless of profile. The resolved policy is recorded on the returned
+    result as ``resolved_output_policy``; ``profile_sha256`` is unaffected.
     """
     check_cancelled(cancellation_token)
     mode = QCRunMode(mode)
+    output_mode = FindingOutputMode(output_mode)
     requested_scope = ComparisonScope(
         excel_sheets=(tuple(compare_sheets) if compare_sheets is not None else None),
         excel_member_sheets=compare_member_sheets or None,
@@ -1466,6 +1501,7 @@ def run_qc(
                 profile=profile or default_profile(),
                 passwords=passwords or {},
                 mode=mode,
+                output_mode=output_mode,
                 allow_large_workbooks=allow_large_workbooks,
                 allow_dependency_indexing=allow_dependency_indexing,
                 run_acceptance=run_acceptance,
@@ -1484,6 +1520,10 @@ def run_qc(
         profile = profile or default_profile()
         passwords = passwords or {}
         result = QCRunResult(profile_name=profile.name, mode=mode)
+        result.requested_output_mode = output_mode
+        result.resolved_output_policy = resolve_output_policy(
+            output_mode, profile.review_policy
+        )
         result.package_manifest = manifest
         if acceptance_requested:
             logger.warning("acceptance threshold ignored in %s", mode.value)
@@ -1664,6 +1704,10 @@ def run_qc(
             on_progress=on_progress,
         )
         result = QCRunResult(profile_name=profile.name, mode=mode)
+        result.requested_output_mode = output_mode
+        result.resolved_output_policy = resolve_output_policy(
+            output_mode, profile.review_policy
+        )
         result.package_manifest = manifest
         if acceptance_requested:
             logger.warning("acceptance threshold ignored in %s", mode.value)
@@ -1761,6 +1805,9 @@ def run_qc(
     profile = profile or default_profile()
     passwords = passwords or {}
     result = QCRunResult(profile_name=profile.name, mode=mode)
+    resolved_output_policy = resolve_output_policy(output_mode, profile.review_policy)
+    result.requested_output_mode = output_mode
+    result.resolved_output_policy = resolved_output_policy
     result.package_manifest = manifest
     if run_acceptance is not None and (
         run_acceptance.absolute > 0 or run_acceptance.relative > 0
@@ -1778,10 +1825,15 @@ def run_qc(
     else:
         run_acceptance = None
     today = dt.date.today()
-    population_policy = profile.review_policy.populations
+    population_policy = resolved_output_policy.populations
     candidate_sink = (
         CandidateSpill(profile, today) if population_policy.enabled else None
     )
+    # One bounded cache per run_qc() call, shared across every sheet/region so
+    # a formula pattern repeated across the workbook is classified once --
+    # see FormulaPairAnalysisMemo's own docstring for the safety evidence
+    # (plan-20260910, Step 5).
+    pair_analysis_memo = FormulaPairAnalysisMemo()
     pre_findings: list[Finding] = []
     post_batches: list[list[Finding]] = []
     current_workbook = None
@@ -2161,6 +2213,7 @@ def run_qc(
             cancellation_token=cancellation_token,
             candidate_sink=candidate_sink,
             telemetry=_formula_telemetry,
+            pair_analysis_memo=pair_analysis_memo,
         )
         check_cancelled(cancellation_token)
         post_batches.append(formula_findings)
@@ -2661,6 +2714,17 @@ def compare_findings(
     losing one of two same-identity findings between runs must still count
     as one resolved, not be hidden because the key was still present
     (Criterion 8).
+
+    Caller contract (plan-20260910 Criterion 5): `previous` and `current`
+    must come from runs that share the same `requested_output_mode`.
+    Populations and atomics key into disjoint identity spaces here, so
+    comparing across a mode change (e.g. a decision-mode run re-queued in
+    atomic mode) makes every population look "resolved" and every atomic
+    member it covered look "new" even when nothing substantive changed.
+    Callers (`run_service.perform_run`, `ui.app._rerun_delta`) check
+    `requested_output_mode` equality before calling this and disclose a
+    representation change instead of calling it -- do not call this
+    directly across a known mode change.
     """
     previous_counts = Counter(
         requeue_identity_key(f) for f in previous if f.severity is not Severity.EXPECTED

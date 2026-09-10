@@ -335,8 +335,11 @@ and `.pptx`, including password-protected files.
 
 ### XLSB formula enrichment
 
-The original XLSB remains read-only and `pyxlsb` remains authoritative for its
-saved values. Formula text is enriched through a platform spreadsheet engine
+The original XLSB remains read-only. Saved cell values are decoded through
+the native kernel when it is importable, falling back to `pyxlsb` with a
+disclosed, content-free reason on any native runtime failure — both paths
+are hash-verified identical (type, value, and number format) on every
+fixture. Formula text is enriched through a platform spreadsheet engine
 only after an independent structural scan of the binary file identifies every
 formula coordinate:
 

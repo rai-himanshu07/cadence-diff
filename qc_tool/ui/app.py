@@ -9,7 +9,6 @@ localhost; sources are read-only. The visual language lives in
 """
 
 import asyncio
-import contextlib
 import dataclasses
 import datetime as dt
 import html
@@ -53,6 +52,7 @@ from qc_tool.config.promotion import (
 from qc_tool.coverage import (
     CoverageItem,
     CoverageState,
+    FindingOutputMode,
     MappingCoverage,
     QCRunMode,
     capability_limited,
@@ -266,6 +266,26 @@ MODE_LABELS = {
     QCRunMode.CYCLE_COMPARISON: "Cycle comparison",
     QCRunMode.FINAL_PACKAGE: "Final-package QC",
 }
+OUTPUT_MODE_LABELS = {
+    FindingOutputMode.DECISION: "Decision (recommended)",
+    FindingOutputMode.PROFILE: "Profile",
+    FindingOutputMode.ATOMIC: "Atomic (advanced)",
+}
+OUTPUT_MODE_DESCRIPTIONS = {
+    FindingOutputMode.DECISION: (
+        "Compact, decision-ready output: related findings are grouped into "
+        "populations. Uses your profile's own population settings when it "
+        "already enables them, otherwise a conservative built-in default."
+    ),
+    FindingOutputMode.PROFILE: (
+        "Exactly what your saved profile's own review policy already "
+        "produces -- the compatibility choice."
+    ),
+    FindingOutputMode.ATOMIC: (
+        "Every individual finding, ungrouped -- forensic detail, outside "
+        "the interactive review target for very large runs."
+    ),
+}
 PHASE_LABELS = {
     RunPhase.PREPARING: "Preparing run",
     RunPhase.LOADING_BASELINE_EXCEL: "Loading baseline Excel",
@@ -328,6 +348,10 @@ class SessionState:
     passwords: dict[str, str] = field(default_factory=dict)  # role -> password
     profile_name: str = "default"
     mode: QCRunMode = QCRunMode.CURRENT_FILE_PREFLIGHT
+    #: Run-level finding-output contract (plan-20260910). New cycle
+    #: comparisons default to the compact `decision` lane; Re-QC prefills
+    #: the source run's own recorded mode instead (see `main_page`).
+    output_mode: FindingOutputMode = FindingOutputMode.DECISION
     allow_large_workbooks: bool = False
     allow_dependency_indexing: bool = False
     acceptance_absolute: float = 0.0
@@ -2339,13 +2363,31 @@ _DELTA_BUDGET_FINDINGS = 50_000
 def _rerun_delta(
     history: "RunHistory", record: "RunRecord"
 ) -> tuple[FindingsDelta | None, str]:
-    """Delta against the re-QC baseline, or a note when it is out of budget."""
+    """Delta against the re-QC baseline, or a note when it is out of budget.
+
+    plan-20260910 Criterion 5: a naive resolved/new comparison is only valid
+    when both runs share the same requested output mode. `requeue_identity_key`
+    keys a population finding by its shape digest but keys an atomic finding
+    by location, so comparing a decision-mode run against an atomic-mode run
+    (or vice versa) compares two disjoint identity spaces -- every population
+    looks "resolved" and every atomic member it would have covered looks
+    "new", even when nothing about the underlying findings changed. Disclose
+    the representation change explicitly instead of showing that noise.
+    """
     if record.rerun_of is None:
         return None, ""
     try:
         previous = history.get_run(record.rerun_of)
     except KeyError:
         return None, ""
+    if previous.requested_output_mode != record.requested_output_mode:
+        return None, (
+            f"change summary vs run #{record.rerun_of} is skipped — output "
+            f"mode changed from {OUTPUT_MODE_LABELS[previous.requested_output_mode]!r} "
+            f"to {OUTPUT_MODE_LABELS[record.requested_output_mode]!r}, so "
+            "population and atomic groupings are not directly comparable — "
+            "the review queue below reflects this run's own mode in full"
+        )
     if (
         len(previous.findings) > _DELTA_BUDGET_FINDINGS
         or len(record.findings) > _DELTA_BUDGET_FINDINGS
@@ -2422,6 +2464,7 @@ def _render_budget_run_view(
         ui.label(heading).classes("runtitle")
         ui.label(
             f"{MODE_LABELS[result.mode]} · profile {result.profile_name!r} · "
+            f"output {OUTPUT_MODE_LABELS[result.requested_output_mode]!r} · "
             + _result_scope_line(result)
         ).classes("runmeta")
         if result.files:
@@ -2608,6 +2651,7 @@ def _render_result_view(
         ui.label(heading).classes("runtitle")
         ui.label(
             f"{MODE_LABELS[result.mode]} · profile {result.profile_name!r} · "
+            f"output {OUTPUT_MODE_LABELS[result.requested_output_mode]!r} · "
             + _result_scope_line(result)
         ).classes("runmeta")
         if result.files:
@@ -5491,6 +5535,8 @@ def _result_from_record(record: RunRecord) -> QCRunResult:
     return QCRunResult(
         profile_name=record.profile,
         mode=record.mode,
+        requested_output_mode=record.requested_output_mode,
+        resolved_output_policy=record.resolved_output_policy,
         files=record.files,
         findings=record.findings,
         disclosures=record.disclosures,
@@ -6042,6 +6088,10 @@ def create_pages(
                     app.storage.general.get("qc_mode"),
                     rerun_mode=rerun_record.mode,
                 )
+                # Re-QC preselects the source run's own recorded mode
+                # (Criterion 7); the analyst may still change it explicitly
+                # -- an intentional representation change, not disabled.
+                state.output_mode = rerun_record.requested_output_mode
             except KeyError:
                 rerun_record = None
 
@@ -6119,10 +6169,27 @@ def create_pages(
                 {mode.value: label for mode, label in MODE_LABELS.items()},
                 value=state.mode.value,
                 on_change=on_mode_change,
-            ).classes("mode-select").props("no-caps spread")
+            ).classes("mode-select").props("no-caps spread").mark("mode-toggle")
             if rerun_record is not None:
                 mode_select.disable()
             update_mode_surface()
+
+            output_mode_copy = ui.label().classes("modecopy")
+
+            def update_output_mode_surface() -> None:
+                output_mode_copy.text = OUTPUT_MODE_DESCRIPTIONS[state.output_mode]
+
+            def on_output_mode_change(e: events.ValueChangeEventArguments) -> None:
+                state.output_mode = FindingOutputMode(e.value)
+                update_output_mode_surface()
+
+            ui.label("Finding output").classes("dk")
+            ui.toggle(
+                {mode.value: label for mode, label in OUTPUT_MODE_LABELS.items()},
+                value=state.output_mode.value,
+                on_change=on_output_mode_change,
+            ).classes("mode-select").props("no-caps spread").mark("output-mode-toggle")
+            update_output_mode_surface()
 
             section("2 · Inputs")
             ui.label(
@@ -7243,6 +7310,7 @@ def create_pages(
                         files={role: str(path) for role, path in files.items()},
                         display_files={role: path.name for role, path in files.items()},
                         package_manifest=manifest.model_dump(mode="json"),
+                        requested_output_mode=state.output_mode.value,
                         compare_member_sheets={
                             key: tuple(sorted(value))
                             for key, value in state.selected_member_sheets.items()
@@ -7335,9 +7403,8 @@ def create_pages(
                 def _refresh_validation() -> None:
                     vm = dialog_state["view_model"]
                     destination_errors = vm.destination_errors()
-                    profile_name_input.props(
-                        f"error={'true' if destination_errors else 'false'} "
-                        f'error-message="{destination_errors[0] if destination_errors else ""}"'
+                    profile_name_input.error = (
+                        destination_errors[0] if destination_errors else None
                     )
                     destination_note.set_text(
                         ""
@@ -7352,10 +7419,7 @@ def create_pages(
                         region = vm.regions[index]
                         errors = region.errors()
                         for widget in controls["column_widgets"]:
-                            widget.props(
-                                f"error={'true' if errors else 'false'} "
-                                f'error-message="{errors[0] if errors else ""}"'
-                            )
+                            widget.error = errors[0] if errors else None
                         icon = "check_circle" if region.is_valid else "error"
                         controls["tab"].props(f"icon={icon}")
                     save_button.set_enabled(vm.is_valid)
@@ -7563,11 +7627,22 @@ def create_pages(
                         save_button = ui.button(
                             "Save rule and run QC", on_click=save_rules
                         ).classes("runbtn").props("no-caps")
-                        ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+
+                        def _cancel() -> None:
+                            dialog.close()
+                            # Criterion 14: Cancel returns focus to the Run
+                            # surface, not wherever the browser defaults to.
+                            ui.run_javascript(
+                                f'getHtmlElement("{run_button.html_id}").focus()'
+                            )
+
+                        ui.button("Cancel", on_click=_cancel).props("flat no-caps")
                 _refresh_validation()
                 if view_model.initial_focus_target == "region_identity" and region_controls:
-                    with contextlib.suppress(Exception):
-                        region_controls[0]["column_widgets"][0].run_method("focus")
+                    first_widget = region_controls[0]["column_widgets"][0]
+                    ui.run_javascript(
+                        f'getHtmlElement("{first_widget.html_id}").focus()'
+                    )
                 dialog.open()
                 return True
 

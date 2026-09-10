@@ -32,11 +32,12 @@ import contextlib
 import datetime as dt
 import shutil
 import tempfile
+import time
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from qc_tool.config.profile import DeliverableProfile, PopulationPolicy
 from qc_tool.findings import (
@@ -66,7 +67,96 @@ from qc_tool.triage.rules import assign_severities
 
 _MAX_SAMPLES = 5
 
-_Member = tuple[Finding, Coordinate, Coordinate | None]
+
+class _MemberFacts(NamedTuple):
+    """Per-candidate facts needed to build membership/samples for an
+    eligible population, without constructing a full ``Finding`` (plan-
+    20260910, Step 6). ``location``/``baseline_location`` are kept as their
+    original strings (not re-derived from ``current``/``baseline``) so a
+    round-trip can never lose formatting a coordinate tuple would drop
+    (e.g. an absolute ``$`` reference, if one were ever present).
+    """
+
+    location: str
+    baseline_location: str | None
+    current: Coordinate
+    baseline: Coordinate | None
+
+
+@dataclass(slots=True)
+class PopulationTelemetry:
+    """Aggregate-only timers for the group-first candidate pipeline
+    (plan-20260910): construction (``CandidateSpill.add``), spill/merge
+    (``CandidateSpill.groups``), and finalize (``finalize_populations``'s own
+    grouping/decision loop). No candidate content -- formula, sheet, value,
+    or coordinate -- is ever recorded, only elapsed seconds.
+    """
+
+    construction_seconds: float = 0.0
+    spill_seconds: float = 0.0
+    finalize_seconds: float = 0.0
+
+
+#: Internal spill row schema version (plan-20260910, Step 6) -- never
+#: persisted past one run (the spill directory is a disposable tempdir), so
+#: this exists for code clarity/future changes, not cross-run compatibility.
+_CANDIDATE_ROW_VERSION = 1
+
+_MISSING = object()
+
+
+def _diff_against_template(
+    template: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Fields of ``payload`` that differ from ``template``, generically --
+    never a hand-picked field list, so no candidate producer's field can be
+    silently dropped. ``population_key`` already guarantees roughly a dozen
+    fields (artifact/sheet/finding_class/severity/provenance/subtype/
+    materiality/temporal_context/waiver state/...) are identical across
+    every member of one group; this is what makes the resulting delta small
+    for the common case, without this function needing to know which fields
+    those are.
+
+    Returns ``None`` (meaning: store the full payload instead) if
+    ``template`` carries a key ``payload`` altogether lacks -- no known
+    producer creates this (a template's keys are always a subset of a later
+    same-key candidate's own keys), but falling back keeps reconstruction
+    correct regardless of any future producer's shape.
+    """
+    if not template.keys() <= payload.keys():
+        return None
+    return {
+        field: value
+        for field, value in payload.items()
+        if template.get(field, _MISSING) != value
+    }
+
+
+def _reconstruct_group_findings(group: list[dict[str, Any]]) -> list[Finding]:
+    """Rebuild every row's full ``Finding`` from its (possibly delta-encoded)
+    spill row, using the group's own template row (the first ``add()`` call
+    for this population key) to fill in whatever a delta row omitted.
+
+    A group always contains at least one ``"full"`` row: the very first
+    ``add()`` call for a given key has no template to diff against yet, and
+    ``_diff_against_template`` itself falls back to ``"full"`` if it ever
+    can't safely diff. Finding it once per group (not once per row) keeps
+    this linear in group size, not quadratic.
+    """
+    template: dict[str, Any] | None = None
+    for candidate in group:
+        if candidate["row"]["kind"] == "full":
+            template = candidate["row"]["finding"]
+            break
+    findings: list[Finding] = []
+    for row in group:
+        inner = row["row"]
+        if inner["kind"] == "full":
+            findings.append(Finding.from_trusted_payload(inner["finding"]))
+        else:
+            assert template is not None, "a delta row implies its group has a full row"
+            findings.append(Finding.from_trusted_payload({**template, **inner["finding"]}))
+    return findings
 
 
 class CandidateSpill:
@@ -78,9 +168,28 @@ class CandidateSpill:
     projection (``assign_severities``) the atomic pipeline always used, so
     the population key computed from it -- and any later atomic replay --
     match atomic-mode behavior exactly.
+
+    Spill rows are delta-encoded against their group's own first-seen
+    candidate (plan-20260910, Step 6): every field ``population_key``
+    already guarantees homogeneous across a group -- artifact, sheet,
+    finding_class, severity, provenance, subtype, materiality,
+    temporal_context, waiver state, and more -- is written once per group,
+    not once per member, shrinking the dominant per-candidate spill/merge
+    cost for the common (large, homogeneous) population case. This is an
+    internal storage optimization only: ``finalize_populations`` still
+    reconstructs one complete, ordinary ``Finding`` per candidate before any
+    grouping/threshold/homogeneity/membership decision runs, so every
+    downstream behavior -- including a heterogeneous or below-threshold
+    group's exact atomic replay -- is unaffected by this encoding.
     """
 
-    def __init__(self, profile: DeliverableProfile, today: dt.date) -> None:
+    def __init__(
+        self,
+        profile: DeliverableProfile,
+        today: dt.date,
+        *,
+        telemetry: PopulationTelemetry | None = None,
+    ) -> None:
         self._profile = profile
         self._today = today
         self._dir = Path(tempfile.mkdtemp(prefix="qc-population-"))
@@ -88,39 +197,65 @@ class CandidateSpill:
         self._spill.__enter__()
         self._closed = False
         self.count = 0
+        self._telemetry = telemetry
+        self._templates: dict[tuple[object, ...], dict[str, Any]] = {}
 
     def add(self, candidate: Finding, *, shape_before: str, shape_after: str) -> None:
+        start = time.perf_counter() if self._telemetry is not None else 0.0
         assign_severities([candidate], self._profile, today=self._today)
         key = population_key(candidate, (shape_before, shape_after))
         coordinate = _coordinate(candidate.location) or (0, 0)
         sort_key = (*key, coordinate[0], coordinate[1])
+        full_payload = finding_payload(candidate)
+        template = self._templates.get(key)
+        if template is None:
+            self._templates[key] = full_payload
+            row: dict[str, Any] = {"kind": "full", "finding": full_payload}
+        else:
+            delta = _diff_against_template(template, full_payload)
+            row = (
+                {"kind": "delta", "finding": delta}
+                if delta is not None
+                else {"kind": "full", "finding": full_payload}
+            )
         payload: dict[str, Any] = {
-            "finding": finding_payload(candidate),
+            "v": _CANDIDATE_ROW_VERSION,
+            "group_key": list(key),
+            "row": row,
             "shape_before": shape_before,
             "shape_after": shape_after,
         }
         self._spill.append(sort_key, payload)
         self.count += 1
+        if self._telemetry is not None:
+            self._telemetry.construction_seconds += time.perf_counter() - start
 
     def groups(self) -> Iterator[list[dict[str, Any]]]:
         """Close the spill and yield contiguous same-key candidate groups.
 
         Consumes (and removes) the spill directory; call at most once.
+        Boundaries come directly from each row's own stored ``group_key``
+        (computed once at ``add()`` time) rather than recomputing
+        ``population_key`` from a reconstructed ``Finding`` -- a delta row's
+        own payload deliberately omits most of what ``population_key`` reads,
+        so recomputing it here would require reconstructing every row before
+        grouping could even begin.
         """
         if not self._closed:
             self._spill.__exit__(None, None, None)
             self._closed = True
         try:
-            current_key: tuple[object, ...] | None = None
+            current_key: list[object] | None = None
             bucket: list[dict[str, Any]] = []
             for row in merge_spill(self._spill.path):
                 if not isinstance(row, dict):
                     raise FindingsStoreError("population candidate payload is not a mapping")
                 payload: dict[str, Any] = row
-                finding = Finding.from_trusted_payload(payload["finding"])
-                key = population_key(
-                    finding, (payload["shape_before"], payload["shape_after"])
-                )
+                key = payload.get("group_key")
+                if not isinstance(key, list):
+                    raise FindingsStoreError(
+                        "population candidate payload is missing its group key"
+                    )
                 if current_key is not None and key != current_key:
                     yield bucket
                     bucket = []
@@ -167,60 +302,120 @@ class PopulationOutcome:
     stats: dict[FindingClass, ClassPopulationStats] = field(default_factory=dict)
 
 
-def _homogeneous_evidence(findings: list[Finding]) -> bool:
-    """Whether every candidate shares identical producer-authored evidence.
-
-    ``population_key`` deliberately excludes ``evidence_tags`` (and only
-    conditionally includes ``event_key``) from its grouping key, so members
-    sharing a key can still disagree on producer-authored evidence. Such a
-    group must replay atomically rather than have that evidence silently
-    dropped or misattributed to one representative member.
+def _row_facts(row: dict[str, Any], template: dict[str, Any]) -> _MemberFacts | None:
+    """(location, baseline_location, current coordinate, baseline
+    coordinate) for one spill row, without constructing a ``Finding``.
+    ``None`` when the row's location does not parse to a single-cell
+    coordinate (``_coordinate``'s own exact rule) -- not eligible as a
+    population member, matching the original per-``Finding`` filter exactly.
     """
-    first = findings[0]
-    return all(
-        finding.event_key == first.event_key
-        and finding.evidence_tags == first.evidence_tags
-        for finding in findings[1:]
+    inner = row["row"]["finding"]
+    location = inner["location"] if "location" in inner else template.get("location")
+    current = _coordinate(location)
+    if current is None or location is None:
+        return None
+    baseline_location = (
+        inner["baseline_location"]
+        if "baseline_location" in inner
+        else template.get("baseline_location")
     )
+    return _MemberFacts(location, baseline_location, current, _coordinate(baseline_location))
+
+
+def _row_evidence(row: dict[str, Any], template: dict[str, Any]) -> tuple[str, frozenset[str]]:
+    """(event_key, evidence_tags) for one spill row, without constructing a
+    ``Finding``. ``population_key`` deliberately excludes ``evidence_tags``
+    (and only conditionally includes ``event_key``) from its grouping key,
+    so members sharing a key can still disagree on producer-authored
+    evidence -- this is exactly what the homogeneity check compares.
+    """
+    inner = row["row"]["finding"]
+    event_key = inner["event_key"] if "event_key" in inner else template.get("event_key", "")
+    tags = inner["evidence_tags"] if "evidence_tags" in inner else template.get("evidence_tags", [])
+    return event_key, frozenset(tags)
 
 
 def finalize_populations(
     spill: CandidateSpill,
     policy: PopulationPolicy,
     scope: ComparisonScope,
+    *,
+    telemetry: PopulationTelemetry | None = None,
 ) -> PopulationOutcome:
-    """Group spilled candidates and decide population vs. atomic replay."""
+    """Group spilled candidates and decide population vs. atomic replay.
+
+    A full ``Finding`` is reconstructed for every member ONLY when a group
+    turns out to need atomic replay (below threshold, heterogeneous
+    evidence, or over the rectangle/pair cap) -- exactly where every
+    member's complete evidence is genuinely needed. For a group that
+    becomes one population, only the representative (the group's template
+    row -- population_key already guarantees every member shares its
+    artifact/sheet/finding_class/severity/provenance/subtype/materiality/
+    temporal_context/waiver state) and up to 5 samples are ever fully
+    reconstructed, however large the group (plan-20260910, Step 6). Scope
+    filtering is likewise decided once per group from the representative
+    alone: every field ``ComparisonScope.filter_findings`` reads (artifact,
+    artifact_member, sheet, slide_index) is population_key-guaranteed
+    identical across a group, so it can never partially trim one group's
+    members -- an already-established invariant this reuses rather than
+    introduces (see the scope test docstrings in ``tests/test_population_
+    finalize.py``).
+
+    When ``telemetry`` is given, ``finalize_seconds`` measures only this
+    function's own per-group grouping/decision loop body; ``spill_seconds``
+    is the residual (this function's total wall time minus that measured
+    body), attributing ``spill.groups()``'s own generator work -- closing
+    the spill writer and the ``merge_spill`` k-way merge -- without double
+    counting time already spent inside the loop body.
+    """
+    total_start = time.perf_counter() if telemetry is not None else 0.0
+    finalize_elapsed = 0.0
     population_findings: list[Finding] = []
     replay_findings: list[Finding] = []
     stats: dict[FindingClass, ClassPopulationStats] = defaultdict(ClassPopulationStats)
     for group in spill.groups():
-        findings = [Finding.from_trusted_payload(row["finding"]) for row in group]
-        findings = scope.filter_findings(findings)
-        if not findings:
+        body_start = time.perf_counter() if telemetry is not None else 0.0
+        template = next(
+            (row["row"]["finding"] for row in group if row["row"]["kind"] == "full"), None
+        )
+        assert template is not None, "every group has at least one full row"
+        representative = Finding.from_trusted_payload(template)
+        if not scope.filter_findings([representative]):
+            if telemetry is not None:
+                finalize_elapsed += time.perf_counter() - body_start
             continue
-        representative = findings[0]
         class_stats = stats[representative.finding_class]
-        class_stats.candidates += len(findings)
-        members: list[_Member] = [
-            (finding, current, _coordinate(finding.baseline_location))
-            for finding in findings
-            if (current := _coordinate(finding.location)) is not None
-        ]
-        if len(members) != len(findings) or len(members) < policy.threshold:
-            class_stats.below_threshold += len(findings)
-            class_stats.replayed += len(findings)
-            replay_findings.extend(findings)
+        class_stats.candidates += len(group)
+
+        facts = [_row_facts(row, template) for row in group]
+        members = [fact for fact in facts if fact is not None]
+        if len(members) != len(group) or len(members) < policy.threshold:
+            class_stats.below_threshold += len(group)
+            class_stats.replayed += len(group)
+            replay_findings.extend(_reconstruct_group_findings(group))
+            if telemetry is not None:
+                finalize_elapsed += time.perf_counter() - body_start
             continue
-        if not _homogeneous_evidence(findings):
-            class_stats.heterogeneous_evidence += len(findings)
-            class_stats.replayed += len(findings)
-            replay_findings.extend(findings)
+        evidence = [_row_evidence(row, template) for row in group]
+        first_event_key, first_tags = evidence[0]
+        homogeneous = all(
+            event_key == first_event_key and tags == first_tags
+            for event_key, tags in evidence[1:]
+        )
+        if not homogeneous:
+            class_stats.heterogeneous_evidence += len(group)
+            class_stats.replayed += len(group)
+            replay_findings.extend(_reconstruct_group_findings(group))
+            if telemetry is not None:
+                finalize_elapsed += time.perf_counter() - body_start
             continue
         membership = _build_membership(members, policy)
         if membership is None:
-            class_stats.over_cap += len(findings)
-            class_stats.replayed += len(findings)
-            replay_findings.extend(findings)
+            class_stats.over_cap += len(group)
+            class_stats.replayed += len(group)
+            replay_findings.extend(_reconstruct_group_findings(group))
+            if telemetry is not None:
+                finalize_elapsed += time.perf_counter() - body_start
             continue
         shape_before = group[0]["shape_before"]
         shape_after = group[0]["shape_after"]
@@ -228,22 +423,28 @@ def finalize_populations(
             _build_population(representative, members, membership, shape_before, shape_after)
         )
         class_stats.populations += 1
+        if telemetry is not None:
+            finalize_elapsed += time.perf_counter() - body_start
+    if telemetry is not None:
+        telemetry.finalize_seconds += finalize_elapsed
+        total_elapsed = time.perf_counter() - total_start
+        telemetry.spill_seconds += max(0.0, total_elapsed - finalize_elapsed)
     return PopulationOutcome(population_findings, replay_findings, dict(stats))
 
 
 def _build_membership(
-    members: list[_Member], policy: PopulationPolicy
+    members: list[_MemberFacts], policy: PopulationPolicy
 ) -> MembershipCodec | None:
     """Build the dual-sided membership codec, or None if it exceeds caps."""
-    current_coords = {current for _, current, _ in members}
+    current_coords = {member.current for member in members}
     rectangles = _rectangles(current_coords)
     if len(rectangles) > policy.max_rectangles:
         return None
     current_rectangles = tuple(_range(rectangle) for rectangle in rectangles)
     offsets = {
-        (baseline[0] - current[0], baseline[1] - current[1])
-        for _, current, baseline in members
-        if baseline is not None
+        (member.baseline[0] - member.current[0], member.baseline[1] - member.current[1])
+        for member in members
+        if member.baseline is not None
     }
     if len(offsets) == 1:
         return MembershipCodec(
@@ -253,13 +454,9 @@ def _build_membership(
             member_count=len(members),
         )
     pairs: list[tuple[str, str]] = []
-    for finding, _current, baseline in members:
-        if (
-            baseline is not None
-            and finding.location is not None
-            and finding.baseline_location is not None
-        ):
-            pairs.append((finding.location, finding.baseline_location))
+    for member in members:
+        if member.baseline is not None and member.baseline_location is not None:
+            pairs.append((member.location, member.baseline_location))
     if len(pairs) != len(members) or len(pairs) > policy.max_explicit_pairs:
         return None
     return MembershipCodec(
@@ -272,28 +469,28 @@ def _build_membership(
 
 def _build_population(
     representative: Finding,
-    members: list[_Member],
+    members: list[_MemberFacts],
     membership: MembershipCodec,
     shape_before: str,
     shape_after: str,
 ) -> Finding:
-    ordered = sorted(members, key=lambda member: member[1])
-    current_coords = {current for _, current, _ in members}
+    ordered = sorted(members, key=lambda member: member.current)
+    current_coords = {member.current for member in members}
     baseline_coords = {
-        baseline for _, _current, baseline in members if baseline is not None
+        member.baseline for member in members if member.baseline is not None
     }
     samples = tuple(
         PopulationSample(
-            current_location=finding.location,  # type: ignore[arg-type]
-            baseline_location=finding.baseline_location,
+            current_location=member.location,
+            baseline_location=member.baseline_location,
         )
-        for finding, _current, _baseline in ordered[:_MAX_SAMPLES]
+        for member in ordered[:_MAX_SAMPLES]
     )
     population = PopulationEvidence(
         member_count=len(members),
         membership=membership,
-        first=ordered[0][0].location,  # type: ignore[arg-type]
-        last=ordered[-1][0].location,  # type: ignore[arg-type]
+        first=ordered[0].location,
+        last=ordered[-1].location,
         samples=samples,
         shape_before_digest=shape_before,
         shape_after_digest=shape_after,

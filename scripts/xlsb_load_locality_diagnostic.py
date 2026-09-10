@@ -19,6 +19,12 @@ after measurement unless ``--keep-staged-copy`` is given. Disables logging
 before touching any path, matching every other private-data probe in this
 project.
 
+Scope: a single source Excel file only. Multi-package (member-qualified)
+scenarios are intentionally unsupported here -- not partially threaded --
+since this diagnostic's whole purpose is one-file load-locality attribution;
+add a member-aware variant separately if that scope is ever actually needed
+rather than half-wiring it into this script's flags.
+
 Usage:
 
     python scripts/xlsb_load_locality_diagnostic.py \\
@@ -40,6 +46,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Literal
 
 # Import qc_tool lazily after sys.path is set so this script can run from a
 # plain `python scripts/...` invocation without an editable install.
@@ -80,7 +87,9 @@ def stage_local_copy(source: Path, work_dir: Path) -> Path:
     return staged
 
 
-def measure_load_seconds(path: Path, *, xlsb_values_engine: str) -> float:
+def measure_load_seconds(
+    path: Path, *, xlsb_values_engine: Literal["pyxlsb", "native", "auto"]
+) -> float:
     from qc_tool.io.loader import load_workbook_snapshot
 
     started = time.perf_counter()
@@ -92,7 +101,7 @@ def run_probe(
     source: Path,
     work_dir: Path,
     *,
-    xlsb_values_engine: str,
+    xlsb_values_engine: Literal["pyxlsb", "native", "auto"],
     keep_staged_copy: bool,
 ) -> dict[str, object]:
     source_hash_before = _sha256(source)

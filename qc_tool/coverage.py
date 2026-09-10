@@ -13,6 +13,23 @@ class QCRunMode(StrEnum):
     FINAL_PACKAGE = "final_package"
 
 
+class FindingOutputMode(StrEnum):
+    """Run-level finding-output contract, orthogonal to `QCRunMode`.
+
+    ``profile`` preserves today's exact profile-driven behavior (resolves
+    from the profile's own persisted ``review_policy``); ``decision`` forces
+    population output on (the profile's own explicit policy when it already
+    enables one, else a versioned conservative built-in policy); ``atomic``
+    forces population output off regardless of profile -- the forensic/
+    compatibility lane, explicitly outside the interactive SLA. See
+    ``qc_tool.config.profile.resolve_output_policy``.
+    """
+
+    PROFILE = "profile"
+    DECISION = "decision"
+    ATOMIC = "atomic"
+
+
 class CoverageState(StrEnum):
     CHECKED = "checked"
     UNAVAILABLE = "unavailable"

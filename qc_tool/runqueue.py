@@ -69,6 +69,9 @@ class RunRequest:
     files: dict[str, str]
     #: Role -> display filename shown in queue surfaces.
     display_files: dict[str, str]
+    #: Run-level finding-output contract request (plan-20260910); a plain
+    #: string mirroring `mode` ("profile"/"decision"/"atomic").
+    requested_output_mode: str = "profile"
     allow_large_workbooks: bool = False
     allow_dependency_indexing: bool = False
     acceptance_absolute: float = 0.0
@@ -162,6 +165,7 @@ class RunQueueManager:
                 profile=request.profile_name,
                 files=dict(request.display_files),
                 queue_position=position,
+                requested_output_mode=request.requested_output_mode,
             )
             self._pending.append((request, held))
             self._ensure_supervisor()

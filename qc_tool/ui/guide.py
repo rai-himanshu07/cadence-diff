@@ -534,6 +534,18 @@ cadence-diff --data-dir "/path/to/qc-data"
                     "value, row, formula, slide, or layout was not changed or removed.",
                     warning=True,
                 )
+                _paragraph(
+                    "Alongside QC mode, choose a <strong>Finding output</strong>: "
+                    "Decision (recommended) groups related findings into compact "
+                    "populations for large runs, using your profile's own population "
+                    "settings when it already enables them, else a conservative "
+                    "built-in default. Profile reproduces exactly what your saved "
+                    "profile's own review policy already produces. Atomic (advanced) "
+                    "lists every individual finding, ungrouped -- forensic detail, "
+                    "outside the interactive review target for very large runs. "
+                    "Re-QC preselects the source run's own recorded output; changing "
+                    "it is an explicit, disclosed representation change, not silent."
+                )
 
             with _guide_section("files", "Files, passwords, and formats"):
                 _list(

@@ -279,6 +279,17 @@ def _run_parser() -> argparse.ArgumentParser:
         help="cycle | preflight | package (default: inferred)",
     )
     parser.add_argument(
+        "--output-mode",
+        choices=["profile", "decision", "atomic"],
+        default="profile",
+        help=(
+            "run-level finding-output contract: profile (default, resolves "
+            "exactly as the profile's own review_policy persists it) | "
+            "decision (forces compact population output on) | atomic "
+            "(forces population output off; forensic/compatibility lane)"
+        ),
+    )
+    parser.add_argument(
         "--profile",
         default=None,
         metavar="NAME_OR_PATH",
@@ -633,7 +644,7 @@ def _cmd_run(args: list[str]) -> int:
         if not path.exists():
             raise ValueError(f"{role}: {path} not found")
 
-    from qc_tool.coverage import QCRunMode, capability_limited
+    from qc_tool.coverage import FindingOutputMode, QCRunMode, capability_limited
     from qc_tool.findings import Severity
     from qc_tool.progress import ProgressEvent
     from qc_tool.report.json_report import write_json_report
@@ -672,6 +683,7 @@ def _cmd_run(args: list[str]) -> int:
             passwords,
             profile,
             mode=QCRunMode(mode_value),
+            output_mode=FindingOutputMode(ns.output_mode),
             allow_large_workbooks=ns.allow_large_workbooks,
             allow_dependency_indexing=ns.allow_dependency_indexing,
             acceptance_absolute=ns.accept_absolute,
@@ -688,7 +700,10 @@ def _cmd_run(args: list[str]) -> int:
         return 3
     result = artifacts.result
 
-    print(f"mode: {result.mode.value}   profile: {result.profile_name}")
+    print(
+        f"mode: {result.mode.value}   profile: {result.profile_name}   "
+        f"output-mode: {result.requested_output_mode.value}"
+    )
     print("files:", "  ".join(f"{r}={n}" for r, n in result.files.items()))
     if capability_limited(result.coverage):
         print(

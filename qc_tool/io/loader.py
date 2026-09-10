@@ -213,7 +213,7 @@ def load_workbook_snapshot(
     password: str | None = None,
     allow_large_workbook: bool = False,
     _ooxml_loader: Literal["streaming", "oracle"] = "streaming",
-    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "pyxlsb",
+    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "auto",
     formula_engine: Literal["native", "excel", "libreoffice", "auto"] = "auto",
     _native_formula_compat_mode: bool = False,
     cancellation_token: CancellationToken | None = None,
@@ -225,7 +225,11 @@ def load_workbook_snapshot(
     compiled BIFF12 kernel), ``excel``/``libreoffice`` (the existing desktop
     adapters), or ``auto`` (native when the kernel extension is importable,
     else the existing platform default). Ignored for xlsx/xlsm, which never
-    need external formula-text enrichment. ``_native_formula_compat_mode`` is
+    need external formula-text enrichment. ``_xlsb_values_engine`` selects
+    the separate XLSB values-decoding axis the same way: ``auto`` (the
+    default) prefers the native kernel when importable and falls back to
+    ``pyxlsb`` with a disclosed, content-free reason on any native runtime
+    failure. ``_native_formula_compat_mode`` is
     a private, oracle-verification-only switch (plan Criterion 13(a)):
     restricts the native engine's returned text to exactly the coordinates a
     legacy engine also covers, for comparing against a legacy-engine oracle.
@@ -1148,9 +1152,11 @@ def _resolve_xlsb_values_engine(
 ) -> Literal["pyxlsb", "native"]:
     """``auto`` -> native when the kernel extension is importable, else
     ``pyxlsb``; any other value passes through unchanged. Mirrors
-    ``_resolve_formula_engine`` for the separate values-decoding axis; the
-    shipped default stays ``pyxlsb`` until guest evidence justifies changing
-    it (plan-20260908-phase-b-guest-performance-followup.md).
+    ``_resolve_formula_engine`` for the separate values-decoding axis.
+    ``auto`` is the shipped production default (plan-20260909 Step 11,
+    promoted from plan-20260908-phase-b-guest-performance-followup.md's
+    diagnostic-only opt-in once the auto-fallback and explicit pyxlsb/native
+    parity contracts were proven non-vacuous).
     """
     if engine != "auto":
         return engine
@@ -1262,7 +1268,7 @@ def _load_xlsb(
     allow_large_workbook: bool = False,
     cancellation_token: CancellationToken | None = None,
     formula_cache: FormulaExtractionCache | None = None,
-    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "pyxlsb",
+    _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "auto",
     formula_engine: Literal["native", "excel", "libreoffice", "auto"] = "auto",
     _native_formula_compat_mode: bool = False,
 ) -> WorkbookSnapshot:

@@ -417,6 +417,52 @@ def test_population_finding_json_uses_v3_and_matches_shipped_schema_keys() -> No
     assert set(schema["required"]) <= set(payload)
 
 
+def test_json_payload_carries_output_mode_and_matches_schema_for_every_version() -> None:
+    """plan-20260910: `requested_output_mode`/`resolved_output_policy` are
+    always present and stay within each shipped schema's declared
+    properties -- for a null resolved policy (v1) and a real, non-null one
+    (v2 via a package manifest) alike.
+    """
+    from qc_tool.config.profile import PopulationPolicy, ResolvedOutputPolicy
+    from qc_tool.coverage import FindingOutputMode
+
+    v1_result = QCRunResult(profile_name="fixture")
+    v1_payload = result_payload(v1_result)
+    v1_schema = json.loads(
+        (Path(__file__).parents[1] / "qc_tool/report/findings.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert v1_payload["requested_output_mode"] == "profile"
+    assert v1_payload["resolved_output_policy"] is None
+    assert set(v1_payload) <= set(v1_schema["properties"])
+
+    decision_result = _package_result()
+    decision_result.requested_output_mode = FindingOutputMode.DECISION
+    resolved = ResolvedOutputPolicy(
+        output_mode=FindingOutputMode.DECISION,
+        populations=PopulationPolicy(enabled=True),
+        source="decision_built_in",
+    )
+    decision_result.resolved_output_policy = resolved
+    decision_payload = result_payload(decision_result, include_review_summary=True)
+    v2_schema = json.loads(
+        (Path(__file__).parents[1] / "qc_tool/report/findings-v2.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert decision_payload["requested_output_mode"] == "decision"
+    # Built from the model's own serialization (not a hand-typed literal):
+    # `PopulationPolicy.classes` derives from a frozenset, whose iteration
+    # order is not guaranteed stable across interpreter invocations.
+    assert decision_payload["resolved_output_policy"] == resolved.model_dump(
+        mode="json"
+    )
+    assert decision_payload["resolved_output_policy"]["populations"]["enabled"] is True
+    assert set(decision_payload) <= set(v2_schema["properties"])
+    assert set(v2_schema["required"]) <= set(decision_payload)
+
+
 def test_multi_member_excel_report_has_package_and_member_columns(
     tmp_path: Path,
 ) -> None:

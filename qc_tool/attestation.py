@@ -182,6 +182,15 @@ def create_attestation(
             # cross-run comparison can later be told an engine changed,
             # never a new schema feature -- present at every schema version.
             "formula_engines": dict(result.formula_engines),
+            # Run-level finding-output contract (plan-20260910): purely
+            # informational disclosure, present at every schema version,
+            # never a verifier gate.
+            "requested_output_mode": result.requested_output_mode.value,
+            "resolved_output_policy": (
+                result.resolved_output_policy.model_dump(mode="json")
+                if result.resolved_output_policy is not None
+                else None
+            ),
         },
         "profile_sha256": _sha256_bytes(profile_bytes),
         "inputs": inputs,

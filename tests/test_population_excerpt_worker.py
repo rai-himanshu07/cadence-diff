@@ -16,6 +16,7 @@ from qc_tool.history.store import sha256_file
 def _write_workbook(path: Path, *, value: str) -> None:
     workbook = Workbook()
     sheet = workbook.active
+    assert sheet is not None
     sheet.title = "Data"
     sheet["A1"] = "label"
     sheet["B2"] = value

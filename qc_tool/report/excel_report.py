@@ -216,6 +216,7 @@ def _write_summary_sheet(
         ("Generated (UTC)", dt.datetime.now(dt.UTC).isoformat(timespec="seconds")),
         ("Profile", result.profile_name),
         ("Mode", result.mode.value),
+        ("Output mode", result.requested_output_mode.value),
         *((f"File: {role}", name) for role, name in result.files.items()),
         (
             "Result status",

@@ -1,5 +1,7 @@
 """Formula QC tests (acceptance criterion 3) against the fixture manifest."""
 
+import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -12,7 +14,10 @@ from qc_tool.excel.align import (
 )
 from qc_tool.excel.formula_tokens import FormulaDiffKind, FormulaDiffSegment
 from qc_tool.excel.formulas import (
+    _FORMULA_PAIR_ANALYSIS_MEMO_CAP,
     FormulaComparisonTelemetry,
+    FormulaPairAnalysis,
+    FormulaPairAnalysisMemo,
     _differs_only_by_extension,
     diff_workbook_formulas,
     formula_text_comparable,
@@ -20,7 +25,7 @@ from qc_tool.excel.formulas import (
     to_r1c1,
 )
 from qc_tool.excel.regions import TableRegion
-from qc_tool.findings import Finding, FindingClass
+from qc_tool.findings import Finding, FindingClass, FindingEvidenceTag
 from qc_tool.io.loader import load_workbook_snapshot
 from qc_tool.io.model import CellRecord, FormulaTextCoverage, SheetSnapshot, WorkbookSnapshot
 from tests.fixtures.manifest_schema import FixtureManifest
@@ -570,3 +575,472 @@ def test_paired_findings_fall_back_to_to_r1c1_when_formula_r1c1_is_absent_on_one
     findings = diff_workbook_formulas(baseline, current, alignment)
 
     assert _locations(findings, FindingClass.FORMULA_LOGIC_CHANGED) == {("Data", "B3")}
+
+
+# --- plan-20260910 Step 5: FormulaPairAnalysis memoization ------------------
+
+
+def _formula_column_workbook(
+    row_formulas: Mapping[int, str | None], *, max_row: int
+) -> WorkbookSnapshot:
+    """A minimal "long" column workbook with one formula cell per row in
+    `row_formulas` (column B) -- generalizes `_long_column_workbook` to an
+    arbitrary row set for Step 5's memoization tests.
+    """
+    cells: dict[tuple[int, int], CellRecord] = {
+        (1, 1): CellRecord(1, 1, "Key"),
+        (1, 2): CellRecord(1, 2, "Value"),
+    }
+    for row, formula in row_formulas.items():
+        cells[(row, 1)] = CellRecord(row, 1, f"row{row}")
+        cells[(row, 2)] = CellRecord(row, 2, None, formula=formula, is_formula=True)
+    return WorkbookSnapshot(
+        source_name="pair-analysis.xlsb",
+        file_format="xlsb",
+        formulas_available=False,
+        styles_available=False,
+        formula_presence_available=True,
+        formula_source="test-engine",
+        formula_text_coverage=FormulaTextCoverage(
+            state="partial", expected_count=len(row_formulas)
+        ),
+        sheets=[SheetSnapshot("Data", "visible", max_row, 2, cells)],
+    )
+
+
+def _alignment_for_rows(rows: list[int], max_row: int) -> WorkbookAlignment:
+    region = TableRegion("Data", 1, 1, max_row, 2, "long", 1, 1, "none")
+    alignment = RegionAlignment(
+        baseline=region,
+        current=region,
+        rows=AxisAlignment(pairs=[(row, row) for row in rows]),
+        columns=AxisAlignment(pairs=[(1, 1), (2, 2)]),
+    )
+    return WorkbookAlignment(common_sheets=["Data"], regions={"Data": [alignment]})
+
+
+def _diverse_construct_rows() -> tuple[dict[int, str], dict[int, str]]:
+    """One row per notable classification construct -- a plain logic change,
+    a range extension, an exact wrapper, an added reference with no wrapper,
+    an absolute/relative mix, a sheet-qualified reference, and a
+    whole-column reference -- each a DISTINCT canonical key (no repeats), so
+    a parity check here proves the memo behaves correctly on a
+    first-and-only MISS, complementing the repeated-pattern tests below that
+    prove HIT behavior.
+    """
+    base = {
+        2: "=B20",  # plain logic change
+        3: "=SUM(C2:C10)",  # range extension
+        4: "=B4",  # exact wrapper (curr wraps it in ROUND)
+        5: "=B5",  # added reference, no wrapper
+        6: "=$B$2+B6",  # absolute + relative mix
+        7: "=Other!A1+B7",  # sheet-qualified reference
+        8: "=SUM(C:C)",  # whole-column reference
+    }
+    curr = {
+        2: "=B30",
+        3: "=SUM(C2:C15)",
+        4: "=ROUND(B4,2)",
+        5: "=B5+C5",
+        6: "=$B$2+B6*2",
+        7: "=Other!A1+B7*2",
+        8: "=SUM(C:C)*2",
+    }
+    return base, curr
+
+
+def test_pair_analysis_memo_is_transparent_on_diverse_single_occurrence_constructs() -> (
+    None
+):
+    base_formulas, curr_formulas = _diverse_construct_rows()
+    rows = sorted(base_formulas)
+    max_row = max(rows) + 1
+    baseline = _formula_column_workbook(base_formulas, max_row=max_row)
+    current = _formula_column_workbook(curr_formulas, max_row=max_row)
+    alignment = _alignment_for_rows(rows, max_row)
+
+    expected = diff_workbook_formulas(baseline, current, alignment)
+    actual = diff_workbook_formulas(
+        baseline, current, alignment, pair_analysis_memo=FormulaPairAnalysisMemo()
+    )
+
+    assert [f.model_dump(mode="json") for f in actual] == [
+        f.model_dump(mode="json") for f in expected
+    ]
+    assert _locations(actual, FindingClass.FORMULA_LOGIC_CHANGED)
+
+
+def _repeated_pattern_rows(
+    count: int, *, start_row: int = 20
+) -> tuple[dict[int, str], dict[int, str], list[int]]:
+    rows = list(range(start_row, start_row + count))
+    base_formulas = {row: f"=A{row}*2" for row in rows}
+    curr_formulas = {row: f"=A{row}*3" for row in rows}
+    return base_formulas, curr_formulas, rows
+
+
+def test_pair_analysis_memo_reuses_the_single_classification_across_every_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """15 rows share one uniform relative pattern -- one canonical key. With
+    the memo enabled, wrapper detection (the expensive, tokenization-based
+    structural match that is genuinely a pure function of the normalized
+    key) must run exactly once for that key, not once per row. The
+    extension check runs on RAW formula text and is deliberately never
+    memoized (see FormulaPairAnalysis's own docstring for why caching it
+    was a real, confirmed bug) -- it must still run once per row, every
+    time.
+    """
+    import qc_tool.excel.formulas as formulas_module
+
+    base_formulas, curr_formulas, rows = _repeated_pattern_rows(15)
+    max_row = max(rows) + 1
+    baseline = _formula_column_workbook(base_formulas, max_row=max_row)
+    current = _formula_column_workbook(curr_formulas, max_row=max_row)
+    alignment = _alignment_for_rows(rows, max_row)
+
+    extension_call_count = 0
+    real_extension_check = formulas_module._differs_only_by_extension
+
+    def _counting_extension_check(base_formula: str, curr_formula: str) -> bool:
+        nonlocal extension_call_count
+        extension_call_count += 1
+        return real_extension_check(base_formula, curr_formula)
+
+    monkeypatch.setattr(
+        formulas_module, "_differs_only_by_extension", _counting_extension_check
+    )
+
+    wrapper_call_count = 0
+    real_detect_wrapper = formulas_module.detect_formula_wrapper
+
+    def _counting_detect_wrapper(base_norm: str, curr_norm: str):
+        nonlocal wrapper_call_count
+        wrapper_call_count += 1
+        return real_detect_wrapper(base_norm, curr_norm)
+
+    monkeypatch.setattr(
+        formulas_module, "detect_formula_wrapper", _counting_detect_wrapper
+    )
+
+    memo = FormulaPairAnalysisMemo()
+    findings = diff_workbook_formulas(
+        baseline, current, alignment, pair_analysis_memo=memo
+    )
+
+    assert extension_call_count == len(rows)
+    assert wrapper_call_count == 1
+    assert len(memo) == 1
+    assert len(_locations(findings, FindingClass.FORMULA_LOGIC_CHANGED)) == len(rows)
+
+
+def test_pair_analysis_memo_recomputes_added_reference_per_occurrence_of_the_same_key() -> (
+    None
+):
+    """Regression for the real-data bug found during plan-20260910 Step 8
+    guest validation: two occurrences that normalize to the IDENTICAL
+    (base_r1c1, curr_r1c1) canonical key can legitimately disagree on
+    whether a reference was added, because that check runs on each
+    occurrence's own RAW (pre-normalization) formula text, not the shared
+    key. Forces two rows to share one canonical key via an explicit
+    ``formula_r1c1`` override (bypassing ``to_r1c1``'s own computation)
+    while giving each row raw formula text that must independently resolve
+    to a DIFFERENT ADDED_REFERENCE verdict. With the memo enabled, each
+    row's evidence_tags must still be computed correctly and independently
+    -- never a stale value carried over from the other row's occurrence of
+    the same key.
+    """
+    shared_base_r1c1 = "=X1+X2"
+    shared_curr_r1c1 = "=X1+X2+X3"
+    cells: dict[tuple[int, int], CellRecord] = {
+        (1, 1): CellRecord(1, 1, "Key"),
+        (1, 2): CellRecord(1, 2, "Value"),
+        (20, 1): CellRecord(20, 1, "row20"),
+        # Row 20: current genuinely adds a reference (C1) absent from
+        # baseline -- ADDED_REFERENCE must be present.
+        (20, 2): CellRecord(
+            20, 2, None, formula="=B1+A1", formula_r1c1=shared_base_r1c1, is_formula=True
+        ),
+        (21, 1): CellRecord(21, 1, "row21"),
+        # Row 21: shares the SAME canonical key (forced via formula_r1c1),
+        # but its own raw text already references C2 on both sides -- only
+        # a literal changed -- so ADDED_REFERENCE must be ABSENT.
+        (21, 2): CellRecord(
+            21, 2, None, formula="=B2+A2+C2*1", formula_r1c1=shared_base_r1c1, is_formula=True
+        ),
+    }
+    baseline = WorkbookSnapshot(
+        source_name="pair-analysis-conflict.xlsb",
+        file_format="xlsb",
+        formulas_available=False,
+        styles_available=False,
+        formula_presence_available=True,
+        formula_source="test-engine",
+        formula_text_coverage=FormulaTextCoverage(state="partial", expected_count=2),
+        sheets=[SheetSnapshot("Data", "visible", 21, 2, cells)],
+    )
+    curr_cells: dict[tuple[int, int], CellRecord] = {
+        (1, 1): CellRecord(1, 1, "Key"),
+        (1, 2): CellRecord(1, 2, "Value"),
+        (20, 1): CellRecord(20, 1, "row20"),
+        (20, 2): CellRecord(
+            20,
+            2,
+            None,
+            formula="=B1+A1+C1",
+            formula_r1c1=shared_curr_r1c1,
+            is_formula=True,
+        ),
+        (21, 1): CellRecord(21, 1, "row21"),
+        (21, 2): CellRecord(
+            21,
+            2,
+            None,
+            formula="=B2+A2+C2*2",
+            formula_r1c1=shared_curr_r1c1,
+            is_formula=True,
+        ),
+    }
+    current = WorkbookSnapshot(
+        source_name="pair-analysis-conflict.xlsb",
+        file_format="xlsb",
+        formulas_available=False,
+        styles_available=False,
+        formula_presence_available=True,
+        formula_source="test-engine",
+        formula_text_coverage=FormulaTextCoverage(state="partial", expected_count=2),
+        sheets=[SheetSnapshot("Data", "visible", 21, 2, curr_cells)],
+    )
+    alignment = _alignment_for_rows([20, 21], 22)
+
+    for memo in (None, FormulaPairAnalysisMemo()):
+        findings = diff_workbook_formulas(
+            baseline, current, alignment, pair_analysis_memo=memo
+        )
+        by_location = {f.location: f for f in findings}
+        assert FindingEvidenceTag.ADDED_REFERENCE in by_location["B20"].evidence_tags
+        assert (
+            FindingEvidenceTag.ADDED_REFERENCE
+            not in by_location["B21"].evidence_tags
+        )
+
+
+def test_pair_analysis_memo_produces_byte_identical_findings_on_a_repeated_pattern() -> (
+    None
+):
+    base_formulas, curr_formulas, rows = _repeated_pattern_rows(15)
+    max_row = max(rows) + 1
+    baseline = _formula_column_workbook(base_formulas, max_row=max_row)
+    current = _formula_column_workbook(curr_formulas, max_row=max_row)
+    alignment = _alignment_for_rows(rows, max_row)
+
+    expected = diff_workbook_formulas(baseline, current, alignment)
+    actual = diff_workbook_formulas(
+        baseline, current, alignment, pair_analysis_memo=FormulaPairAnalysisMemo()
+    )
+
+    assert [f.model_dump(mode="json") for f in actual] == [
+        f.model_dump(mode="json") for f in expected
+    ]
+
+
+def test_pair_analysis_memo_produces_byte_identical_findings_on_the_manifest_fixture(
+    baseline: WorkbookSnapshot, current: WorkbookSnapshot, alignment: WorkbookAlignment
+) -> None:
+    """Real-fixture regression check: enabling the memo on the standard
+    E01-E18 manifest pair changes zero findings.
+    """
+    expected = diff_workbook_formulas(baseline, current, alignment)
+    actual = diff_workbook_formulas(
+        baseline, current, alignment, pair_analysis_memo=FormulaPairAnalysisMemo()
+    )
+
+    assert [f.model_dump(mode="json") for f in actual] == [
+        f.model_dump(mode="json") for f in expected
+    ]
+
+
+def test_pair_analysis_memo_tracks_hits_and_misses_in_telemetry() -> None:
+    base_formulas, curr_formulas, rows = _repeated_pattern_rows(15)
+    max_row = max(rows) + 1
+    baseline = _formula_column_workbook(base_formulas, max_row=max_row)
+    current = _formula_column_workbook(curr_formulas, max_row=max_row)
+    alignment = _alignment_for_rows(rows, max_row)
+
+    telemetry = FormulaComparisonTelemetry()
+    diff_workbook_formulas(
+        baseline,
+        current,
+        alignment,
+        telemetry=telemetry,
+        pair_analysis_memo=FormulaPairAnalysisMemo(),
+    )
+
+    assert telemetry.pair_analysis_memo_misses == 1
+    assert telemetry.pair_analysis_memo_hits == len(rows) - 1
+
+
+def test_pair_analysis_memo_omitted_leaves_telemetry_counters_at_zero(
+    baseline: WorkbookSnapshot,
+    current: WorkbookSnapshot,
+    alignment: WorkbookAlignment,
+) -> None:
+    telemetry = FormulaComparisonTelemetry()
+    diff_workbook_formulas(baseline, current, alignment, telemetry=telemetry)
+
+    assert telemetry.pair_analysis_memo_hits == 0
+    assert telemetry.pair_analysis_memo_misses == 0
+
+
+def test_pair_analysis_memo_cap_fallback_stays_correct() -> None:
+    """Past its cap the memo recomputes -- never caches -- but stays
+    correct, mirroring `_CurrentNormalizationMemo`'s own established
+    cap-fallback contract.
+    """
+    memo = FormulaPairAnalysisMemo(cap=1)
+    first = FormulaPairAnalysis(
+        wrapper_kind=None,
+        wrapper_exact=None,
+        event_key="",
+    )
+    memo.put("=RC[-1]*2", "=RC[-1]*3", first)
+    assert memo.get("=RC[-1]*2", "=RC[-1]*3") == first
+    assert len(memo) == 1
+
+    second = FormulaPairAnalysis(
+        wrapper_kind="wrapped",
+        wrapper_exact=True,
+        event_key="formula-wrapper:wrapped:abc",
+    )
+    # A second distinct key exceeds the cap of 1: never cached, but the
+    # already-cached first key is unaffected.
+    memo.put("=RC[-2]*2", "=RC[-2]*3", second)
+    assert memo.get("=RC[-2]*2", "=RC[-2]*3") is None
+    assert len(memo) == 1
+    assert memo.get("=RC[-1]*2", "=RC[-1]*3") == first
+
+
+def test_pair_analysis_memo_extrapolated_full_cap_stays_within_128_mib() -> None:
+    """Empirical proof for Step 5's 128 MiB budget: measure the deep byte
+    size of a representative sample filled into the memo, then extrapolate
+    linearly to the full cap (filling the actual ~150K-entry cap is
+    unnecessarily slow for a unit test, and homogeneous dict entries scale
+    linearly).
+    """
+    import random
+    import sys
+
+    def _deep_size(obj: object, seen: set[int] | None = None) -> int:
+        if seen is None:
+            seen = set()
+        if id(obj) in seen:
+            return 0
+        seen.add(id(obj))
+        size = sys.getsizeof(obj)
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                size += _deep_size(key, seen) + _deep_size(value, seen)
+        elif isinstance(obj, (list, tuple, set, frozenset)):
+            for item in obj:
+                size += _deep_size(item, seen)
+        return size
+
+    rng = random.Random(0)
+    sample_size = 5_000
+    memo = FormulaPairAnalysisMemo(cap=sample_size)
+    for i in range(sample_size):
+        base_norm = "=" + "+".join(
+            f"R[{rng.randint(-50, 50)}]C[{rng.randint(-20, 20)}]"
+            for _ in range(rng.randint(1, 5))
+        )
+        curr_norm = base_norm + f"+R[{rng.randint(-50, 50)}]C"
+        memo.put(
+            base_norm,
+            curr_norm,
+            FormulaPairAnalysis(
+                wrapper_kind=("wrapped" if i % 3 == 0 else None),
+                wrapper_exact=(bool(i % 2) if i % 3 == 0 else None),
+                event_key=f"formula-wrapper:wrapped:{i:012x}" if i % 3 == 0 else "",
+            ),
+        )
+
+    assert len(memo) > sample_size * 0.9  # a rare RNG string collision is fine
+    measured_bytes = _deep_size(memo._values)  # white-box internal measurement
+    bytes_per_entry = measured_bytes / len(memo)
+    projected_full_cap_bytes = bytes_per_entry * _FORMULA_PAIR_ANALYSIS_MEMO_CAP
+
+    budget_bytes = 128 * 1024 * 1024
+    assert projected_full_cap_bytes < budget_bytes, (
+        f"projected {projected_full_cap_bytes / (1024 * 1024):.1f} MiB at the "
+        f"full {_FORMULA_PAIR_ANALYSIS_MEMO_CAP}-entry cap exceeds the 128 MiB "
+        f"budget (measured {bytes_per_entry:.1f} bytes/entry from a "
+        f"{sample_size}-entry sample)"
+    )
+
+
+def test_pair_analysis_memo_improves_compare_time_on_a_repeated_pattern_workload() -> (
+    None
+):
+    """Step 5's required benchmark: on a workload where the SAME canonical
+    key repeats across many rows (unlike Step 3's own overhead benchmark,
+    which deliberately used a UNIQUE multiplier per row to isolate
+    telemetry-only cost), memoizing wrapper detection must measurably speed
+    up `diff_workbook_formulas()`'s own wall time -- this function's cost is
+    exactly what `run_qc()`'s `comparing_formulas` phase measures. Uses
+    `time.process_time()` (CPU time, immune to OS-scheduling noise) and
+    `min()` across repeats -- the same robust methodology Step 3 needed for
+    a reliable result on this shared host.
+
+    The 5% budget (not Step 5's original 30%) reflects a real, confirmed
+    correctness fix found during plan-20260910 Step 8 guest validation: the
+    `expected` (extension) flag and the ADDED_REFERENCE evidence tag are
+    computed from RAW formula text and are NOT a pure function of the
+    normalized cache key (a real-data conflict probe found exactly one
+    canonical key whose occurrences disagreed on ADDED_REFERENCE), so both
+    are now always recomputed fresh -- only wrapper detection (a genuine
+    pure function of the key) is still memoized. A smaller, correct
+    improvement is the right outcome; do not restore the 30% budget by
+    caching the unsafe fields again. The margin below 10% (rather than
+    right at it) absorbs this shared-host benchmark's own run-to-run CPU
+    noise (measured 9.3%-16.3% across repeated local runs).
+    """
+    base_formulas, curr_formulas, rows = _repeated_pattern_rows(20_000)
+    max_row = max(rows) + 1
+    baseline = _formula_column_workbook(base_formulas, max_row=max_row)
+    current = _formula_column_workbook(curr_formulas, max_row=max_row)
+    alignment = _alignment_for_rows(rows, max_row)
+
+    repeats = 9
+
+    def run(*, memoized: bool) -> float:
+        started = time.process_time()
+        diff_workbook_formulas(
+            baseline,
+            current,
+            alignment,
+            pair_analysis_memo=FormulaPairAnalysisMemo() if memoized else None,
+        )
+        return time.process_time() - started
+
+    run(memoized=False)  # untimed warm-up each side
+    run(memoized=True)
+    unmemoized_times: list[float] = []
+    memoized_times: list[float] = []
+    for _ in range(repeats):
+        unmemoized_times.append(run(memoized=False))
+        memoized_times.append(run(memoized=True))
+
+    unmemoized_best = min(unmemoized_times)
+    memoized_best = min(memoized_times)
+    assert unmemoized_best > 0.05, (
+        "fixture too small to measure reliably "
+        f"(unmemoized best {unmemoized_best:.4f}s CPU) -- widen it, don't "
+        "loosen the 5% budget"
+    )
+    improvement = (unmemoized_best - memoized_best) / unmemoized_best
+
+    assert improvement >= 0.05, (
+        f"memoized compare time improved only {improvement:.4%}, below the "
+        f"required 5% (unmemoized best {unmemoized_best:.4f}s CPU, memoized "
+        f"best {memoized_best:.4f}s CPU)"
+    )

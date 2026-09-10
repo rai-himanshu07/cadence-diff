@@ -13,6 +13,9 @@ reconstructed pairs equal the atomic run's pairs exactly.
 from __future__ import annotations
 
 import datetime as dt
+import shutil
+import tempfile
+import time
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -347,4 +350,273 @@ def test_population_pipeline_below_threshold_replays_atomically(tmp_path: Path) 
         ]
 
     assert digest(replayed) == digest(atomic_findings)
+
+
+# --- plan-20260910 Step 6: delta-encoded candidate spill --------------------
+
+
+def test_candidate_spill_stores_only_the_first_row_of_a_group_in_full() -> None:
+    """White-box check of the internal spill row shape: the first `add()`
+    call for a population key writes a full row; every later call for the
+    SAME key writes a smaller delta row, since `population_key` already
+    guarantees roughly a dozen fields are identical across the group.
+    """
+    spill = CandidateSpill(_profile(), _TODAY)
+    for row in range(2, 17):  # 15 members, one uniform shift
+        candidate = _candidate(location=f"B{row}", baseline_location=f"B{row - 1}")
+        spill.add(candidate, shape_before="digest-before", shape_after="digest-after")
+
+    groups = list(spill.groups())
+    assert len(groups) == 1
+    group = groups[0]
+    assert len(group) == 15
+    kinds = [row["row"]["kind"] for row in group]
+    assert kinds.count("full") == 1
+    assert kinds.count("delta") == 14
+
+    full_row = next(row for row in group if row["row"]["kind"] == "full")
+    delta_row = next(row for row in group if row["row"]["kind"] == "delta")
+    # The delta omits every field population_key already guarantees shared
+    # (artifact/sheet/finding_class/severity/... are absent), keeping only
+    # what genuinely varies member to member.
+    assert len(delta_row["row"]["finding"]) < len(full_row["row"]["finding"])
+    for shared_field in ("artifact", "sheet", "finding_class", "severity"):
+        assert shared_field not in delta_row["row"]["finding"]
+    assert "location" in delta_row["row"]["finding"]
+    assert "baseline_location" in delta_row["row"]["finding"]
+
+
+def test_reconstructed_candidates_are_field_identical_to_the_originals() -> None:
+    """Parity check: every candidate reconstructed from the spill (whether
+    stored full or delta-encoded) is field-for-field identical to what
+    `finding_payload()` would have produced directly from the original
+    in-memory candidate, before `assign_severities` mutates severity/waiver
+    state and before spilling (both sides must reflect that mutation).
+    """
+    spill = CandidateSpill(_profile(), _TODAY)
+    originals: list[Finding] = []
+    for row in range(2, 21):  # 19 members, one uniform shift
+        candidate = _candidate(location=f"B{row}", baseline_location=f"B{row - 1}")
+        spill.add(candidate, shape_before="digest-before", shape_after="digest-after")
+        originals.append(candidate)  # add() mutates severity in place
+
+    policy = PopulationPolicy(enabled=True, threshold=100)  # force atomic replay
+    outcome = finalize_populations(spill, policy, _NO_SCOPE)
+
+    assert outcome.population_findings == []
+    assert len(outcome.replay_findings) == 19
+    reconstructed_by_location = {
+        finding.location: finding for finding in outcome.replay_findings
+    }
+    for original in originals:
+        reconstructed = reconstructed_by_location[original.location]
+        assert reconstructed.model_dump(mode="json") == original.model_dump(mode="json")
+
+
+def test_candidate_spill_handles_heterogeneous_evidence_with_delta_encoding() -> None:
+    """The delta encoding must not hide a genuine per-member difference in a
+    field `population_key` does NOT guarantee homogeneous (`evidence_tags`)
+    -- reruns the heterogeneous-evidence scenario through the new codec.
+    """
+    spill = CandidateSpill(_profile(), _TODAY)
+    for row in range(2, 8):  # 6 members, no tags
+        spill.add(
+            _candidate(location=f"C{row}", baseline_location=f"C{row - 1}"),
+            shape_before="digest-before",
+            shape_after="digest-after",
+        )
+    for row in range(8, 14):  # 6 members, a distinct event_key
+        candidate = _candidate(location=f"C{row}", baseline_location=f"C{row - 1}")
+        candidate.event_key = "distinct-event"
+        spill.add(candidate, shape_before="digest-before", shape_after="digest-after")
+
+    policy = PopulationPolicy(enabled=True, threshold=10)
+    outcome = finalize_populations(spill, policy, _NO_SCOPE)
+
+    assert outcome.population_findings == [], (
+        "a genuine event_key difference within one population_key group must "
+        "still force atomic replay, delta encoding or not"
+    )
+    assert len(outcome.replay_findings) == 12
+    stats = outcome.stats[FindingClass.FORMULA_LOGIC_CHANGED]
+    assert stats.heterogeneous_evidence == 12
+
+
+def test_candidate_spill_delta_encoding_reduces_the_full_pipeline_wall_time() -> None:
+    """Step 6's required benchmark: for a large, homogeneous population, the
+    current add()+finalize_populations() cycle is measurably faster than a
+    self-contained reference that mimics the pre-Step-6 approach exactly
+    (always-full spill rows, always-full per-member reconstruction) on the
+    identical fixture. Candidates here are built with the REAL `Finding(...)`
+    constructor, not `model_construct` -- profiling this benchmark first
+    with `model_construct` (matching this file's other, small-scale,
+    correctness-only tests) showed pydantic's `model_construct` spending
+    ~85% of total wall time in `inspect.signature()` introspection for
+    unfilled defaults, a pure test-fixture artifact with zero relationship
+    to production cost (real producers always call the normal `Finding(...)`
+    constructor) -- that artifact was large enough to hide Step 6's real
+    effect entirely at this row count. Uses `time.process_time()` +
+    `min()`-over-repeats (Step 3/5's proven robust methodology).
+    """
+    from qc_tool.findings_store import SpillWriter, finding_payload, merge_spill
+    from qc_tool.review import _coordinate, _rectangles
+    from qc_tool.review import population_key as _population_key
+    from qc_tool.triage.rules import assign_severities
+
+    def _real_candidate(location: str, baseline_location: str) -> Finding:
+        return Finding(
+            artifact="excel",
+            finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+            sheet="Sheet1",
+            location=location,
+            baseline_location=baseline_location,
+            baseline_value="=A1",
+            current_value="=A2",
+            message=f"Sheet1!{location}: formula logic changed",
+        )
+
+    profile = _profile()
+    rows = 20_000
+    policy = PopulationPolicy(enabled=True, threshold=10)
+
+    def run_reference() -> float:
+        """Pre-Step-6 behavior: every spill row stores a full payload, and
+        finalize reconstructs a full `Finding` for every member up front.
+        """
+        directory = Path(tempfile.mkdtemp(prefix="qc-population-reference-"))
+        try:
+            writer = SpillWriter(directory / "candidates.qcfb")
+            writer.__enter__()
+            started = time.process_time()
+            for line_number in range(2, 2 + rows):
+                candidate = _real_candidate(f"B{line_number}", f"B{line_number - 1}")
+                assign_severities([candidate], profile, today=_TODAY)
+                key = _population_key(candidate, ("digest-before", "digest-after"))
+                coordinate = _coordinate(candidate.location) or (0, 0)
+                sort_key = (*key, coordinate[0], coordinate[1])
+                writer.append(
+                    sort_key,
+                    {
+                        "finding": finding_payload(candidate),
+                        "shape_before": "digest-before",
+                        "shape_after": "digest-after",
+                    },
+                )
+            writer.__exit__(None, None, None)
+            current_key = None
+            bucket: list[dict] = []
+            groups: list[list[dict]] = []
+            for raw_row in merge_spill(writer.path):
+                assert isinstance(raw_row, dict)
+                row: dict = raw_row
+                finding = Finding.from_trusted_payload(row["finding"])
+                key = _population_key(finding, (row["shape_before"], row["shape_after"]))
+                if current_key is not None and key != current_key:
+                    groups.append(bucket)
+                    bucket = []
+                current_key = key
+                bucket.append(row)
+            if bucket:
+                groups.append(bucket)
+            for group in groups:
+                findings = [Finding.from_trusted_payload(row["finding"]) for row in group]
+                members = [
+                    (finding, current, _coordinate(finding.baseline_location))
+                    for finding in findings
+                    if (current := _coordinate(finding.location)) is not None
+                ]
+                if len(members) < policy.threshold:
+                    continue
+                current_coords = {current for _, current, _ in members}
+                if len(_rectangles(current_coords)) > policy.max_rectangles:
+                    continue
+            return time.process_time() - started
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def run_current() -> float:
+        spill = CandidateSpill(profile, _TODAY)
+        started = time.process_time()
+        for row in range(2, 2 + rows):
+            candidate = _real_candidate(f"B{row}", f"B{row - 1}")
+            spill.add(candidate, shape_before="digest-before", shape_after="digest-after")
+        finalize_populations(spill, policy, _NO_SCOPE)
+        return time.process_time() - started
+
+    repeats = 5
+    run_reference()  # untimed warm-up each side
+    run_current()
+    reference_times = [run_reference() for _ in range(repeats)]
+    current_times = [run_current() for _ in range(repeats)]
+
+    reference_best = min(reference_times)
+    current_best = min(current_times)
+    assert reference_best > 0.05, (
+        "fixture too small to measure reliably "
+        f"(reference best {reference_best:.4f}s CPU) -- widen it, don't "
+        "loosen the improvement check"
+    )
+    improvement = (reference_best - current_best) / reference_best
+
+    assert improvement >= 0.30, (
+        f"Step 6's candidate pipeline improved only {improvement:.4%} vs the "
+        f"pre-Step-6 reference (reference best {reference_best:.4f}s CPU, "
+        f"current best {current_best:.4f}s CPU) -- expected a meaningful, "
+        "not marginal, shrink"
+    )
+
+
+def test_diff_against_template_falls_back_to_full_when_template_has_extra_keys() -> None:
+    from qc_tool.excel.population import _diff_against_template
+
+    template = {"a": 1, "b": 2, "c": 3}
+    payload_missing_c = {"a": 1, "b": 5}
+    assert _diff_against_template(template, payload_missing_c) is None
+
+    payload_same_keys = {"a": 1, "b": 5, "c": 3}
+    assert _diff_against_template(template, payload_same_keys) == {"b": 5}
+
+    payload_extra_key = {"a": 1, "b": 2, "c": 3, "d": 9}
+    assert _diff_against_template(template, payload_extra_key) == {"d": 9}
+
+
+def test_candidate_spill_delta_encoded_file_is_smaller_than_a_full_row_equivalent(
+    tmp_path: Path,
+) -> None:
+    from qc_tool.findings_store import SpillWriter, finding_payload
+
+    profile = _profile()
+    rows = 20_000
+
+    delta_spill = CandidateSpill(profile, _TODAY)
+    for row in range(2, 2 + rows):
+        candidate = _candidate(location=f"B{row}", baseline_location=f"B{row - 1}")
+        delta_spill.add(candidate, shape_before="digest-before", shape_after="digest-after")
+    delta_path = delta_spill._spill.path
+    delta_spill._spill.__exit__(None, None, None)  # force-flush without reading back
+    delta_bytes = delta_path.stat().st_size
+    delta_spill.abort()  # cleans up the tempdir; safe on an already-exited writer
+
+    full_path = tmp_path / "full_reference.qcfb"
+    full_writer = SpillWriter(full_path)
+    full_writer.__enter__()
+    for row in range(2, 2 + rows):
+        reference_candidate = _candidate(location=f"B{row}", baseline_location=f"B{row - 1}")
+        full_writer.append(
+            [row, 0],
+            {
+                "finding": finding_payload(reference_candidate),
+                "shape_before": "digest-before",
+                "shape_after": "digest-after",
+            },
+        )
+    full_writer.__exit__(None, None, None)
+    full_bytes = full_path.stat().st_size
+
+    reduction = (full_bytes - delta_bytes) / full_bytes
+    assert reduction >= 0.10, (
+        f"delta-encoded spill ({delta_bytes} bytes) did not shrink by at "
+        f"least 10% vs a full-row-per-candidate equivalent ({full_bytes} "
+        f"bytes) -- actual reduction {reduction:.2%}"
+    )
 

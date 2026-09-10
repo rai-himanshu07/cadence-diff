@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS run_state (
     run_id INTEGER,
     error TEXT NOT NULL DEFAULT '',
     phases TEXT NOT NULL DEFAULT '[]',
-    action_required TEXT NOT NULL DEFAULT '{}'
+    action_required TEXT NOT NULL DEFAULT '{}',
+    requested_output_mode TEXT NOT NULL DEFAULT 'profile'
 );
 """
 
@@ -73,6 +74,12 @@ _MIGRATIONS = {
     "action_required": (
         "ALTER TABLE run_state ADD COLUMN action_required TEXT NOT NULL DEFAULT '{}'"
     ),
+    #: Run-level finding-output contract (plan-20260910); "profile" for any
+    #: row queued before this column existed.
+    "requested_output_mode": (
+        "ALTER TABLE run_state ADD COLUMN requested_output_mode TEXT "
+        "NOT NULL DEFAULT 'profile'"
+    ),
 }
 
 
@@ -99,6 +106,10 @@ class RunStateRecord:
     #: Bounded, primitive-only payload for `RunStatus.BLOCKED`; see
     #: `qc_tool.run_action.RunActionRequired`. Empty/`None` otherwise.
     action_required: dict[str, object] | None = None
+    #: Run-level finding-output contract request (plan-20260910); a plain
+    #: string mirroring `mode` -- "profile" for any row queued before this
+    #: column existed.
+    requested_output_mode: str = "profile"
 
     @property
     def is_active(self) -> bool:
@@ -146,6 +157,7 @@ def _record(row: sqlite3.Row) -> RunStateRecord:
         error=row["error"],
         phases=json.loads(row["phases"]),
         action_required=(_decode_action_required(row)),
+        requested_output_mode=row["requested_output_mode"],
     )
 
 
@@ -178,13 +190,15 @@ class RunStateStore:
         profile: str,
         files: dict[str, str],
         queue_position: int,
+        requested_output_mode: str = "profile",
     ) -> RunStateRecord:
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO run_state (
-                    request_id, created_at, status, queue_position, mode, profile, files
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    request_id, created_at, status, queue_position, mode, profile, files,
+                    requested_output_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -194,6 +208,7 @@ class RunStateStore:
                     mode,
                     profile,
                     json.dumps(files),
+                    requested_output_mode,
                 ),
             )
         record = self.get(request_id)

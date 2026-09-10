@@ -23,6 +23,12 @@ established precedent for private/diagnostic-only parameters (e.g. the
 ``_native_compat_mode`` oracle scripts) -- ``perform_run()`` deliberately has
 no passthrough for these switches.
 
+Scope: a single baseline/current Excel pair only. Multi-package (member
+-qualified) scenarios are intentionally unsupported here -- not partially
+threaded -- since this diagnostic's whole purpose is phase attribution for
+one pair; add a member-aware variant separately if that scope is ever
+actually needed rather than half-wiring it into this script's flags.
+
 Usage:
 
     python scripts/formula_phase_diagnostic.py \\
@@ -107,7 +113,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile", type=Path, default=None, help="Optional named profile YAML."
     )
-    parser.add_argument("--allow-large-workbooks", action="store_true", default=True)
     return parser
 
 
@@ -149,7 +154,10 @@ def main() -> int:
         current_excel=args.current_excel,
         profile=profile,
         mode=QCRunMode.CYCLE_COMPARISON,
-        allow_large_workbooks=args.allow_large_workbooks,
+        # This diagnostic exists to measure large-workbook formula-phase
+        # throughput; it always opts in rather than exposing a toggle that
+        # would just make the script refuse its own purpose (Criterion 18).
+        allow_large_workbooks=True,
         formula_cache=cache,
         _formula_telemetry=telemetry,
         _xlsb_values_engine=args.xlsb_values_engine,

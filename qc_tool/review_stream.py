@@ -539,8 +539,15 @@ def _spatial_summaries(
 ) -> Iterator[_SortableSummary]:
     by_coordinate = partition.by_coordinate
     pending = set(by_coordinate)
-    while pending:
-        first = min(pending)
+    # Repeatedly calling min() on a shrinking set is O(n) per call, O(n^2)
+    # overall when a partition has many small disconnected components (a
+    # sheet with mixed finding classes at scattered coordinates). A sorted
+    # scan that skips already-visited coordinates picks the exact same
+    # "smallest remaining" seed every time (it's the first not-yet-visited
+    # entry in ascending order) in O(n log n) total instead.
+    for first in sorted(by_coordinate):
+        if first not in pending:
+            continue
         pending.remove(first)
         component = {first}
         queue = deque([first])

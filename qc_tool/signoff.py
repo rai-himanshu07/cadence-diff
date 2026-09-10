@@ -126,6 +126,8 @@ def _result_from_record(record: RunRecord) -> QCRunResult:
     return QCRunResult(
         profile_name=record.profile,
         mode=record.mode,
+        requested_output_mode=record.requested_output_mode,
+        resolved_output_policy=record.resolved_output_policy,
         files=record.files,
         findings=record.findings,
         disclosures=record.disclosures,

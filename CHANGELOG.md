@@ -39,6 +39,15 @@ project uses [Semantic Versioning](https://semver.org/).
   contains a population finding; v1/v2 outputs and readers remain
   compatible for atomic/package runs without one.
 - CI workflow building and testing the native kernel's wheels.
+- A versioned run-level finding-output contract, `FindingOutputMode`
+  (`profile` / `decision` / `atomic`), threaded through the run request,
+  worker IPC, history, stored-run rehydration, Excel/HTML/JSON reports,
+  attestation, Re-QC, and package-member runs, separately from `QCRunMode`
+  and without changing `profile_sha256`. The UI exposes a segmented
+  "Finding output" control that preselects `decision` (population-grouped,
+  compact) for new cycle comparisons; `profile` keeps today's exact
+  behavior and `atomic` is the forensic/advanced lane, explicitly outside
+  the interactive SLA.
 
 ### Changed
 
@@ -53,6 +62,12 @@ project uses [Semantic Versioning](https://semver.org/).
   happen to share an identity key can no longer collapse into one.
 - Blocked-run CLI and UI messages now name the package member whenever it
   is not `primary`.
+- Formula comparison memoizes per-pair wrapper classification across a
+  run (bounded, 128 MiB cap) once real-workload telemetry showed compare
+  time dominating a compact decision-mode run; population candidate
+  storage now uses a delta-encoded, lazily-reconstructed codec instead of
+  eagerly building a full finding per member. Both keep exact finding and
+  review parity with the prior, uncached behavior.
 
 ### Fixed
 
@@ -61,6 +76,11 @@ project uses [Semantic Versioning](https://semver.org/).
   runtime failure become a disclosed, bounded `FormulaEnrichmentError` and
   fall back to formula-presence-only coverage, instead of an unhandled
   `ValueError`, `IndexError`, or `RuntimeError` from a normal run.
+- Re-QC's change-summary banner no longer compares findings naively across
+  an output-mode change: `requested_output_mode` differing between the
+  compared runs now discloses the representation change explicitly instead
+  of showing a resolved/new count computed across two incompatible
+  identity spaces (population vs. atomic).
 
 ## [1.2.0]
 

@@ -47,6 +47,7 @@
 <div class="meta">
   Generated {{ generated_at }} (UTC)
   | mode: <strong>{{ result.mode.value }}</strong>
+  | output: <strong>{{ result.requested_output_mode.value }}</strong>
   {% for role, name in result.files.items() %} | {{ role }}: <strong>{{ name }}</strong>{% endfor %}
   | verified cross-checks: {{ result.verified_crosschecks }}
   {% if capability_limited %} | <strong class="capability-limited">capability-limited</strong>{% endif %}
