@@ -233,28 +233,35 @@ def _write_summary_sheet(
             for severity, count in counts.review_items.items()
         ),
         *(
-            (f"{severity.value.title()} atomic findings", str(count))
+            (f"{severity.value.title()} finding records", str(count))
             for severity, count in counts.atomic_findings.items()
+        ),
+        *(
+            (f"{severity.value.title()} represented changes", str(count))
+            for severity, count in (counts.represented_changes or {}).items()
         ),
     ]
     for offset, (label, value) in enumerate(rows, start=3):
         grid.set(offset, 1, label, font=Font(bold=True))
         grid.set(offset, 2, value)
+    next_row = 3 + len(rows)
     if result.mapping_coverage is not None:
         mapping = result.mapping_coverage
         mapping_rows = (
-            ("Eligible PPT figures", mapping.eligible),
+            ("Readable PPT figures", mapping.eligible),
+            ("Unavailable PPT surfaces", mapping.unavailable),
+            ("Total PPT surfaces", mapping.eligible + mapping.unavailable),
             ("Mapped figures", mapping.mapped),
             ("Verified figures", mapping.verified),
             ("Mismatched figures", mapping.mismatched),
             ("Unresolved mappings", mapping.unresolved),
             ("Unmapped figures", mapping.unmapped),
         )
-        start = 3 + len(rows)
-        for offset, (label, value) in enumerate(mapping_rows, start=start):
+        for offset, (label, value) in enumerate(mapping_rows, start=next_row):
             grid.set(offset, 1, label, font=Font(bold=True))
             grid.set(offset, 2, value)
-    disclosure_row = 3 + len(rows) + 1
+        next_row += len(mapping_rows)
+    disclosure_row = next_row + 1
     for offset, disclosure in enumerate(result.disclosures):
         grid.set(
             disclosure_row + offset,
@@ -264,7 +271,7 @@ def _write_summary_sheet(
         )
     grid.link(3, 4, location="'Stories'!A1", label="Change stories")
     grid.link(4, 4, location="'Review Groups'!A1", label="Review groups")
-    grid.link(5, 4, location="'Findings'!A1", label="Atomic findings")
+    grid.link(5, 4, location="'Findings'!A1", label="Finding records")
     grid.link(6, 4, location="'Coverage'!A1", label="Coverage")
     if result.alignment_trust is not None:
         grid.link(7, 4, location="'Alignment Trust'!A1", label="Alignment trust")

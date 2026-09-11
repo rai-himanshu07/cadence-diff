@@ -37,6 +37,9 @@ automatically.
 
 ![QC Tool review queue](https://raw.githubusercontent.com/rai-himanshu07/cadence-diff/main/qc_tool/assets/review-queue.png)
 
+For engineering boundaries, runtime flows, domain contracts, and extension
+guidance, see the [architecture reference](architecture.md).
+
 ## Three QC modes
 
 | Mode | Inputs | What it answers |
@@ -65,8 +68,9 @@ compatibility option.
 <details>
 <summary><strong>Detailed capability reference</strong></summary>
 
-Every run reports explicit coverage — checked / degraded / unavailable —
-so a check that could not run is never silently treated as passed.
+Every run reports explicit coverage — checked / degraded / unavailable / not
+included — so an omitted artifact is distinct from a check that could not run,
+and neither is silently treated as passed.
 Findings support analyst severity overrides and comments; exports
 (annotated Excel workbook, self-contained HTML) regenerate from the
 reviewed state. A reviewed run can be finalized into immutable reports and a
@@ -77,9 +81,10 @@ automatically.
 Analyst-facing views partition findings into deterministic **semantic pattern
 groups**, the primary analyst decisions. Spatial groups remain a separate
 backward-compatible layout metric. Pattern review-item counts answer how many
-decisions remain; atomic-finding counts preserve the complete cell-level
-evidence. Results open on the review queue with a selected-decision evidence
-panel; stories, coverage, and every atomic finding are one click away.
+decisions remain; finding-record counts preserve the stored evidence contract,
+while represented-change counts disclose the cells summarized by populations.
+Results open on the review queue with a selected-decision evidence panel;
+stories, coverage, finding records, and population membership are one click away.
 A finding-class multi-select composes with severity and text filtering, while
 the disjoint All / Needs review / Reviewed selector keeps partially reviewed
 groups in the action queue. While that queue owns focus, `j`/`k` or Arrow keys

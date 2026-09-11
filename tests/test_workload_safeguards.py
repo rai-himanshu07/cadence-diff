@@ -326,6 +326,7 @@ def test_progress_subdivides_every_planned_excel_phase(tmp_path: Path) -> None:
         RunPhase.COMPARING_FORMULAS,
         RunPhase.INDEXING_DEPENDENCIES,
         RunPhase.QUERYING_IMPACTS,
+        RunPhase.FINALIZING_FINDINGS,
         RunPhase.BUILDING_REVIEW,
     } <= set(telemetry.records)
     assert all(path.read_bytes() == data for path, data in before.items())
@@ -353,6 +354,7 @@ def test_excel_cycle_phases_are_sequential_with_alignment_detail(
         RunPhase.INDEXING_DEPENDENCIES,
         RunPhase.QUERYING_IMPACTS,
         RunPhase.DIFFING_EXCEL,
+        RunPhase.FINALIZING_FINDINGS,
         RunPhase.BUILDING_REVIEW,
     ]
     spans = [span(phase) for phase in ordered]

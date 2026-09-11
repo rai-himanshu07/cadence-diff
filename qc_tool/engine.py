@@ -1454,13 +1454,20 @@ def _run_multi_package(
                 check_id="excel-ppt-crosscheck",
                 label="Excel to PowerPoint mappings",
                 artifact="package",
-                state=CoverageState.UNAVAILABLE,
+                state=CoverageState.NOT_INCLUDED,
                 detail="Use final-package mode for Excel-to-PowerPoint QC",
             )
         )
 
+    report_progress(on_progress, RunPhase.FINALIZING_FINDINGS, total=1)
     add_findings(expired_waiver_findings(profile, today))
     sequence, severity_counts = stream.finalize()
+    report_progress(
+        on_progress,
+        RunPhase.FINALIZING_FINDINGS,
+        processed=1,
+        total=1,
+    )
     result = QCRunResult(
         profile_name=profile.name,
         mode=mode,
@@ -1697,7 +1704,7 @@ def run_qc(
                     check_id="excel-intrinsic",
                     label="Current Excel intrinsic checks",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="No current workbook supplied",
                 )
             )
@@ -1731,7 +1738,7 @@ def run_qc(
                         check_id="ppt-intrinsic",
                         label="Current PowerPoint intrinsic checks",
                         artifact="ppt",
-                        state=CoverageState.UNAVAILABLE,
+                        state=CoverageState.NOT_INCLUDED,
                         detail="No current deck supplied",
                     ),
                     media_structural_coverage(),
@@ -1739,7 +1746,7 @@ def run_qc(
                         check_id="ppt-media-visual",
                         label="Rendered media and visual layout",
                         artifact="ppt",
-                        state=CoverageState.UNAVAILABLE,
+                        state=CoverageState.NOT_INCLUDED,
                         detail="No current deck supplied",
                     ),
                 ]
@@ -1750,21 +1757,21 @@ def run_qc(
                 check_id="excel-cycle-comparison",
                 label="Historical Excel changes",
                 artifact="excel",
-                state=CoverageState.UNAVAILABLE,
+                state=CoverageState.NOT_INCLUDED,
                 detail="No baseline workbook supplied",
             ),
             CoverageItem(
                 check_id="ppt-cycle-comparison",
                 label="Historical PowerPoint changes",
                 artifact="ppt",
-                state=CoverageState.UNAVAILABLE,
+                state=CoverageState.NOT_INCLUDED,
                 detail="No baseline deck supplied",
             ),
             CoverageItem(
                 check_id="excel-ppt-crosscheck",
                 label="Excel to PowerPoint mappings",
                 artifact="package",
-                state=CoverageState.UNAVAILABLE,
+                state=CoverageState.NOT_INCLUDED,
                 detail="Use final-package mode for current Excel-to-PowerPoint QC",
             ),
             ]
@@ -1884,7 +1891,7 @@ def run_qc(
                 check_id="cycle-comparison",
                 label="Historical cycle comparison",
                 artifact="package",
-                state=CoverageState.UNAVAILABLE,
+                state=CoverageState.NOT_INCLUDED,
                 detail="No baseline files supplied",
             ),
         ]
@@ -2554,56 +2561,56 @@ def run_qc(
                     check_id="excel-workload",
                     label="Excel workload safeguards",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="Excel pair not supplied",
                 ),
                 CoverageItem(
                     check_id="excel-values",
                     label="Excel values and presentation",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="Excel pair not supplied",
                 ),
                 CoverageItem(
                     check_id="excel-structure",
                     label="Excel workbook structure",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="Excel pair not supplied",
                 ),
                 CoverageItem(
                     check_id="excel-formulas",
                     label="Excel formulas",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="Excel pair not supplied",
                 ),
                 CoverageItem(
                     check_id="excel-dependencies",
                     label="Formula dependency impact tracing",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="Excel pair not supplied",
                 ),
                 CoverageItem(
                     check_id="excel-interaction-rules",
                     label="Data validation and conditional-format rules",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="Excel pair not supplied",
                 ),
                 CoverageItem(
                     check_id="excel-conditional-format-styles",
                     label="Conditional-format differential styles",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="Excel pair not supplied",
                 ),
                 CoverageItem(
                     check_id="excel-availability",
                     label="Availability boundaries",
                     artifact="excel",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="Excel pair not supplied",
                 ),
             ]
@@ -2615,14 +2622,14 @@ def run_qc(
                     check_id="ppt-comparison",
                     label="PowerPoint content and charts",
                     artifact="ppt",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="PowerPoint pair not supplied",
                 ),
                 CoverageItem(
                     check_id="ppt-availability",
                     label="Availability boundaries",
                     artifact="ppt",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="PowerPoint pair not supplied",
                 ),
                 media_structural_coverage(),
@@ -2630,7 +2637,7 @@ def run_qc(
                     check_id="ppt-media-visual",
                     label="Rendered media and visual layout",
                     artifact="ppt",
-                    state=CoverageState.UNAVAILABLE,
+                    state=CoverageState.NOT_INCLUDED,
                     detail="PowerPoint pair not supplied",
                 ),
             ]
@@ -2686,7 +2693,11 @@ def run_qc(
                 check_id="excel-ppt-crosscheck",
                 label="Excel to PowerPoint mappings",
                 artifact="package",
-                state=CoverageState.UNAVAILABLE,
+                state=(
+                    CoverageState.NOT_INCLUDED
+                    if current_deck is None or current_workbook is None
+                    else CoverageState.UNAVAILABLE
+                ),
                 detail=reason,
             )
         )
@@ -2760,6 +2771,7 @@ def run_qc(
             )
             if values_coverage is not None:
                 values_coverage.findings = produced
+        report_progress(on_progress, RunPhase.FINALIZING_FINDINGS, total=1)
         if candidate_sink is not None:
             outcome = finalize_populations(
                 candidate_sink,
@@ -2799,6 +2811,12 @@ def run_qc(
         expired = expired_waiver_findings(profile, today)
         assign_severities(expired, profile, today=today)
         stream.add(expired)
+        report_progress(
+            on_progress,
+            RunPhase.FINALIZING_FINDINGS,
+            processed=1,
+            total=1,
+        )
         report_progress(on_progress, RunPhase.BUILDING_REVIEW, total=1)
         sequence, severity_counts = stream.finalize()
     except BaseException:

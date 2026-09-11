@@ -26,7 +26,13 @@ from qc_tool.config.profile import (
     resolve_output_policy,
     save_profile,
 )
-from qc_tool.coverage import FindingOutputMode, MappingCoverage, QCRunMode
+from qc_tool.coverage import (
+    CoverageItem,
+    CoverageState,
+    FindingOutputMode,
+    MappingCoverage,
+    QCRunMode,
+)
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import (
@@ -56,6 +62,7 @@ from qc_tool.signoff import finalize_run, required_acknowledgements
 from qc_tool.ui.app import (
     LensEntry,
     _acceptance_summary,
+    _capability_summary,
     _class_filter_label,
     _cluster_context_html,
     _context_grid_html,
@@ -1293,6 +1300,33 @@ def test_mapping_stats_reconcile_readable_and_unavailable_surfaces() -> None:
     assert stats["total surfaces"] == 27
 
 
+def test_capability_summary_separates_omitted_inputs_from_failed_checks() -> None:
+    omitted = CoverageItem(
+        check_id="ppt-comparison",
+        label="PowerPoint comparison",
+        artifact="ppt",
+        state=CoverageState.NOT_INCLUDED,
+    )
+
+    assert _capability_summary([omitted]) == (
+        "ok",
+        "Included checks ran",
+        "1 not included in this run",
+    )
+
+    unavailable = CoverageItem(
+        check_id="excel-formulas",
+        label="Excel formulas",
+        artifact="excel",
+        state=CoverageState.UNAVAILABLE,
+    )
+    tone, title, detail = _capability_summary([omitted, unavailable])
+    assert tone == "limited"
+    assert title == "Capability limited"
+    assert "1 unavailable" in detail
+    assert "1 not included in this run" in detail
+
+
 def test_context_grid_html_escapes_source_values() -> None:
     excerpt = GridExcerpt(
         rows=[1],
@@ -1670,13 +1704,26 @@ async def test_run_detail_page(user: User, fixture_dir: Path, tmp_path: Path) ->
     await user.should_see("cross-checks ok")
     await user.should_see("Review queue")
     await user.should_see("Atomic evidence")
-    await user.should_see("atomic findings")
+    await user.should_see("finding records")
+    await user.should_see("represented changes")
     await user.should_see("review time")
     await user.should_see("0:00")
     await user.should_see("Start")
     # Review queue is the default view; evidence tabs are opt-in.
     panels = user.find(kind=ui.tab_panels).elements.pop()
     assert panels.value == "review"
+
+
+@pytest.mark.asyncio
+async def test_first_run_hides_specialist_controls_in_advanced_sections(
+    user: User, tmp_path: Path
+) -> None:
+    create_pages(tmp_path / "work")
+
+    await user.open("/")
+
+    await user.should_see("Advanced finding output")
+    await user.should_see("Advanced comparison and safety options")
 
 
 @pytest.mark.asyncio

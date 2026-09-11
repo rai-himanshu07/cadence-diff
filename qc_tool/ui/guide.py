@@ -90,8 +90,9 @@ GLOSSARY = (
     ),
     (
         "atomic finding",
-        "One individual difference or control result. Every export, history "
-        "record, and attestation keeps atomic evidence.",
+        "One individual difference or control result in Atomic output. In "
+        "Decision output, a population finding record can represent many cell "
+        "changes while preserving exact membership evidence.",
     ),
     (
         "story",
@@ -105,7 +106,8 @@ GLOSSARY = (
     ),
     (
         "coverage",
-        "Whether each check was checked, degraded, or unavailable. A low finding "
+        "Whether each check was checked, degraded, unavailable, or not included "
+        "because that artifact or workflow was not part of the run. A low finding "
         "count with unavailable checks is not a clean result.",
     ),
     (
@@ -136,7 +138,7 @@ GUIDE_SCRIPT = r"""
   const links = Array.from(document.querySelectorAll('.guide-toc-link'));
     const aliases = {
         launch: 'install windows path command not found shortcut start browser first run data directory storage localappdata xdg_data_home',
-        coverage: 'capability limited unavailable degraded not checked workload refusal override memory projected findings safety',
+        coverage: 'capability limited unavailable degraded not included omitted input not checked workload refusal override memory projected findings safety',
         mappings: 'mapping unavailable opaque screenshot raster image claim',
         review: 'unreviewed only replace all confirm severity reviewed note',
         reqc: 'rerun repeat carry forward history',
@@ -864,12 +866,12 @@ cadence-diff --data-dir "/path/to/qc-data"
                         "The queue pages under its own footer: choose 10 to 100 rows per page (remembered on this machine), pick an order — <em>priority</em> (the evidence default), severity, location, or findings — with a direction toggle, and drag a column boundary in the header to resize; double-click the boundary to restore the defaults. Ordering moves a related series and its decisions together, never splitting them.",
                         "The <strong>review time</strong> box at the top right is an explicit Start/Pause timer with a four-hour cap per session; finalizing the run freezes it, and the recorded minutes feed the longitudinal dossier.",
                         "The queue is ordered by evidence, not by sheet position. The detail panel says <em>prioritized because</em> and names the counts it scored on: severity, materiality, historical position, provenance, downstream impacts, population size, and whether a story explains it.",
-                        "Ordering only reorders. Every review item and every atomic finding stays reachable; nothing is hidden.",
+                        "Ordering only reorders. Every review item and finding record stays reachable; nothing is hidden.",
                         "Waived, already-reviewed, and expected-growth decisions sink below everything still open, because they need no new judgement.",
-                        "Pattern review-item counts are analyst decisions; atomic-finding counts are the underlying evidence. Spatial review counts remain a compatibility metric.",
+                        "Pattern review-item counts are analyst decisions; finding-record counts are stored evidence rows; represented-change counts include every cell summarized by a population. Spatial review counts remain a compatibility metric.",
                         "Select a review item to see its evidence axes, baseline/current values, impacts, and nearby cells in the detail panel.",
                         "For formula logic changes, expand <strong>Formula token diff</strong> to see a normalized token-level comparison; added tokens are underlined and removed tokens are struck through.",
-                        "Open a group for paged atomic members, or use the Atomic evidence view for every individual finding.",
+                        "Open a group for paged members, or use the Atomic evidence view for every stored finding record and each population's exact membership.",
                         "Use Unreviewed only to preserve prior member decisions. Replace all overwrites every existing member decision in that group, so use it only when you intend to replace prior analyst work.",
                         "Use the Review selector to show All, Needs review, or Reviewed groups. Keyboard triage is available: <code>j</code>/<code>k</code> or Arrow keys move between visible review items; <code>1</code>/<code>2</code>/<code>3</code>/<code>4</code> set Critical/Warning/Info/Expected for the current unreviewed group and advance; <code>c</code> confirms the current severity as reviewed.",
                         "What-if preview uses private typed numeric evidence to show how temporary acceptance bounds or a materiality review floor would change atomics and decisions. It ignores analyst overrides, never parses display strings, never writes the run or profile, and keeps accepted changes visible as Info.",
@@ -877,9 +879,9 @@ cadence-diff --data-dir "/path/to/qc-data"
                         "Use the severity selector only for an analyst disposition; it does not rewrite engine logic.",
                         "Add a specific comment naming the evidence, approver or source, date, and required follow-up. Avoid comments such as <em>looks fine</em> or <em>checked</em> with no support.",
                         "Exports are regenerated from the reviewed state so comments and overrides are included.",
-                        "Excel and HTML exports lead with semantic pattern groups while retaining every atomic finding; Excel links stay inside the report workbook.",
+                        "Excel and HTML exports lead with semantic pattern groups while retaining every finding record and population membership; Excel links stay inside the report workbook.",
                         "On very large runs (over 50,000 findings) report files are not written at run time — the run becomes reviewable sooner, and <strong>Generate Excel/HTML report</strong> on the run page builds the file on demand, stores it with the run, and downloads it. Expect several minutes for a million-finding report; reviewing continues meanwhile.",
-                        "When group-first output is enabled on a profile, a large run of identical formula-logic or number-format changes is shown as one <strong>population</strong> item instead of one row per cell. Its detail shows the member count, the current-side cell ranges, and how baseline cells map to them; sample excerpts and a full member list are not available yet. A smaller or non-uniform group of the same class still reviews as ordinary atomic findings — nothing is silently combined.",
+                        "When group-first output is enabled on a profile, a large run of identical formula-logic or number-format changes is shown as one <strong>population</strong> item instead of one row per cell. Its detail shows the member count, the current-side cell ranges, and how baseline cells map to them; sample excerpts and the full paged member list remain available. A smaller or non-uniform group of the same class still reviews as individual finding records — nothing is silently combined.",
                     ]
                 )
                 _callout(

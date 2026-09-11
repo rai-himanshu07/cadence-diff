@@ -17,7 +17,7 @@ from qc_tool.attestation import (
     verify_attestation,
 )
 from qc_tool.config.profile import DeliverableProfile
-from qc_tool.coverage import MappingCoverage, QCRunMode
+from qc_tool.coverage import CoverageItem, CoverageState, MappingCoverage, QCRunMode
 from qc_tool.engine import QCRunResult
 from qc_tool.history.review_state import RunFinalizedError
 from qc_tool.history.store import RunHistory
@@ -64,6 +64,34 @@ def _finalize_ready(fixture_dir: Path, work_dir: Path):
         set(required_acknowledgements(record)),
     )
     return run_id, signoff
+
+
+def test_not_included_coverage_does_not_require_signoff_acknowledgement(
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    run_id, _files = _reviewed_run(fixture_dir, tmp_path / "work")
+    record = RunHistory(tmp_path / "work" / "history.sqlite3").get_run(run_id)
+    record.coverage.extend(
+        [
+            CoverageItem(
+                check_id="omitted-ppt",
+                label="PowerPoint comparison",
+                artifact="ppt",
+                state=CoverageState.NOT_INCLUDED,
+            ),
+            CoverageItem(
+                check_id="failed-formulas",
+                label="Formula comparison",
+                artifact="excel",
+                state=CoverageState.UNAVAILABLE,
+            ),
+        ]
+    )
+
+    acknowledgements = set(required_acknowledgements(record))
+    assert "coverage:omitted-ppt" not in acknowledgements
+    assert "coverage:failed-formulas" in acknowledgements
 
 
 def test_finalization_stops_this_runs_review_timer(

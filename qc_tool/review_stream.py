@@ -45,6 +45,7 @@ from qc_tool.review import (
     _rationale,
     _rectangles,
     finding_identity_key,
+    represented_change_count,
 )
 from qc_tool.story import (
     _DRIVER_CLASSES,
@@ -100,6 +101,7 @@ class GroupSummary:
     spatial: bool
     artifact_member: str
     member_finding_ids: tuple[str, ...]
+    represented_change_count: int | None = None
 
     @property
     def member_count(self) -> int:
@@ -125,19 +127,32 @@ def summary_of(group: ReviewGroup) -> GroupSummary:
         spatial=group.spatial,
         artifact_member=group.artifact_member,
         member_finding_ids=tuple(member.finding_id for member in group.members),
+        represented_change_count=sum(
+            represented_change_count(member) for member in group.members
+        ),
     )
 
 
 def counts_from_summaries(summaries: Iterable[GroupSummary]) -> ReviewCounts:
     review_items = dict.fromkeys(Severity, 0)
     atomic_findings = dict.fromkeys(Severity, 0)
+    represented_changes = dict.fromkeys(Severity, 0)
+    represented_complete = True
     for summary in summaries:
         review_items[summary.severity] += 1
         atomic_findings[summary.severity] += summary.member_count
-    return ReviewCounts(review_items=review_items, atomic_findings=atomic_findings)
+        if summary.represented_change_count is None:
+            represented_complete = False
+        else:
+            represented_changes[summary.severity] += summary.represented_change_count
+    return ReviewCounts(
+        review_items=review_items,
+        atomic_findings=atomic_findings,
+        represented_changes=represented_changes if represented_complete else None,
+    )
 
 
-VIEW_SUMMARY_VERSION = 1
+VIEW_SUMMARY_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +309,7 @@ def encode_view_summaries(
                 "spatial": summary.spatial,
                 "artifact_member": summary.artifact_member,
                 "member_finding_ids": list(summary.member_finding_ids),
+                "represented_change_count": summary.represented_change_count,
                 "priority": {
                     "material": aggregates[summary.group_id].material,
                     "historical": aggregates[summary.group_id].historical,
@@ -338,7 +354,8 @@ def decode_view_summaries(
     """
     try:
         payload = json.loads(zlib.decompress(blob).decode("utf-8"))
-        if payload.get("version") != VIEW_SUMMARY_VERSION:
+        version = payload.get("version")
+        if version not in {1, VIEW_SUMMARY_VERSION}:
             return None
         summaries: list[GroupSummary] = []
         aggregates: dict[str, GroupPriorityAggregate] = {}
@@ -361,6 +378,11 @@ def decode_view_summaries(
                     spatial=item["spatial"],
                     artifact_member=item["artifact_member"],
                     member_finding_ids=tuple(item["member_finding_ids"]),
+                    represented_change_count=(
+                        item.get("represented_change_count")
+                        if version >= 2
+                        else None
+                    ),
                 )
             )
             priority = item["priority"]
@@ -400,6 +422,7 @@ class _Member(NamedTuple):
     baseline: Coordinate | None
     element_raw: str
     location: str
+    represented_change_count: int
     sort_payload: tuple[object, ...]
 
 
@@ -412,6 +435,7 @@ def _member_record(finding: Finding, *, with_payload: bool) -> _Member:
         baseline=_coordinate(finding.baseline_location),
         element_raw=finding.element or "",
         location=finding.location or finding.baseline_location or "",
+        represented_change_count=represented_change_count(finding),
         # Mirrors _review_sort_key's member tuple. Only groups that can share
         # a group_id (identical key + identities, i.e. duplicate singletons)
         # ever reach this tiebreak, so it is retained only when requested.
@@ -507,6 +531,7 @@ def _singleton_summary(finding: Finding) -> _SortableSummary:
             spatial=False,
             artifact_member=finding.artifact_member,
             member_finding_ids=(finding.finding_id,),
+            represented_change_count=record.represented_change_count,
         ),
         member_payloads=(record.sort_payload,),
     )
@@ -602,6 +627,9 @@ def _spatial_summaries(
                 spatial=True,
                 artifact_member=partition.artifact_member,
                 member_finding_ids=tuple(member.finding_id for member in members),
+                represented_change_count=sum(
+                    member.represented_change_count for member in members
+                ),
             ),
             member_payloads=(),
         )
@@ -817,6 +845,9 @@ class _PatternAccumulator:
                         member_finding_ids=tuple(
                             member.finding_id for member in members
                         ),
+                        represented_change_count=sum(
+                            member.represented_change_count for member in members
+                        ),
                     ),
                     member_payloads=(),
                 )
@@ -980,7 +1011,7 @@ class _StoryState:
                 sorted(self.formula_event_keys) or [str(self.component)]
             )[0]
         elif kind is StoryKind.ERROR_POPULATION:
-            title = f"Error population: {self.member_count} atomic findings"
+            title = f"Error population: {self.member_count} finding records"
             description = (
                 "A proven same-artifact, sheet, column, and literal population. "
                 "Grouping identifies one incident; it does not imply reduced risk."

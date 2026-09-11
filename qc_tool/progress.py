@@ -23,6 +23,7 @@ class RunPhase(StrEnum):
     COMPARING_FORMULAS = "comparing_formulas"
     INDEXING_DEPENDENCIES = "indexing_dependencies"
     QUERYING_IMPACTS = "querying_impacts"
+    FINALIZING_FINDINGS = "finalizing_findings"
     BUILDING_REVIEW = "building_review"
     ANALYZING_POWERPOINT = "analyzing_powerpoint"
     CROSSCHECKING = "crosschecking"

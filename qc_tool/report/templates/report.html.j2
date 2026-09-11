@@ -73,7 +73,9 @@ count is not a clean result. Review the check coverage table below.</div>
 {% if result.mapping_coverage %}
 <h2>Mapping coverage</h2>
 <div class="meta">
-  {{ result.mapping_coverage.eligible }} eligible |
+  {{ result.mapping_coverage.eligible }} readable |
+  {{ result.mapping_coverage.unavailable }} unavailable |
+  {{ result.mapping_coverage.eligible + result.mapping_coverage.unavailable }} total surfaces |
   {{ result.mapping_coverage.mapped }} mapped |
   {{ result.mapping_coverage.verified }} verified |
   {{ result.mapping_coverage.mismatched }} mismatched |
@@ -95,11 +97,11 @@ count is not a clean result. Review the check coverage table below.</div>
 <div class="note">{{ disclosure }}</div>
 {% endfor %}
 {% if not atomics_included %}
-<div class="note">This run produced {{ result.findings | length }} atomic
-findings, above the {{ atomics_threshold }}-row inline limit for a single
+<div class="note">This run produced {{ result.findings | length }} finding
+records, above the {{ atomics_threshold }}-row inline limit for a single
 HTML file, so per-finding detail is not embedded here. Every decision,
 story, and coverage row below is complete; the Excel and JSON exports and
-the review app carry every atomic finding.</div>
+the review app carry every finding record.</div>
 {% endif %}
 {% if result.alignment_trust %}
 <h2>Alignment trust</h2>
@@ -177,7 +179,10 @@ unchanged — stories are a lens over the same findings.</div>
   {% for severity, count in counts.review_items.items() %}
   <div class="card {{ severity.value }}"><span class="n">{{ count }}</span>
     {{ severity.value }} pattern review items
-    <span class="affected">{{ counts.atomic_findings[severity] }} atomic findings</span>
+    <span class="affected">{{ counts.atomic_findings[severity] }} finding record{% if counts.atomic_findings[severity] != 1 %}s{% endif %}</span>
+    {% if counts.represented_changes is not none %}
+    <span class="affected">{{ counts.represented_changes[severity] }} represented change{% if counts.represented_changes[severity] != 1 %}s{% endif %}</span>
+    {% endif %}
   </div>
   {% endfor %}
 </div>
@@ -208,7 +213,7 @@ unchanged — stories are a lens over the same findings.</div>
     </tr>
     <tr><td colspan="7">
       {%- if atomics_included %}
-      <details><summary>View {{ group.member_count }} atomic finding{% if group.member_count != 1 %}s{% endif %}</summary>
+      <details><summary>View {{ group.member_count }} finding record{% if group.member_count != 1 %}s{% endif %}</summary>
         <table class="member-table">
           <thead><tr><th>ID</th><th>Severity</th>{% if result.package_manifest and not result.package_manifest.is_legacy_projection %}<th>Member</th>{% endif %}<th>Location</th><th>Element</th>
             <th>Baseline</th><th>Current</th><th>Message</th><th>Analyst comment</th>

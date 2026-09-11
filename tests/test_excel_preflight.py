@@ -48,7 +48,7 @@ def test_current_excel_preflight_runs_without_baseline(fixture_dir: Path) -> Non
     comparison = next(
         item for item in result.coverage if item.check_id == "excel-cycle-comparison"
     )
-    assert comparison.state is CoverageState.UNAVAILABLE
+    assert comparison.state is CoverageState.NOT_INCLUDED
     assert sha256_file(source) == before
 
 

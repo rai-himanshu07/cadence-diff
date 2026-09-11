@@ -348,14 +348,14 @@ def _run_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--individual-findings",
         action="store_true",
-        help="print atomic findings instead of grouped review items",
+        help="print finding records instead of grouped review items",
     )
     parser.add_argument(
         "--json-review-summary",
         action="store_true",
         help=(
             "add a versioned semantic review summary to the JSON export; "
-            "atomic findings remain unchanged"
+            "finding records remain unchanged"
         ),
     )
     parser.add_argument(
@@ -732,12 +732,20 @@ def _cmd_run(args: list[str]) -> int:
         ),
     )
     print(
-        "atomic findings:",
+        "finding records:",
         "  ".join(
             f"{severity.value}={count}"
             for severity, count in pattern_counts.atomic_findings.items()
         ),
     )
+    if pattern_counts.represented_changes is not None:
+        print(
+            "represented changes:",
+            "  ".join(
+                f"{severity.value}={count}"
+                for severity, count in pattern_counts.represented_changes.items()
+            ),
+        )
     if result.coverage:
         states: dict[str, int] = {}
         for item in result.coverage:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import zlib
 from collections.abc import Sequence
 
 from qc_tool.engine import QCRunResult
@@ -10,6 +12,8 @@ from qc_tool.findings import (
     Finding,
     FindingClass,
     FindingEvidenceTag,
+    MembershipCodec,
+    PopulationEvidence,
     Severity,
 )
 from qc_tool.review import (
@@ -20,8 +24,11 @@ from qc_tool.review import (
 )
 from qc_tool.review_stream import (
     counts_from_summaries,
+    decode_view_summaries,
+    encode_view_summaries,
     stream_stories,
     summarize_pattern_groups,
+    summarize_pattern_groups_with_priority,
     summarize_review_groups,
     summary_of,
 )
@@ -63,6 +70,65 @@ def test_counts_match_list_builders(qc_result: QCRunResult) -> None:
     assert counts_from_summaries(
         summarize_pattern_groups(iter(findings))
     ) == count_pattern_groups(build_pattern_groups(findings))
+
+
+def test_population_counts_one_record_and_all_represented_changes() -> None:
+    finding = Finding(
+        finding_id="F0001",
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        severity=Severity.WARNING,
+        sheet="Data",
+        location="B2:B20",
+        message="19 cells share one population",
+        population=PopulationEvidence(
+            member_count=19,
+            membership=MembershipCodec(
+                current_rectangles=("B2:B20",),
+                baseline_mode="shift",
+                shift=(0, 0),
+                member_count=19,
+            ),
+            first="B2",
+            last="B20",
+            shape_before_digest="a" * 64,
+            shape_after_digest="b" * 64,
+        ),
+    )
+
+    counts = counts_from_summaries(summarize_pattern_groups([finding]))
+
+    assert counts.review_items[Severity.WARNING] == 1
+    assert counts.atomic_findings[Severity.WARNING] == 1
+    assert counts.represented_changes is not None
+    assert counts.represented_changes[Severity.WARNING] == 19
+
+
+def test_legacy_view_summary_does_not_invent_represented_changes() -> None:
+    finding = Finding(
+        finding_id="F0001",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.WARNING,
+        sheet="Data",
+        location="B2",
+        message="value changed",
+    )
+    summaries, aggregates = summarize_pattern_groups_with_priority([finding])
+    encoded = encode_view_summaries(summaries, aggregates, [])
+    payload = json.loads(zlib.decompress(encoded).decode("utf-8"))
+    payload["version"] = 1
+    for group in payload["groups"]:
+        group.pop("represented_change_count")
+
+    decoded = decode_view_summaries(
+        zlib.compress(json.dumps(payload).encode("utf-8"), 6)
+    )
+
+    assert decoded is not None
+    legacy_counts = counts_from_summaries(decoded[0])
+    assert legacy_counts.atomic_findings[Severity.WARNING] == 1
+    assert legacy_counts.represented_changes is None
 
 
 def test_summaries_match_for_multi_member_findings(qc_result: QCRunResult) -> None:

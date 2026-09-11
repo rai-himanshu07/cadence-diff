@@ -302,6 +302,7 @@ PHASE_LABELS = {
     RunPhase.COMPARING_FORMULAS: "Comparing formulas",
     RunPhase.INDEXING_DEPENDENCIES: "Indexing dependencies",
     RunPhase.QUERYING_IMPACTS: "Querying impacts",
+    RunPhase.FINALIZING_FINDINGS: "Finalizing findings",
     RunPhase.BUILDING_REVIEW: "Building review groups",
     RunPhase.ANALYZING_POWERPOINT: "Analyzing PowerPoint",
     RunPhase.CROSSCHECKING: "Cross-checking package",
@@ -719,15 +720,31 @@ def _capability_summary(coverage: list[CoverageItem]) -> tuple[str, str, str]:
         1 for item in coverage if item.state is CoverageState.UNAVAILABLE
     )
     degraded = sum(1 for item in coverage if item.state is CoverageState.DEGRADED)
+    not_included = sum(
+        1 for item in coverage if item.state is CoverageState.NOT_INCLUDED
+    )
+    omitted_detail = (
+        f"; {not_included} not included in this run" if not_included else ""
+    )
     if unavailable:
         return (
             "limited",
             "Capability limited",
             f"{unavailable} unavailable, {degraded} degraded — a low finding "
-            "count is not a clean result",
+            f"count is not a clean result{omitted_detail}",
         )
     if degraded:
-        return ("neutral", "Partial capability", f"{degraded} degraded checks")
+        return (
+            "neutral",
+            "Partial capability",
+            f"{degraded} degraded checks{omitted_detail}",
+        )
+    if not_included:
+        return (
+            "ok",
+            "Included checks ran",
+            f"{not_included} not included in this run",
+        )
     return ("ok", "All checks ran", "")
 
 
@@ -1560,7 +1577,7 @@ def _history_row(record: RunRecord) -> dict[str, object]:
         if record.pattern_review_counts
         else (record.review_counts, "spatial review items")
         if record.review_counts
-        else (record.counts, "atomic findings")
+        else (record.counts, "finding records")
     )
     return {
         "id": record.run_id,
@@ -1616,7 +1633,8 @@ def _history_trend_row(record: RunRecord, history: RunHistory) -> dict[str, obje
             (record.pattern_review_counts or record.review_counts or record.counts).values()
         ),
         "limited": sum(
-            item.state is not CoverageState.CHECKED for item in record.coverage
+            item.state in {CoverageState.DEGRADED, CoverageState.UNAVAILABLE}
+            for item in record.coverage
         ),
         "mapped": mapping.mapped if mapping is not None else 0,
         "verified": mapping.verified if mapping is not None else 0,
@@ -2494,7 +2512,7 @@ def _render_budget_run_view(
             for severity, count in result.counts.items():
                 with ui.column().classes(f"stat stat-{severity.value}"):
                     ui.label(f"{count:,}").classes("n")
-                    ui.label(f"{severity.value} atomic findings").classes("l")
+                    ui.label(f"{severity.value} finding records").classes("l")
         ui.label(
             f"This run's {len(result.findings):,} findings exceed the "
             "interactive review budget, so the workbench is summarized "
@@ -2736,9 +2754,19 @@ def _render_result_view(
                     with ui.column().classes(f"stat stat-{severity.value}"):
                         ui.label(str(count)).classes("n")
                         ui.label(f"{severity.value} pattern review items").classes("l")
+                        finding_records = counts.atomic_findings[severity]
                         ui.label(
-                            f"{counts.atomic_findings[severity]:,} atomic findings"
+                            f"{finding_records:,} finding record"
+                            f"{'s' if finding_records != 1 else ''}"
                         ).classes("a")
+                        if counts.represented_changes is not None:
+                            represented = counts.represented_changes[severity]
+                            ui.label(
+                                f"{represented:,} represented change"
+                                f"{'s' if represented != 1 else ''}"
+                            ).classes("a")
+                        else:
+                            ui.label("represented changes unavailable").classes("a")
                 with ui.column().classes("stat"):
                     ui.label(str(result.verified_crosschecks)).classes("n")
                     ui.label("cross-checks ok").classes("l")
@@ -3685,10 +3713,16 @@ def _render_result_view(
             checked = [
                 item for item in result.coverage if item.state is CoverageState.CHECKED
             ]
+            not_included = [
+                item
+                for item in result.coverage
+                if item.state is CoverageState.NOT_INCLUDED
+            ]
             with ui.element("div").classes("statstrip"):
                 for tone, label, items in (
                     ("critical", "unavailable", unavailable),
                     ("warning", "degraded", degraded),
+                    ("neutral", "not included", not_included),
                     ("expected", "checked", checked),
                 ):
                     with ui.column().classes(f"stat stat-{tone}"):
@@ -3856,12 +3890,13 @@ def _render_result_view(
 
         with ui.tab_panel("atomic"):
             ui.label(
-                "Every atomic finding behind the review queue, with analyst "
-                "severity overrides and comments."
+                "Every finding record behind the review queue, including exact "
+                "membership for population records, with analyst severity "
+                "overrides and comments."
             ).classes("note")
             if atomic_paged:
                 ui.label(
-                    f"{len(result.findings):,} atomic findings — this tab pages "
+                    f"{len(result.findings):,} finding records — this tab pages "
                     "server-side; severity pills filter the review queue, and "
                     "the Excel/JSON exports carry every finding."
                 ).classes("hint")
@@ -5398,7 +5433,7 @@ def _render_mapping_review(
             item.detail
             for item in result.coverage
             if item.check_id == "excel-ppt-crosscheck"
-            and item.state is not CoverageState.CHECKED
+            and item.state in {CoverageState.DEGRADED, CoverageState.UNAVAILABLE}
             and item.detail
         ),
         "",
@@ -6195,22 +6230,27 @@ def create_pages(
                 mode_select.disable()
             update_mode_surface()
 
-            output_mode_copy = ui.label().classes("modecopy")
+            with (
+                ui.expansion("Advanced finding output").classes("w-full mt-2"),
+                ui.column().classes("gap-2 p-2 w-full"),
+            ):
+                output_mode_copy = ui.label().classes("modecopy")
 
-            def update_output_mode_surface() -> None:
-                output_mode_copy.text = OUTPUT_MODE_DESCRIPTIONS[state.output_mode]
+                def update_output_mode_surface() -> None:
+                    output_mode_copy.text = OUTPUT_MODE_DESCRIPTIONS[state.output_mode]
 
-            def on_output_mode_change(e: events.ValueChangeEventArguments) -> None:
-                state.output_mode = FindingOutputMode(e.value)
+                def on_output_mode_change(e: events.ValueChangeEventArguments) -> None:
+                    state.output_mode = FindingOutputMode(e.value)
+                    update_output_mode_surface()
+
+                ui.toggle(
+                    {mode.value: label for mode, label in OUTPUT_MODE_LABELS.items()},
+                    value=state.output_mode.value,
+                    on_change=on_output_mode_change,
+                ).classes("mode-select").props("no-caps spread").mark(
+                    "output-mode-toggle"
+                )
                 update_output_mode_surface()
-
-            ui.label("Finding output").classes("dk")
-            ui.toggle(
-                {mode.value: label for mode, label in OUTPUT_MODE_LABELS.items()},
-                value=state.output_mode.value,
-                on_change=on_output_mode_change,
-            ).classes("mode-select").props("no-caps spread").mark("output-mode-toggle")
-            update_output_mode_surface()
 
             section("2 · Inputs")
             ui.label(
@@ -6664,6 +6704,24 @@ def create_pages(
                 state.profile_name = str(e.value)
                 refresh_readiness()
 
+            def on_acceptance_absolute(e: events.ValueChangeEventArguments) -> None:
+                state.acceptance_absolute = float(e.value or 0.0)
+                refresh_readiness()
+
+            def on_acceptance_percent(e: events.ValueChangeEventArguments) -> None:
+                state.acceptance_percent = float(e.value or 0.0)
+                refresh_readiness()
+
+            def on_allow_large(e: events.ValueChangeEventArguments) -> None:
+                state.allow_large_workbooks = bool(e.value)
+                refresh_readiness()
+
+            def on_allow_dependency_indexing(
+                e: events.ValueChangeEventArguments,
+            ) -> None:
+                state.allow_dependency_indexing = bool(e.value)
+                refresh_readiness()
+
             with ui.row().classes("policyrow"):
                 profile_select = (
                     ui.select(
@@ -6679,24 +6737,12 @@ def create_pages(
                     "ghostbtn"
                 ).props("no-caps flat")
 
-                def on_acceptance_absolute(e: events.ValueChangeEventArguments) -> None:
-                    state.acceptance_absolute = float(e.value or 0.0)
-                    refresh_readiness()
-
-                def on_acceptance_percent(e: events.ValueChangeEventArguments) -> None:
-                    state.acceptance_percent = float(e.value or 0.0)
-                    refresh_readiness()
-
-                def on_allow_large(e: events.ValueChangeEventArguments) -> None:
-                    state.allow_large_workbooks = bool(e.value)
-                    refresh_readiness()
-
-                def on_allow_dependency_indexing(
-                    e: events.ValueChangeEventArguments,
-                ) -> None:
-                    state.allow_dependency_indexing = bool(e.value)
-                    refresh_readiness()
-
+            with (
+                ui.expansion("Advanced comparison and safety options").classes(
+                    "w-full mt-2"
+                ),
+                ui.row().classes("policyrow p-2"),
+            ):
                 ui.number(
                     label="Accept ± value",
                     value=0,

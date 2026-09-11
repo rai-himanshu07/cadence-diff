@@ -519,7 +519,7 @@ def _materialize(
             )
         ) or (sorted({m.event_key for m in formula_members if m.event_key}) or [str(component)])[0]
     elif kind is StoryKind.ERROR_POPULATION:
-        title = f"Error population: {len(members)} atomic findings"
+        title = f"Error population: {len(members)} finding records"
         description = (
             "A proven same-artifact, sheet, column, and literal population. "
             "Grouping identifies one incident; it does not imply reduced risk."

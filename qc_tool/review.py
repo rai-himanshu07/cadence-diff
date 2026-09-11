@@ -90,10 +90,23 @@ class ReviewGroup:
 
 @dataclass(frozen=True, slots=True)
 class ReviewCounts:
-    """Review decisions and their underlying atomic evidence by severity."""
+    """Review decisions, finding records, and represented changes by severity.
+
+    ``atomic_findings`` retains its historical field name for compatibility;
+    its values count stored ``Finding`` records. One population record can
+    represent many underlying changes.
+    """
 
     review_items: dict[Severity, int]
     atomic_findings: dict[Severity, int]
+    represented_changes: dict[Severity, int] | None = None
+
+
+def represented_change_count(finding: Finding) -> int:
+    """Number of underlying changes represented by one finding record."""
+    if finding.population is not None:
+        return finding.population.member_count
+    return 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,13 +553,21 @@ def build_review_groups(findings: Sequence[Finding]) -> list[ReviewGroup]:
 
 
 def review_counts(groups: list[ReviewGroup]) -> ReviewCounts:
-    """Count analyst decisions and their atomic members by severity."""
+    """Count decisions, finding records, and represented changes by severity."""
     review_items = dict.fromkeys(Severity, 0)
     atomic_findings = dict.fromkeys(Severity, 0)
+    represented_changes = dict.fromkeys(Severity, 0)
     for group in groups:
         review_items[group.severity] += 1
         atomic_findings[group.severity] += group.member_count
-    return ReviewCounts(review_items=review_items, atomic_findings=atomic_findings)
+        represented_changes[group.severity] += sum(
+            represented_change_count(finding) for finding in group.members
+        )
+    return ReviewCounts(
+        review_items=review_items,
+        atomic_findings=atomic_findings,
+        represented_changes=represented_changes,
+    )
 
 
 # --- semantic pattern groups -------------------------------------------------

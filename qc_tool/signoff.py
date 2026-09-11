@@ -50,7 +50,7 @@ def required_acknowledgements(record: RunRecord) -> tuple[str, ...]:
     required = {
         f"coverage:{item.check_id}"
         for item in record.coverage
-        if item.state is not CoverageState.CHECKED
+        if item.state in {CoverageState.DEGRADED, CoverageState.UNAVAILABLE}
     }
     mapping = record.mapping_coverage
     if mapping is not None:

@@ -99,6 +99,17 @@ def review_summary(
         "atomic_findings_by_severity": {
             severity.value: count for severity, count in counts.atomic_findings.items()
         },
+        "finding_records_by_severity": {
+            severity.value: count for severity, count in counts.atomic_findings.items()
+        },
+        "represented_changes_by_severity": (
+            {
+                severity.value: count
+                for severity, count in counts.represented_changes.items()
+            }
+            if counts.represented_changes is not None
+            else None
+        ),
         "stories": [
             {
                 "story_id": story.story_id,

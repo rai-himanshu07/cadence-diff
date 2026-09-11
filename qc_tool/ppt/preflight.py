@@ -33,7 +33,7 @@ def media_structural_coverage(
             check_id="ppt-media-structural",
             label="Embedded media byte structure",
             artifact="ppt",
-            state=CoverageState.UNAVAILABLE,
+            state=CoverageState.NOT_INCLUDED,
             detail="PowerPoint deck not supplied",
         )
     available = all(deck.media_available for deck in decks)

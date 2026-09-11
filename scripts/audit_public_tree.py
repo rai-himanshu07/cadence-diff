@@ -17,6 +17,7 @@ _ALLOWED_FILES = {
     "LICENSE",
     "README.md",
     "SECURITY.md",
+    "architecture.md",
     "environment.yml",
     "main.py",
     "pyproject.toml",

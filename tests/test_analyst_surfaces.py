@@ -148,6 +148,19 @@ def test_capability_limited_is_reported_whenever_a_check_is_unavailable() -> Non
     assert payload["review_summary"]["capability_limited"] is True
 
 
+def test_not_included_checks_do_not_make_a_run_capability_limited() -> None:
+    coverage = [
+        CoverageItem(
+            check_id="ppt-not-supplied",
+            label="PowerPoint comparison",
+            artifact="ppt",
+            state=CoverageState.NOT_INCLUDED,
+        )
+    ]
+
+    assert capability_limited(coverage) is False
+
+
 def test_machine_json_stays_atomic_and_the_review_summary_is_opt_in() -> None:
     result = _result()
 
@@ -164,6 +177,12 @@ def test_machine_json_stays_atomic_and_the_review_summary_is_opt_in() -> None:
     assert summary["alignment_trust"] is None
     assert sum(summary["pattern_review_counts"].values()) == len(summary["groups"])
     assert sum(summary["atomic_findings_by_severity"].values()) == len(result.findings)
+    assert summary["finding_records_by_severity"] == summary[
+        "atomic_findings_by_severity"
+    ]
+    assert sum(summary["represented_changes_by_severity"].values()) == len(
+        result.findings
+    )
     assert {
         finding_id for group in summary["groups"] for finding_id in group["finding_ids"]
     } == {finding.finding_id for finding in result.findings}

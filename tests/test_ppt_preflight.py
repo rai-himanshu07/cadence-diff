@@ -31,7 +31,7 @@ def test_current_ppt_preflight_runs_without_baseline(fixture_dir: Path) -> None:
     comparison = next(
         item for item in result.coverage if item.check_id == "ppt-cycle-comparison"
     )
-    assert comparison.state is CoverageState.UNAVAILABLE
+    assert comparison.state is CoverageState.NOT_INCLUDED
     structural_media = next(
         item
         for item in result.coverage
@@ -55,6 +55,12 @@ def test_media_structural_coverage_refuses_ambiguous_shape_pairing() -> None:
     assert coverage.state is CoverageState.DEGRADED
     assert "2 media shape(s)" in coverage.detail
     assert "were not compared" in coverage.detail
+
+
+def test_media_structural_coverage_marks_an_omitted_deck_not_included() -> None:
+    coverage = media_structural_coverage()
+
+    assert coverage.state is CoverageState.NOT_INCLUDED
 
 
 def test_ppt_preflight_detects_intrinsic_defects() -> None:

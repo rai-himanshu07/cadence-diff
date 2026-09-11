@@ -32,6 +32,7 @@ class FindingOutputMode(StrEnum):
 
 class CoverageState(StrEnum):
     CHECKED = "checked"
+    NOT_INCLUDED = "not_included"
     UNAVAILABLE = "unavailable"
     DEGRADED = "degraded"
 

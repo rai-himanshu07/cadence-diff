@@ -5,6 +5,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
+from qc_tool.coverage import MappingCoverage
 from qc_tool.engine import QCRunResult, run_qc
 from qc_tool.findings import Finding, FindingClass, SeriesAnchorV1, Severity
 from qc_tool.history.review_state import finding_evidence_digest
@@ -69,7 +70,8 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
     assert "ooxml-streaming:" in summary_text
     assert "current.xlsx" in summary_text
     assert "Critical pattern review items" in summary_text
-    assert "Critical atomic findings" in summary_text
+    assert "Critical finding records" in summary_text
+    assert "Critical represented changes" in summary_text
 
     coverage = workbook["Coverage"]
     assert coverage["A1"].value == "Artifact"
@@ -187,6 +189,12 @@ def test_excel_report_population_column(tmp_path: Path) -> None:
         "19 cells; B2:B20; shift (0, 0)"
     )
     assert findings.cell(row=3, column=len(header_row)).value in (None, "")
+    summary_values = {
+        row[0].value: row[1].value
+        for row in workbook["Summary"].iter_rows(min_col=1, max_col=2)
+    }
+    assert summary_values["Warning finding records"] == "1"
+    assert summary_values["Warning represented changes"] == "19"
 
 
 def test_html_report_population_column(tmp_path: Path) -> None:
@@ -223,6 +231,46 @@ def test_html_report_population_column(tmp_path: Path) -> None:
 
     assert "<th>Population</th>" in html
     assert "19 cells; B2:B20; shift (0, 0)" in html
+    assert "1 finding record" in html
+    assert "19 represented changes" in html
+
+
+def test_mapping_reports_include_unavailable_and_total_surfaces(
+    tmp_path: Path,
+) -> None:
+    result = QCRunResult(
+        profile_name="mapping",
+        mapping_coverage=MappingCoverage(
+            eligible=26,
+            unavailable=1,
+            mapped=1,
+            verified=1,
+            unmapped=25,
+        ),
+        disclosures=["Mapping disclosure remains visible"],
+    )
+
+    html = render_html_report(result)
+    assert "26 readable" in html
+    assert "1 unavailable" in html
+    assert "27 total surfaces" in html
+
+    path = tmp_path / "mapping.xlsx"
+    write_excel_report(result, path)
+    workbook = load_workbook(path)
+    summary = workbook["Summary"]
+    values = {
+        row[0].value: row[1].value
+        for row in summary.iter_rows(min_col=1, max_col=2)
+        if row[0].value
+    }
+    assert values["Readable PPT figures"] == 26
+    assert values["Unavailable PPT surfaces"] == 1
+    assert values["Total PPT surfaces"] == 27
+    summary_text = " ".join(
+        str(cell.value) for row in summary.iter_rows() for cell in row if cell.value
+    )
+    assert "Mapping disclosure remains visible" in summary_text
 
 
 def test_html_report_contents(qc_result: QCRunResult, tmp_path: Path) -> None:
@@ -239,8 +287,9 @@ def test_html_report_contents(qc_result: QCRunResult, tmp_path: Path) -> None:
     # Self-contained: no external asset references.
     assert "http://" not in html and "https://" not in html
     assert "pattern review items" in html
-    assert "atomic findings" in html
-    # Every atomic finding remains available in safely escaped inline JSON.
+    assert "finding records" in html
+    assert "represented changes" in html
+    # Every finding record remains available in safely escaped inline JSON.
     assert all(finding.finding_id in html for finding in qc_result.findings)
     assert "data-member-body" in html
     assert "const pageSize = 50" in html

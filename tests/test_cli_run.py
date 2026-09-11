@@ -32,7 +32,8 @@ def test_cycle_run_exit_codes_and_json(
     assert "mode: cycle_comparison" in out
     assert "pattern review items:" in out
     assert "spatial review items:" in out
-    assert "atomic findings:" in out
+    assert "finding records:" in out
+    assert "represented changes:" in out
     assert "critical=" in out and "reports:" in out
 
     payload = json.loads(json_path.read_text(encoding="utf-8"))
