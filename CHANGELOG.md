@@ -48,6 +48,14 @@ project uses [Semantic Versioning](https://semver.org/).
   compact) for new cycle comparisons; `profile` keeps today's exact
   behavior and `atomic` is the forensic/advanced lane, explicitly outside
   the interactive SLA.
+- The standalone `xlsbkernel` wheel now targets CPython's 3.11 stable ABI and
+  is installable through the `cadence-diff[native]` extra. Its formula-delta
+  classifier uses a 16 MiB batch cap and per-string pre-screen with exact
+  per-row Python fallback. A same-tree real Windows A/B reduced formula
+  comparison by 51.34% and total time by 32.13%, clearing its ship gates.
+- Parent-supervised Windows acceptance with a hard wall-clock deadline,
+  periodic process-tree RSS sampling, Office-process accounting, complete
+  aggregate phase/service/formula/population telemetry, and source rehashing.
 
 ### Changed
 
@@ -58,6 +66,9 @@ project uses [Semantic Versioning](https://semver.org/).
   every run and disclosed across Re-QC, carry-forward, and attestation, so
   automatic engine selection never causes an undisclosed evidence change
   between two machines with different optional kernels installed.
+- The resolved cached-values decoder is also recorded per workbook role and
+  preserved through history, stored-run reconstruction, carry-forward,
+  reports, JSON schemas, sign-off, and signed attestation validation.
 - Re-QC delta accounting uses multiset semantics, so two populations that
   happen to share an identity key can no longer collapse into one.
 - Blocked-run CLI and UI messages now name the package member whenever it
@@ -68,6 +79,12 @@ project uses [Semantic Versioning](https://semver.org/).
   storage now uses a delta-encoded, lazily-reconstructed codec instead of
   eagerly building a full finding per member. Both keep exact finding and
   review parity with the prior, uncached behavior.
+- Population candidate templates now stop at an explicit 4,096-key cap;
+  finalization streams capped group state to lazy result blocks, reconstructing
+  full atomic findings only for groups that must replay.
+- Multi-workbook ranked-table checks collect all currently blocked package
+  members into one bounded action, so one dialog save can resolve every known
+  row-identity rule before Re-QC.
 
 ### Fixed
 
@@ -81,6 +98,12 @@ project uses [Semantic Versioning](https://semver.org/).
   compared runs now discloses the representation change explicitly instead
   of showing a resolved/new count computed across two incompatible
   identity spaces (population vs. atomic).
+- Re-QC also suppresses a delta when the requested mode is unchanged but the
+  effective population policy or observed population/atomic representation is
+  incompatible.
+- Default population classes now have canonical ordering, and resolved output
+  policies are independent deeply-frozen snapshots, eliminating hash-seed
+  profile drift and mutation through aliased nested models.
 
 ## [1.2.0]
 

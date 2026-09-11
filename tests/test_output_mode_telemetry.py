@@ -18,6 +18,7 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from qc_tool.config.profile import PopulationPolicy, default_profile
+from qc_tool.coverage import FindingOutputMode
 from qc_tool.excel.align import align_workbooks
 from qc_tool.excel.formulas import (
     FormulaComparisonTelemetry,
@@ -163,6 +164,39 @@ def test_perform_run_telemetry_accounts_every_named_phase_and_residual(
     assert telemetry.residual_seconds >= 0.0
     # The residual is a small remainder, not the dominant share of the run.
     assert telemetry.residual_seconds < telemetry.total_seconds
+
+
+def test_perform_run_threads_all_compact_telemetry_without_changing_findings(
+    tmp_path: Path,
+) -> None:
+    base, curr = _write_formula_pair(tmp_path, rows=25)
+    plain = perform_run(
+        tmp_path / "plain",
+        {"baseline_excel": base, "current_excel": curr},
+        {},
+        default_profile(),
+        output_mode=FindingOutputMode.DECISION,
+    )
+    formula = FormulaComparisonTelemetry()
+    pairs = PairKeyTelemetry()
+    populations = PopulationTelemetry()
+    instrumented = perform_run(
+        tmp_path / "instrumented",
+        {"baseline_excel": base, "current_excel": curr},
+        {},
+        default_profile(),
+        output_mode=FindingOutputMode.DECISION,
+        _formula_telemetry=formula,
+        _pair_key_telemetry=pairs,
+        _population_telemetry=populations,
+    )
+
+    assert [finding.model_dump(mode="json") for finding in instrumented.result.findings] == [
+        finding.model_dump(mode="json") for finding in plain.result.findings
+    ]
+    assert pairs.changed_pairs == 25
+    assert populations.construction_seconds > 0.0
+    assert populations.finalize_seconds > 0.0
 
 
 def _build_large_formula_pair(tmp_path: Path, *, rows: int) -> tuple[Path, Path]:

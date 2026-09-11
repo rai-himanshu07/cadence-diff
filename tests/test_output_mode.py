@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from qc_tool.config.profile import (
     DeliverableProfile,
     PopulationPolicy,
@@ -38,7 +41,7 @@ def test_profile_mode_returns_the_profiles_own_policy_unchanged() -> None:
 
     assert resolved.output_mode is FindingOutputMode.PROFILE
     assert resolved.source == "profile"
-    assert resolved.populations == review_policy.populations
+    assert resolved.populations.model_dump() == review_policy.populations.model_dump()
     assert resolved.populations.enabled is False
 
 
@@ -47,7 +50,7 @@ def test_profile_mode_honors_an_explicit_profile_policy_exactly() -> None:
     review_policy = ReviewPolicy(populations=custom)
     resolved = resolve_output_policy(FindingOutputMode.PROFILE, review_policy)
 
-    assert resolved.populations == custom
+    assert resolved.populations.model_dump() == custom.model_dump()
     assert resolved.source == "profile"
 
 
@@ -70,7 +73,7 @@ def test_decision_mode_uses_the_profiles_own_policy_when_already_enabled() -> No
     resolved = resolve_output_policy(FindingOutputMode.DECISION, review_policy)
 
     assert resolved.source == "profile"
-    assert resolved.populations == custom
+    assert resolved.populations.model_dump() == custom.model_dump()
 
 
 def test_decision_mode_falls_back_to_a_conservative_built_in_default() -> None:
@@ -80,7 +83,7 @@ def test_decision_mode_falls_back_to_a_conservative_built_in_default() -> None:
     assert resolved.source == "decision_built_in"
     assert resolved.populations.enabled is True
     # Every other field keeps its documented conservative default.
-    assert resolved.populations == PopulationPolicy(enabled=True)
+    assert resolved.populations.model_dump() == PopulationPolicy(enabled=True).model_dump()
     # Never mutates the profile's own (disabled) policy.
     assert review_policy.populations.enabled is False
 
@@ -89,6 +92,25 @@ def test_resolved_output_policy_is_frozen_and_versioned() -> None:
     resolved = resolve_output_policy(FindingOutputMode.ATOMIC, ReviewPolicy())
     assert resolved.version == 1
     assert isinstance(resolved, ResolvedOutputPolicy)
+
+
+def test_population_default_class_order_is_canonical() -> None:
+    assert PopulationPolicy().classes == (
+        FindingClass.FORMULA_LOGIC_CHANGED,
+        FindingClass.NUMBER_FORMAT_CHANGED,
+    )
+
+
+def test_resolved_policy_is_a_deep_immutable_snapshot() -> None:
+    custom = PopulationPolicy(enabled=True, threshold=25)
+    review_policy = ReviewPolicy(populations=custom)
+    resolved = resolve_output_policy(FindingOutputMode.PROFILE, review_policy)
+
+    review_policy.populations.threshold = 99
+
+    assert resolved.populations.threshold == 25
+    with pytest.raises(ValidationError):
+        resolved.populations.threshold = 77
 
 
 def test_output_mode_never_perturbs_profile_sha256() -> None:

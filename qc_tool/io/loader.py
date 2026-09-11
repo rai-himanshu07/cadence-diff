@@ -13,6 +13,7 @@ remain those read from the original xlsb.
 """
 
 import functools
+import importlib.metadata
 import io
 import logging
 import posixpath
@@ -158,6 +159,14 @@ _XLSB_ERRORS = {
     "0x24": "#NUM!",
     "0x2a": "#N/A",
 }
+
+
+def _distribution_fingerprint(distribution: str, label: str) -> str:
+    try:
+        version = importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        version = "unknown"
+    return f"{label}:{version}"
 
 
 class UnsupportedFormatError(Exception):
@@ -377,6 +386,7 @@ def _load_ooxml_oracle(
         interaction_rules_supported=True,
         conditional_format_styles_supported=True,
         formula_source="openpyxl",
+        values_source=_distribution_fingerprint("openpyxl", "openpyxl-oracle"),
         formula_detail="Formula text read directly from OOXML",
         calculation_mode=wb_formulas.calculation.calcMode,
         full_calc_on_load=wb_formulas.calculation.fullCalcOnLoad,
@@ -791,6 +801,7 @@ def _load_ooxml_streaming(
             interaction_rules_supported=True,
             conditional_format_styles_supported=True,
             formula_source="openpyxl",
+            values_source=_distribution_fingerprint("openpyxl", "ooxml-streaming"),
             formula_detail="Formula text read directly from OOXML",
             calculation_mode=wb_formulas.calculation.calcMode,
             full_calc_on_load=wb_formulas.calculation.fullCalcOnLoad,
@@ -1359,6 +1370,12 @@ def _load_xlsb(
             logger.warning(
                 "%s: %s", source_name, snapshot.values_engine_fallback_detail
             )
+    if resolved_values_engine == "native":
+        from qc_tool.io.native_kernel import native_values_fingerprint
+
+        snapshot.values_source = native_values_fingerprint() or "native-biff12:unknown"
+    else:
+        snapshot.values_source = _distribution_fingerprint("pyxlsb", "pyxlsb")
     with (
         open_xlsb(io.BytesIO(data)) as wb,
         zipfile.ZipFile(io.BytesIO(data)) as style_archive,

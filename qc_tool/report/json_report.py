@@ -155,6 +155,8 @@ def _payload_scaffold(
             if result.resolved_output_policy is not None
             else None
         ),
+        "formula_engines": dict(result.formula_engines),
+        "values_engines": dict(result.values_engines),
         "comparison_scope": result.comparison_scope.model_dump(
             mode="json",
             exclude_none=True,

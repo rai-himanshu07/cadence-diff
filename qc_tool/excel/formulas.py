@@ -417,6 +417,20 @@ class FormulaComparisonTelemetry:
     pair_analysis_memo_hits: int = 0
     pair_analysis_memo_misses: int = 0
 
+    #: One bounded GIL-detached native call per changed-pair chunk. Unsupported
+    #: rows fall back individually to the Python oracle.
+    native_delta_seconds: float = 0.0
+    native_delta_batches: int = 0
+    native_delta_batch_failures: int = 0
+    native_delta_api_failures: int = 0
+    native_delta_protocol_failures: int = 0
+    native_delta_runtime_failures: int = 0
+    native_delta_supported_pairs: int = 0
+    native_delta_fallback_pairs: int = 0
+    native_delta_declared_unsupported_pairs: int = 0
+    native_delta_invalid_output_pairs: int = 0
+    native_delta_oversized_pairs: int = 0
+
 
 @dataclass(slots=True)
 class PairKeyTelemetry:
@@ -939,6 +953,340 @@ def _error_findings(
 # --- paired-cell checks ------------------------------------------------------
 
 
+_NATIVE_FORMULA_DELTA_BATCH = 50_000
+_NATIVE_FORMULA_DELTA_BATCH_BYTES = 16 * 1024 * 1024
+_NATIVE_FORMULA_DELTA_MAX_STRING_BYTES = 32_768
+
+
+@dataclass(frozen=True, slots=True)
+class _FormulaDeltaOccurrence:
+    base_row: int
+    base_col: int
+    curr_row: int
+    curr_col: int
+    location: str
+    base_formula: str
+    curr_formula: str
+    base_norm: str
+    curr_norm: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FormulaDeltaAnalysis:
+    expected: bool
+    wrapper_kind: str | None
+    wrapper_exact: bool | None
+    event_key: str
+    added_reference: bool
+
+
+def _native_formula_delta_analysis(row: object) -> _FormulaDeltaAnalysis | None:
+    if not isinstance(row, tuple | list) or len(row) != 6:
+        return None
+    supported, expected, wrapper_kind, wrapper_exact, event_key, added_reference = row
+    if (
+        type(supported) is not bool
+        or type(expected) is not bool
+        or not isinstance(event_key, str)
+        or type(added_reference) is not bool
+        or not supported
+    ):
+        return None
+    if wrapper_kind is None:
+        if wrapper_exact is not None or event_key:
+            return None
+    elif (
+        wrapper_kind not in {"wrapped", "unwrapped"}
+        or type(wrapper_exact) is not bool
+        or re.fullmatch(
+            rf"formula-wrapper:{wrapper_kind}:[0-9a-f]{{12}}", event_key
+        )
+        is None
+    ):
+        return None
+    return _FormulaDeltaAnalysis(
+        expected=expected,
+        wrapper_kind=wrapper_kind,
+        wrapper_exact=wrapper_exact,
+        event_key=event_key,
+        added_reference=added_reference,
+    )
+
+
+def _native_formula_delta_declares_fallback(row: object) -> bool:
+    return bool(
+        isinstance(row, tuple | list)
+        and len(row) == 6
+        and row[0] is False
+        and row[1] is False
+        and row[2] is None
+        and row[3] is None
+        and row[4] == ""
+        and row[5] is False
+    )
+
+
+def _formula_delta_occurrence_byte_lengths(
+    occurrence: _FormulaDeltaOccurrence,
+) -> tuple[int, int, int, int]:
+    return (
+        len(occurrence.base_formula.encode("utf-8")),
+        len(occurrence.curr_formula.encode("utf-8")),
+        len(occurrence.base_norm.encode("utf-8")),
+        len(occurrence.curr_norm.encode("utf-8")),
+    )
+
+
+def _python_formula_delta_analysis(
+    occurrence: _FormulaDeltaOccurrence,
+    *,
+    pair_analysis_memo: FormulaPairAnalysisMemo | None,
+    telemetry: FormulaComparisonTelemetry | None,
+) -> _FormulaDeltaAnalysis:
+    ext_start = time.perf_counter()
+    expected = _differs_only_by_extension(
+        occurrence.base_formula, occurrence.curr_formula
+    )
+    if telemetry is not None:
+        telemetry.extension_seconds += time.perf_counter() - ext_start
+    wrapper_start = time.perf_counter()
+    if expected:
+        wrapper_kind = None
+        wrapper_exact = None
+        event_key = ""
+    else:
+        cached_analysis = (
+            pair_analysis_memo.get(occurrence.base_norm, occurrence.curr_norm)
+            if pair_analysis_memo is not None
+            else None
+        )
+        if cached_analysis is not None:
+            if telemetry is not None:
+                telemetry.pair_analysis_memo_hits += 1
+            wrapper_kind = cached_analysis.wrapper_kind
+            wrapper_exact = cached_analysis.wrapper_exact
+            event_key = cached_analysis.event_key
+        else:
+            if pair_analysis_memo is not None and telemetry is not None:
+                telemetry.pair_analysis_memo_misses += 1
+            wrapper = detect_formula_wrapper(
+                occurrence.base_norm, occurrence.curr_norm
+            )
+            wrapper_kind = wrapper.kind if wrapper is not None else None
+            wrapper_exact = wrapper.exact if wrapper is not None else None
+            event_key = (
+                f"formula-wrapper:{wrapper.kind}:{wrapper.skeleton_key}"
+                if wrapper is not None
+                else ""
+            )
+            if pair_analysis_memo is not None:
+                pair_analysis_memo.put(
+                    occurrence.base_norm,
+                    occurrence.curr_norm,
+                    FormulaPairAnalysis(
+                        wrapper_kind=wrapper_kind,
+                        wrapper_exact=wrapper_exact,
+                        event_key=event_key,
+                    ),
+                )
+    try:
+        baseline_references = {
+            operand.value.casefold()
+            for operand in formula_reference_operands(occurrence.base_formula)
+        }
+        current_references = {
+            operand.value.casefold()
+            for operand in formula_reference_operands(occurrence.curr_formula)
+        }
+    except (TokenizerError, TypeError, ValueError) as exc:
+        logger.warning(
+            "formula-reference-tag-unavailable %s: %s",
+            occurrence.location,
+            type(exc).__name__,
+        )
+        added_reference = False
+    else:
+        added_reference = bool(current_references - baseline_references)
+    if telemetry is not None:
+        telemetry.wrapper_reference_seconds += time.perf_counter() - wrapper_start
+    return _FormulaDeltaAnalysis(
+        expected=expected,
+        wrapper_kind=wrapper_kind,
+        wrapper_exact=wrapper_exact,
+        event_key=event_key,
+        added_reference=added_reference,
+    )
+
+
+def _classify_formula_delta_batch(
+    occurrences: list[_FormulaDeltaOccurrence],
+    *,
+    pair_analysis_memo: FormulaPairAnalysisMemo | None,
+    telemetry: FormulaComparisonTelemetry | None,
+    use_native: bool,
+) -> list[_FormulaDeltaAnalysis]:
+    native_rows = None
+    native_attempted = False
+    if use_native:
+        try:
+            from qc_tool.io.native_kernel import (
+                formula_delta_batch,
+                native_kernel_available,
+            )
+
+            if native_kernel_available():
+                native_attempted = True
+                native_start = time.perf_counter()
+                if telemetry is not None:
+                    telemetry.native_delta_batches += 1
+                try:
+                    native_rows = formula_delta_batch(
+                        [
+                            (
+                                occurrence.base_formula,
+                                occurrence.curr_formula,
+                                occurrence.base_norm,
+                                occurrence.curr_norm,
+                            )
+                            for occurrence in occurrences
+                        ]
+                    )
+                finally:
+                    if telemetry is not None:
+                        telemetry.native_delta_seconds += (
+                            time.perf_counter() - native_start
+                        )
+                if not isinstance(native_rows, list) or len(native_rows) != len(
+                    occurrences
+                ):
+                    if telemetry is not None:
+                        telemetry.native_delta_batch_failures += 1
+                        telemetry.native_delta_protocol_failures += 1
+                    native_rows = None
+        except (SystemExit, KeyboardInterrupt, GeneratorExit, MemoryError):
+            raise
+        except RuntimeError:
+            if telemetry is not None and native_attempted:
+                telemetry.native_delta_batch_failures += 1
+                telemetry.native_delta_api_failures += 1
+            native_rows = None
+        except BaseException:
+            if telemetry is not None and native_attempted:
+                telemetry.native_delta_batch_failures += 1
+                telemetry.native_delta_runtime_failures += 1
+            native_rows = None
+
+    analyses: list[_FormulaDeltaAnalysis] = []
+    for index, occurrence in enumerate(occurrences):
+        native_row = native_rows[index] if native_rows is not None else None
+        native = _native_formula_delta_analysis(
+            native_row
+        )
+        if native is not None:
+            analyses.append(native)
+            if telemetry is not None:
+                telemetry.native_delta_supported_pairs += 1
+            continue
+        analyses.append(
+            _python_formula_delta_analysis(
+                occurrence,
+                pair_analysis_memo=pair_analysis_memo,
+                telemetry=telemetry,
+            )
+        )
+        if telemetry is not None and native_attempted:
+            telemetry.native_delta_fallback_pairs += 1
+            if native_row is not None:
+                if _native_formula_delta_declares_fallback(native_row):
+                    telemetry.native_delta_declared_unsupported_pairs += 1
+                else:
+                    telemetry.native_delta_invalid_output_pairs += 1
+    return analyses
+
+
+def _append_formula_delta_finding(
+    occurrence: _FormulaDeltaOccurrence,
+    analysis: _FormulaDeltaAnalysis,
+    *,
+    sheet_name: str,
+    findings: list[Finding],
+    candidate_sink: CandidateSpill | None,
+    pair_key_telemetry: PairKeyTelemetry | None,
+    telemetry: FormulaComparisonTelemetry | None,
+) -> None:
+    evidence_tags: set[FindingEvidenceTag] = set()
+    if analysis.wrapper_kind is not None:
+        if analysis.wrapper_exact is None:
+            raise ValueError("native wrapper classification omitted exactness")
+        evidence_tags.add(
+            FindingEvidenceTag.EXACT_WRAPPER
+            if analysis.wrapper_exact
+            else FindingEvidenceTag.SHAPE_WRAPPER
+        )
+    if analysis.added_reference:
+        evidence_tags.add(FindingEvidenceTag.ADDED_REFERENCE)
+    if analysis.expected:
+        wording = "formula range extended with new-cycle data"
+    elif analysis.wrapper_kind is not None:
+        if analysis.wrapper_exact is None:
+            raise ValueError("wrapper classification omitted exactness")
+        wording = "formula logic changed" + _WRAPPER_NOTES[
+            (analysis.wrapper_kind, analysis.wrapper_exact)
+        ]
+    else:
+        wording = "formula logic changed"
+    expected_reason = (
+        FindingExpectedReason.CADENCE_EXTENSION if analysis.expected else None
+    )
+    subtype = (
+        _WRAPPER_SUBTYPES[analysis.wrapper_kind]
+        if analysis.wrapper_kind is not None
+        else None
+    )
+    if pair_key_telemetry is not None:
+        pair_key_telemetry.observe(
+            occurrence.base_norm,
+            occurrence.curr_norm,
+            (
+                analysis.wrapper_kind,
+                analysis.wrapper_exact,
+                analysis.event_key,
+            ),
+        )
+    message = f"{sheet_name}!{occurrence.location}: {wording}"
+    construct_start = time.perf_counter()
+    candidate = Finding(
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        expected_reason=expected_reason,
+        subtype=subtype,
+        event_key=analysis.event_key,
+        evidence_tags=evidence_tags,
+        sheet=sheet_name,
+        location=occurrence.location,
+        baseline_location=_ref(occurrence.base_row, occurrence.base_col),
+        baseline_value=occurrence.base_formula,
+        current_value=occurrence.curr_formula,
+        message=message,
+    )
+    if candidate_sink is not None:
+        candidate_sink.add(
+            candidate,
+            shape_before=hashlib.sha256(
+                occurrence.base_norm.encode("utf-8")
+            ).hexdigest(),
+            shape_after=hashlib.sha256(
+                occurrence.curr_norm.encode("utf-8")
+            ).hexdigest(),
+        )
+    else:
+        findings.append(candidate)
+    if telemetry is not None:
+        telemetry.finding_construction_seconds += (
+            time.perf_counter() - construct_start
+        )
+
+
 def _paired_cell_findings(
     base_sheet: SheetSnapshot,
     curr_sheet: SheetSnapshot,
@@ -952,10 +1300,37 @@ def _paired_cell_findings(
     candidate_sink: CandidateSpill | None = None,
     pair_key_telemetry: PairKeyTelemetry | None = None,
     pair_analysis_memo: FormulaPairAnalysisMemo | None = None,
+    use_native_delta: bool = True,
 ) -> list[Finding]:
     findings = []
     sheet_name = curr_sheet.name
     traversal_start = time.perf_counter()
+    pending: list[_FormulaDeltaOccurrence] = []
+    pending_bytes = 0
+
+    def flush_pending() -> None:
+        nonlocal pending_bytes
+        if not pending:
+            return
+        analyses = _classify_formula_delta_batch(
+            pending,
+            pair_analysis_memo=pair_analysis_memo,
+            telemetry=telemetry,
+            use_native=use_native_delta,
+        )
+        for occurrence, analysis in zip(pending, analyses, strict=True):
+            _append_formula_delta_finding(
+                occurrence,
+                analysis,
+                sheet_name=sheet_name,
+                findings=findings,
+                candidate_sink=candidate_sink,
+                pair_key_telemetry=pair_key_telemetry,
+                telemetry=telemetry,
+            )
+        pending.clear()
+        pending_bytes = 0
+
     for (base_row, base_col), (curr_row, curr_col) in region.cell_pairs():
         base_cell = base_sheet.cells.get((base_row, base_col))
         curr_cell = curr_sheet.cells.get((curr_row, curr_col))
@@ -968,6 +1343,7 @@ def _paired_cell_findings(
         location = _ref(curr_row, curr_col)
 
         if base_has_formula and not curr_has_formula:
+            flush_pending()
             baseline_value = (
                 base_cell.formula
                 if base_cell is not None and base_cell.formula is not None
@@ -1075,166 +1451,79 @@ def _paired_cell_findings(
                 telemetry.normalization_calls += calls
             if base_norm == curr_norm:
                 continue
-            # `expected` and the ADDED_REFERENCE evidence tag are both
-            # computed from RAW (pre-normalization) formula text, so they
-            # are NOT a pure function of the (base_norm, curr_norm) cache
-            # key -- two different occurrences of the identical R1C1 shape
-            # can legitimately disagree on either (confirmed empirically on
-            # real data: plan-20260910 Step 8 guest validation found exactly
-            # one such key with a genuine ADDED_REFERENCE conflict across
-            # its occurrences). Only wrapper_kind/wrapper_exact/event_key
-            # are a pure function of the key (detect_formula_wrapper takes
-            # only base_norm/curr_norm as input) and are safe to memoize;
-            # `expected` and the reference-added check are always
-            # recomputed fresh below, on every occurrence, regardless of
-            # cache hit/miss.
-            ext_start = time.perf_counter()
-            expected = _differs_only_by_extension(base_formula, curr_formula)
-            if telemetry is not None:
-                telemetry.extension_seconds += time.perf_counter() - ext_start
-            evidence_tags: set[FindingEvidenceTag] = set()
-            wrapper_start = time.perf_counter()
-            if expected:
-                wrapper_kind = None
-                wrapper_exact = None
-                event_key = ""
-            else:
-                cached_analysis = (
-                    pair_analysis_memo.get(base_norm, curr_norm)
-                    if pair_analysis_memo is not None
-                    else None
+            occurrence = _FormulaDeltaOccurrence(
+                base_row=base_row,
+                base_col=base_col,
+                curr_row=curr_row,
+                curr_col=curr_col,
+                location=location,
+                base_formula=base_formula,
+                curr_formula=curr_formula,
+                base_norm=base_norm,
+                curr_norm=curr_norm,
+            )
+            if not use_native_delta:
+                analysis = _python_formula_delta_analysis(
+                    occurrence,
+                    pair_analysis_memo=pair_analysis_memo,
+                    telemetry=telemetry,
                 )
-                if cached_analysis is not None:
+                _append_formula_delta_finding(
+                    occurrence,
+                    analysis,
+                    sheet_name=sheet_name,
+                    findings=findings,
+                    candidate_sink=candidate_sink,
+                    pair_key_telemetry=pair_key_telemetry,
+                    telemetry=telemetry,
+                )
+                continue
+            if use_native_delta:
+                byte_lengths = _formula_delta_occurrence_byte_lengths(occurrence)
+                if any(
+                    length > _NATIVE_FORMULA_DELTA_MAX_STRING_BYTES
+                    for length in byte_lengths
+                ):
+                    flush_pending()
+                    analysis = _python_formula_delta_analysis(
+                        occurrence,
+                        pair_analysis_memo=pair_analysis_memo,
+                        telemetry=telemetry,
+                    )
+                    _append_formula_delta_finding(
+                        occurrence,
+                        analysis,
+                        sheet_name=sheet_name,
+                        findings=findings,
+                        candidate_sink=candidate_sink,
+                        pair_key_telemetry=pair_key_telemetry,
+                        telemetry=telemetry,
+                    )
                     if telemetry is not None:
-                        telemetry.pair_analysis_memo_hits += 1
-                    wrapper_kind = cached_analysis.wrapper_kind
-                    wrapper_exact = cached_analysis.wrapper_exact
-                    event_key = cached_analysis.event_key
-                else:
-                    if pair_analysis_memo is not None and telemetry is not None:
-                        telemetry.pair_analysis_memo_misses += 1
-                    wrapper = detect_formula_wrapper(base_norm, curr_norm)
-                    wrapper_kind = wrapper.kind if wrapper is not None else None
-                    wrapper_exact = wrapper.exact if wrapper is not None else None
-                    event_key = (
-                        f"formula-wrapper:{wrapper.kind}:{wrapper.skeleton_key}"
-                        if wrapper is not None
-                        else ""
-                    )
-                    if pair_analysis_memo is not None:
-                        pair_analysis_memo.put(
-                            base_norm,
-                            curr_norm,
-                            FormulaPairAnalysis(
-                                wrapper_kind=wrapper_kind,
-                                wrapper_exact=wrapper_exact,
-                                event_key=event_key,
-                            ),
-                        )
-                if wrapper_kind is not None:
-                    assert wrapper_exact is not None
-                    evidence_tags.add(
-                        FindingEvidenceTag.EXACT_WRAPPER
-                        if wrapper_exact
-                        else FindingEvidenceTag.SHAPE_WRAPPER
-                    )
-            try:
-                baseline_references = {
-                    operand.value.casefold()
-                    for operand in formula_reference_operands(base_formula)
-                }
-                current_references = {
-                    operand.value.casefold()
-                    for operand in formula_reference_operands(curr_formula)
-                }
-            except (TokenizerError, TypeError, ValueError) as exc:
-                logger.warning(
-                    "formula-reference-tag-unavailable %s!%s: %s",
-                    sheet_name,
-                    location,
-                    type(exc).__name__,
-                )
+                        telemetry.native_delta_fallback_pairs += 1
+                        telemetry.native_delta_oversized_pairs += 1
+                    continue
+                occurrence_bytes = sum(byte_lengths)
             else:
-                if current_references - baseline_references:
-                    evidence_tags.add(FindingEvidenceTag.ADDED_REFERENCE)
-            if telemetry is not None:
-                telemetry.wrapper_reference_seconds += (
-                    time.perf_counter() - wrapper_start
+                occurrence_bytes = 0
+            if (
+                use_native_delta
+                and pending
+                and pending_bytes + occurrence_bytes
+                > _NATIVE_FORMULA_DELTA_BATCH_BYTES
+            ):
+                flush_pending()
+            pending.append(occurrence)
+            pending_bytes += occurrence_bytes
+            if (
+                len(pending) >= _NATIVE_FORMULA_DELTA_BATCH
+                or (
+                    use_native_delta
+                    and pending_bytes >= _NATIVE_FORMULA_DELTA_BATCH_BYTES
                 )
-            if expected:
-                wording = "formula range extended with new-cycle data"
-            elif wrapper_kind is not None:
-                assert wrapper_exact is not None
-                wording = "formula logic changed" + _WRAPPER_NOTES[
-                    (wrapper_kind, wrapper_exact)
-                ]
-            else:
-                wording = "formula logic changed"
-            expected_reason = (
-                FindingExpectedReason.CADENCE_EXTENSION if expected else None
-            )
-            subtype = (
-                _WRAPPER_SUBTYPES[wrapper_kind] if wrapper_kind is not None else None
-            )
-            if pair_key_telemetry is not None:
-                # Observe only the portion FormulaPairAnalysisMemo actually
-                # caches (wrapper_kind/wrapper_exact/event_key) -- `expected`
-                # and the ADDED_REFERENCE tag are always freshly computed
-                # now (see the comment above), so including them here would
-                # make every real workload show spurious "conflicts" for
-                # values that were never claimed to be cacheable.
-                pair_key_telemetry.observe(
-                    base_norm,
-                    curr_norm,
-                    (wrapper_kind, wrapper_exact, event_key),
-                )
-            message = f"{sheet_name}!{location}: {wording}"
-            construct_start = time.perf_counter()
-            if candidate_sink is not None:
-                candidate = Finding(
-                    artifact="excel",
-                    finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
-                    expected_reason=expected_reason,
-                    subtype=subtype,
-                    event_key=event_key,
-                    evidence_tags=evidence_tags,
-                    sheet=sheet_name,
-                    location=location,
-                    baseline_location=_ref(base_row, base_col),
-                    baseline_value=base_formula,
-                    current_value=curr_formula,
-                    message=message,
-                )
-                candidate_sink.add(
-                    candidate,
-                    shape_before=hashlib.sha256(
-                        base_norm.encode("utf-8")
-                    ).hexdigest(),
-                    shape_after=hashlib.sha256(
-                        curr_norm.encode("utf-8")
-                    ).hexdigest(),
-                )
-            else:
-                findings.append(
-                    Finding(
-                        artifact="excel",
-                        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
-                        expected_reason=expected_reason,
-                        subtype=subtype,
-                        event_key=event_key,
-                        evidence_tags=evidence_tags,
-                        sheet=sheet_name,
-                        location=location,
-                        baseline_location=_ref(base_row, base_col),
-                        baseline_value=base_formula,
-                        current_value=curr_formula,
-                        message=message,
-                    )
-                )
-            if telemetry is not None:
-                telemetry.finding_construction_seconds += (
-                    time.perf_counter() - construct_start
-                )
+            ):
+                flush_pending()
+    flush_pending()
     if telemetry is not None:
         telemetry.paired_traversal_seconds += time.perf_counter() - traversal_start
     return findings
@@ -1495,6 +1784,7 @@ def diff_workbook_formulas(
     candidate_sink: CandidateSpill | None = None,
     pair_key_telemetry: PairKeyTelemetry | None = None,
     pair_analysis_memo: FormulaPairAnalysisMemo | None = None,
+    _use_native_delta: bool = True,
 ) -> list[Finding]:
     findings = _error_findings(
         baseline, current, alignment, profile, cycle=cycle, telemetry=telemetry
@@ -1542,6 +1832,7 @@ def diff_workbook_formulas(
                     candidate_sink=candidate_sink,
                     pair_key_telemetry=pair_key_telemetry,
                     pair_analysis_memo=pair_analysis_memo,
+                    use_native_delta=_use_native_delta,
                 )
             )
             if compare_text:

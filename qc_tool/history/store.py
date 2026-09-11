@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS runs (
     ,profile_snapshot TEXT NOT NULL DEFAULT 'null'
     ,profile_sha256 TEXT NOT NULL DEFAULT ''
     ,formula_engines TEXT NOT NULL DEFAULT '{}'
+    ,values_engines TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS annotations (
     run_id INTEGER NOT NULL,
@@ -298,6 +299,9 @@ _MIGRATIONS = {
     "formula_engines": (
         "ALTER TABLE runs ADD COLUMN formula_engines TEXT NOT NULL DEFAULT '{}'"
     ),
+    "values_engines": (
+        "ALTER TABLE runs ADD COLUMN values_engines TEXT NOT NULL DEFAULT '{}'"
+    ),
     #: Run-level finding-output contract (plan-20260910); "profile" and
     #: "null" (no resolved policy recorded) for any run committed before
     #: this pair of columns existed -- exactly today's behavior.
@@ -417,6 +421,8 @@ class RunRecord:
     #: (e.g. "native-biff12:1.2.3"); "{}" for legacy runs or roles where
     #: formula enrichment never ran.
     formula_engines: dict[str, str] = field(default_factory=dict)
+    #: Resolved cached-values decoder per excel role; ``{}`` for legacy rows.
+    values_engines: dict[str, str] = field(default_factory=dict)
     #: Run-level finding-output contract request (plan-20260910); "profile"
     #: for any run recorded before this contract existed -- exactly today's
     #: legacy behavior.
@@ -860,11 +866,11 @@ class RunHistory:
                     mapping_suggestions, review_counts, pattern_review_counts,
                     story_counts, comparison_scope, package_manifest, focus_targets,
                     profile_snapshot, profile_sha256, counterfactual_digest,
-                    series_anchor_digest, formula_engines,
+                    series_anchor_digest, formula_engines, values_engines,
                     requested_output_mode, resolved_output_policy
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -915,6 +921,7 @@ class RunHistory:
                     aggregate_digest,
                     series_digest,
                     json.dumps(result.formula_engines),
+                    json.dumps(result.values_engines),
                     result.requested_output_mode.value,
                     json.dumps(
                         result.resolved_output_policy.model_dump(mode="json")
@@ -1176,6 +1183,7 @@ class RunHistory:
             storage_bytes=row["storage_bytes"],
             alignment_trust=decode_alignment_trust_payload(alignment_trust_payload),
             formula_engines=json.loads(row["formula_engines"]),
+            values_engines=json.loads(row["values_engines"]),
             requested_output_mode=FindingOutputMode(row["requested_output_mode"]),
             resolved_output_policy=(
                 ResolvedOutputPolicy.model_validate(resolved_output_policy_payload)

@@ -43,10 +43,14 @@ import cProfile
 import hashlib
 import json
 import logging
+import multiprocessing as mp
+import queue
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Protocol
 
 import psutil
 
@@ -81,18 +85,118 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _tree_rss(process: psutil.Process) -> int:
-    """Combined RSS of this process plus every live child (e.g. Excel)."""
+_OFFICE_PROCESS_NAMES = frozenset(
+    {"excel.exe", "soffice", "soffice.bin", "soffice.exe", "libreoffice"}
+)
+
+
+class _MonitoredProcess(Protocol):
+    @property
+    def pid(self) -> int | None: ...
+
+    @property
+    def exitcode(self) -> int | None: ...
+
+    def is_alive(self) -> bool: ...
+
+    def join(self, timeout: float | None = None) -> None: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessSupervision:
+    sampled_peak_rss_bytes: int
+    owned_office_process_peak: int
+    timed_out: bool
+    exit_code: int | None
+
+
+def _process_tree_metrics(process_id: int) -> tuple[int, int]:
+    """Current RSS and owned Office-process count for one live process tree."""
+    try:
+        root = psutil.Process(process_id)
+        processes = [root, *root.children(recursive=True)]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return 0, 0
     total = 0
-    procs = [process]
-    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-        procs.extend(process.children(recursive=True))
-    for proc in procs:
+    office = 0
+    for proc in processes:
         with contextlib.suppress(
             psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess
         ):
             total += proc.memory_info().rss
-    return total
+            if proc.name().casefold() in _OFFICE_PROCESS_NAMES:
+                office += 1
+    return total, office
+
+
+def _system_office_process_count() -> int:
+    count = 0
+    for process in psutil.process_iter(("name",)):
+        with contextlib.suppress(
+            psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess
+        ):
+            if str(process.info.get("name") or "").casefold() in _OFFICE_PROCESS_NAMES:
+                count += 1
+    return count
+
+
+def _terminate_process_tree(process: _MonitoredProcess) -> None:
+    descendants: list[psutil.Process] = []
+    if process.pid is not None:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            descendants = psutil.Process(process.pid).children(recursive=True)
+    for descendant in descendants:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            descendant.terminate()
+    if process.is_alive():
+        process.terminate()
+    process.join(timeout=2.0)
+    alive = []
+    if descendants:
+        _gone, alive = psutil.wait_procs(descendants, timeout=2.0)
+    for descendant in alive:
+        with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            descendant.kill()
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=2.0)
+
+
+def _monitor_process(
+    process: _MonitoredProcess,
+    *,
+    deadline_seconds: float,
+    sample_interval_seconds: float = 0.05,
+) -> ProcessSupervision:
+    """Monitor an already-started child and enforce its wall-clock deadline."""
+    if process.pid is None:
+        raise ValueError("cannot monitor a process that has not started")
+    deadline = time.monotonic() + deadline_seconds
+    peak_rss = 0
+    office_peak = 0
+    timed_out = False
+    while process.is_alive():
+        rss, office = _process_tree_metrics(process.pid)
+        peak_rss = max(peak_rss, rss)
+        office_peak = max(office_peak, office)
+        if time.monotonic() >= deadline:
+            timed_out = True
+            _terminate_process_tree(process)
+            break
+        process.join(timeout=sample_interval_seconds)
+    rss, office = _process_tree_metrics(process.pid)
+    peak_rss = max(peak_rss, rss)
+    office_peak = max(office_peak, office)
+    return ProcessSupervision(
+        sampled_peak_rss_bytes=peak_rss,
+        owned_office_process_peak=office_peak,
+        timed_out=timed_out,
+        exit_code=process.exitcode,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -147,49 +251,37 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    # A degraded-path warning inside qc_tool (e.g. a failed formula-worker
-    # fallback) can embed the real source filename via %s formatting; Python's
-    # default root-logger handler would otherwise print it straight to stderr.
-    # Disabled before this script ever touches a real path, matching every
-    # other private-data probe in this project. Deliberately NOT at module
-    # level: importing this module for a future test (with only synthetic
-    # fixtures) must not globally silence logging for the rest of the
-    # pytest session.
-    logging.disable(logging.CRITICAL)
-    args = _parser().parse_args()
-
+def _execute_acceptance(args: argparse.Namespace) -> dict[str, object]:
+    """Run one acceptance workload inside the supervised child process."""
     from qc_tool.config.profile import default_profile, load_profile
     from qc_tool.coverage import FindingOutputMode, QCRunMode
-    from qc_tool.excel.formulas import FormulaComparisonTelemetry
+    from qc_tool.excel.formulas import FormulaComparisonTelemetry, PairKeyTelemetry
+    from qc_tool.excel.population import PopulationTelemetry
     from qc_tool.history.review_state import finding_evidence_digest
+    from qc_tool.history.store import RunHistory
     from qc_tool.progress import (
         CancellationToken,
         PhaseTelemetry,
         ProgressEvent,
-        RunCancelled,
         RunPhase,
     )
-    from qc_tool.run_service import perform_run
+    from qc_tool.run_service import PerformRunTelemetry, perform_run
 
     files = {
         "baseline_excel": args.baseline_excel,
         "current_excel": args.current_excel,
     }
-    before_hashes = {role: _sha256(path) for role, path in files.items()}
     profile = load_profile(args.profile) if args.profile is not None else default_profile()
 
     process = psutil.Process()
-    peak_tree_rss = _tree_rss(process)
-    telemetry = PhaseTelemetry()
+    phase_telemetry = PhaseTelemetry()
     formula_telemetry = FormulaComparisonTelemetry()
+    pair_key_telemetry = PairKeyTelemetry()
+    population_telemetry = PopulationTelemetry()
+    perform_telemetry = PerformRunTelemetry()
     recording_history_subphases: dict[str, float] = {}
     cancel_flag = CancellationToken()
-    deadline_started = time.perf_counter()
 
-    # Scoped to just RECORDING_HISTORY: profiling the whole perform_run() call
-    # re-pays cProfile's per-call overhead on already-understood phases
-    # (comparing_formulas, querying_impacts, building_review) for nothing.
     profiler = cProfile.Profile() if args.cprofile_output is not None else None
     profiling_active = False
 
@@ -202,73 +294,55 @@ def main() -> int:
             elif profiling_active and event.phase is not RunPhase.RECORDING_HISTORY:
                 profiler.disable()
                 profiling_active = False
-        # Hard diagnostic deadline (Criterion 14): a content-free, bounded
-        # cancellation past --deadline-seconds -- never an unbounded private
-        # measurement run.
-        if time.perf_counter() - deadline_started > args.deadline_seconds:
-            cancel_flag.cancel()
-        telemetry(event)
+        phase_telemetry(event)
 
     started = time.perf_counter()
     cpu_before = process.cpu_times()
-    try:
-        artifacts = perform_run(
-            args.work_dir,
-            files,
-            {},
-            profile,
-            mode=QCRunMode.CYCLE_COMPARISON,
-            output_mode=FindingOutputMode(args.output_mode),
-            # This acceptance harness exists to measure large-workbook (LARGE_WORKBOOK
-            # -class) throughput; it always opts in rather than exposing a
-            # toggle that would just make the script refuse its own purpose
-            # (Criterion 18).
-            allow_large_workbooks=True,
-            write_reports=False,
-            cancellation_token=cancel_flag,
-            on_progress=on_progress,
-            # Diagnostic only (see RunHistory.record_run's docstring): breaks
-            # the single recording_history phase down into main_pass/story_
-            # classify_and_replay/sqlite_write/storage_measurement/total so a
-            # large-N cost concentration is attributable, not just a total.
-            on_subphase=recording_history_subphases.__setitem__,
-            # plan-20260910 Step 7 precondition evidence: aggregate-only
-            # per-pair classification timings, never a formula/sheet/
-            # coordinate (see FormulaComparisonTelemetry's own docstring).
-            _formula_telemetry=formula_telemetry,
-        )
-    except RunCancelled:
-        print(
-            f"aborted: exceeded the {args.deadline_seconds:g}s hard diagnostic "
-            "deadline",
-            file=sys.stderr,
-        )
-        return 4
+    artifacts = perform_run(
+        args.work_dir,
+        files,
+        {},
+        profile,
+        mode=QCRunMode.CYCLE_COMPARISON,
+        output_mode=FindingOutputMode(args.output_mode),
+        allow_large_workbooks=True,
+        write_reports=False,
+        cancellation_token=cancel_flag,
+        on_progress=on_progress,
+        on_subphase=recording_history_subphases.__setitem__,
+        _perform_run_telemetry=perform_telemetry,
+        _formula_telemetry=formula_telemetry,
+        _pair_key_telemetry=pair_key_telemetry,
+        _population_telemetry=population_telemetry,
+    )
     if profiler is not None:
         if profiling_active:
             profiler.disable()
         profiler.dump_stats(str(args.cprofile_output))
     elapsed = time.perf_counter() - started
     cpu_after = process.cpu_times()
-    peak_tree_rss = max(peak_tree_rss, _tree_rss(process))
 
-    after_hashes = {role: _sha256(path) for role, path in files.items()}
     result = artifacts.result
     digests = [finding_evidence_digest(f) for f in result.findings]
     ordered_digest = hashlib.sha256("\n".join(digests).encode("utf-8")).hexdigest()
+    record = RunHistory(args.work_dir / "history.sqlite3").get_run(artifacts.run_id)
+    phases = phase_telemetry.as_payload()
+    named_phase_seconds = 0.0
+    for item in phases:
+        elapsed_value = item.get("elapsed_seconds") if isinstance(item, dict) else None
+        if isinstance(elapsed_value, int | float):
+            named_phase_seconds += float(elapsed_value)
 
-    # plan-20260910 Step 7 precondition evidence: the NARROW reading is only
-    # the per-pair classification work Step 7's own scope proposes moving to
-    # Rust (extension detection, wrapper detection, and the reference-delta
-    # scan) -- excludes normalization (to_r1c1, already native-kernel-
-    # addressable via a separate existing surface) and complexity_
-    # assessment_seconds/finding_construction_seconds (both stay Python per
-    # the plan's own explicit scope). The BROADER reading additionally
-    # includes normalization for a conservative upper bound. Both are
-    # reported so the Step 7 GO/NO-GO decision isn't pre-judged by this
-    # script's own interpretation.
-    rust_addressable_narrow_seconds = (
+    # After native integration these two Python timers contain only rows that
+    # requested fallback. Report that cost separately, then add the native FFI
+    # time for the complete current classification cost. The legacy
+    # rust_addressable_* keys remain for before/after report compatibility,
+    # but now truthfully include both execution paths.
+    python_fallback_delta_seconds = (
         formula_telemetry.extension_seconds + formula_telemetry.wrapper_reference_seconds
+    )
+    rust_addressable_narrow_seconds = (
+        formula_telemetry.native_delta_seconds + python_fallback_delta_seconds
     )
     rust_addressable_broad_seconds = (
         rust_addressable_narrow_seconds + formula_telemetry.normalization_seconds
@@ -278,16 +352,39 @@ def main() -> int:
         "label": args.label,
         "run_id": artifacts.run_id,
         "elapsed_seconds": elapsed,
-        # Parent-process CPU only -- a short-lived Excel COM child's own CPU
-        # time is not attributable here without continuous polling across
-        # its lifetime; elapsed_seconds and combined_process_tree_peak_rss_
-        # bytes remain the authoritative wall-time/memory evidence.
+        # Worker-process CPU only. The supervising parent separately samples
+        # the complete worker/descendant process tree for RSS and Office use.
         "cpu_user_seconds": cpu_after.user - cpu_before.user,
         "cpu_system_seconds": cpu_after.system - cpu_before.system,
         "findings": len(result.findings),
         "ordered_evidence_digest": ordered_digest,
-        "phases": telemetry.as_payload(),
+        "phases": phases,
+        "named_phase_seconds": named_phase_seconds,
+        "phase_residual_seconds": max(0.0, elapsed - named_phase_seconds),
         "recording_history_subphases": recording_history_subphases,
+        "review_counts": dict(record.review_counts),
+        "pattern_review_counts": dict(record.pattern_review_counts),
+        "story_counts": dict(record.story_counts),
+        "perform_run_telemetry": {
+            "initial_hash_seconds": perform_telemetry.initial_hash_seconds,
+            "qc_seconds": perform_telemetry.qc_seconds,
+            "rehash_seconds": perform_telemetry.rehash_seconds,
+            "reports_seconds": perform_telemetry.reports_seconds,
+            "history_seconds": perform_telemetry.history_seconds,
+            "total_seconds": perform_telemetry.total_seconds,
+            "residual_seconds": perform_telemetry.residual_seconds,
+        },
+        "population_telemetry": {
+            "construction_seconds": population_telemetry.construction_seconds,
+            "spill_seconds": population_telemetry.spill_seconds,
+            "finalize_seconds": population_telemetry.finalize_seconds,
+        },
+        "pair_key_telemetry": {
+            "changed_pairs": pair_key_telemetry.changed_pairs,
+            "distinct_pair_keys": pair_key_telemetry.distinct_pair_keys,
+            "classification_conflicts": pair_key_telemetry.classification_conflicts,
+            "frequency_histogram": pair_key_telemetry.frequency_histogram(),
+        },
         # plan-20260910 Step 7 precondition evidence -- aggregate-only
         # counts/durations, no formula/sheet/coordinate (see
         # FormulaComparisonTelemetry's own docstring).
@@ -306,15 +403,42 @@ def main() -> int:
             "error_scan_seconds": formula_telemetry.error_scan_seconds,
             "pair_analysis_memo_hits": formula_telemetry.pair_analysis_memo_hits,
             "pair_analysis_memo_misses": formula_telemetry.pair_analysis_memo_misses,
+            "native_delta_seconds": formula_telemetry.native_delta_seconds,
+            "native_delta_batches": formula_telemetry.native_delta_batches,
+            "native_delta_batch_failures": (
+                formula_telemetry.native_delta_batch_failures
+            ),
+            "native_delta_api_failures": (
+                formula_telemetry.native_delta_api_failures
+            ),
+            "native_delta_protocol_failures": (
+                formula_telemetry.native_delta_protocol_failures
+            ),
+            "native_delta_runtime_failures": (
+                formula_telemetry.native_delta_runtime_failures
+            ),
+            "native_delta_supported_pairs": (
+                formula_telemetry.native_delta_supported_pairs
+            ),
+            "native_delta_fallback_pairs": (
+                formula_telemetry.native_delta_fallback_pairs
+            ),
+            "native_delta_declared_unsupported_pairs": (
+                formula_telemetry.native_delta_declared_unsupported_pairs
+            ),
+            "native_delta_invalid_output_pairs": (
+                formula_telemetry.native_delta_invalid_output_pairs
+            ),
+            "native_delta_oversized_pairs": (
+                formula_telemetry.native_delta_oversized_pairs
+            ),
+            "python_fallback_delta_seconds": python_fallback_delta_seconds,
+            "formula_delta_classification_seconds": (
+                rust_addressable_narrow_seconds
+            ),
             "rust_addressable_narrow_seconds": rust_addressable_narrow_seconds,
             "rust_addressable_broad_seconds": rust_addressable_broad_seconds,
         },
-        "combined_process_tree_peak_rss_bytes": peak_tree_rss,
-        "source_hashes_unchanged": before_hashes == after_hashes,
-        # plan-20260910 Criterion 8: the run-level output-mode contract and
-        # per-role resolved formula-engine identities, both purely
-        # aggregate/informational -- a values-engine fallback (if any) is
-        # already covered by the existing `disclosures` list below.
         "requested_output_mode": result.requested_output_mode.value,
         "resolved_output_policy": (
             result.resolved_output_policy.model_dump(mode="json")
@@ -322,11 +446,102 @@ def main() -> int:
             else None
         ),
         "formula_engines": dict(result.formula_engines),
-        "disclosures": list(result.disclosures),
+        "values_engines": dict(result.values_engines),
+        # Raw disclosures can legitimately carry selected sheet names. Keep
+        # only their count in this private-workload aggregate report.
+        "disclosure_count": len(result.disclosures),
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True))
-    print(json.dumps({k: v for k, v in report.items() if k != "phases"}, indent=2, sort_keys=True))
+    return report
+
+
+def _acceptance_child(args: argparse.Namespace, result_queue: Any) -> None:
+    logging.disable(logging.CRITICAL)
+    try:
+        result_queue.put(("ok", _execute_acceptance(args)))
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__))
+
+
+def _write_report(path: Path, report: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def main() -> int:
+    # Disabled before parent or child touches a private path. Kept inside the
+    # entry point so importing this module never silences another test/logger.
+    logging.disable(logging.CRITICAL)
+    args = _parser().parse_args()
+    if args.deadline_seconds <= 0:
+        _parser().error("--deadline-seconds must be positive")
+    files = {
+        "baseline_excel": args.baseline_excel,
+        "current_excel": args.current_excel,
+    }
+    before_hashes = {role: _sha256(path) for role, path in files.items()}
+    office_before = _system_office_process_count()
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(target=_acceptance_child, args=(args, result_queue))
+    supervised_started = time.perf_counter()
+    process.start()
+    supervision = _monitor_process(
+        process,
+        deadline_seconds=args.deadline_seconds,
+    )
+    supervised_elapsed = time.perf_counter() - supervised_started
+    after_hashes = {role: _sha256(path) for role, path in files.items()}
+    office_after = _system_office_process_count()
+    common = {
+        "label": args.label,
+        "supervised_elapsed_seconds": supervised_elapsed,
+        "sampled_process_tree_peak_rss_bytes": supervision.sampled_peak_rss_bytes,
+        # Backward-compatible field name, now backed by periodic sampling.
+        "combined_process_tree_peak_rss_bytes": supervision.sampled_peak_rss_bytes,
+        "office_process_counts": {
+            "system_before": office_before,
+            "owned_peak": supervision.owned_office_process_peak,
+            "system_after": office_after,
+        },
+        "source_hashes_unchanged": before_hashes == after_hashes,
+    }
+    if supervision.timed_out:
+        report = {**common, "status": "timeout"}
+        _write_report(args.output, report)
+        print(
+            f"aborted: exceeded the {args.deadline_seconds:g}s hard diagnostic deadline",
+            file=sys.stderr,
+        )
+        return 4
+    try:
+        status, payload = result_queue.get(timeout=5.0)
+    except queue.Empty:
+        status, payload = "error", "MissingChildResult"
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+    if supervision.exit_code != 0 or status != "ok" or not isinstance(payload, dict):
+        report = {
+            **common,
+            "status": "error",
+            "error_type": str(payload) if status == "error" else "ChildProcessError",
+        }
+        _write_report(args.output, report)
+        print(f"aborted: acceptance child failed ({report['error_type']})", file=sys.stderr)
+        return 2
+    report = {**payload, **common, "status": "complete"}
+    _write_report(args.output, report)
+    print(
+        json.dumps(
+            {
+                key: value
+                for key, value in report.items()
+                if key not in {"phases", "recording_history_subphases"}
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 

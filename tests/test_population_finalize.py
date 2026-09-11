@@ -13,12 +13,14 @@ reconstructed pairs equal the atomic run's pairs exactly.
 from __future__ import annotations
 
 import datetime as dt
+import random
 import shutil
 import tempfile
 import time
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
 from qc_tool.config.profile import (
     DeliverableProfile,
@@ -384,6 +386,116 @@ def test_candidate_spill_stores_only_the_first_row_of_a_group_in_full() -> None:
         assert shared_field not in delta_row["row"]["finding"]
     assert "location" in delta_row["row"]["finding"]
     assert "baseline_location" in delta_row["row"]["finding"]
+
+
+def test_candidate_spill_caps_templates_for_high_cardinality_inputs() -> None:
+    from qc_tool.excel.population import _CANDIDATE_TEMPLATE_CAP
+
+    spill = CandidateSpill(_profile(), _TODAY)
+    try:
+        for index in range(_CANDIDATE_TEMPLATE_CAP + 1_000):
+            row = index + 2
+            spill.add(
+                _candidate(location=f"B{row}", baseline_location=f"B{row - 1}"),
+                shape_before=f"before-{index}",
+                shape_after=f"after-{index}",
+            )
+
+        assert len(spill._templates) == _CANDIDATE_TEMPLATE_CAP
+    finally:
+        spill.abort()
+
+
+def test_streamed_membership_matches_the_list_reference_on_random_geometry() -> None:
+    from qc_tool.excel.population import _build_membership, _MemberFacts
+
+    generator = random.Random(20260911)
+    policy = PopulationPolicy(
+        enabled=True,
+        threshold=1,
+        max_rectangles=12,
+        max_explicit_pairs=100,
+    )
+    for _trial in range(40):
+        coordinates = sorted(
+            generator.sample(
+                [(row, column) for row in range(2, 20) for column in range(2, 9)],
+                generator.randint(1, 60),
+            )
+        )
+        candidate_offsets = ((-1, 0), (1, 0), (0, 1), (0, -1), (2, 1))
+        primary_offset = generator.choice(candidate_offsets)
+        offsets = [
+            primary_offset
+            if generator.random() < 0.75
+            else generator.choice(candidate_offsets)
+            for _coordinate_value in coordinates
+        ]
+        members: list[_MemberFacts] = []
+        spill = CandidateSpill(_profile(), _TODAY)
+        for (row, column), (row_offset, column_offset) in zip(
+            coordinates, offsets, strict=True
+        ):
+            location = f"{get_column_letter(column)}{row}"
+            baseline = (row + row_offset, column + column_offset)
+            baseline_location = f"{get_column_letter(baseline[1])}{baseline[0]}"
+            members.append(
+                _MemberFacts(location, baseline_location, (row, column), baseline)
+            )
+            spill.add(
+                _candidate(
+                    location=location,
+                    baseline_location=baseline_location,
+                ),
+                shape_before="digest-before",
+                shape_after="digest-after",
+            )
+
+        reference = _build_membership(members, policy)
+        outcome = finalize_populations(spill, policy, _NO_SCOPE)
+
+        if reference is None:
+            assert len(outcome.replay_findings) == len(members)
+            assert len(outcome.population_findings) == 0
+        else:
+            assert len(outcome.replay_findings) == 0
+            assert len(outcome.population_findings) == 1
+            population = outcome.population_findings[0].population
+            assert population is not None
+            assert population.membership == reference
+
+
+def test_population_outcomes_are_lazy_block_sequences() -> None:
+    from qc_tool.findings_store import FindingSequence
+
+    population_spill = CandidateSpill(_profile(), _TODAY)
+    for row in range(2, 14):
+        population_spill.add(
+            _candidate(location=f"B{row}", baseline_location=f"B{row - 1}"),
+            shape_before="digest-before",
+            shape_after="digest-after",
+        )
+    population_outcome = finalize_populations(
+        population_spill,
+        PopulationPolicy(enabled=True, threshold=10),
+        _NO_SCOPE,
+    )
+
+    replay_spill = CandidateSpill(_profile(), _TODAY)
+    for row in range(2, 7):
+        replay_spill.add(
+            _candidate(location=f"C{row}", baseline_location=f"C{row - 1}"),
+            shape_before="digest-before",
+            shape_after="digest-after",
+        )
+    replay_outcome = finalize_populations(
+        replay_spill,
+        PopulationPolicy(enabled=True, threshold=10),
+        _NO_SCOPE,
+    )
+
+    assert isinstance(population_outcome.population_findings, FindingSequence)
+    assert isinstance(replay_outcome.replay_findings, FindingSequence)
 
 
 def test_reconstructed_candidates_are_field_identical_to_the_originals() -> None:

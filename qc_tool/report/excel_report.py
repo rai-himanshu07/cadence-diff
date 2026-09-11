@@ -217,6 +217,8 @@ def _write_summary_sheet(
         ("Profile", result.profile_name),
         ("Mode", result.mode.value),
         ("Output mode", result.requested_output_mode.value),
+        *((f"Formula engine: {role}", engine) for role, engine in result.formula_engines.items()),
+        *((f"Values engine: {role}", engine) for role, engine in result.values_engines.items()),
         *((f"File: {role}", name) for role, name in result.files.items()),
         (
             "Result status",

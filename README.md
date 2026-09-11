@@ -388,9 +388,16 @@ without a seeded cause.
 
 `native/xlsbkernel/` is an optional Rust/PyO3 accelerator that speeds up XLSB
 value and formula decoding. It is its **own, separately versioned package**
-(`xlsbkernel`, built with maturin) — it is never a build- or install-time
-dependency of `cadence-diff`, which stays on Hatchling and installs and runs
-identically whether or not it is present. Build and install it locally with:
+(`xlsbkernel`, built with maturin) and uses the CPython 3.11 stable ABI, so one
+platform wheel supports Python 3.11 and 3.12. Install the accelerated build with:
+
+```bash
+python -m pip install "cadence-diff[native]"
+```
+
+The base `cadence-diff` install remains fully functional without it and falls
+back with explicit coverage disclosure. For local native development, build and
+install the wheel with:
 
 ```bash
 conda run -n cadence-diff-dev maturin build --release -m native/xlsbkernel/Cargo.toml

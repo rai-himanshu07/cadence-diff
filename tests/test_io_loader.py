@@ -1053,6 +1053,9 @@ def test_xlsb_native_values_engine_matches_pyxlsb(fixture_dir: Path) -> None:
     default_snap = load_workbook_snapshot(path)
     native_snap = load_workbook_snapshot(path, _xlsb_values_engine="native")
 
+    assert native_snap.values_source is not None
+    assert native_snap.values_source.startswith("native-biff12:")
+
     assert native_snap.sheet_names == default_snap.sheet_names
     for sheet_name in default_snap.sheet_names:
         default_sheet = default_snap.sheet(sheet_name)
@@ -1123,6 +1126,9 @@ def test_xlsb_values_engine_auto_degrades_to_pyxlsb_when_unavailable(
     auto_snap = load_workbook_snapshot(path, _xlsb_values_engine="auto")
     pyxlsb_snap = load_workbook_snapshot(path, _xlsb_values_engine="pyxlsb")
 
+    assert auto_snap.values_source is not None
+    assert auto_snap.values_source.startswith("pyxlsb:")
+
     assert auto_snap.sheet_names == pyxlsb_snap.sheet_names
     for sheet_name in pyxlsb_snap.sheet_names:
         assert set(auto_snap.sheet(sheet_name).cells) == set(
@@ -1158,6 +1164,8 @@ def test_xlsb_values_engine_auto_falls_back_to_pyxlsb_on_a_runtime_failure(
         )
     assert auto_snap.values_engine_fallback_detail != ""
     assert "RuntimeError" in auto_snap.values_engine_fallback_detail
+    assert auto_snap.values_source is not None
+    assert auto_snap.values_source.startswith("pyxlsb:")
     assert pyxlsb_snap.values_engine_fallback_detail == ""
 
 

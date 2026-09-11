@@ -187,9 +187,15 @@ def preview_carry_forward(history: RunHistory, run_id: int) -> CarryForwardPrevi
         ),
         engine_provenance_mismatch=tuple(
             sorted(
-                role
-                for role in set(source.formula_engines) & set(current.formula_engines)
-                if source.formula_engines[role] != current.formula_engines[role]
+                {
+                    role
+                    for source_engines, current_engines in (
+                        (source.formula_engines, current.formula_engines),
+                        (source.values_engines, current.values_engines),
+                    )
+                    for role in set(source_engines) & set(current_engines)
+                    if source_engines[role] != current_engines[role]
+                }
             )
         ),
     )

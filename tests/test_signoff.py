@@ -105,6 +105,8 @@ def test_finalization_creates_v2_attestation_and_locks_review_mutations(
     assert manifest["schema_version"] == 2
     assert manifest["profile_sha256"] == record.profile_sha256
     assert manifest["signoff"]["review_state_digest"] == signoff.review_state_digest
+    assert manifest["run"]["formula_engines"] == record.formula_engines
+    assert manifest["run"]["values_engines"] == record.values_engines
 
     finding_id = record.findings[0].finding_id
     with pytest.raises(RunFinalizedError):

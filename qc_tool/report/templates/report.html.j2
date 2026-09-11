@@ -48,6 +48,8 @@
   Generated {{ generated_at }} (UTC)
   | mode: <strong>{{ result.mode.value }}</strong>
   | output: <strong>{{ result.requested_output_mode.value }}</strong>
+  {% for role, engine in result.formula_engines.items() %} | formula engine {{ role }}: <strong>{{ engine }}</strong>{% endfor %}
+  {% for role, engine in result.values_engines.items() %} | values engine {{ role }}: <strong>{{ engine }}</strong>{% endfor %}
   {% for role, name in result.files.items() %} | {{ role }}: <strong>{{ name }}</strong>{% endfor %}
   | verified cross-checks: {{ result.verified_crosschecks }}
   {% if capability_limited %} | <strong class="capability-limited">capability-limited</strong>{% endif %}

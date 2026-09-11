@@ -8,6 +8,13 @@ dynamic = ["version"]
 description = "Optional native BIFF12/XLSB decoder accelerator for cadence-diff"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+classifiers = [
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Rust",
+	"Operating System :: Microsoft :: Windows :: Windows 10",
+	"Operating System :: POSIX :: Linux",
+]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

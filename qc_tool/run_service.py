@@ -15,8 +15,15 @@ from pathlib import Path
 
 from qc_tool.config.profile import DeliverableProfile, NumericTolerance
 from qc_tool.coverage import FindingOutputMode, QCRunMode
-from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings, run_qc
-from qc_tool.excel.formulas import FormulaComparisonTelemetry
+from qc_tool.engine import (
+    FindingsDelta,
+    QCRunResult,
+    compare_findings,
+    output_representations_compatible,
+    run_qc,
+)
+from qc_tool.excel.formulas import FormulaComparisonTelemetry, PairKeyTelemetry
+from qc_tool.excel.population import PopulationTelemetry
 from qc_tool.history.store import RunHistory
 from qc_tool.io.formula_cache import FormulaExtractionCache
 from qc_tool.package import PackageManifest, paths_by_member
@@ -108,6 +115,8 @@ def perform_run(
     formula_cache_enabled: bool = True,
     _perform_run_telemetry: PerformRunTelemetry | None = None,
     _formula_telemetry: FormulaComparisonTelemetry | None = None,
+    _pair_key_telemetry: PairKeyTelemetry | None = None,
+    _population_telemetry: PopulationTelemetry | None = None,
 ) -> RunArtifacts:
     """Run QC, record the run in history, and defer reports to on-demand.
 
@@ -194,6 +203,8 @@ def perform_run(
         on_progress=on_progress,
         formula_cache=formula_cache,
         _formula_telemetry=_formula_telemetry,
+        _pair_key_telemetry=_pair_key_telemetry,
+        _population_telemetry=_population_telemetry,
     )
     if _perform_run_telemetry is not None:
         _perform_run_telemetry.qc_seconds += time.perf_counter() - _qc_start
@@ -266,9 +277,16 @@ def perform_run(
                 # every population look "resolved" and every atomic member it
                 # covered look "new" (plan-20260910 Criterion 5).
                 if (
-                    previous.requested_output_mode == result.requested_output_mode
-                    and len(previous.findings) <= REPORT_DEFER_FINDINGS
+                    len(previous.findings) <= REPORT_DEFER_FINDINGS
                     and len(result.findings) <= REPORT_DEFER_FINDINGS
+                    and output_representations_compatible(
+                        previous.requested_output_mode,
+                        previous.resolved_output_policy,
+                        previous.findings,
+                        result.requested_output_mode,
+                        result.resolved_output_policy,
+                        result.findings,
+                    )
                 ):
                     delta = compare_findings(previous.findings, result.findings)
             except KeyError:

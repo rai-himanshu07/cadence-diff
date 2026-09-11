@@ -114,8 +114,8 @@ class CarryForwardPreview(BaseModel):
     resolved: tuple[str, ...] = ()
     ambiguous: tuple[str, ...] = ()
     populations: tuple[PopulationCarryForwardCandidate, ...] = ()
-    #: Excel roles shared by both runs whose resolved formula engine differs
-    #: (e.g. the native kernel became available/unavailable between runs).
+    #: Excel roles shared by both runs whose resolved formula or values engine
+    #: differs (e.g. the native kernel became available/unavailable).
     #: A non-empty tuple means evidence for those roles may not be directly
     #: comparable even where a digest happens to match or differ -- an
     #: explicit disclosure, not a block, since `exact`'s own digest equality

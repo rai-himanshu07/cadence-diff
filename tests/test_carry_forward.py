@@ -186,6 +186,33 @@ def test_preview_reports_no_mismatch_when_engines_match_or_are_unrecorded(
     assert preview.engine_provenance_mismatch == ()
 
 
+def test_preview_discloses_a_cross_run_values_engine_mismatch(tmp_path: Path) -> None:
+    history = RunHistory(tmp_path / "history.sqlite3")
+    previous_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[_finding("F1", "A1", "1")],
+            values_engines={"current_excel": "pyxlsb:1.0.10"},
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    current_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[_finding("N1", "A1", "1")],
+            values_engines={"current_excel": "native-biff12:1.2.3"},
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+    )
+
+    preview = preview_carry_forward(history, current_id)
+
+    assert preview.engine_provenance_mismatch == ("current_excel",)
+
+
 def test_apply_recomputes_and_rejects_nonexact_or_unknown_selection(
     tmp_path: Path,
 ) -> None:

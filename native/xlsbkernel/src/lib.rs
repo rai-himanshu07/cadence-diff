@@ -10,6 +10,7 @@
 //! dependency were removed once nothing called them anymore.
 use pyo3::prelude::*;
 
+mod formula_delta;
 mod formula_report;
 mod ftab;
 mod ptg;
@@ -21,6 +22,7 @@ mod workbook;
 
 #[pymodule]
 fn xlsbkernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(formula_delta::formula_delta_batch, m)?)?;
     m.add_function(wrap_pyfunction!(formula_report::formula_r1c1_report, m)?)?;
     m.add_function(wrap_pyfunction!(formula_report::raw_values_report, m)?)?;
     m.add_function(wrap_pyfunction!(formula_report::formula_surface_report, m)?)?;

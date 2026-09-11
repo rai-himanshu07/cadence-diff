@@ -40,11 +40,24 @@ from qc_tool.config.profile import (
     default_profile,
 )
 from qc_tool.coverage import QCRunMode
-from qc_tool.engine import run_qc
+from qc_tool.engine import _aggregate_ranked_package_actions, run_qc
 from qc_tool.excel.align import AlignmentTrustManifest, AlignmentTrustManifestV2
 from qc_tool.findings import FindingClass
 from qc_tool.io.model import CellValue
-from qc_tool.run_action import RunActionReason, RunBlockedError
+from qc_tool.package import (
+    PackageArtifact,
+    PackageManifest,
+    PackageMember,
+    PackageSide,
+)
+from qc_tool.run_action import (
+    MAX_RUN_ACTION_ITEMS,
+    RunActionItem,
+    RunActionReason,
+    RunActionRequired,
+    RunBlockedError,
+)
+from qc_tool.ui.ranked_table_dialog import apply_view_model, view_model_from_action
 
 #: Large enough that a fully displaced permutation clears the detector's
 #: MIN_PROJECTED_MISMATCHES (10,000) floor -- see tests/test_ranked_identity.py
@@ -430,6 +443,98 @@ def test_perform_run_writes_no_history_or_reports_when_blocked_by_detector(
         assert RunHistory(history_db).list_runs() == []
     runs_dir = work_dir / "runs"
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+def test_ranked_package_action_cap_represents_every_blocked_member() -> None:
+    actions = [
+        (
+            f"member{member_index}",
+            RunActionRequired(
+                version=2,
+                reason=RunActionReason.ROW_IDENTITY_CONFIRMATION_REQUIRED,
+                items=[
+                    RunActionItem(sheet="Panel", cell=f"A{item_index + 1}")
+                    for item_index in range(20)
+                ],
+            ),
+        )
+        for member_index in range(8)
+    ]
+
+    action = _aggregate_ranked_package_actions(actions)
+
+    assert len(action.items) == MAX_RUN_ACTION_ITEMS
+    assert {item.member_id for item in action.items} == {
+        f"member{member_index}" for member_index in range(8)
+    }
+    assert action.omitted_items == 144
+
+
+def test_multi_package_reports_and_resolves_all_ranked_members_in_one_cycle(
+    tmp_path: Path,
+) -> None:
+    members: list[PackageMember] = []
+    files: dict[str, Path] = {}
+    headers = ("Rank", "ID", "Value", "Value2", "Value3")
+    for member_index, member_id in enumerate(("ops", "primary")):
+        base_rows = _detector_rows(_LARGE_N)
+        for row in base_rows:
+            row[1] = f"M{member_index}-{row[1]}"
+        current_rows = _shuffled(base_rows, seed=99 + member_index)
+        baseline = tmp_path / f"baseline-{member_id}.xlsx"
+        current = tmp_path / f"current-{member_id}.xlsx"
+        _write_panel(baseline, base_rows, headers=headers)
+        _write_panel(current, current_rows, headers=headers)
+        for side, path in (
+            (PackageSide.BASELINE, baseline),
+            (PackageSide.CURRENT, current),
+        ):
+            member = PackageMember(
+                member_id=member_id,
+                side=side,
+                artifact=PackageArtifact.EXCEL,
+                display_name=path.name,
+            )
+            members.append(member)
+            files[member.role_key] = path
+    manifest = PackageManifest(members=tuple(members))
+
+    with pytest.raises(RunBlockedError) as excinfo:
+        run_qc(
+            package_manifest=manifest,
+            package_files=files,
+            mode=QCRunMode.CYCLE_COMPARISON,
+        )
+
+    action = excinfo.value.action_required
+    assert action.reason is RunActionReason.ROW_IDENTITY_CONFIRMATION_REQUIRED
+    assert {item.member_id for item in action.items} == {"ops", "primary"}
+    assert {
+        item.ranked_table_evidence.member_id
+        for item in action.items
+        if item.ranked_table_evidence is not None
+    } == {"ops", "primary"}
+    view_model = view_model_from_action(
+        action.model_dump(mode="json"),
+        source_profile="default",
+    )
+    assert view_model is not None
+    view_model = view_model.with_profile_name("ranked-package")
+    assert view_model.is_valid
+    profile = apply_view_model(
+        default_profile(),
+        view_model,
+        workbook_count=2,
+    ).model_copy(update={"name": "ranked-package"})
+
+    result = run_qc(
+        package_manifest=manifest,
+        package_files=files,
+        profile=profile,
+        mode=QCRunMode.CYCLE_COMPARISON,
+    )
+
+    assert _classes(result, FindingClass.VALUE_CHANGED) == []
 
 
 # --- V1/V2 alignment-trust manifest ----------------------------------------

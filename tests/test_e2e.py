@@ -11,7 +11,7 @@ Plus: whole-pipeline read-only guarantee and a large-workbook run.
 
 import hashlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -208,7 +208,21 @@ def test_streaming_and_oracle_produce_equal_e2e_results(
         current_ppt=current_ppt,
     )
 
-    assert streaming == oracle
+    roles = {"baseline_excel", "current_excel"}
+    assert set(streaming.values_engines) == roles
+    assert set(oracle.values_engines) == roles
+    assert all(
+        engine.startswith("ooxml-streaming:")
+        for engine in streaming.values_engines.values()
+    )
+    assert all(
+        engine.startswith("openpyxl-oracle:")
+        for engine in oracle.values_engines.values()
+    )
+    assert replace(streaming, values_engines={}) == replace(
+        oracle,
+        values_engines={},
+    )
 
 
 def test_xlsb_defect_detected(fixture_dir: Path, manifest: FixtureManifest) -> None:

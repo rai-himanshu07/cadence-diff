@@ -9,10 +9,15 @@ import secrets
 import zipfile
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from qc_tool import __version__
-from qc_tool.config.profile import DeliverableProfile, canonical_profile_bytes
+from qc_tool.config.profile import (
+    DeliverableProfile,
+    ResolvedOutputPolicy,
+    canonical_profile_bytes,
+)
+from qc_tool.coverage import FindingOutputMode, QCRunMode
 from qc_tool.engine import QCRunResult
 from qc_tool.history.review_state import ANNOTATION_LINEAGE_VERSION, AnnotationLineage
 from qc_tool.package import PackageManifest
@@ -51,6 +56,39 @@ class PopulationManifestEntry(BaseModel):
     identity_key_digest: str
     member_count: int
     membership_digest: str
+
+
+class AttestationRunMetadata(BaseModel):
+    """Validated signed run contract, with defaults for legacy bundles."""
+
+    mode: QCRunMode
+    profile: str
+    counts: dict[str, int]
+    coverage: list[dict[str, object]]
+    mapping_coverage: dict[str, object] | None = None
+    verified_crosschecks: int
+    formula_engines: dict[str, str] = Field(default_factory=dict)
+    values_engines: dict[str, str] = Field(default_factory=dict)
+    requested_output_mode: FindingOutputMode = FindingOutputMode.PROFILE
+    resolved_output_policy: ResolvedOutputPolicy | None = None
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("formula_engines", "values_engines")
+    @classmethod
+    def validate_engine_map(cls, value: dict[str, str]) -> dict[str, str]:
+        if any(not role or not engine for role, engine in value.items()):
+            raise ValueError("engine provenance requires non-empty roles and identities")
+        return value
+
+    @model_validator(mode="after")
+    def validate_output_policy(self) -> "AttestationRunMetadata":
+        if self.resolved_output_policy is not None:
+            if self.resolved_output_policy.output_mode is not self.requested_output_mode:
+                raise ValueError("resolved output policy does not match requested output mode")
+        elif self.requested_output_mode is not FindingOutputMode.PROFILE:
+            raise ValueError("non-profile output mode requires a resolved output policy")
+        return self
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -182,6 +220,7 @@ def create_attestation(
             # cross-run comparison can later be told an engine changed,
             # never a new schema feature -- present at every schema version.
             "formula_engines": dict(result.formula_engines),
+            "values_engines": dict(result.values_engines),
             # Run-level finding-output contract (plan-20260910): purely
             # informational disclosure, present at every schema version,
             # never a verifier gate.
@@ -250,6 +289,11 @@ def verify_attestation(path: Path, *, key: bytes) -> AttestationVerification:
             result.add(
                 "schema-version", f"unsupported attestation schema {schema_version!r}"
             )
+
+        try:
+            AttestationRunMetadata.model_validate(manifest.get("run"))
+        except (TypeError, ValueError):
+            result.add("run-metadata", "signed run metadata is missing or invalid")
 
         # Cumulative, presence-driven feature validation: a v3/v4 bundle can
         # ALSO carry a sign-off (schema_version reflects the HIGHEST tier

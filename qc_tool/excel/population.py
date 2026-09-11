@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import itertools
 import shutil
 import tempfile
 import time
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -48,15 +49,21 @@ from qc_tool.findings import (
     PopulationSample,
 )
 from qc_tool.findings_store import (
+    BLOCK_FINDINGS,
+    BlockFile,
+    FindingSequence,
     FindingsStoreError,
     SpillWriter,
+    decode_block,
     finding_payload,
     merge_spill,
 )
 from qc_tool.review import (
     Coordinate,
+    Rectangle,
     _bounding_range,
     _coordinate,
+    _horizontal_runs,
     _range,
     _rectangles,
     population_identity_digest,
@@ -101,6 +108,12 @@ class PopulationTelemetry:
 #: persisted past one run (the spill directory is a disposable tempdir), so
 #: this exists for code clarity/future changes, not cross-run compatibility.
 _CANDIDATE_ROW_VERSION = 1
+
+# Delta templates are an optimization, never required for correctness. Once
+# this cap is reached, unseen keys store full rows while already-admitted keys
+# keep using their template. This bounds whole-run retained payloads under
+# high-cardinality workloads without changing any reconstructed finding.
+_CANDIDATE_TEMPLATE_CAP = 4_096
 
 _MISSING = object()
 
@@ -196,6 +209,7 @@ class CandidateSpill:
         self._spill = SpillWriter(self._dir / "candidates.qcfb")
         self._spill.__enter__()
         self._closed = False
+        self._disposed = False
         self.count = 0
         self._telemetry = telemetry
         self._templates: dict[tuple[object, ...], dict[str, Any]] = {}
@@ -205,11 +219,20 @@ class CandidateSpill:
         assign_severities([candidate], self._profile, today=self._today)
         key = population_key(candidate, (shape_before, shape_after))
         coordinate = _coordinate(candidate.location) or (0, 0)
-        sort_key = (*key, coordinate[0], coordinate[1])
         full_payload = finding_payload(candidate)
         template = self._templates.get(key)
         if template is None:
-            self._templates[key] = full_payload
+            if len(self._templates) < _CANDIDATE_TEMPLATE_CAP:
+                self._templates[key] = full_payload
+                self._spill.append(
+                    (*key, -1, -1, -1),
+                    {
+                        "v": _CANDIDATE_ROW_VERSION,
+                        "group_key": list(key),
+                        "kind": "template",
+                        "template": full_payload,
+                    },
+                )
             row: dict[str, Any] = {"kind": "full", "finding": full_payload}
         else:
             delta = _diff_against_template(template, full_payload)
@@ -225,13 +248,77 @@ class CandidateSpill:
             "shape_before": shape_before,
             "shape_after": shape_after,
         }
-        self._spill.append(sort_key, payload)
+        self._spill.append((*key, 0, coordinate[0], coordinate[1]), payload)
         self.count += 1
         if self._telemetry is not None:
             self._telemetry.construction_seconds += time.perf_counter() - start
 
+    def iter_groups(
+        self,
+    ) -> Iterator[tuple[dict[str, Any], Iterator[dict[str, Any]]]]:
+        """Yield each template and its coordinate-sorted candidate-row stream.
+
+        The optional template marker sorts before every real candidate in its
+        group. Keys rejected by the bounded template cache store only full
+        rows, so their first candidate supplies the reconstruction template.
+        The caller must exhaust each row iterator before requesting the next
+        group, matching ``itertools.groupby``'s streaming contract.
+        """
+        if not self._closed:
+            self._spill.__exit__(None, None, None)
+            self._closed = True
+
+        def group_key(raw: object) -> tuple[object, ...]:
+            if not isinstance(raw, dict):
+                raise FindingsStoreError("population candidate payload is not a mapping")
+            key = raw.get("group_key")
+            if not isinstance(key, list):
+                raise FindingsStoreError(
+                    "population candidate payload is missing its group key"
+                )
+            return tuple(key)
+
+        for _key, raw_group in itertools.groupby(
+            merge_spill(self._spill.path), key=group_key
+        ):
+            group = iter(raw_group)
+            first = next(group)
+            if not isinstance(first, dict):
+                raise FindingsStoreError("population candidate payload is not a mapping")
+            if first.get("kind") == "template":
+                template = first.get("template")
+                if not isinstance(template, dict):
+                    raise FindingsStoreError(
+                        "population candidate template is not a mapping"
+                    )
+                rows = group
+            else:
+                inner = first.get("row")
+                template = (
+                    inner.get("finding")
+                    if isinstance(inner, dict) and inner.get("kind") == "full"
+                    else None
+                )
+                if not isinstance(template, dict):
+                    raise FindingsStoreError(
+                        "population group has no reconstruction template"
+                    )
+                rows = itertools.chain((first,), group)
+
+            def candidate_rows(
+                source: Iterator[object] = rows,
+            ) -> Iterator[dict[str, Any]]:
+                for raw in source:
+                    if not isinstance(raw, dict) or not isinstance(raw.get("row"), dict):
+                        raise FindingsStoreError(
+                            "population candidate row is not a mapping"
+                        )
+                    yield raw
+
+            yield template, candidate_rows()
+
     def groups(self) -> Iterator[list[dict[str, Any]]]:
-        """Close the spill and yield contiguous same-key candidate groups.
+        """Compatibility wrapper that materializes one group at a time.
 
         Consumes (and removes) the spill directory; call at most once.
         Boundaries come directly from each row's own stored ``group_key``
@@ -241,38 +328,25 @@ class CandidateSpill:
         so recomputing it here would require reconstructing every row before
         grouping could even begin.
         """
-        if not self._closed:
-            self._spill.__exit__(None, None, None)
-            self._closed = True
         try:
-            current_key: list[object] | None = None
-            bucket: list[dict[str, Any]] = []
-            for row in merge_spill(self._spill.path):
-                if not isinstance(row, dict):
-                    raise FindingsStoreError("population candidate payload is not a mapping")
-                payload: dict[str, Any] = row
-                key = payload.get("group_key")
-                if not isinstance(key, list):
-                    raise FindingsStoreError(
-                        "population candidate payload is missing its group key"
-                    )
-                if current_key is not None and key != current_key:
-                    yield bucket
-                    bucket = []
-                current_key = key
-                bucket.append(payload)
-            if bucket:
-                yield bucket
+            for _template, rows in self.iter_groups():
+                yield list(rows)
         finally:
-            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dispose()
+
+    def _dispose(self) -> None:
+        if self._disposed:
+            return
+        shutil.rmtree(self._dir, ignore_errors=True)
+        self._templates.clear()
+        self._disposed = True
 
     def abort(self) -> None:
-        if self._closed:
-            return
-        with contextlib.suppress(Exception):
-            self._spill.__exit__(None, None, None)
-        shutil.rmtree(self._dir, ignore_errors=True)
-        self._closed = True
+        if not self._closed:
+            with contextlib.suppress(Exception):
+                self._spill.__exit__(None, None, None)
+            self._closed = True
+        self._dispose()
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
@@ -297,9 +371,10 @@ class ClassPopulationStats:
 
 @dataclass(slots=True)
 class PopulationOutcome:
-    population_findings: list[Finding] = field(default_factory=list)
-    replay_findings: list[Finding] = field(default_factory=list)
+    population_findings: Sequence[Finding] = field(default_factory=list)
+    replay_findings: Sequence[Finding] = field(default_factory=list)
     stats: dict[FindingClass, ClassPopulationStats] = field(default_factory=dict)
+    _storage: object | None = field(default=None, repr=False, compare=False)
 
 
 def _row_facts(row: dict[str, Any], template: dict[str, Any]) -> _MemberFacts | None:
@@ -335,6 +410,231 @@ def _row_evidence(row: dict[str, Any], template: dict[str, Any]) -> tuple[str, f
     return event_key, frozenset(tags)
 
 
+@dataclass(slots=True)
+class _GroupAccumulator:
+    """Bounded facts needed to decide and encode one sorted candidate group."""
+
+    policy: PopulationPolicy
+    count: int = 0
+    malformed: bool = False
+    homogeneous: bool = True
+    shape_before: str = ""
+    shape_after: str = ""
+    first_location: str = ""
+    last_location: str = ""
+    samples: list[PopulationSample] = field(default_factory=list)
+    _first_evidence: tuple[str, frozenset[str]] | None = None
+    _current_row: int | None = None
+    _current_columns: list[int] = field(default_factory=list)
+    _previous_row: int | None = None
+    _active: dict[tuple[int, int], int] = field(default_factory=dict)
+    _rectangles: list[Rectangle] = field(default_factory=list)
+    _rectangle_overflow: bool = False
+    _offsets: set[tuple[int, int]] = field(default_factory=set)
+    _pairs: list[tuple[str, str]] = field(default_factory=list)
+    _pair_count: int = 0
+    _current_bounds: Rectangle | None = None
+    _baseline_bounds: Rectangle | None = None
+    _finished: bool = False
+
+    def observe(self, row: dict[str, Any], template: dict[str, Any]) -> None:
+        self.count += 1
+        if self.count == 1:
+            self.shape_before = str(row["shape_before"])
+            self.shape_after = str(row["shape_after"])
+        evidence = _row_evidence(row, template)
+        if self._first_evidence is None:
+            self._first_evidence = evidence
+        elif evidence != self._first_evidence:
+            self.homogeneous = False
+        facts = _row_facts(row, template)
+        if facts is None:
+            self.malformed = True
+            return
+        if not self.first_location:
+            self.first_location = facts.location
+        self.last_location = facts.location
+        if len(self.samples) < _MAX_SAMPLES:
+            self.samples.append(
+                PopulationSample(
+                    current_location=facts.location,
+                    baseline_location=facts.baseline_location,
+                )
+            )
+        self._current_bounds = _extend_bounds(self._current_bounds, facts.current)
+        if facts.baseline is not None:
+            self._baseline_bounds = _extend_bounds(self._baseline_bounds, facts.baseline)
+            offset = (
+                facts.baseline[0] - facts.current[0],
+                facts.baseline[1] - facts.current[1],
+            )
+            if len(self._offsets) < 2 or offset in self._offsets:
+                self._offsets.add(offset)
+        if facts.baseline_location is not None and facts.baseline is not None:
+            self._pair_count += 1
+            if len(self._pairs) <= self.policy.max_explicit_pairs:
+                self._pairs.append((facts.location, facts.baseline_location))
+        if self._current_row is None:
+            self._current_row = facts.current[0]
+        elif facts.current[0] != self._current_row:
+            self._flush_row()
+            self._current_row = facts.current[0]
+        self._current_columns.append(facts.current[1])
+
+    def _append_rectangle(self, rectangle: Rectangle) -> None:
+        if len(self._rectangles) < self.policy.max_rectangles:
+            self._rectangles.append(rectangle)
+        else:
+            self._rectangle_overflow = True
+
+    def _flush_active(self, end_row: int) -> None:
+        for (start_col, end_col), start_row in self._active.items():
+            self._append_rectangle((start_row, start_col, end_row, end_col))
+        self._active.clear()
+
+    def _flush_row(self) -> None:
+        if self._current_row is None:
+            return
+        row = self._current_row
+        if self._previous_row is not None and row != self._previous_row + 1:
+            self._flush_active(self._previous_row)
+        runs = set(_horizontal_runs(sorted(set(self._current_columns))))
+        for run in set(self._active).difference(runs):
+            start_col, end_col = run
+            self._append_rectangle((self._active.pop(run), start_col, row - 1, end_col))
+        for run in runs.difference(self._active):
+            self._active[run] = row
+        self._previous_row = row
+        self._current_columns.clear()
+
+    def membership(self) -> MembershipCodec | None:
+        if not self._finished:
+            self._flush_row()
+            if self._previous_row is not None:
+                self._flush_active(self._previous_row)
+            self._finished = True
+        if self._rectangle_overflow:
+            return None
+        current_rectangles = tuple(_range(item) for item in sorted(self._rectangles))
+        if len(self._offsets) == 1:
+            return MembershipCodec(
+                current_rectangles=current_rectangles,
+                baseline_mode="shift",
+                shift=next(iter(self._offsets)),
+                member_count=self.count,
+            )
+        if self._pair_count != self.count or len(self._pairs) > self.policy.max_explicit_pairs:
+            return None
+        return MembershipCodec(
+            current_rectangles=current_rectangles,
+            baseline_mode="pairs",
+            pairs=tuple(self._pairs),
+            member_count=self.count,
+        )
+
+    @property
+    def current_bounding_range(self) -> str:
+        return _range(self._current_bounds) if self._current_bounds is not None else ""
+
+    @property
+    def baseline_bounding_range(self) -> str:
+        return _range(self._baseline_bounds) if self._baseline_bounds is not None else ""
+
+    @property
+    def evidence(self) -> tuple[str, frozenset[str]]:
+        return self._first_evidence or ("", frozenset())
+
+
+def _extend_bounds(bounds: Rectangle | None, coordinate: Coordinate) -> Rectangle:
+    row, column = coordinate
+    if bounds is None:
+        return row, column, row, column
+    min_row, min_col, max_row, max_col = bounds
+    return (
+        min(min_row, row),
+        min(min_col, column),
+        max(max_row, row),
+        max(max_col, column),
+    )
+
+
+def _finding_from_candidate_row(
+    row: dict[str, Any], template: dict[str, Any]
+) -> Finding:
+    inner = row["row"]
+    payload = (
+        inner["finding"]
+        if inner["kind"] == "full"
+        else {**template, **inner["finding"]}
+    )
+    return Finding.from_trusted_payload(payload)
+
+
+def _iter_block_payloads(path: Path) -> Iterator[object]:
+    source = BlockFile.open(path)
+    for index in range(len(source.block_infos())):
+        yield from decode_block(source.read_block(index))
+
+
+def _append_block_payload(
+    container: BlockFile,
+    buffer: list[object],
+    payload: object,
+) -> None:
+    buffer.append(payload)
+    if len(buffer) >= BLOCK_FINDINGS:
+        container.append_rows(buffer)
+        buffer.clear()
+
+
+def _flush_block_payloads(container: BlockFile, buffer: list[object]) -> None:
+    if buffer:
+        container.append_rows(buffer)
+        buffer.clear()
+
+
+def _build_streamed_population(
+    representative: Finding,
+    group: _GroupAccumulator,
+    membership: MembershipCodec,
+) -> Finding:
+    population = PopulationEvidence(
+        member_count=group.count,
+        membership=membership,
+        first=group.first_location,
+        last=group.last_location,
+        samples=tuple(group.samples),
+        shape_before_digest=group.shape_before,
+        shape_after_digest=group.shape_after,
+    )
+    finding = Finding(
+        artifact=representative.artifact,
+        artifact_member=representative.artifact_member,
+        finding_class=representative.finding_class,
+        severity=representative.severity,
+        expected_reason=representative.expected_reason,
+        provenance=representative.provenance,
+        subtype=representative.subtype,
+        materiality=representative.materiality,
+        temporal_context=representative.temporal_context,
+        evidence_tags=representative.evidence_tags,
+        event_key=representative.event_key,
+        sheet=representative.sheet,
+        location=group.current_bounding_range,
+        baseline_location=group.baseline_bounding_range,
+        element="population",
+        message=(
+            f"{representative.sheet}: {group.count} cells share one "
+            f"{representative.finding_class.value} population"
+        ),
+        waiver_reason=representative.waiver_reason,
+        waiver_expires=representative.waiver_expires,
+        population=population,
+    )
+    finding.root_cause_key = "population:" + population_identity_digest(finding)
+    return finding
+
+
 def finalize_populations(
     spill: CandidateSpill,
     policy: PopulationPolicy,
@@ -342,94 +642,142 @@ def finalize_populations(
     *,
     telemetry: PopulationTelemetry | None = None,
 ) -> PopulationOutcome:
-    """Group spilled candidates and decide population vs. atomic replay.
+    """Stream candidate groups into bounded membership or exact replay output.
 
-    A full ``Finding`` is reconstructed for every member ONLY when a group
-    turns out to need atomic replay (below threshold, heterogeneous
-    evidence, or over the rectangle/pair cap) -- exactly where every
-    member's complete evidence is genuinely needed. For a group that
-    becomes one population, only the representative (the group's template
-    row -- population_key already guarantees every member shares its
-    artifact/sheet/finding_class/severity/provenance/subtype/materiality/
-    temporal_context/waiver state) and up to 5 samples are ever fully
-    reconstructed, however large the group (plan-20260910, Step 6). Scope
-    filtering is likewise decided once per group from the representative
-    alone: every field ``ComparisonScope.filter_findings`` reads (artifact,
-    artifact_member, sheet, slide_index) is population_key-guaranteed
-    identical across a group, so it can never partially trim one group's
-    members -- an already-established invariant this reuses rather than
-    introduces (see the scope test docstrings in ``tests/test_population_
-    finalize.py``).
-
-    When ``telemetry`` is given, ``finalize_seconds`` measures only this
-    function's own per-group grouping/decision loop body; ``spill_seconds``
-    is the residual (this function's total wall time minus that measured
-    body), attributing ``spill.groups()``'s own generator work -- closing
-    the spill writer and the ``merge_spill`` k-way merge -- without double
-    counting time already spent inside the loop body.
+    One first pass aggregates only capped rectangles/pairs, five samples,
+    bounds, counts, and evidence homogeneity. Compact rows are copied in sorted
+    order to a block file. A second sequential pass reconstructs full findings
+    only for groups marked for atomic replay. Both result collections are lazy
+    block-backed sequences owned by the returned outcome.
     """
     total_start = time.perf_counter() if telemetry is not None else 0.0
     finalize_elapsed = 0.0
-    population_findings: list[Finding] = []
-    replay_findings: list[Finding] = []
     stats: dict[FindingClass, ClassPopulationStats] = defaultdict(ClassPopulationStats)
-    for group in spill.groups():
-        body_start = time.perf_counter() if telemetry is not None else 0.0
-        template = next(
-            (row["row"]["finding"] for row in group if row["row"]["kind"] == "full"), None
-        )
-        assert template is not None, "every group has at least one full row"
-        representative = Finding.from_trusted_payload(template)
-        if not scope.filter_findings([representative]):
-            if telemetry is not None:
-                finalize_elapsed += time.perf_counter() - body_start
-            continue
-        class_stats = stats[representative.finding_class]
-        class_stats.candidates += len(group)
+    storage = tempfile.TemporaryDirectory(prefix="qc-population-outcome-")
+    storage_path = Path(storage.name)
+    ordered_path = storage_path / "ordered.qcfb"
+    decisions_path = storage_path / "decisions.qcfb"
+    populations_path = storage_path / "populations.qcfb"
+    replay_path = storage_path / "replay.qcfb"
+    try:
+        ordered_buffer: list[object] = []
+        decision_buffer: list[object] = []
+        population_buffer: list[object] = []
+        with (
+            BlockFile(ordered_path) as ordered_file,
+            BlockFile(decisions_path) as decision_file,
+            BlockFile(populations_path) as population_file,
+        ):
+            for template, rows in spill.iter_groups():
+                body_start = time.perf_counter() if telemetry is not None else 0.0
+                representative = Finding.from_trusted_payload(template)
+                group = _GroupAccumulator(policy)
+                _append_block_payload(
+                    ordered_file,
+                    ordered_buffer,
+                    {"kind": "template", "template": template},
+                )
+                for row in rows:
+                    _append_block_payload(ordered_file, ordered_buffer, row)
+                    group.observe(row, template)
 
-        facts = [_row_facts(row, template) for row in group]
-        members = [fact for fact in facts if fact is not None]
-        if len(members) != len(group) or len(members) < policy.threshold:
-            class_stats.below_threshold += len(group)
-            class_stats.replayed += len(group)
-            replay_findings.extend(_reconstruct_group_findings(group))
-            if telemetry is not None:
-                finalize_elapsed += time.perf_counter() - body_start
-            continue
-        evidence = [_row_evidence(row, template) for row in group]
-        first_event_key, first_tags = evidence[0]
-        homogeneous = all(
-            event_key == first_event_key and tags == first_tags
-            for event_key, tags in evidence[1:]
-        )
-        if not homogeneous:
-            class_stats.heterogeneous_evidence += len(group)
-            class_stats.replayed += len(group)
-            replay_findings.extend(_reconstruct_group_findings(group))
-            if telemetry is not None:
-                finalize_elapsed += time.perf_counter() - body_start
-            continue
-        membership = _build_membership(members, policy)
-        if membership is None:
-            class_stats.over_cap += len(group)
-            class_stats.replayed += len(group)
-            replay_findings.extend(_reconstruct_group_findings(group))
-            if telemetry is not None:
-                finalize_elapsed += time.perf_counter() - body_start
-            continue
-        shape_before = group[0]["shape_before"]
-        shape_after = group[0]["shape_after"]
-        population_findings.append(
-            _build_population(representative, members, membership, shape_before, shape_after)
-        )
-        class_stats.populations += 1
+                action = "drop"
+                if scope.filter_findings([representative]):
+                    class_stats = stats[representative.finding_class]
+                    class_stats.candidates += group.count
+                    if group.malformed or group.count < policy.threshold:
+                        class_stats.below_threshold += group.count
+                        class_stats.replayed += group.count
+                        action = "replay"
+                    elif not group.homogeneous:
+                        class_stats.heterogeneous_evidence += group.count
+                        class_stats.replayed += group.count
+                        action = "replay"
+                    else:
+                        membership = group.membership()
+                        if membership is None:
+                            class_stats.over_cap += group.count
+                            class_stats.replayed += group.count
+                            action = "replay"
+                        else:
+                            population = _build_streamed_population(
+                                representative,
+                                group,
+                                membership,
+                            )
+                            _append_block_payload(
+                                population_file,
+                                population_buffer,
+                                finding_payload(population),
+                            )
+                            class_stats.populations += 1
+                            action = "population"
+                _append_block_payload(
+                    decision_file,
+                    decision_buffer,
+                    {"count": group.count, "action": action},
+                )
+                if telemetry is not None:
+                    finalize_elapsed += time.perf_counter() - body_start
+            _flush_block_payloads(ordered_file, ordered_buffer)
+            _flush_block_payloads(decision_file, decision_buffer)
+            _flush_block_payloads(population_file, population_buffer)
+
+        spill.abort()
+        ordered = iter(_iter_block_payloads(ordered_path))
+        replay_buffer: list[object] = []
+        with BlockFile(replay_path) as replay_file:
+            for raw_decision in _iter_block_payloads(decisions_path):
+                if not isinstance(raw_decision, dict):
+                    raise FindingsStoreError("population decision is not a mapping")
+                raw_marker = next(ordered)
+                if not isinstance(raw_marker, dict) or raw_marker.get("kind") != "template":
+                    raise FindingsStoreError("population replay template is missing")
+                template = raw_marker.get("template")
+                if not isinstance(template, dict):
+                    raise FindingsStoreError("population replay template is not a mapping")
+                count = raw_decision.get("count")
+                action = raw_decision.get("action")
+                if not isinstance(count, int) or action not in {
+                    "drop",
+                    "population",
+                    "replay",
+                }:
+                    raise FindingsStoreError("population decision is invalid")
+                for _ in range(count):
+                    raw_row = next(ordered)
+                    if not isinstance(raw_row, dict):
+                        raise FindingsStoreError("population replay row is not a mapping")
+                    if action == "replay":
+                        _append_block_payload(
+                            replay_file,
+                            replay_buffer,
+                            finding_payload(_finding_from_candidate_row(raw_row, template)),
+                        )
+            try:
+                next(ordered)
+            except StopIteration:
+                pass
+            else:
+                raise FindingsStoreError("population replay contains unconsumed rows")
+            _flush_block_payloads(replay_file, replay_buffer)
+
+        population_findings = FindingSequence(BlockFile.open(populations_path))
+        replay_findings = FindingSequence(BlockFile.open(replay_path))
         if telemetry is not None:
-            finalize_elapsed += time.perf_counter() - body_start
-    if telemetry is not None:
-        telemetry.finalize_seconds += finalize_elapsed
-        total_elapsed = time.perf_counter() - total_start
-        telemetry.spill_seconds += max(0.0, total_elapsed - finalize_elapsed)
-    return PopulationOutcome(population_findings, replay_findings, dict(stats))
+            telemetry.finalize_seconds += finalize_elapsed
+            total_elapsed = time.perf_counter() - total_start
+            telemetry.spill_seconds += max(0.0, total_elapsed - finalize_elapsed)
+        return PopulationOutcome(
+            population_findings=population_findings,
+            replay_findings=replay_findings,
+            stats=dict(stats),
+            _storage=storage,
+        )
+    except BaseException:
+        spill.abort()
+        storage.cleanup()
+        raise
 
 
 def _build_membership(

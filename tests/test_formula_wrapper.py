@@ -146,6 +146,7 @@ class TestDiffIntegration:
                 baseline,
                 current,
                 _block_alignment(1, 4),
+                _use_native_delta=False,
             )
 
         logic = [

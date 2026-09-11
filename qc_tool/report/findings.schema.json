@@ -7,6 +7,10 @@
     "schema_version",
     "mode",
     "profile",
+    "requested_output_mode",
+    "resolved_output_policy",
+    "formula_engines",
+    "values_engines",
     "files",
     "counts",
     "coverage",
@@ -19,8 +23,36 @@
     "context_included": {"type": "boolean"},
     "mode": {"type": "string"},
     "profile": {"type": "string"},
-    "requested_output_mode": {"type": "string"},
-    "resolved_output_policy": {"type": ["object", "null"]},
+    "requested_output_mode": {"enum": ["profile", "decision", "atomic"]},
+    "resolved_output_policy": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["version", "output_mode", "populations", "source"],
+          "properties": {
+            "version": {"const": 1},
+            "output_mode": {"enum": ["profile", "decision", "atomic"]},
+            "populations": {
+              "type": "object",
+              "required": ["enabled", "threshold", "classes", "max_rectangles", "max_explicit_pairs"],
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "threshold": {"type": "integer", "minimum": 1},
+                "classes": {"type": "array", "items": {"enum": ["formula_logic_changed", "number_format_changed"]}, "uniqueItems": true},
+                "max_rectangles": {"type": "integer", "minimum": 1},
+                "max_explicit_pairs": {"type": "integer", "minimum": 1}
+              },
+              "additionalProperties": false
+            },
+            "source": {"enum": ["profile", "decision_built_in", "atomic_forced"]}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "formula_engines": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "values_engines": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
     "comparison_scope": {"type": "object"},
     "files": {"type": "object", "additionalProperties": {"type": "string"}},
     "counts": {"type": "object", "additionalProperties": {"type": "integer"}},

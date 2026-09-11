@@ -449,6 +449,10 @@ class WorkbookSnapshot:
     interaction_rules_supported: bool = True
     conditional_format_styles_supported: bool = True
     formula_source: str | None = None
+    #: Resolved cached-values decoder identity. Unlike
+    #: ``values_engine_fallback_detail``, this always names the engine that
+    #: actually supplied values after any ``auto`` fallback.
+    values_source: str | None = field(default=None, compare=False)
     formula_detail: str = ""
     chart_detail: str = ""
     interaction_rule_detail: str = ""

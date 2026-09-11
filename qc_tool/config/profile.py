@@ -348,8 +348,9 @@ class FindingWaiver(BaseModel):
 
 #: Classes eligible for group-first population output (Phase A). A closed
 #: list -- adding a class here is a scope decision, not a config typo.
-POPULATION_ELIGIBLE_CLASSES = frozenset(
-    {FindingClass.FORMULA_LOGIC_CHANGED, FindingClass.NUMBER_FORMAT_CHANGED}
+POPULATION_ELIGIBLE_CLASSES = (
+    FindingClass.FORMULA_LOGIC_CHANGED,
+    FindingClass.NUMBER_FORMAT_CHANGED,
 )
 
 
@@ -398,6 +399,12 @@ class ReviewPolicy(BaseModel):
 DECISION_MODE_POLICY_VERSION = 1
 
 
+class ResolvedPopulationPolicy(PopulationPolicy):
+    """Immutable copy of the population policy used by one completed run."""
+
+    model_config = {"frozen": True}
+
+
 class ResolvedOutputPolicy(BaseModel):
     """Versioned, persisted record of exactly which population policy one
     run actually used, and why -- kept separate from `profile_sha256` so a
@@ -407,7 +414,7 @@ class ResolvedOutputPolicy(BaseModel):
 
     version: Literal[1] = 1
     output_mode: FindingOutputMode
-    populations: PopulationPolicy
+    populations: ResolvedPopulationPolicy
     #: ``"profile"``: the profile's own explicit, already-enabled policy.
     #: ``"decision_built_in"``: decision mode's conservative default because
     #: the profile did not itself enable populations.
@@ -415,6 +422,10 @@ class ResolvedOutputPolicy(BaseModel):
     source: Literal["profile", "decision_built_in", "atomic_forced"]
 
     model_config = {"frozen": True}
+
+
+def _resolved_population_policy(policy: PopulationPolicy) -> ResolvedPopulationPolicy:
+    return ResolvedPopulationPolicy.model_validate(policy.model_dump(mode="python"))
 
 
 def resolve_output_policy(
@@ -434,24 +445,24 @@ def resolve_output_policy(
     if output_mode is FindingOutputMode.ATOMIC:
         return ResolvedOutputPolicy(
             output_mode=output_mode,
-            populations=PopulationPolicy(enabled=False),
+            populations=_resolved_population_policy(PopulationPolicy(enabled=False)),
             source="atomic_forced",
         )
     if output_mode is FindingOutputMode.DECISION:
         if review_policy.populations.enabled:
             return ResolvedOutputPolicy(
                 output_mode=output_mode,
-                populations=review_policy.populations,
+                populations=_resolved_population_policy(review_policy.populations),
                 source="profile",
             )
         return ResolvedOutputPolicy(
             output_mode=output_mode,
-            populations=PopulationPolicy(enabled=True),
+            populations=_resolved_population_policy(PopulationPolicy(enabled=True)),
             source="decision_built_in",
         )
     return ResolvedOutputPolicy(
         output_mode=output_mode,
-        populations=review_policy.populations,
+        populations=_resolved_population_policy(review_policy.populations),
         source="profile",
     )
 

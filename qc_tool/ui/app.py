@@ -58,7 +58,12 @@ from qc_tool.coverage import (
     capability_limited,
 )
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
-from qc_tool.engine import FindingsDelta, QCRunResult, compare_findings
+from qc_tool.engine import (
+    FindingsDelta,
+    QCRunResult,
+    compare_findings,
+    output_representations_compatible,
+)
 from qc_tool.excel.formulas import formula_token_diff
 from qc_tool.excel.population_excerpt_worker import (
     PopulationExcerptRequest,
@@ -2395,6 +2400,20 @@ def _rerun_delta(
         return None, (
             f"change summary vs run #{record.rerun_of} is skipped for very "
             "large runs — counts and the review queue are complete"
+        )
+    if not output_representations_compatible(
+        previous.requested_output_mode,
+        previous.resolved_output_policy,
+        previous.findings,
+        record.requested_output_mode,
+        record.resolved_output_policy,
+        record.findings,
+    ):
+        return None, (
+            f"change summary vs run #{record.rerun_of} is skipped — the "
+            "effective output policy or population grouping changed, so "
+            "population and atomic decisions are not directly comparable — "
+            "the review queue below reflects this run in full"
         )
     return compare_findings(previous.findings, record.findings), ""
 
@@ -5538,6 +5557,8 @@ def _result_from_record(record: RunRecord) -> QCRunResult:
         requested_output_mode=record.requested_output_mode,
         resolved_output_policy=record.resolved_output_policy,
         files=record.files,
+        formula_engines=record.formula_engines,
+        values_engines=record.values_engines,
         findings=record.findings,
         disclosures=record.disclosures,
         coverage=record.coverage,

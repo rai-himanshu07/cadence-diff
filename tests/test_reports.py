@@ -66,6 +66,7 @@ def test_excel_report_structure(qc_result: QCRunResult, tmp_path: Path) -> None:
     )
     assert "fixture" in summary_text  # profile name
     assert "cycle_comparison" in summary_text
+    assert "ooxml-streaming:" in summary_text
     assert "current.xlsx" in summary_text
     assert "Critical pattern review items" in summary_text
     assert "Critical atomic findings" in summary_text
@@ -423,7 +424,7 @@ def test_json_payload_carries_output_mode_and_matches_schema_for_every_version()
     properties -- for a null resolved policy (v1) and a real, non-null one
     (v2 via a package manifest) alike.
     """
-    from qc_tool.config.profile import PopulationPolicy, ResolvedOutputPolicy
+    from qc_tool.config.profile import ReviewPolicy, resolve_output_policy
     from qc_tool.coverage import FindingOutputMode
 
     v1_result = QCRunResult(profile_name="fixture")
@@ -439,10 +440,11 @@ def test_json_payload_carries_output_mode_and_matches_schema_for_every_version()
 
     decision_result = _package_result()
     decision_result.requested_output_mode = FindingOutputMode.DECISION
-    resolved = ResolvedOutputPolicy(
-        output_mode=FindingOutputMode.DECISION,
-        populations=PopulationPolicy(enabled=True),
-        source="decision_built_in",
+    decision_result.formula_engines = {"current_excel": "native-biff12:1.2.3"}
+    decision_result.values_engines = {"current_excel": "native-biff12:1.2.3"}
+    resolved = resolve_output_policy(
+        FindingOutputMode.DECISION,
+        ReviewPolicy(),
     )
     decision_result.resolved_output_policy = resolved
     decision_payload = result_payload(decision_result, include_review_summary=True)
@@ -452,13 +454,14 @@ def test_json_payload_carries_output_mode_and_matches_schema_for_every_version()
         )
     )
     assert decision_payload["requested_output_mode"] == "decision"
-    # Built from the model's own serialization (not a hand-typed literal):
-    # `PopulationPolicy.classes` derives from a frozenset, whose iteration
-    # order is not guaranteed stable across interpreter invocations.
+    # Compare against the production model serialization rather than a
+    # duplicated hand-written policy payload.
     assert decision_payload["resolved_output_policy"] == resolved.model_dump(
         mode="json"
     )
     assert decision_payload["resolved_output_policy"]["populations"]["enabled"] is True
+    assert decision_payload["formula_engines"] == decision_result.formula_engines
+    assert decision_payload["values_engines"] == decision_result.values_engines
     assert set(decision_payload) <= set(v2_schema["properties"])
     assert set(v2_schema["required"]) <= set(decision_payload)
 

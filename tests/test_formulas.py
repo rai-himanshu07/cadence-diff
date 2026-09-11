@@ -659,9 +659,15 @@ def test_pair_analysis_memo_is_transparent_on_diverse_single_occurrence_construc
     current = _formula_column_workbook(curr_formulas, max_row=max_row)
     alignment = _alignment_for_rows(rows, max_row)
 
-    expected = diff_workbook_formulas(baseline, current, alignment)
+    expected = diff_workbook_formulas(
+        baseline, current, alignment, _use_native_delta=False
+    )
     actual = diff_workbook_formulas(
-        baseline, current, alignment, pair_analysis_memo=FormulaPairAnalysisMemo()
+        baseline,
+        current,
+        alignment,
+        pair_analysis_memo=FormulaPairAnalysisMemo(),
+        _use_native_delta=False,
     )
 
     assert [f.model_dump(mode="json") for f in actual] == [
@@ -725,7 +731,11 @@ def test_pair_analysis_memo_reuses_the_single_classification_across_every_repeat
 
     memo = FormulaPairAnalysisMemo()
     findings = diff_workbook_formulas(
-        baseline, current, alignment, pair_analysis_memo=memo
+        baseline,
+        current,
+        alignment,
+        pair_analysis_memo=memo,
+        _use_native_delta=False,
     )
 
     assert extension_call_count == len(rows)
@@ -815,7 +825,11 @@ def test_pair_analysis_memo_recomputes_added_reference_per_occurrence_of_the_sam
 
     for memo in (None, FormulaPairAnalysisMemo()):
         findings = diff_workbook_formulas(
-            baseline, current, alignment, pair_analysis_memo=memo
+            baseline,
+            current,
+            alignment,
+            pair_analysis_memo=memo,
+            _use_native_delta=False,
         )
         by_location = {f.location: f for f in findings}
         assert FindingEvidenceTag.ADDED_REFERENCE in by_location["B20"].evidence_tags
@@ -834,9 +848,15 @@ def test_pair_analysis_memo_produces_byte_identical_findings_on_a_repeated_patte
     current = _formula_column_workbook(curr_formulas, max_row=max_row)
     alignment = _alignment_for_rows(rows, max_row)
 
-    expected = diff_workbook_formulas(baseline, current, alignment)
+    expected = diff_workbook_formulas(
+        baseline, current, alignment, _use_native_delta=False
+    )
     actual = diff_workbook_formulas(
-        baseline, current, alignment, pair_analysis_memo=FormulaPairAnalysisMemo()
+        baseline,
+        current,
+        alignment,
+        pair_analysis_memo=FormulaPairAnalysisMemo(),
+        _use_native_delta=False,
     )
 
     assert [f.model_dump(mode="json") for f in actual] == [
@@ -850,9 +870,15 @@ def test_pair_analysis_memo_produces_byte_identical_findings_on_the_manifest_fix
     """Real-fixture regression check: enabling the memo on the standard
     E01-E18 manifest pair changes zero findings.
     """
-    expected = diff_workbook_formulas(baseline, current, alignment)
+    expected = diff_workbook_formulas(
+        baseline, current, alignment, _use_native_delta=False
+    )
     actual = diff_workbook_formulas(
-        baseline, current, alignment, pair_analysis_memo=FormulaPairAnalysisMemo()
+        baseline,
+        current,
+        alignment,
+        pair_analysis_memo=FormulaPairAnalysisMemo(),
+        _use_native_delta=False,
     )
 
     assert [f.model_dump(mode="json") for f in actual] == [
@@ -874,6 +900,7 @@ def test_pair_analysis_memo_tracks_hits_and_misses_in_telemetry() -> None:
         alignment,
         telemetry=telemetry,
         pair_analysis_memo=FormulaPairAnalysisMemo(),
+        _use_native_delta=False,
     )
 
     assert telemetry.pair_analysis_memo_misses == 1
@@ -1004,7 +1031,19 @@ def test_pair_analysis_memo_improves_compare_time_on_a_repeated_pattern_workload
     right at it) absorbs this shared-host benchmark's own run-to-run CPU
     noise (measured 9.3%-16.3% across repeated local runs).
     """
-    base_formulas, curr_formulas, rows = _repeated_pattern_rows(20_000)
+    rows = list(range(20, 2_020))
+    base_formulas: dict[int, str] = {}
+    curr_formulas: dict[int, str] = {}
+    for row in rows:
+        core = f"SUM(A{row}:B{row})+C{row}*D{row}+E{row}*F{row}+G{row}*H{row}"
+        distractor = (
+            f"SUM(I{row}:J{row})+K{row}*L{row}+M{row}*N{row}+O{row}*P{row}"
+        )
+        expression = core
+        for _ in range(10):
+            expression = f"IF(FALSE,{distractor},{expression})"
+        base_formulas[row] = f"={core}"
+        curr_formulas[row] = f"={expression}"
     max_row = max(rows) + 1
     baseline = _formula_column_workbook(base_formulas, max_row=max_row)
     current = _formula_column_workbook(curr_formulas, max_row=max_row)
@@ -1019,6 +1058,7 @@ def test_pair_analysis_memo_improves_compare_time_on_a_repeated_pattern_workload
             current,
             alignment,
             pair_analysis_memo=FormulaPairAnalysisMemo() if memoized else None,
+            _use_native_delta=False,
         )
         return time.process_time() - started
 

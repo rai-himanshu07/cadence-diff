@@ -8,6 +8,7 @@ whether XLSB formula text was enriched or only formula presence was checked.
 
 import contextlib
 import datetime as dt
+import hashlib
 import logging
 import shutil
 import tempfile
@@ -19,7 +20,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from openpyxl.formula.tokenizer import TokenizerError
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
 
 from qc_tool.availability import (
     availability_coverage,
@@ -86,14 +89,21 @@ from qc_tool.excel.diff_vba import diff_workbook_vba, vba_coverage
 from qc_tool.excel.formulas import (
     FormulaComparisonTelemetry,
     FormulaPairAnalysisMemo,
+    PairKeyTelemetry,
     diff_workbook_formulas,
     formula_text_compatible,
+    to_r1c1,
 )
 from qc_tool.excel.interaction import (
     conditional_style_coverage,
     interaction_rule_coverage,
 )
-from qc_tool.excel.population import CandidateSpill, ClassPopulationStats, finalize_populations
+from qc_tool.excel.population import (
+    CandidateSpill,
+    ClassPopulationStats,
+    PopulationTelemetry,
+    finalize_populations,
+)
 from qc_tool.excel.preflight import defined_name_scope_coverage, preflight_workbook
 from qc_tool.excel.prerequisites import check_comparison_prerequisites
 from qc_tool.excel.ranked_identity import detect_ranked_table_candidate
@@ -130,6 +140,7 @@ from qc_tool.progress import (
 )
 from qc_tool.review import requeue_identity_key
 from qc_tool.run_action import (
+    MAX_RUN_ACTION_ITEMS,
     RankedTableEvidence,
     RunActionItem,
     RunActionReason,
@@ -334,6 +345,25 @@ def _enrich_population_samples(
             population.population = evidence.model_copy(
                 update={"sampled_impacts": tuple(impacts)}
             )
+
+
+def _finding_batches(
+    findings: Sequence[Finding], *, batch_size: int = BLOCK_FINDINGS
+) -> Iterator[list[Finding]]:
+    """Bounded batches from list or lazy spill-backed finding sequences."""
+    source = (
+        findings.iter_trusted()
+        if isinstance(findings, FindingSequence)
+        else iter(findings)
+    )
+    batch: list[Finding] = []
+    for finding in source:
+        batch.append(finding)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def _enrich_retained_findings(
@@ -723,6 +753,8 @@ class QCRunResult:
     #: Persisted so Re-QC/carry-forward can disclose a cross-run engine
     #: change instead of silently comparing evidence from two engines.
     formula_engines: dict[str, str] = field(default_factory=dict)
+    #: Resolved cached-values decoder per excel role, including any fallback.
+    values_engines: dict[str, str] = field(default_factory=dict)
     findings: Sequence[Finding] = field(default_factory=list)
     disclosures: list[str] = field(default_factory=list)
     coverage: list[CoverageItem] = field(default_factory=list)
@@ -948,6 +980,68 @@ def _apply_comparison_scope(
     return validated.filter_findings(findings)
 
 
+def _memberize_run_action(
+    action: RunActionRequired,
+    member_id: str,
+) -> RunActionRequired:
+    items = [
+        item.model_copy(
+            update={
+                "member_id": member_id,
+                "ranked_table_evidence": (
+                    item.ranked_table_evidence.model_copy(
+                        update={"member_id": member_id}
+                    )
+                    if item.ranked_table_evidence is not None
+                    else None
+                ),
+            }
+        )
+        for item in action.items
+    ]
+    return RunActionRequired(
+        version=action.version,
+        reason=action.reason,
+        items=items,
+        message=action.message,
+        omitted_items=action.omitted_items,
+    )
+
+
+def _aggregate_ranked_package_actions(
+    actions: list[tuple[str, RunActionRequired]],
+) -> RunActionRequired:
+    member_actions = [
+        _memberize_run_action(action, member_id)
+        for member_id, action in actions
+    ]
+    selected: list[RunActionItem] = []
+    max_items = max((len(action.items) for action in member_actions), default=0)
+    for item_index in range(max_items):
+        for action in member_actions:
+            if item_index < len(action.items):
+                selected.append(action.items[item_index])
+                if len(selected) == MAX_RUN_ACTION_ITEMS:
+                    break
+        if len(selected) == MAX_RUN_ACTION_ITEMS:
+            break
+    known_items = sum(len(action.items) for action in member_actions)
+    omitted_items = sum(action.omitted_items for action in member_actions)
+    omitted_items += known_items - len(selected)
+    member_count = len(member_actions)
+    return RunActionRequired(
+        version=2,
+        reason=RunActionReason.ROW_IDENTITY_CONFIRMATION_REQUIRED,
+        items=selected,
+        omitted_items=omitted_items,
+        message=(
+            f"Review row matching for {member_count} package workbook "
+            f"member{'s' if member_count != 1 else ''}, save the rules, and "
+            "Re-QC."
+        ),
+    )
+
+
 def _run_multi_package(
     *,
     manifest: PackageManifest,
@@ -965,6 +1059,9 @@ def _run_multi_package(
     cancellation_token: CancellationToken | None,
     on_progress: ProgressCallback | None,
     formula_cache: FormulaExtractionCache | None = None,
+    formula_telemetry: FormulaComparisonTelemetry | None = None,
+    pair_key_telemetry: PairKeyTelemetry | None = None,
+    population_telemetry: PopulationTelemetry | None = None,
 ) -> QCRunResult:
     """Run existing single-artifact pipelines sequentially, then merge once."""
     paths_by_member(files, manifest)
@@ -1014,10 +1111,12 @@ def _run_multi_package(
     disclosures: list[str] = []
     trust_manifests: list[AlignmentTrustPayload] = []
     formula_engines: dict[str, str] = {}
+    values_engines: dict[str, str] = {}
     current_deck_snapshot: DeckSnapshot | None = None
     package_reconciler: MultiPackageReconciler | None = None
     package_result = None
     member_events = 0
+    ranked_blocks: list[tuple[str, RunActionRequired]] = []
     stream = _FindingStream()
     today = dt.date.today()
 
@@ -1118,25 +1217,21 @@ def _run_multi_package(
                     cancellation_token=cancellation_token,
                     on_progress=on_progress,
                     formula_cache=formula_cache,
+                    _formula_telemetry=formula_telemetry,
+                    _pair_key_telemetry=pair_key_telemetry,
+                    _population_telemetry=population_telemetry,
                 )
             except RunBlockedError as blocked:
-                # The inner call always tags "primary"; attribute the
-                # mismatch to the actual package member before it propagates.
-                blocked.action_required.items = [
-                    item.model_copy(
-                        update={
-                            "member_id": member_id,
-                            "ranked_table_evidence": (
-                                item.ranked_table_evidence.model_copy(
-                                    update={"member_id": member_id}
-                                )
-                                if item.ranked_table_evidence is not None
-                                else None
-                            ),
-                        }
-                    )
-                    for item in blocked.action_required.items
-                ]
+                if (
+                    blocked.action_required.reason
+                    is RunActionReason.ROW_IDENTITY_CONFIRMATION_REQUIRED
+                ):
+                    ranked_blocks.append((member_id, blocked.action_required))
+                    continue
+                blocked.action_required = _memberize_run_action(
+                    blocked.action_required,
+                    member_id,
+                )
                 raise
             member_findings, member_coverage, member_trust = (
                 _memberize_excel_result(subresult, member_id)
@@ -1149,6 +1244,10 @@ def _run_multi_package(
                 formula_engines[baseline.role_key] = engine
             if engine := subresult.formula_engines.get("current_excel"):
                 formula_engines[current.role_key] = engine
+            if engine := subresult.values_engines.get("baseline_excel"):
+                values_engines[baseline.role_key] = engine
+            if engine := subresult.values_engines.get("current_excel"):
+                values_engines[current.role_key] = engine
             disclosures.extend(
                 f"Excel member {member_id}: {detail}"
                 for detail in subresult.disclosures
@@ -1171,6 +1270,9 @@ def _run_multi_package(
                 on_progress=on_progress,
                 _snapshot_capture=capture,
                 formula_cache=formula_cache,
+                _formula_telemetry=formula_telemetry,
+                _pair_key_telemetry=pair_key_telemetry,
+                _population_telemetry=population_telemetry,
             )
             member_findings, member_coverage, _member_trust = (
                 _memberize_excel_result(subresult, member_id)
@@ -1208,6 +1310,8 @@ def _run_multi_package(
             coverage.extend(member_coverage)
             if engine := subresult.formula_engines.get("current_excel"):
                 formula_engines[current.role_key] = engine
+            if engine := subresult.values_engines.get("current_excel"):
+                values_engines[current.role_key] = engine
             disclosures.extend(
                 f"Excel member {member_id}: {detail}"
                 for detail in subresult.disclosures
@@ -1246,6 +1350,9 @@ def _run_multi_package(
                 ]
             )
             member_events += 1
+
+    if ranked_blocks:
+        raise RunBlockedError(_aggregate_ranked_package_actions(ranked_blocks))
 
     if mode is QCRunMode.CYCLE_COMPARISON and baseline_ppt and current_ppt:
         baseline = baseline_ppt[0]
@@ -1361,6 +1468,7 @@ def _run_multi_package(
         resolved_output_policy=resolve_output_policy(output_mode, profile.review_policy),
         files={member.role_key: member.display_name for member in manifest.members},
         formula_engines=formula_engines,
+        values_engines=values_engines,
         disclosures=list(dict.fromkeys(disclosures)),
         coverage=coverage,
         package_manifest=manifest,
@@ -1415,6 +1523,8 @@ def run_qc(
     _native_compat_mode: bool = False,
     _xlsb_values_engine: Literal["pyxlsb", "native", "auto"] = "auto",
     _formula_telemetry: FormulaComparisonTelemetry | None = None,
+    _pair_key_telemetry: PairKeyTelemetry | None = None,
+    _population_telemetry: PopulationTelemetry | None = None,
 ) -> QCRunResult:
     """Run a full QC comparison. ``passwords`` is keyed by file name.
 
@@ -1511,6 +1621,9 @@ def run_qc(
                 cancellation_token=cancellation_token,
                 on_progress=on_progress,
                 formula_cache=formula_cache,
+                formula_telemetry=_formula_telemetry,
+                pair_key_telemetry=_pair_key_telemetry,
+                population_telemetry=_population_telemetry,
             )
     if mode is QCRunMode.CURRENT_FILE_PREFLIGHT:
         if baseline_excel is not None or baseline_ppt is not None:
@@ -1548,6 +1661,8 @@ def run_qc(
             result.files["current_excel"] = current_excel.name
             if workbook.formula_source is not None:
                 result.formula_engines["current_excel"] = workbook.formula_source
+            if workbook.values_source is not None:
+                result.values_engines["current_excel"] = workbook.values_source
             if workbook.values_engine_fallback_detail:
                 result.disclosures.append(
                     f"current_excel: {workbook.values_engine_fallback_detail}"
@@ -1718,6 +1833,8 @@ def run_qc(
         }
         if workbook.formula_source is not None:
             result.formula_engines["current_excel"] = workbook.formula_source
+        if workbook.values_source is not None:
+            result.values_engines["current_excel"] = workbook.values_source
         if workbook.values_engine_fallback_detail:
             result.disclosures.append(
                 f"current_excel: {workbook.values_engine_fallback_detail}"
@@ -1827,7 +1944,9 @@ def run_qc(
     today = dt.date.today()
     population_policy = resolved_output_policy.populations
     candidate_sink = (
-        CandidateSpill(profile, today) if population_policy.enabled else None
+        CandidateSpill(profile, today, telemetry=_population_telemetry)
+        if population_policy.enabled
+        else None
     )
     # One bounded cache per run_qc() call, shared across every sheet/region so
     # a formula pattern repeated across the workbook is classified once --
@@ -1916,6 +2035,10 @@ def run_qc(
             result.formula_engines["baseline_excel"] = base_wb.formula_source
         if curr_wb.formula_source is not None:
             result.formula_engines["current_excel"] = curr_wb.formula_source
+        if base_wb.values_source is not None:
+            result.values_engines["baseline_excel"] = base_wb.values_source
+        if curr_wb.values_source is not None:
+            result.values_engines["current_excel"] = curr_wb.values_source
         if base_wb.values_engine_fallback_detail:
             result.disclosures.append(
                 f"baseline_excel: {base_wb.values_engine_fallback_detail}"
@@ -2213,6 +2336,7 @@ def run_qc(
             cancellation_token=cancellation_token,
             candidate_sink=candidate_sink,
             telemetry=_formula_telemetry,
+            pair_key_telemetry=_pair_key_telemetry,
             pair_analysis_memo=pair_analysis_memo,
         )
         check_cancelled(cancellation_token)
@@ -2638,28 +2762,35 @@ def run_qc(
                 values_coverage.findings = produced
         if candidate_sink is not None:
             outcome = finalize_populations(
-                candidate_sink, population_policy, validated_scope
+                candidate_sink,
+                population_policy,
+                validated_scope,
+                telemetry=_population_telemetry,
             )
             for finding_class, class_stats in outcome.stats.items():
                 result.coverage.append(_population_coverage(finding_class, class_stats))
             if outcome.replay_findings:
-                assign_severities(outcome.replay_findings, profile, today=today)
-                _enrich_retained_findings(
-                    outcome.replay_findings,
-                    baseline_workbook=baseline_workbook,
-                    current_workbook=current_workbook,
-                    current_deck=current_deck,
-                    dependency_graph=dependency_graph,
-                    crosscheck=profile.crosscheck,
-                )
-                stream.add(outcome.replay_findings)
+                for replay_batch in _finding_batches(outcome.replay_findings):
+                    assign_severities(replay_batch, profile, today=today)
+                    _enrich_retained_findings(
+                        replay_batch,
+                        baseline_workbook=baseline_workbook,
+                        current_workbook=current_workbook,
+                        current_deck=current_deck,
+                        dependency_graph=dependency_graph,
+                        crosscheck=profile.crosscheck,
+                    )
+                    stream.add(replay_batch)
             if outcome.population_findings:
-                _enrich_population_samples(
-                    outcome.population_findings,
-                    current_workbook=current_workbook,
-                    dependency_graph=dependency_graph,
-                )
-                stream.add(outcome.population_findings)
+                for population_batch in _finding_batches(
+                    outcome.population_findings
+                ):
+                    _enrich_population_samples(
+                        population_batch,
+                        current_workbook=current_workbook,
+                        dependency_graph=dependency_graph,
+                    )
+                    stream.add(population_batch)
         if buffered_post is not None:
             stream.add(buffered_post.iter_trusted())
             if buffered_post_dir is not None:
@@ -2697,6 +2828,178 @@ class FindingsDelta:
     persisting: int
 
 
+PopulationRepresentationKey = tuple[object, ...]
+
+
+def _output_policy_representation_key(
+    mode: FindingOutputMode,
+    policy: ResolvedOutputPolicy | None,
+) -> tuple[object, ...]:
+    """Canonical effective representation contract for cross-run comparison."""
+    if policy is None:
+        # Historical PROFILE rows predate explicit output policies and used
+        # populations-disabled behavior.
+        return (mode.value, False) if mode is FindingOutputMode.PROFILE else (mode.value, None)
+    populations = policy.populations
+    if not populations.enabled:
+        return (mode.value, False)
+    return (
+        mode.value,
+        True,
+        populations.threshold,
+        tuple(sorted(item.value for item in populations.classes)),
+        populations.max_rectangles,
+        populations.max_explicit_pairs,
+    )
+
+
+def _population_scope_key(finding: Finding) -> tuple[str, ...]:
+    return (
+        finding.artifact,
+        finding.artifact_member,
+        finding.finding_class.value,
+        finding.sheet or "",
+    )
+
+
+def _baseline_translation_mode_for_representation(finding: Finding) -> str:
+    if finding.population is not None:
+        membership = finding.population.membership
+        if membership.baseline_mode == "shift":
+            return "in-place" if membership.shift == (0, 0) else "translated"
+        return "translated"
+    if finding.baseline_location is None:
+        return "no-baseline"
+    try:
+        baseline = coordinate_to_tuple(finding.baseline_location)
+        current = coordinate_to_tuple(finding.location or "")
+    except ValueError:
+        return "marker"
+    return "in-place" if baseline == current else "translated"
+
+
+def _population_representation_key(
+    finding: Finding,
+) -> PopulationRepresentationKey | None:
+    """Comparable group shape for an eligible population or atomic finding."""
+    if finding.finding_class not in {
+        FindingClass.FORMULA_LOGIC_CHANGED,
+        FindingClass.NUMBER_FORMAT_CHANGED,
+    }:
+        return None
+    if finding.population is not None:
+        shape_before = finding.population.shape_before_digest
+        shape_after = finding.population.shape_after_digest
+    elif finding.finding_class is FindingClass.NUMBER_FORMAT_CHANGED:
+        shape_before = finding.baseline_value or ""
+        shape_after = finding.current_value or ""
+    else:
+        baseline_formula = finding.baseline_value
+        current_formula = finding.current_value
+        baseline_location = finding.baseline_location
+        current_location = finding.location
+        if (
+            not isinstance(baseline_formula, str)
+            or not isinstance(current_formula, str)
+            or not isinstance(baseline_location, str)
+            or not isinstance(current_location, str)
+        ):
+            return None
+        try:
+            baseline_row, baseline_column = coordinate_to_tuple(baseline_location)
+            current_row, current_column = coordinate_to_tuple(current_location)
+            baseline_r1c1 = to_r1c1(
+                baseline_formula,
+                baseline_row,
+                baseline_column,
+            )
+            current_r1c1 = to_r1c1(
+                current_formula,
+                current_row,
+                current_column,
+            )
+        except (TokenizerError, TypeError, ValueError):
+            return None
+        shape_before = hashlib.sha256(baseline_r1c1.encode("utf-8")).hexdigest()
+        shape_after = hashlib.sha256(current_r1c1.encode("utf-8")).hexdigest()
+    return (
+        *_population_scope_key(finding),
+        finding.severity.value if finding.severity is not None else "",
+        finding.expected_reason.value if finding.expected_reason is not None else "",
+        finding.provenance.value if finding.provenance is not None else "",
+        finding.subtype.value if finding.subtype is not None else "",
+        finding.materiality.value if finding.materiality is not None else "",
+        finding.temporal_context.value if finding.temporal_context is not None else "",
+        tuple(sorted(tag.value for tag in finding.evidence_tags)),
+        finding.event_key,
+        shape_before,
+        shape_after,
+        _baseline_translation_mode_for_representation(finding),
+        finding.waiver_reason,
+        finding.waiver_expires,
+    )
+
+
+def _population_scope_from_representation(
+    key: PopulationRepresentationKey,
+) -> tuple[str, ...]:
+    return tuple(str(value) for value in key[:4])
+
+
+def output_representations_compatible(
+    previous_mode: FindingOutputMode,
+    previous_policy: ResolvedOutputPolicy | None,
+    previous: Sequence[Finding],
+    current_mode: FindingOutputMode,
+    current_policy: ResolvedOutputPolicy | None,
+    current: Sequence[Finding],
+) -> bool:
+    """Whether a location/population identity comparison is demonstrably safe."""
+    if _output_policy_representation_key(
+        previous_mode, previous_policy
+    ) != _output_policy_representation_key(current_mode, current_policy):
+        return False
+
+    def keys(
+        findings: Sequence[Finding],
+    ) -> tuple[
+        set[PopulationRepresentationKey],
+        set[PopulationRepresentationKey],
+        set[tuple[str, ...]],
+    ]:
+        populations: set[PopulationRepresentationKey] = set()
+        atomics: set[PopulationRepresentationKey] = set()
+        unknown_atomic_scopes: set[tuple[str, ...]] = set()
+        for finding in findings:
+            key = _population_representation_key(finding)
+            if finding.population is not None:
+                if key is not None:
+                    populations.add(key)
+            elif finding.finding_class in {
+                FindingClass.FORMULA_LOGIC_CHANGED,
+                FindingClass.NUMBER_FORMAT_CHANGED,
+            }:
+                if key is None:
+                    unknown_atomic_scopes.add(_population_scope_key(finding))
+                else:
+                    atomics.add(key)
+        return populations, atomics, unknown_atomic_scopes
+
+    previous_populations, previous_atomics, previous_unknown = keys(previous)
+    current_populations, current_atomics, current_unknown = keys(current)
+    if previous_populations & current_atomics or current_populations & previous_atomics:
+        return False
+    if any(
+        _population_scope_from_representation(key) in current_unknown
+        for key in previous_populations
+    ):
+        return False
+    return not any(
+        _population_scope_from_representation(key) in previous_unknown
+        for key in current_populations
+    )
+
+
 def compare_findings(
     previous: Sequence[Finding], current: Sequence[Finding]
 ) -> FindingsDelta:
@@ -2715,16 +3018,11 @@ def compare_findings(
     as one resolved, not be hidden because the key was still present
     (Criterion 8).
 
-    Caller contract (plan-20260910 Criterion 5): `previous` and `current`
-    must come from runs that share the same `requested_output_mode`.
-    Populations and atomics key into disjoint identity spaces here, so
-    comparing across a mode change (e.g. a decision-mode run re-queued in
-    atomic mode) makes every population look "resolved" and every atomic
-    member it covered look "new" even when nothing substantive changed.
-    Callers (`run_service.perform_run`, `ui.app._rerun_delta`) check
-    `requested_output_mode` equality before calling this and disclose a
-    representation change instead of calling it -- do not call this
-    directly across a known mode change.
+    Caller contract: `previous` and `current` must pass
+    `output_representations_compatible` first. Populations and atomics key
+    into disjoint identity spaces here, and representation can change because
+    of effective policy or threshold crossings even when the requested mode
+    stays the same.
     """
     previous_counts = Counter(
         requeue_identity_key(f) for f in previous if f.severity is not Severity.EXPECTED

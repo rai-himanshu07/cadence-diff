@@ -188,6 +188,10 @@ def test_attestation_discloses_resolved_formula_engines(
             "baseline_excel": "libreoffice:24.2.4.2",
             "current_excel": "native-biff12:1.2.3",
         },
+        values_engines={
+            "baseline_excel": "pyxlsb:1.0.10",
+            "current_excel": "native-biff12:1.2.3",
+        },
     )
     bundle = create_attestation(
         tmp_path / "engines.qca",
@@ -205,7 +209,46 @@ def test_attestation_discloses_resolved_formula_engines(
         "baseline_excel": "libreoffice:24.2.4.2",
         "current_excel": "native-biff12:1.2.3",
     }
+    assert manifest["run"]["values_engines"] == {
+        "baseline_excel": "pyxlsb:1.0.10",
+        "current_excel": "native-biff12:1.2.3",
+    }
     assert verify_attestation(bundle, key=b"e" * 32).valid
+
+
+def test_verifier_rejects_resigned_invalid_run_metadata(
+    fixture_dir: Path, tmp_path: Path
+) -> None:
+    key = b"m" * 32
+    bundle = create_attestation(
+        tmp_path / "run-metadata.qca",
+        result=QCRunResult(profile_name="signed"),
+        profile=fixture_profile(),
+        input_files={"current_excel": fixture_dir / "current.xlsx"},
+        report_paths={},
+        key=key,
+    )
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        members = {
+            name: archive.read(name)
+            for name in archive.namelist()
+            if name != "manifest.json"
+        }
+    manifest["run"]["requested_output_mode"] = "random"
+    unsigned = {name: value for name, value in manifest.items() if name != "signature"}
+    payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    manifest["signature"]["value"] = hmac.new(key, payload, hashlib.sha256).hexdigest()
+    tampered = tmp_path / "invalid-run-metadata.qca"
+    with zipfile.ZipFile(tampered, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+    verification = verify_attestation(tampered, key=key)
+
+    assert not verification.valid
+    assert any(issue.code == "run-metadata" for issue in verification.issues)
 
 
 def _population_finding_for_signoff_test():

@@ -609,6 +609,28 @@ def test_record_run_persists_resolved_formula_engines(tmp_path: Path) -> None:
     }
 
 
+def test_record_run_persists_resolved_values_engines(tmp_path: Path) -> None:
+    history = RunHistory(tmp_path / "history.sqlite3")
+    run_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            values_engines={
+                "baseline_excel": "native-biff12:1.2.3",
+                "current_excel": "pyxlsb:1.0.10",
+            },
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+
+    record = history.get_run(run_id)
+
+    assert record.values_engines == {
+        "baseline_excel": "native-biff12:1.2.3",
+        "current_excel": "pyxlsb:1.0.10",
+    }
+
+
 def test_legacy_run_without_formula_engines_defaults_to_an_empty_dict(
     tmp_path: Path,
 ) -> None:
@@ -625,6 +647,22 @@ def test_legacy_run_without_formula_engines_defaults_to_an_empty_dict(
         )
 
     assert history.get_run(run_id).formula_engines == {}
+
+
+def test_legacy_run_without_values_engines_defaults_to_an_empty_dict(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "history.sqlite3"
+    history = RunHistory(database)
+    run_id = history.record_run(
+        QCRunResult(profile_name="fixture"), file_hashes={}, report_paths={}
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE runs SET values_engines = '{}' WHERE id = ?", (run_id,)
+        )
+
+    assert history.get_run(run_id).values_engines == {}
 
 
 def test_record_run_reports_fixed_code_subphase_timings(tmp_path: Path) -> None:

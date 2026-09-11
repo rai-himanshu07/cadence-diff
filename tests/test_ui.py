@@ -1,6 +1,7 @@
 """UI smoke tests (criterion 12): pages render; perform_run produces artifacts."""
 
 import datetime as dt
+import hashlib
 import inspect
 import logging
 import os
@@ -18,7 +19,13 @@ from openpyxl.utils import get_column_letter
 
 import qc_tool.run_service as run_service
 import qc_tool.ui.app as app_module
-from qc_tool.config.profile import DeliverableProfile, save_profile
+from qc_tool.config.profile import (
+    DeliverableProfile,
+    PopulationPolicy,
+    ReviewPolicy,
+    resolve_output_policy,
+    save_profile,
+)
 from qc_tool.coverage import FindingOutputMode, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion, SuggestedSource
 from qc_tool.engine import QCRunResult
@@ -2153,6 +2160,131 @@ def test_rerun_delta_still_compares_normally_within_the_same_output_mode(
     assert delta.persisting == 1
     assert delta.resolved == 0
     assert delta.new == 0
+
+
+def test_rerun_delta_skips_same_mode_effective_policy_change(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    finding = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        severity=Severity.WARNING,
+        sheet="Data",
+        location="B2",
+        baseline_location="B2",
+        baseline_value="=A2*2",
+        current_value="=A2*3",
+        message="changed",
+    )
+    previous_policy = resolve_output_policy(
+        FindingOutputMode.PROFILE,
+        ReviewPolicy(populations=PopulationPolicy(enabled=True, threshold=10)),
+    )
+    current_policy = resolve_output_policy(
+        FindingOutputMode.PROFILE,
+        ReviewPolicy(populations=PopulationPolicy(enabled=True, threshold=20)),
+    )
+    previous_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding],
+            requested_output_mode=FindingOutputMode.PROFILE,
+            resolved_output_policy=previous_policy,
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    current_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding.model_copy(update={"finding_id": "N1"})],
+            requested_output_mode=FindingOutputMode.PROFILE,
+            resolved_output_policy=current_policy,
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+    )
+
+    delta, note = _rerun_delta(history, history.get_run(current_id))
+
+    assert delta is None
+    assert "effective output policy" in note
+
+
+def test_rerun_delta_skips_same_policy_threshold_crossing(tmp_path: Path) -> None:
+    from qc_tool.findings import MembershipCodec, PopulationEvidence
+
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    policy = resolve_output_policy(
+        FindingOutputMode.DECISION,
+        ReviewPolicy(populations=PopulationPolicy(enabled=True, threshold=10)),
+    )
+    atomic = Finding(
+        finding_id="A1",
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        severity=Severity.WARNING,
+        sheet="Data",
+        location="B2",
+        baseline_location="B2",
+        baseline_value="=A2*2",
+        current_value="=A2*3",
+        message="changed",
+    )
+    shape_before = hashlib.sha256(b"=RC[-1]*2").hexdigest()
+    shape_after = hashlib.sha256(b"=RC[-1]*3").hexdigest()
+    population = Finding(
+        finding_id="P1",
+        artifact="excel",
+        finding_class=FindingClass.FORMULA_LOGIC_CHANGED,
+        severity=Severity.WARNING,
+        sheet="Data",
+        location="B2:B11",
+        element="population",
+        message="population",
+        population=PopulationEvidence(
+            member_count=10,
+            membership=MembershipCodec(
+                current_rectangles=("B2:B11",),
+                baseline_mode="shift",
+                shift=(0, 0),
+                member_count=10,
+            ),
+            first="B2",
+            last="B11",
+            shape_before_digest=shape_before,
+            shape_after_digest=shape_after,
+        ),
+    )
+    previous_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[population],
+            requested_output_mode=FindingOutputMode.DECISION,
+            resolved_output_policy=policy,
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    current_id = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[atomic],
+            requested_output_mode=FindingOutputMode.DECISION,
+            resolved_output_policy=policy,
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+    )
+
+    delta, note = _rerun_delta(history, history.get_run(current_id))
+
+    assert delta is None
+    assert "population grouping changed" in note
 
 
 @pytest.mark.asyncio
