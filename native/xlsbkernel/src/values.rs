@@ -3,8 +3,8 @@
 //! inspection of the installed pyxlsb 1.x source -- see the B1 decision
 //! record), NOT calamine. calamine's `worksheet_range()` auto-classifies
 //! date-formatted numeric cells into a separate `Data::DateTime` variant
-//! that pyxlsb never produces (confirmed empirically: 2,014/1,943,753 real
-//! LARGE_WORKBOOK cells reclassified on one file alone), which would break exact
+//! that pyxlsb never produces (confirmed empirically on representative
+//! large-workbook inputs), which would break exact
 //! parity with the pyxlsb path this project's number-format/date
 //! conversion already depends on running AFTER, not before, this layer.
 //! This revises B0's tentative "keep calamine for values" note with direct

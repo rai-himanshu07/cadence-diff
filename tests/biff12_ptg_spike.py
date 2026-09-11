@@ -1,6 +1,6 @@
 """Non-production research spike: BIFF12 Ptg formula-token inventory.
 
-plan-20260904-large_workbook-load-and-formula-compare.md, Step 5. Scope, deliberately
+plan-20260904-large-workbook-load-and-formula-compare.md, Step 5. Scope, deliberately
 bounded and disclosed up front:
 
 - This module NEVER ships in the production loader (`qc_tool/`) and is

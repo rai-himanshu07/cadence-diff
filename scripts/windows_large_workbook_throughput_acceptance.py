@@ -1,16 +1,18 @@
-"""Windows ext4-guest LARGE_WORKBOOK throughput acceptance: phase timings, CPU, and
-combined process-tree peak memory for a real perform_run() invocation, with
+"""Windows representative large-workbook throughput acceptance.
+
+Records phase timings, CPU, and combined process-tree peak memory for a real
+perform_run() invocation, with
 a persistent formula-extraction cache to distinguish cold/one-hit/two-hit
-scenarios (plan-20260904-large_workbook-load-and-formula-compare.md, Step 4).
+scenarios (plan-20260904-large-workbook-load-and-formula-compare.md, Step 4).
 
 Never prints or persists a filename, sheet name, formula, coordinate, or
 defined name -- only counts, timings, hashes, aggregate memory figures, and
 the caller-supplied ``--label``, which is restricted to a short, safe,
 generic token (lowercase alphanumeric/hyphen only) so it structurally cannot
-carry a filename or path. Run the safe pilot first, then the real LARGE_WORKBOOK pair,
-on the same ext4-backed win11 QEMU guest, once for the pre-change code and
-once for the candidate code (see the runbook in docs/HANDOFF.md for the
-exact invocation sequence).
+carry a filename or path. Run the safe pilot first, then the representative
+large-workbook pair, on the same ext4-backed win11 QEMU guest, once for the
+pre-change code and once for the candidate code (see the runbook in
+docs/HANDOFF.md for the exact invocation sequence).
 
 Usage (PowerShell or cmd, inside the project's Windows environment):
 
@@ -24,7 +26,7 @@ Usage (PowerShell or cmd, inside the project's Windows environment):
 Run it up to three times against the SAME --work-dir (so the formula cache
 persists) to observe cold, then two-hit (same pair again -- both sides
 cache-hit), scenarios. A one-hit (single new file, one cached side) scenario
-needs a third distinct file and is not reproducible with only the two LARGE_WORKBOOK
+needs a third distinct file and is not reproducible with only the two representative large-workbook
 files; if unavailable, its saving is inferred as approximately half of the
 two-hit saving.
 
@@ -72,7 +74,7 @@ def _safe_label(value: str) -> str:
     if len(value) > _MAX_LABEL_LENGTH or not _SAFE_LABEL_RE.match(value):
         raise argparse.ArgumentTypeError(
             "label must be 1-64 lowercase alphanumeric/hyphen segments "
-            "(e.g. 'large_workbook-pre-change-cold'), never a filename or path"
+            "(e.g. 'large-workbook-pre-change-cold'), never a filename or path"
         )
     return value
 
@@ -214,7 +216,7 @@ def _parser() -> argparse.ArgumentParser:
         "--label",
         required=True,
         type=_safe_label,
-        help="Short generic scenario token, e.g. 'large_workbook-pre-change-cold' "
+        help="Short generic scenario token, e.g. 'large-workbook-pre-change-cold' "
         "(lowercase alphanumeric/hyphen only, max 64 chars -- never a "
         "filename or path).",
     )

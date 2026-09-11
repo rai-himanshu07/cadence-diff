@@ -1,9 +1,9 @@
 //! Ptg token-stream renderer: turns `rgce`/`rgcb` formula bytes into A1 or
 //! R1C1 text. Faithful, opcode-by-opcode port of `render()` in
-//! `ptg_decoder.py` (already proven byte-exact against desktop Excel on both
-//! real LARGE_WORKBOOK files -- see `artifacts/group-first-20260906/`'s Native Decoder
-//! Experiment evidence); this port's job is exact agreement with that
-//! reference, not independent re-derivation of the BIFF12 spec.
+//! `ptg_decoder.py` (already proven byte-exact against desktop Excel on
+//! representative large-workbook inputs; retained aggregate evidence is
+//! private); this port's job is exact agreement with that reference, not
+//! independent re-derivation of the BIFF12 spec.
 //!
 //! Deliberate, disclosed divergence from the Python reference: stack
 //! underflow (an opcode popping more operands than are present) is a
@@ -32,17 +32,15 @@
 //! here).
 //!
 //! KNOWN, DISCLOSED, BOUNDED residual gap in R1C1 mode only (found by the
-//! same B2 guest verification, not yet root-caused): on the real LARGE_WORKBOOK pair,
-//! after the three fixes above, R1C1 mode reaches ~99.8% byte-exact parity
-//! with desktop Excel's Formula2R1C1 cache (was ~0% before the fixes); the
-//! remaining ~0.2% (3,472/1,736,710 cells on the baseline LARGE_WORKBOOK file;
-//! 3,490/1,655,302 on the current LARGE_WORKBOOK file, both files' A1/Formula2 fidelity
-//! unaffected at 100%) is narrowly isolated to sheet-qualified
-//! (`Sheet!...`), absolute (no relative offsets at all), range (`X:Y`)
-//! references, with a consistent but unexplained +8-character length
-//! delta and only 4 distinct patterns per file -- suggesting one specific,
-//! not-yet-identified formula construct reused by a shared/array formula
-//! across many rows, not a diffuse bug. Extensive synthetic reproduction
+//! same B2 guest verification, not yet root-caused): on representative
+//! large-workbook inputs, after the three fixes above, R1C1 mode reaches
+//! greater than 99% byte-exact parity with desktop Excel's Formula2R1C1
+//! cache. The small residual, with A1/Formula2 fidelity unaffected, is
+//! narrowly isolated to sheet-qualified (`Sheet!...`), absolute (no
+//! relative offsets at all), range (`X:Y`) references with a consistent
+//! length delta and a small number of repeated patterns -- suggesting one
+//! specific, not-yet-identified formula construct reused by a shared/array
+//! formula across many rows, not a diffuse bug. Extensive synthetic reproduction
 //! attempts (single- and multi-sheet 3D refs, regular/whole-column/whole-row
 //! ranges, zero- and non-zero-offset combinations, range-operator-joined
 //! defined names, explicit duplicate-prefix ranges) all matched real Excel

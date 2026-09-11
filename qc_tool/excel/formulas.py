@@ -586,7 +586,7 @@ _CURRENT_NORMALIZATION_MEMO_CAP = 200_000
 
 class _CurrentNormalizationMemo:
     """Region-scoped current-side R1C1 cache shared by paired and consistency
-    checks (Step 2 of plan-20260904-large_workbook-load-and-formula-compare.md).
+    checks (Step 2 of plan-20260904-large-workbook-load-and-formula-compare.md).
 
     Keyed by current coordinate only: within one `diff_workbook_formulas()`
     call the current `WorkbookSnapshot` is read-only, so a given (row, column)

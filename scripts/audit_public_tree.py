@@ -48,6 +48,11 @@ _SECRET_PATTERNS = {
     "PyPI token": re.compile(r"\bpypi-[A-Za-z0-9_-]{20,}\b"),
     "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 }
+_PROHIBITED_PUBLIC_PATTERNS = {
+    "private workload codename": re.compile(
+        r"(?i)(?<![a-z0-9])\x54\x58\x4f(?![a-z0-9])"
+    ),
+}
 _MAX_TRACKED_BYTES = 5 * 1024 * 1024
 _PNG_TEXT_CHUNKS = (b"tEXt", b"zTXt", b"iTXt", b"eXIf")
 
@@ -70,6 +75,9 @@ def main() -> int:
         path = Path(relative)
         if not _is_allowed(relative):
             errors.append(f"tracked path is outside public allowlist: {relative}")
+        for label, pattern in _PROHIBITED_PUBLIC_PATTERNS.items():
+            if pattern.search(relative):
+                errors.append(f"possible {label} in tracked path: {relative}")
         if path.suffix.lower() in _PRIVATE_SUFFIXES:
             errors.append(f"private artifact suffix is tracked: {relative}")
         if path.exists() and path.stat().st_size > _MAX_TRACKED_BYTES:
@@ -90,6 +98,9 @@ def main() -> int:
         except (UnicodeDecodeError, OSError):
             continue
         for label, pattern in _SECRET_PATTERNS.items():
+            if pattern.search(text):
+                errors.append(f"possible {label} in tracked file: {relative}")
+        for label, pattern in _PROHIBITED_PUBLIC_PATTERNS.items():
             if pattern.search(text):
                 errors.append(f"possible {label} in tracked file: {relative}")
     if errors:

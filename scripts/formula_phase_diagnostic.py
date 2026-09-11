@@ -35,7 +35,7 @@ Usage:
         --baseline-excel /path/to/baseline.xlsb \\
         --current-excel /path/to/current.xlsb \\
         --xlsb-values-engine auto \\
-        --label large_workbook-values-auto \\
+        --label large-workbook-values-auto \\
         --output /path/to/result.json
 """
 
@@ -67,7 +67,7 @@ def _safe_label(value: str) -> str:
     if len(value) > _MAX_LABEL_LENGTH or not _SAFE_LABEL_RE.match(value):
         raise argparse.ArgumentTypeError(
             "label must be 1-64 lowercase alphanumeric/hyphen segments "
-            "(e.g. 'large_workbook-values-auto'), never a filename or path"
+            "(e.g. 'large-workbook-values-auto'), never a filename or path"
         )
     return value
 
@@ -96,7 +96,7 @@ def _parser() -> argparse.ArgumentParser:
         "--label",
         required=True,
         type=_safe_label,
-        help="Short generic scenario token, e.g. 'large_workbook-values-auto' "
+        help="Short generic scenario token, e.g. 'large-workbook-values-auto' "
         "(lowercase alphanumeric/hyphen only, max 64 chars -- never a "
         "filename or path).",
     )

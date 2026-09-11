@@ -31,7 +31,7 @@ Usage:
         --source-excel Z:\\path\\to\\current.xlsb \\
         --work-dir C:\\QC-Pilot\\load-locality-work \\
         --xlsb-values-engine auto \\
-        --label large_workbook-current-shared-vs-local \\
+        --label large-workbook-current-shared-vs-local \\
         --output Z:\\QC_Tool\\windows-return\\load-locality-current.json
 """
 
@@ -64,7 +64,7 @@ def _safe_label(value: str) -> str:
     if len(value) > _MAX_LABEL_LENGTH or not _SAFE_LABEL_RE.match(value):
         raise argparse.ArgumentTypeError(
             "label must be 1-64 lowercase alphanumeric/hyphen segments "
-            "(e.g. 'large_workbook-current-shared-vs-local'), never a filename or path"
+            "(e.g. 'large-workbook-current-shared-vs-local'), never a filename or path"
         )
     return value
 
@@ -155,7 +155,7 @@ def _parser() -> argparse.ArgumentParser:
         "--label",
         required=True,
         type=_safe_label,
-        help="Short generic scenario token, e.g. 'large_workbook-current-shared-vs-local' "
+        help="Short generic scenario token, e.g. 'large-workbook-current-shared-vs-local' "
         "(lowercase alphanumeric/hyphen only, max 64 chars -- never a "
         "filename or path).",
     )

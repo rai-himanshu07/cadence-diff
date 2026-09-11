@@ -93,8 +93,8 @@ def test_safe_label_rejects_free_text() -> None:
         diagnostic._safe_label("has a space")
     with pytest.raises(argparse.ArgumentTypeError):
         diagnostic._safe_label("C:/some/path.xlsb")
-    assert diagnostic._safe_label("large_workbook-current-shared-vs-local") == (
-        "large_workbook-current-shared-vs-local"
+    assert diagnostic._safe_label("large-workbook-current-shared-vs-local") == (
+        "large-workbook-current-shared-vs-local"
     )
 
 

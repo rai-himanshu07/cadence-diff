@@ -1201,7 +1201,7 @@ def test_xlsb_native_formula_engine_dispatches_through_load_workbook_snapshot(
     tmp_path: Path,
 ) -> None:
     """Wiring proof, not a rendering-correctness proof (that is B0/B1/B2's
-    real-LARGE_WORKBOOK-file evidence): a real load with ``formula_engine="native"``
+    real-representative large-workbook-file evidence): a real load with ``formula_engine="native"``
     must reach the native adapter, set `formula_source` to a
     ``native-biff12:`` engine string, and never raise -- even for a cell the
     kernel could not decode (the synthetic writer's formula records carry no

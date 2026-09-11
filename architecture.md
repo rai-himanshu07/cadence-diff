@@ -1,7 +1,7 @@
 # QC Tool Architecture
 
 **Project:** `cadence-diff` (import package `qc_tool`)  
-**Architecture baseline:** `main@281e0a9`  
+**Architecture baseline:** `main@e1480b3`  
 **Runtime:** Python 3.11 or 3.12; optional Rust/PyO3 `xlsbkernel`  
 **Primary deployment:** local, single-user NiceGUI application bound to loopback  
 **Data posture:** read-only source processing, local persistence, no LLM or remote analysis service
@@ -985,7 +985,7 @@ deploy.
 - Atomic output is forensic and outside the interactive performance SLA.
 - Decision output groups only the closed eligible finding classes and preserves
   exact membership evidence.
-- Cold XLSB loads on the final LARGE_WORKBOOK acceptance pair remain above the 60-second
+- Cold XLSB loads on the final representative large-workbook pair remain above the 60-second
   per-workbook goal; warm loads pass it.
 - Final cold/warm totals pass the 600-second release gate but not the 420-second
   goal or 330-second stretch target.

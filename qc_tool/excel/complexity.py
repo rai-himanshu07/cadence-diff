@@ -131,7 +131,8 @@ def assess_workbook_complexity(
                 # produce an identical _formula_cost() regardless of which
                 # cell's own text computed it -- reusing it as the cache key
                 # skips formula_pattern_key()'s tokenization on every cache
-                # hit, which real-LARGE_WORKBOOK-scale telemetry showed dominating this
+                # hit, which representative large-workbook telemetry showed
+                # dominating this
                 # scan's cost (plan-20260908-phase-b-guest-performance-
                 # followup.md). Falls back to the original pattern key
                 # exactly as before when no adapter R1C1 is available.
