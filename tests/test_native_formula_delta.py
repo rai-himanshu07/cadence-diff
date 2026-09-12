@@ -31,7 +31,7 @@ from tests.test_formulas import (
 
 pytestmark = pytest.mark.skipif(
     not native_kernel_available(),
-    reason="native/xlsbkernel is not built in this environment",
+    reason="native/cadence_diff_native is not built in this environment",
 )
 
 

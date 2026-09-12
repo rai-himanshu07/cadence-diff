@@ -123,7 +123,7 @@ from qc_tool.findings_store import (
 )
 from qc_tool.io.formula_cache import FormulaExtractionCache
 from qc_tool.io.loader import load_workbook_snapshot
-from qc_tool.io.model import WorkbookSnapshot
+from qc_tool.io.model import WorkbookSnapshot, display_cell_value
 from qc_tool.package import PackageArtifact, PackageManifest, PackageSide, paths_by_member
 from qc_tool.ppt.diff import diff_decks
 from qc_tool.ppt.element_match import match_slide_elements
@@ -901,8 +901,11 @@ def _ranked_table_suggestions(
     baseline: WorkbookSnapshot,
     current: WorkbookSnapshot,
 ) -> list[RunActionItem]:
-    """Bounded, value-free evidence for every unconfigured positional block
-    region that looks like a ranked/sorted table under raw position.
+    """Bounded evidence for every unconfigured positional block region.
+
+    The payload is structural and aggregate except for short, bounded header
+    labels used by the local confirmation dialog. Ordinary row values never
+    leave the engine through this action.
 
     Only regions that fell back to plain positional row alignment are
     screened: a region with a confirmed ``RowIdentityRule`` already aligns by
@@ -930,7 +933,20 @@ def _ranked_table_suggestions(
                 get_column_letter(column)
                 for column in range(region.current.min_col, region.current.max_col + 1)
             )
-            data_row_count = region.current.max_row - region.current.min_row + 1
+            column_headers = tuple(
+                display_cell_value(
+                    curr_sheet.cells[(candidate.header_row, column)].value
+                )
+                if candidate.header_row is not None
+                and (candidate.header_row, column) in curr_sheet.cells
+                else ""
+                for column in range(region.current.min_col, region.current.max_col + 1)
+            )
+            data_row_count = (
+                region.current.max_row - candidate.header_row
+                if candidate.header_row is not None
+                else region.current.max_row - region.current.min_row + 1
+            )
             items.append(
                 RunActionItem(
                     sheet=sheet_name,
@@ -943,7 +959,9 @@ def _ranked_table_suggestions(
                         sheet=sheet_name,
                         current_range=region.current.cell_range,
                         data_row_count=data_row_count,
+                        header_row=candidate.header_row,
                         available_columns=available_columns,
+                        column_headers=column_headers,
                         suggested_identity_columns=candidate.column_letters,
                         suggested_ordinal_columns=candidate.ordinal_column_letters,
                         non_blank_coverage=candidate.non_blank_coverage,

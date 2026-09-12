@@ -85,6 +85,7 @@ from qc_tool.ui.app import (
     _queue_status_line,
     _relative_time,
     _rerun_delta,
+    _rerun_profile_choice,
     _review_group_rows,
     _role_requirement,
     _run_blockers,
@@ -93,6 +94,9 @@ from qc_tool.ui.app import (
     _set_desktop_focus_preference,
     _storage_prompt_due,
     _storage_secret,
+    _temporary_profile_name,
+    _temporary_row_matching_base,
+    _terminal_request_summary,
     build_cluster_context,
     create_pages,
     list_profiles,
@@ -1050,6 +1054,128 @@ def test_queue_status_line_reports_position_for_queued_requests() -> None:
 
     assert "Queued" in _queue_status_line(record)
     assert "position 2" in _queue_status_line(record)
+
+
+def test_terminal_request_summary_explains_blocked_attempt_without_a_run() -> None:
+    record = RunStateRecord(
+        request_id="0123456789abcdef",
+        created_at=dt.datetime.now(dt.UTC),
+        status=RunStatus.BLOCKED,
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        action_required={"reason": "row_identity_confirmation_required"},
+    )
+
+    summary = _terminal_request_summary(record)
+
+    assert "paused for row matching" in summary
+    assert "No completed run was recorded" in summary
+
+
+def test_terminal_request_summary_explains_complexity_failure_without_details() -> None:
+    record = RunStateRecord(
+        request_id="fedcba9876543210",
+        created_at=dt.datetime.now(dt.UTC),
+        status=RunStatus.FAILED,
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        phase=RunPhase.COMPARING_FORMULAS.value,
+        error="WorkbookComplexityError: private detail must not render",
+    )
+
+    summary = _terminal_request_summary(record)
+
+    assert "Comparing formulas" in summary
+    assert "Override workbook workload refusals" in summary
+    assert "No completed run was recorded" in summary
+    assert "private detail" not in summary
+
+
+def test_rerun_profile_choice_restores_an_unsaved_snapshot() -> None:
+    snapshot = DeliverableProfile(name="default (temporary)")
+    record = RunRecord(
+        run_id=1,
+        started_at=dt.datetime.now(dt.UTC),
+        profile=snapshot.name,
+        mode=QCRunMode.CYCLE_COMPARISON,
+        files={},
+        file_hashes={},
+        counts={},
+        review_counts={},
+        disclosures=[],
+        verified_crosschecks=0,
+        report_paths={},
+        profile_snapshot=snapshot,
+    )
+
+    options, selected, override = _rerun_profile_choice(record, ["default"])
+
+    assert options == ["default", "default (temporary)"]
+    assert selected == "default (temporary)"
+    assert override == snapshot
+    assert override is not snapshot
+
+
+def test_rerun_profile_choice_prefers_a_current_saved_profile() -> None:
+    snapshot = DeliverableProfile(name="saved")
+    record = RunRecord(
+        run_id=1,
+        started_at=dt.datetime.now(dt.UTC),
+        profile="saved",
+        mode=QCRunMode.CYCLE_COMPARISON,
+        files={},
+        file_hashes={},
+        counts={},
+        review_counts={},
+        disclosures=[],
+        verified_crosschecks=0,
+        report_paths={},
+        profile_snapshot=snapshot,
+    )
+
+    options, selected, override = _rerun_profile_choice(
+        record, ["default", "saved"]
+    )
+
+    assert options == ["default", "saved"]
+    assert selected == "saved"
+    assert override is None
+
+
+def test_migrated_default_temporary_profile_recovers_without_yaml(
+    tmp_path: Path,
+) -> None:
+    profile = _temporary_row_matching_base(
+        tmp_path,
+        "default (temporary)",
+        None,
+    )
+
+    assert profile.name == "default"
+    assert _temporary_profile_name(profile.name) == "default (temporary)"
+    assert _temporary_profile_name("default (temporary)") == "default (temporary)"
+
+
+def test_missing_non_default_temporary_profile_has_targeted_error(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="no longer available"):
+        _temporary_row_matching_base(tmp_path, "missing (temporary)", None)
+
+
+def test_temporary_profile_snapshot_takes_precedence_over_disk(
+    tmp_path: Path,
+) -> None:
+    snapshot = DeliverableProfile(name="unsaved (temporary)")
+
+    recovered = _temporary_row_matching_base(
+        tmp_path,
+        snapshot.name,
+        snapshot,
+    )
+
+    assert recovered == snapshot
+    assert recovered is not snapshot
 
 
 @pytest.mark.asyncio
@@ -3034,9 +3160,9 @@ def test_run_qc_submission_is_single_flight() -> None:
     owned request's RunStateRecord.is_active goes false (never a terminal
     allowlist) or the analyst explicitly cancels the projection dialog."""
     source = inspect.getsource(app_module.create_pages)
-    start_run_source = source.split("async def start_run() -> None:", 1)[1].split(
+    start_run_source = source.split("async def start_run(", 1)[1].split(
         "def _open_projection_dialog(", 1
-    )[0]
+    )[0].split(") -> None:", 1)[1]
 
     # the guard is the very first statement, before any `await`, so a second
     # concurrently scheduled click sees the lock before it can act
@@ -3087,11 +3213,20 @@ def test_ranked_block_opens_the_review_row_matching_dialog() -> None:
     assert '"Review row matching"' in flat
     assert '"QC paused"' in flat
     assert '"Save rule and run QC"' in flat
+    assert '"Run QC once"' in flat
+    assert '"Run once"' in flat
+    assert '"Existing profile or new name"' in flat
+    assert "options=region.column_options" in source
+    assert "await start_run(profile_override=profile)" in source
+    assert "profile_override: DeliverableProfile | None = None" in source
+    assert '"rankedtable-card"' in flat
+    assert '"rankedtable-body w-full gap-2"' in flat
     assert "await start_run()" in source
     assert "view_model_from_action(" in source
     blocked_branch = source.split("elif record.status is RunStatus.BLOCKED:", 1)[1]
     assert '== "row_identity_confirmation_required"' in blocked_branch
-    assert "_open_row_identity_setup(action, record.profile)" in blocked_branch
+    assert "record.profile_snapshot" in blocked_branch
+    assert "DeliverableProfile.model_validate(" in blocked_branch
 
 
 def test_guide_describes_manual_prerequisites_and_ranked_setup() -> None:
@@ -3100,7 +3235,8 @@ def test_guide_describes_manual_prerequisites_and_ranked_setup() -> None:
     source = inspect.getsource(guide.render_guide)
     assert "Prerequisite cells are manually pinned for both OOXML and XLSB" in source
     assert "Ranked or sorted tables" in source
-    assert "QC then re-runs automatically" in source
+    assert "run once without saving" in source
+    assert "re-runs automatically" in source
     assert "automatic dropdown suggestions are OOXML-only" not in source
 
 

@@ -42,6 +42,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "cadence-diff-native"
+version = "2.0.0"
+dependencies = [
+ "once_cell",
+ "pyo3",
+ "quick-xml",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zip",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -445,20 +459,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "xlsbkernel"
-version = "0.1.0"
-dependencies = [
- "once_cell",
- "pyo3",
- "quick-xml",
- "regex",
- "serde",
- "serde_json",
- "sha2",
- "zip",
-]
 
 [[package]]
 name = "zip"

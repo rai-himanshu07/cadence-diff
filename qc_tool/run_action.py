@@ -4,8 +4,9 @@ history, queue, UI, and CLI surfaces.
 A blocked run is a terminal, non-active outcome distinct from success,
 failure, or cancellation: something about the supplied inputs (not a QC
 finding) means the comparison cannot proceed until the analyst takes an
-action outside this tool. No cell value, formula, or path ever enters this
-payload -- only bounded labels, locations, and aggregate counts.
+action outside this tool. No formula or path enters this payload. Ranked-table
+actions may carry bounded header labels for local analyst confirmation; all
+other fields are structural labels, locations, and aggregate counts.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ MAX_RUN_ACTION_DETAIL_CHARS = 1_024
 MAX_RUN_ACTION_MESSAGE_CHARS = 1_024
 MAX_RANKED_TABLE_RANGE_CHARS = 64
 MAX_RANKED_TABLE_AVAILABLE_COLUMNS = 512
+MAX_RANKED_TABLE_HEADER_CHARS = 80
 
 
 class RunActionReason(StrEnum):
@@ -35,9 +37,11 @@ class RunActionReason(StrEnum):
 class RankedTableEvidence(BaseModel):
     """Typed, value-free evidence for one ranked/sorted-table suggestion.
 
-    Every field is a bounded structural label (member id, sheet, region
-    range, column letters) or a plain aggregate number -- never a cell
-    value, header string, or raw telemetry sentence. Field names
+    Most fields are bounded structural labels or aggregate numbers. The one
+    deliberate content exception is ``column_headers``: short header labels
+    shown only in the local confirmation dialog so an analyst need not reopen
+    the workbook. Ordinary row values and raw telemetry never enter this
+    payload. Field names
     intentionally mirror ``qc_tool.excel.ranked_identity.RankedTableCandidate``
     so the producer can populate this by direct attribute copy.
     """
@@ -47,7 +51,11 @@ class RankedTableEvidence(BaseModel):
     sheet: str = ""
     current_range: str = ""
     data_row_count: int = Field(default=0, ge=0)
+    header_row: int | None = Field(default=None, ge=1)
     available_columns: tuple[str, ...] = Field(
+        default=(), max_length=MAX_RANKED_TABLE_AVAILABLE_COLUMNS
+    )
+    column_headers: tuple[str, ...] = Field(
         default=(), max_length=MAX_RANKED_TABLE_AVAILABLE_COLUMNS
     )
     suggested_identity_columns: tuple[str, ...] = Field(default=(), max_length=12)
@@ -77,9 +85,19 @@ class RankedTableEvidence(BaseModel):
             return tuple(value)[:MAX_RANKED_TABLE_AVAILABLE_COLUMNS]
         return value
 
+    @field_validator("column_headers", mode="before")
+    @classmethod
+    def bound_column_headers(cls, value: object) -> object:
+        if not isinstance(value, list | tuple):
+            return value
+        return tuple(
+            " ".join(str(entry or "").split())[:MAX_RANKED_TABLE_HEADER_CHARS]
+            for entry in value[:MAX_RANKED_TABLE_AVAILABLE_COLUMNS]
+        )
+
 
 class RunActionItem(BaseModel):
-    """One bounded location the analyst must look at; never a value."""
+    """One bounded location; ranked evidence may include short headers."""
 
     member_id: str = Field(default="primary", pattern=MEMBER_ID_PATTERN)
     sheet: str = ""

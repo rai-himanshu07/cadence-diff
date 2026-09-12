@@ -1,5 +1,5 @@
-# cargo-deny configuration for the optional native XLSB kernel
-# (native/xlsbkernel/). Run via `cargo deny check` from this directory.
+# cargo-deny configuration for the cadence-diff native engine
+# (native/cadence_diff_native/). Run via `cargo deny check` from this directory.
 # Release-grade Rust hygiene per plan-20260906-group-first-and-native-kernel.md's
 # Phase B design ("cargo audit/cargo deny licence + advisory checks").
 

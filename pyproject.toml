@@ -32,6 +32,7 @@ dependencies = [
   "nicegui>=2.0",
   "platformdirs>=4.0",
   "pywin32>=306; sys_platform == 'win32'",
+  "cadence-diff-native==2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -44,17 +45,16 @@ dev = [
   "pyright",
   "psutil>=6.0",
   "networkx>=3.2",  # tests/dependency_oracle.py parity only
-  "maturin>=1.5,<2",  # builds native/xlsbkernel/ (optional native XLSB kernel, plan-20260906)
+  "maturin>=1.5,<2",  # builds native/cadence_diff_native/ (Rust/PyO3)
 ]
 native = [
-  "xlsbkernel>=0.1.0,<0.2",
+  "cadence-diff-native==2.0.0",
 ]
 
-# The native XLSB kernel (`native/xlsbkernel/`, Rust/PyO3) is NOT a runtime
-# dependency: it is an optional accelerator imported defensively by
-# `qc_tool/io/native_kernel.py` (absent -> the existing pyxlsb path is used
-# unchanged). Release builds publish its platform wheel alongside the main
-# package; users opt in with `cadence-diff[native]`.
+# The native engine is an automatic runtime dependency. Its distribution ships
+# platform-specific Rust wheels plus a universal fallback wheel, so normal pip
+# installs never require a local Rust toolchain. The `native` extra remains as a
+# compatibility alias for existing installation commands.
 
 [project.scripts]
 cadence-diff = "qc_tool.cli:main"

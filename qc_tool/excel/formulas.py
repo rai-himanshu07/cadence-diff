@@ -125,7 +125,7 @@ def to_r1c1(formula: str, host_row: int, host_col: int) -> str:
 
 def _normalize_formula(cell: CellRecord, row: int, col: int) -> str:
     """R1C1 text for a cell: the adapter-supplied value when present
-    (currently only the native XLSB kernel, already validated per definition
+    (currently only the cadence-diff native engine, already validated per definition
     -- see `qc_tool.io.native_formula._validated_r1c1_cells`), else computed
     here from `cell.formula`.
     """

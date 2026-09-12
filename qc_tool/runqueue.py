@@ -165,6 +165,7 @@ class RunQueueManager:
                 profile=request.profile_name,
                 files=dict(request.display_files),
                 queue_position=position,
+                profile_snapshot=dict(request.profile),
                 requested_output_mode=request.requested_output_mode,
             )
             self._pending.append((request, held))

@@ -35,6 +35,9 @@ MIN_PROJECTED_AVOIDED_MISMATCHES = 10_000
 MAX_SINGLE_CANDIDATES = 12
 MAX_COMPOSITE_SIZE = 3
 _SAMPLE_ROWS = 500
+_HEADER_SCAN_ROWS = 32
+_HEADER_SCAN_COLUMNS = 64
+_HEADER_LOOKAHEAD_ROWS = 24
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +53,7 @@ class RankedTableCandidate:
     mismatch_reduction: float
     projected_positional_mismatches: int
     ordinal_columns: tuple[int, ...] = ()
+    header_row: int | None = None
 
     @property
     def column_letters(self) -> tuple[str, ...]:
@@ -185,6 +189,105 @@ def _row_keys(
             parts.append(_key_component(value))
         keys[row] = None if blank else tuple(parts)
     return keys
+
+
+def _infer_header_row(
+    base_sheet: SheetSnapshot,
+    curr_sheet: SheetSnapshot,
+    base_region: TableRegion,
+    curr_region: TableRegion,
+    identity_columns: tuple[int, ...],
+    ordinal_columns: tuple[int, ...],
+) -> int | None:
+    """Find a stable text header immediately before displaced data.
+
+    Ranked tables can have titles or metadata above their actual header. The
+    scan is deliberately bounded and cross-cycle: a candidate header must be
+    text-rich and stable in both files, while following identity rows must show
+    the displacement that caused this detector to fire. Unclear cases return
+    ``None`` and preserve the existing first-row behavior.
+    """
+    base_height = base_region.max_row - base_region.min_row + 1
+    curr_height = curr_region.max_row - curr_region.min_row + 1
+    scan_rows = min(_HEADER_SCAN_ROWS, base_height, curr_height)
+    display_columns = range(
+        curr_region.min_col,
+        min(curr_region.max_col + 1, curr_region.min_col + _HEADER_SCAN_COLUMNS),
+    )
+    minimum_text_cells = min(2, curr_region.max_col - curr_region.min_col + 1)
+    if not ordinal_columns:
+        return None
+    candidates: list[tuple[int, float, float, int]] = []
+    for offset in range(scan_rows):
+        base_row = base_region.min_row + offset
+        curr_row = curr_region.min_row + offset
+        comparable = 0
+        stable = 0
+        stable_text = 0
+        for column in display_columns:
+            base_value = _cell_value(base_sheet, base_row, column)
+            curr_value = _cell_value(curr_sheet, curr_row, column)
+            if _is_blank(base_value) and _is_blank(curr_value):
+                continue
+            comparable += 1
+            if _key_component(base_value) != _key_component(curr_value):
+                continue
+            stable += 1
+            if isinstance(curr_value, str) and curr_value.strip():
+                stable_text += 1
+        if (
+            comparable == 0
+            or stable_text < minimum_text_cells
+            or stable / comparable < 0.75
+        ):
+            continue
+        ordinal_boundary = False
+        for column in ordinal_columns:
+            header_value = _cell_value(curr_sheet, curr_row, column)
+            following_values = [
+                _cell_value(curr_sheet, row, column)
+                for row in range(curr_row + 1, min(curr_region.max_row, curr_row + 4) + 1)
+            ]
+            if (
+                (isinstance(header_value, str) or _is_blank(header_value))
+                and len(following_values) >= 3
+                and _is_sequence_like(following_values)
+            ):
+                ordinal_boundary = True
+                break
+        if not ordinal_boundary:
+            continue
+
+        following = 0
+        displaced = 0
+        for next_offset in range(
+            offset + 1,
+            min(scan_rows, offset + 1 + _HEADER_LOOKAHEAD_ROWS),
+        ):
+            next_base_row = base_region.min_row + next_offset
+            next_curr_row = curr_region.min_row + next_offset
+            base_values = tuple(
+                _cell_value(base_sheet, next_base_row, column)
+                for column in identity_columns
+            )
+            curr_values = tuple(
+                _cell_value(curr_sheet, next_curr_row, column)
+                for column in identity_columns
+            )
+            if any(_is_blank(value) for value in (*base_values, *curr_values)):
+                continue
+            base_key = tuple(_key_component(value) for value in base_values)
+            curr_key = tuple(_key_component(value) for value in curr_values)
+            following += 1
+            displaced += base_key != curr_key
+        if following < 3 or displaced / following < MIN_DISPLACED_RATIO:
+            continue
+        candidates.append(
+            (stable_text, stable / comparable, displaced / following, offset)
+        )
+    if not candidates:
+        return None
+    return curr_region.min_row + max(candidates)[3]
 
 
 def _sample_mismatch_reduction(
@@ -380,16 +483,21 @@ def detect_ranked_table_candidate(
                 best = candidate
     if best is None:
         return None
+    ordinal_columns = tuple(
+        screen.column
+        for screen in screens
+        if _is_sequence_like(_column_values(base_sheet, base_region, screen.column))
+        and _is_sequence_like(_column_values(curr_sheet, curr_region, screen.column))
+    )
     return replace(
         best,
-        ordinal_columns=tuple(
-            screen.column
-            for screen in screens
-            if _is_sequence_like(
-                _column_values(base_sheet, base_region, screen.column)
-            )
-            and _is_sequence_like(
-                _column_values(curr_sheet, curr_region, screen.column)
-            )
+        ordinal_columns=ordinal_columns,
+        header_row=_infer_header_row(
+            base_sheet,
+            curr_sheet,
+            base_region,
+            curr_region,
+            best.columns,
+            ordinal_columns,
         ),
     )

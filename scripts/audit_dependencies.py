@@ -11,7 +11,7 @@ AUDIT_COMMAND = (
     sys.executable,
     "-m",
     "pip_audit",
-    ".",
+    "--local",
     "--format=json",
     "--progress-spinner=off",
     "--desc=off",

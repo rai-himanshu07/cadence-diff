@@ -239,9 +239,13 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .profile-editor-actions { position: sticky; bottom: -1px; z-index: 2;
   background: var(--panel); border-top: 1px solid var(--line);
   padding: 0.65rem 0 0.2rem; width: 100%; }
-.rankedtable-actions { position: sticky; bottom: -1px; z-index: 2;
-  background: var(--panel); border-top: 1px solid var(--line);
-  padding: 0.65rem 0 0.2rem; width: 100%; }
+.rankedtable-card { width: min(46rem, 96vw); height: min(46rem, 92vh);
+  max-height: 92vh; display: flex; flex-direction: column; overflow: hidden; }
+.rankedtable-head, .rankedtable-actions { flex: 0 0 auto; width: 100%; }
+.rankedtable-body { flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  overscroll-behavior: contain; padding-right: 0.25rem; }
+.rankedtable-actions { background: var(--panel); border-top: 1px solid var(--line);
+  padding: 0.65rem 0 0.2rem; }
 .preline { white-space: pre-line; overflow-wrap: anywhere; }
 
 /* formula token diff */

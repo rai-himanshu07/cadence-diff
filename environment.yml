@@ -33,7 +33,7 @@ dependencies:
   - pip
   - pip:
       - "pywin32>=306; sys_platform == 'win32'"
-      # Builds the optional native XLSB kernel (native/xlsbkernel/, Rust/PyO3;
-      # `maturin develop --release` from that directory); not a runtime
-      # dependency of the shipped package -- see pyproject.toml's note.
+      # Builds the cadence-diff-native Rust/PyO3 wheel from
+      # native/cadence_diff_native/; end users receive a prebuilt native wheel
+      # or the universal fallback declared in pyproject.toml.
       - "maturin>=1.5,<2"

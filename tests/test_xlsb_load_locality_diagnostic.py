@@ -100,7 +100,7 @@ def test_safe_label_rejects_free_text() -> None:
 
 @pytest.mark.skipif(
     not native_kernel_available(),
-    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+    reason="native/cadence_diff_native/ not built in this environment (optional accelerator)",
 )
 def test_run_probe_accepts_native_values_engine(
     source_xlsb: Path, tmp_path: Path

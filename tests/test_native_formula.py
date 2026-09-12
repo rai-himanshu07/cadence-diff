@@ -1,4 +1,4 @@
-"""Tests for the optional native formula surface adapter
+"""Tests for the native formula surface adapter
 (`qc_tool/io/native_formula.py`) -- B2's "definitions + per-cell ids + names
 surface" deliverable, plus B3's `FormulaExtraction` adapter
 (`extract_formulas_with_native_kernel`) and compatibility-mode restriction
@@ -8,10 +8,12 @@ surface" deliverable, plus B3's `FormulaExtraction` adapter
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import qc_tool.io.native_formula as native_formula_module
+import qc_tool.io.native_kernel as native_kernel_module
 from qc_tool.io.formula_enrichment import FormulaEnrichmentError, FormulaExtraction
 from qc_tool.io.native_formula import (
     DefinedNameSurface,
@@ -28,9 +30,21 @@ from qc_tool.io.xlsb_formula import XlsbFormulaScan
 FIXTURE = Path(__file__).parent / "fixtures" / "generated" / "current.xlsb"
 
 
+def _available_native_module() -> SimpleNamespace:
+    return SimpleNamespace(
+        __version__="2.0.0",
+        __kernel_api_version__=1,
+        __native_available__=True,
+        raw_values_report=lambda data: [],
+        formula_surface_report=lambda data: ([], []),
+        formula_r1c1_report=lambda data: [],
+        formula_delta_batch=lambda pairs: [],
+    )
+
+
 @pytest.mark.skipif(
     not native_formula_available(),
-    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+    reason="native/cadence_diff_native/ not built in this environment (optional accelerator)",
 )
 def test_formula_surface_report_returns_a_typed_surface() -> None:
     surface = formula_surface_report(FIXTURE.read_bytes())
@@ -53,8 +67,8 @@ def test_formula_surface_report_returns_a_typed_surface() -> None:
 def test_formula_surface_report_raises_a_clear_error_when_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", None)
-    with pytest.raises(RuntimeError, match="native xlsbkernel"):
+    monkeypatch.setattr(native_kernel_module, "_native_module", None)
+    with pytest.raises(RuntimeError, match=r"native engine unavailable \(missing\)"):
         formula_surface_report(FIXTURE.read_bytes())
 
 
@@ -93,13 +107,13 @@ def test_extract_formulas_with_native_kernel_prefixes_and_converts_coordinates(
     coordinates (Criterion 9 depends on every consumer seeing one contract
     regardless of engine).
     """
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", object())
+    monkeypatch.setattr(
+        native_kernel_module, "_native_module", _available_native_module()
+    )
     monkeypatch.setattr(
         native_formula_module, "formula_surface_report", lambda data: _fake_surface()
     )
-    monkeypatch.setattr(
-        native_formula_module.importlib.metadata, "version", lambda name: "9.9.9"
-    )
+    monkeypatch.setattr(native_kernel_module, "native_distribution_version", lambda: "9.9.9")
 
     extraction = extract_formulas_with_native_kernel(b"unused", _scan())
 
@@ -120,7 +134,7 @@ def test_extract_formulas_with_native_kernel_raises_formula_enrichment_error_whe
     `qc_tool/io/loader.py`'s existing degrade-gracefully `except` clause
     catches it identically to the Excel/LibreOffice adapters.
     """
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", None)
+    monkeypatch.setattr(native_kernel_module, "_native_module", None)
     with pytest.raises(FormulaEnrichmentError, match=r"native.*formula engine"):
         extract_formulas_with_native_kernel(b"unused", _scan())
 
@@ -134,13 +148,13 @@ def test_extract_formulas_with_native_kernel_also_populates_r1c1(
     validate-and-fallback path -- see the dedicated `_validated_r1c1_cells`
     tests below for the trusted-kernel-value path).
     """
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", object())
+    monkeypatch.setattr(
+        native_kernel_module, "_native_module", _available_native_module()
+    )
     monkeypatch.setattr(
         native_formula_module, "formula_surface_report", lambda data: _fake_surface()
     )
-    monkeypatch.setattr(
-        native_formula_module.importlib.metadata, "version", lambda name: "9.9.9"
-    )
+    monkeypatch.setattr(native_kernel_module, "native_distribution_version", lambda: "9.9.9")
 
     extraction = extract_formulas_with_native_kernel(b"unused", _scan())
 
@@ -154,7 +168,7 @@ def test_extract_formulas_with_native_kernel_also_populates_r1c1(
 def test_native_adapter_fingerprint_none_when_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", None)
+    monkeypatch.setattr(native_kernel_module, "_native_module", None)
     assert native_adapter_fingerprint() is None
 
 

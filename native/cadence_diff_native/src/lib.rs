@@ -1,5 +1,5 @@
 //! PyO3 extension module entry point. Registers the B0/B1/B2 kernel
-//! functions (`native/xlsbkernel/`'s owned, bounds-checked BIFF12 reader --
+//! functions (`native/cadence_diff_native/`'s owned, bounds-checked BIFF12 reader --
 //! records/workbook/ptg/sheet/values/surface -- see each module's own doc
 //! comment). No longer depends on `calamine`: the initial exploratory
 //! `formula_stats`/`values_columnar` functions this crate started from
@@ -21,7 +21,10 @@ mod values;
 mod workbook;
 
 #[pymodule]
-fn xlsbkernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn cadence_diff_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__kernel_api_version__", 1u32)?;
+    m.add("__native_available__", true)?;
     m.add_function(wrap_pyfunction!(formula_delta::formula_delta_batch, m)?)?;
     m.add_function(wrap_pyfunction!(formula_report::formula_r1c1_report, m)?)?;
     m.add_function(wrap_pyfunction!(formula_report::raw_values_report, m)?)?;

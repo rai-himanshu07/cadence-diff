@@ -2,7 +2,7 @@
 
 import json
 
-from scripts.audit_dependencies import interpret_audit
+from scripts.audit_dependencies import AUDIT_COMMAND, interpret_audit
 
 
 def _payload(vulns: list[dict[str, object]] | None = None) -> str:
@@ -17,6 +17,11 @@ def _payload(vulns: list[dict[str, object]] | None = None) -> str:
             ]
         }
     )
+
+
+def test_default_audit_uses_the_installed_environment_without_resolution() -> None:
+    assert "--local" in AUDIT_COMMAND
+    assert "." not in AUDIT_COMMAND
 
 
 def test_clean_dependency_audit_returns_zero(capsys) -> None:

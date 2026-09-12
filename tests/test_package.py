@@ -240,6 +240,12 @@ def test_empty_row_identity_rules_preserve_canonical_profile_hash() -> None:
     assert profile_sha256(implicit_sheet) == profile_sha256(explicit_empty)
 
 
+def test_absent_row_identity_header_preserves_legacy_canonical_shape() -> None:
+    rule = RowIdentityRule(anchor_cell="A1", identity_columns=["B"])
+
+    assert "header_row" not in rule.model_dump(mode="json")
+
+
 def test_new_profile_rules_reject_malformed_locations_at_model_boundary() -> None:
     from pydantic import ValidationError
 

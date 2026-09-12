@@ -60,7 +60,7 @@ class CellRecord:
     formula: str | None = None
     #: Canonical R1C1 text (``=``-prefixed, matching ``formula``'s own
     #: convention), populated only when an adapter can supply it per
-    #: definition (currently: the native XLSB kernel). ``None`` means no
+    #: definition (currently: the cadence-diff native engine). ``None`` means no
     #: adapter-supplied R1C1 is available; consumers fall back to computing
     #: it themselves from ``formula``.
     formula_r1c1: str | None = None

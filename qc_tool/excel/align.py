@@ -643,12 +643,16 @@ def _identity_key_component(value: object) -> object:
 
 
 def _identity_row_keys(
-    sheet: SheetSnapshot, region: TableRegion, columns: list[int]
+    sheet: SheetSnapshot,
+    region: TableRegion,
+    columns: list[int],
+    *,
+    first_row: int | None = None,
 ) -> dict[int, tuple[object, ...]]:
     """Row -> composite identity key. A row with any blank component is
     excluded entirely -- it is never guessed at, only left unmatched."""
     keys: dict[int, tuple[object, ...]] = {}
-    for row in range(region.min_row, region.max_row + 1):
+    for row in range(first_row or region.min_row, region.max_row + 1):
         parts: list[object] = []
         blank = False
         for col in columns:
@@ -685,8 +689,22 @@ def _align_rows_by_identity(
     identity_columns = [
         column_index_from_string(letter) for letter in rule.identity_columns
     ]
-    base_keys = _identity_row_keys(base_sheet, base_region, identity_columns)
-    curr_keys = _identity_row_keys(curr_sheet, curr_region, identity_columns)
+    base_first_row = (
+        max(base_region.min_row, rule.header_row + 1)
+        if rule.header_row is not None
+        else base_region.min_row
+    )
+    curr_first_row = (
+        max(curr_region.min_row, rule.header_row + 1)
+        if rule.header_row is not None
+        else curr_region.min_row
+    )
+    base_keys = _identity_row_keys(
+        base_sheet, base_region, identity_columns, first_row=base_first_row
+    )
+    curr_keys = _identity_row_keys(
+        curr_sheet, curr_region, identity_columns, first_row=curr_first_row
+    )
 
     base_rows_by_key: dict[tuple[object, ...], list[int]] = {}
     for row, key in sorted(base_keys.items()):
@@ -704,6 +722,21 @@ def _align_rows_by_identity(
     matched_base: set[int] = set()
     matched_current: set[int] = set()
     ambiguous_keys: set[tuple[object, ...]] = set()
+
+    if rule.header_row is not None:
+        base_prefix = list(range(base_region.min_row, base_first_row))
+        curr_prefix = list(range(curr_region.min_row, curr_first_row))
+        shared_prefix = min(len(base_prefix), len(curr_prefix))
+        for base_row, curr_row in zip(
+            base_prefix[:shared_prefix],
+            curr_prefix[:shared_prefix],
+            strict=True,
+        ):
+            alignment.pairs.append((base_row, curr_row))
+            matched_base.add(base_row)
+            matched_current.add(curr_row)
+        alignment.deleted.extend(base_prefix[shared_prefix:])
+        alignment.inserted.extend(curr_prefix[shared_prefix:])
 
     for key in sorted(base_rows_by_key.keys() | curr_rows_by_key.keys(), key=repr):
         base_rows = base_rows_by_key.get(key, [])
@@ -750,10 +783,10 @@ def _align_rows_by_identity(
         matched_current |= skipped_curr
 
     alignment.pairs.sort()
-    for row in range(base_region.min_row, base_region.max_row + 1):
+    for row in range(base_first_row, base_region.max_row + 1):
         if row not in matched_base:
             alignment.deleted.append(row)
-    for row in range(curr_region.min_row, curr_region.max_row + 1):
+    for row in range(curr_first_row, curr_region.max_row + 1):
         if row in matched_current:
             continue
         alignment.inserted.append(row)

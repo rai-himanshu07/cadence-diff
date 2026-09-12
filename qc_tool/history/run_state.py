@@ -1,8 +1,10 @@
 """Private lifecycle state for active and queued QC run requests.
 
-Completed runs stay in the `runs` table; this table only tracks work that is
-queued or in flight so a browser refresh can reconnect to it. It never stores
-passwords, source paths, file contents, formulas, or findings.
+Completed runs stay in the `runs` table; this table tracks request lifecycle so
+a browser refresh can reconnect to it or explain a terminal attempt. It never
+stores passwords, source paths, file contents, formulas, or findings. The
+private profile snapshot is retained so an unsaved one-run contract can be
+reused if that request blocks again.
 """
 
 import datetime as dt
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS run_state (
     error TEXT NOT NULL DEFAULT '',
     phases TEXT NOT NULL DEFAULT '[]',
     action_required TEXT NOT NULL DEFAULT '{}',
+    profile_snapshot TEXT NOT NULL DEFAULT 'null',
     requested_output_mode TEXT NOT NULL DEFAULT 'profile'
 );
 """
@@ -74,6 +77,9 @@ _MIGRATIONS = {
     "action_required": (
         "ALTER TABLE run_state ADD COLUMN action_required TEXT NOT NULL DEFAULT '{}'"
     ),
+    "profile_snapshot": (
+        "ALTER TABLE run_state ADD COLUMN profile_snapshot TEXT NOT NULL DEFAULT 'null'"
+    ),
     #: Run-level finding-output contract (plan-20260910); "profile" for any
     #: row queued before this column existed.
     "requested_output_mode": (
@@ -106,6 +112,9 @@ class RunStateRecord:
     #: Bounded, primitive-only payload for `RunStatus.BLOCKED`; see
     #: `qc_tool.run_action.RunActionRequired`. Empty/`None` otherwise.
     action_required: dict[str, object] | None = None
+    #: Exact primitive profile payload submitted to this request. Private,
+    #: never rendered; lets a blocked temporary request continue without YAML.
+    profile_snapshot: dict[str, object] | None = None
     #: Run-level finding-output contract request (plan-20260910); a plain
     #: string mirroring `mode` -- "profile" for any row queued before this
     #: column existed.
@@ -138,6 +147,10 @@ def _decode_action_required(row: sqlite3.Row) -> dict[str, object] | None:
 
 
 def _record(row: sqlite3.Row) -> RunStateRecord:
+    try:
+        profile_snapshot = json.loads(row["profile_snapshot"])
+    except (KeyError, IndexError, json.JSONDecodeError):
+        profile_snapshot = None
     return RunStateRecord(
         request_id=row["request_id"],
         created_at=dt.datetime.fromisoformat(row["created_at"]),
@@ -157,6 +170,9 @@ def _record(row: sqlite3.Row) -> RunStateRecord:
         error=row["error"],
         phases=json.loads(row["phases"]),
         action_required=(_decode_action_required(row)),
+        profile_snapshot=(
+            profile_snapshot if isinstance(profile_snapshot, dict) else None
+        ),
         requested_output_mode=row["requested_output_mode"],
     )
 
@@ -190,6 +206,7 @@ class RunStateStore:
         profile: str,
         files: dict[str, str],
         queue_position: int,
+        profile_snapshot: dict[str, object] | None = None,
         requested_output_mode: str = "profile",
     ) -> RunStateRecord:
         with self._connect() as conn:
@@ -197,8 +214,8 @@ class RunStateStore:
                 """
                 INSERT INTO run_state (
                     request_id, created_at, status, queue_position, mode, profile, files,
-                    requested_output_mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    profile_snapshot, requested_output_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -208,6 +225,7 @@ class RunStateStore:
                     mode,
                     profile,
                     json.dumps(files),
+                    json.dumps(profile_snapshot),
                     requested_output_mode,
                 ),
             )
@@ -234,6 +252,18 @@ class RunStateStore:
                 statuses,
             ).fetchall()
         return [_record(row) for row in rows]
+
+    def latest_terminal(self) -> RunStateRecord | None:
+        """Most recent finished request, including blocked/failed attempts."""
+        placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+        statuses = sorted(status.value for status in ACTIVE_STATUSES)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT * FROM run_state WHERE status NOT IN ({placeholders}) "
+                "ORDER BY finished_at DESC, created_at DESC, rowid DESC LIMIT 1",
+                statuses,
+            ).fetchone()
+        return None if row is None else _record(row)
 
     def set_queue_position(self, request_id: str, position: int) -> None:
         with self._connect() as conn:

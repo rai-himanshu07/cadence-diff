@@ -73,7 +73,8 @@ def blocked_message(
     """A terminal, non-failure outcome: the run cannot proceed as configured.
 
     ``action_required`` is the bounded, primitive-only
-    ``RunActionRequired.model_dump(mode="json")`` payload -- never a value,
+    ``RunActionRequired.model_dump(mode="json")`` payload -- never an ordinary
+    row value (ranked-table actions may carry bounded header labels),
     formula, or path.
     """
     return {

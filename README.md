@@ -35,6 +35,12 @@ The shortcut uses the environment's absolute Python path, so neither `PATH` nor
 Conda activation is needed. Installation never changes the Desktop
 automatically.
 
+The 2.x package automatically installs `cadence-diff-native`. Pip selects its
+precompiled Rust wheel on certified CPython 3.11/3.12 Windows x64 and glibc
+Linux x86_64 systems, and its pure-Python fallback wheel elsewhere. Users do
+not need Rust, Cargo, or a compiler. Newer Python versions are allowed and may
+use the stable-ABI wheel, but remain best-effort until added to CI.
+
 ![QC Tool review queue](https://raw.githubusercontent.com/rai-himanshu07/cadence-diff/main/qc_tool/assets/review-queue.png)
 
 For engineering boundaries, runtime flows, domain contracts, and extension
@@ -389,32 +395,38 @@ deliverable pairs with a ground-truth defect manifest, and the E2E suite
 asserts both directions — every seeded defect detected, and no finding
 without a seeded cause.
 
-### Optional native XLSB kernel
+### Native engine packaging
 
-`native/xlsbkernel/` is an optional Rust/PyO3 accelerator that speeds up XLSB
-value and formula decoding. It is its **own, separately versioned package**
-(`xlsbkernel`, built with maturin) and uses the CPython 3.11 stable ABI, so one
-platform wheel supports Python 3.11 and 3.12. Install the accelerated build with:
+`native/cadence_diff_native/` is the Rust/PyO3 engine for XLSB value/formula
+decoding and high-volume formula-delta classification. It is published as the
+separate implementation distribution `cadence-diff-native`, but normal users
+install only the complete product:
 
 ```bash
-python -m pip install "cadence-diff[native]"
+python -m pip install cadence-diff
 ```
 
-The base `cadence-diff` install remains fully functional without it and falls
-back with explicit coverage disclosure. For local native development, build and
-install the wheel with:
+The `[native]` extra remains a redundant compatibility alias for old commands.
+The native package uses CPython's 3.11 stable ABI, so one platform wheel covers
+regular CPython 3.11 and newer. On a platform without a compatible native wheel,
+pip installs the helper's universal fallback wheel and QC Tool uses its existing
+Python/platform adapters with explicit coverage disclosure.
+
+Pip manages Python packages and the compiled extension. It does not install or
+license desktop Excel, and it does not install host `libreoffice` or `bwrap`;
+users manage those external prerequisites for the corresponding fallback paths.
+
+For local native development, build and install the wheel with:
 
 ```bash
-conda run -n cadence-diff-dev maturin build --release -m native/xlsbkernel/Cargo.toml
-conda run -n cadence-diff-dev pip install native/xlsbkernel/target/wheels/xlsbkernel-*.whl
+conda run -n cadence-diff-dev maturin build --release -m native/cadence_diff_native/Cargo.toml
+conda run -n cadence-diff-dev pip install native/cadence_diff_native/target/wheels/cadence_diff_native-*.whl
 ```
 
 or, for iterative development, `maturin develop --release` from inside
-`native/xlsbkernel/`. Set a profile's `formula_engine` to `native` (or leave
-it `auto`, the default, which prefers native when importable) to use it; when
-absent, XLSB formula/value handling falls back to the existing Excel-COM
-(Windows) or LibreOffice (Linux) adapters exactly as before, with the
-fallback disclosed in run coverage.
+`native/cadence_diff_native/`. Leave `formula_engine` at `auto` to prefer a
+compatible native engine. A forced `native` setting fails closed when only the
+fallback wheel is available.
 
 ### Layout
 
@@ -438,16 +450,16 @@ qc_tool/
                packaged operator guide at /guide
   engine.py    run orchestration
 native/
-  xlsbkernel/  optional Rust/PyO3 XLSB decoder accelerator (own package)
+  cadence_diff_native/  Rust/PyO3 native Excel analysis engine (own package)
 ```
 
 ## Publishing (maintainers)
 
-Releases are built and validated by GitHub Actions, then published through PyPI
-Trusted Publishing. Create an annotated version tag matching
-`qc_tool.__version__`, publish the corresponding GitHub Release, and promote the
-exact workflow-built artifacts. Do not upload manually or rebuild between
-validation and publication.
+Releases are built once from an annotated version tag and published through
+PyPI Trusted Publishing. The manually authorized workflow publishes and verifies
+all `cadence-diff-native` wheels first, then publishes and verifies
+`cadence-diff`, and creates the GitHub Release last. Do not upload manually or
+rebuild between validation and publication.
 
 ## License
 

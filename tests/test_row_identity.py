@@ -84,6 +84,26 @@ def _write_panel(
     workbook.save(path)
 
 
+def _write_panel_with_preamble(
+    path: Path,
+    rows: list[list[CellValue]],
+    *,
+    title: str,
+) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.title = "Panel"
+    sheet.cell(row=1, column=3, value=title)
+    sheet.cell(row=2, column=3, value="Updated weekly")
+    for column, header in enumerate(("Rank", "ID", "Value"), start=1):
+        sheet.cell(row=3, column=column, value=header)
+    for row_index, row in enumerate(rows, start=4):
+        for column, value in enumerate(row, start=1):
+            sheet.cell(row=row_index, column=column, value=value)
+    workbook.save(path)
+
+
 def _base_rows(n: int) -> list[list[CellValue]]:
     return [[i + 1, f"ID{i}", 100.0 + i] for i in range(n)]
 
@@ -177,6 +197,36 @@ def test_confirmed_identity_still_reports_a_genuine_value_change(
     value_findings = _classes(result, FindingClass.VALUE_CHANGED)
     assert len(value_findings) == 1
     assert "999" in (value_findings[0].current_value or "")
+
+
+def test_confirmed_header_keeps_preamble_in_positional_comparison(
+    tmp_path: Path,
+) -> None:
+    rows = _base_rows(30)
+    current_rows = _shuffled(rows, seed=1234)
+    baseline, current = tmp_path / "baseline.xlsx", tmp_path / "current.xlsx"
+    _write_panel_with_preamble(baseline, rows, title="Internal report")
+    _write_panel_with_preamble(current, current_rows, title="Updated report")
+    profile = _profile_with_rule(
+        RowIdentityRule(
+            anchor_cell="B4",
+            header_row=3,
+            identity_columns=["B"],
+            ordinal_columns=["A"],
+        )
+    )
+
+    result = run_qc(
+        baseline_excel=baseline,
+        current_excel=current,
+        profile=profile,
+        mode=QCRunMode.CYCLE_COMPARISON,
+    )
+
+    value_findings = _classes(result, FindingClass.VALUE_CHANGED)
+    assert len(value_findings) == 1
+    assert value_findings[0].location == "C1"
+    assert _classes(result, FindingClass.ROW_INSERTED, FindingClass.ROW_DELETED) == []
 
 
 def test_composite_identity_resolves_single_column_ambiguity(tmp_path: Path) -> None:
@@ -368,8 +418,16 @@ def test_unconfirmed_ranked_table_blocks_for_confirmation(tmp_path: Path) -> Non
     assert evidence.member_id == "primary"
     assert evidence.sheet == "Panel"
     assert evidence.current_range == f"A1:E{n + 1}"
-    assert evidence.data_row_count == n + 1
+    assert evidence.data_row_count == n
+    assert evidence.header_row == 1
     assert evidence.available_columns == ("A", "B", "C", "D", "E")
+    assert evidence.column_headers == (
+        "Rank",
+        "ID",
+        "Value",
+        "Value2",
+        "Value3",
+    )
     assert evidence.suggested_identity_columns == ("B",)
     assert evidence.suggested_ordinal_columns == ("A",)
     assert 0.0 <= evidence.non_blank_coverage <= 1.0

@@ -3,9 +3,9 @@ requires = ["maturin>=1.5,<2"]
 build-backend = "maturin"
 
 [project]
-name = "xlsbkernel"
+name = "cadence-diff-native"
 dynamic = ["version"]
-description = "Optional native BIFF12/XLSB decoder accelerator for cadence-diff"
+description = "Native Excel analysis accelerator for cadence-diff"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 classifiers = [
@@ -16,5 +16,10 @@ classifiers = [
 	"Operating System :: POSIX :: Linux",
 ]
 
+[project.urls]
+Homepage = "https://github.com/rai-himanshu07/cadence-diff"
+Repository = "https://github.com/rai-himanshu07/cadence-diff"
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
+module-name = "cadence_diff_native"

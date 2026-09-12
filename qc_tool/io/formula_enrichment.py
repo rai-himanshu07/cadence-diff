@@ -82,7 +82,7 @@ class FormulaExtraction:
     #: even though any collected names remain valid data.
     defined_names_complete: bool = False
     #: Canonical, `=`-prefixed R1C1 text per coordinate, when the adapter can
-    #: supply it per definition (currently: the native XLSB kernel only).
+    #: supply it per definition (currently: the cadence-diff native engine only).
     #: `None` for adapters that never produce it (Excel COM, LibreOffice);
     #: `merge_formula_extraction` leaves `CellRecord.formula_r1c1` at its
     #: default `None` in that case, and formula comparison falls back to

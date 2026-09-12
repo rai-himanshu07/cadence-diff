@@ -27,8 +27,10 @@ _V2_ITEM: dict[str, object] = {
         "member_id": "primary",
         "sheet": "Panel",
         "current_range": "A1:E6001",
-        "data_row_count": 6001,
+        "data_row_count": 6000,
+        "header_row": 1,
         "available_columns": ["A", "B", "C", "D", "E"],
+        "column_headers": ["Rank", "Record ID", "Value", "Value 2", "Value 3"],
         "suggested_identity_columns": ["B"],
         "suggested_ordinal_columns": ["A"],
         "non_blank_coverage": 0.999,
@@ -64,9 +66,17 @@ def test_region_draft_from_v2_item_carries_typed_evidence() -> None:
     assert region.anchor_cell == "A1"
     assert region.current_range == "A1:E6001"
     assert region.available_columns == ("A", "B", "C", "D", "E")
+    assert region.header_row == 1
+    assert region.column_headers == (
+        "Rank",
+        "Record ID",
+        "Value",
+        "Value 2",
+        "Value 3",
+    )
     assert region.identity_columns == ("B",)
     assert region.ordinal_columns == ("A",)
-    assert region.data_row_count == 6001
+    assert region.data_row_count == 6000
 
 
 def test_region_draft_from_v1_item_is_the_bounded_compatibility_path() -> None:
@@ -104,6 +114,18 @@ def test_region_label_omits_range_for_a_legacy_item() -> None:
     assert region.label == "Legacy"
 
 
+def test_column_options_keep_letters_and_add_detected_headers() -> None:
+    region = region_draft_from_item(_V2_ITEM)
+    assert region is not None
+    assert region.column_options == {
+        "A": "A · Rank",
+        "B": "B · Record ID",
+        "C": "C · Value",
+        "D": "D · Value 2",
+        "E": "E · Value 3",
+    }
+
+
 def test_noise_summary_and_why_paused_use_typed_evidence_not_telemetry() -> None:
     region = region_draft_from_item(_V2_ITEM)
     assert region is not None
@@ -111,7 +133,7 @@ def test_noise_summary_and_why_paused_use_typed_evidence_not_telemetry() -> None
     assert "500,000" in region.noise_summary
     assert "non_blank_coverage=" not in region.noise_summary
     detail = region.why_paused_detail
-    assert "6,001 data rows" in detail
+    assert "6,000 data rows" in detail
     assert "100%" in detail  # non-blank coverage rounds to 100% at .0%
     assert "non_blank_coverage=" not in detail
 
@@ -186,7 +208,11 @@ def _view_model() -> DialogViewModel:
             dict(_V2_ITEM, sheet="Panel2", member_id="ops"),
         ]
     }
-    view_model = view_model_from_action(action, source_profile="ops-profile")
+    view_model = view_model_from_action(
+        action,
+        source_profile="ops-profile",
+        opened_source_existed=True,
+    )
     assert view_model is not None
     return view_model
 
@@ -211,6 +237,21 @@ def test_view_model_from_action_blanks_destination_when_source_is_default() -> N
     assert view_model is not None
     assert view_model.profile_name == ""
     assert view_model.opened_profile_name == ""
+    assert not view_model.persist_profile
+    assert view_model.is_valid
+
+
+def test_unsaved_temporary_source_defaults_to_run_once() -> None:
+    view_model = view_model_from_action(
+        {"items": [_V2_ITEM]},
+        source_profile="default (temporary)",
+        source_profile_saved=False,
+    )
+
+    assert view_model is not None
+    assert view_model.profile_name == ""
+    assert not view_model.persist_profile
+    assert view_model.is_valid
 
 
 def test_with_active_index_clamps_to_the_region_bounds() -> None:
@@ -252,6 +293,30 @@ def test_destination_errors_requires_a_non_default_name() -> None:
     assert not view_model.with_profile_name("ops-profile-2").destination_errors()
 
 
+def test_temporary_mode_never_requires_a_profile_destination() -> None:
+    view_model = _view_model().with_persist_profile(False).with_profile_name("")
+    assert not view_model.destination_errors()
+    assert view_model.is_valid
+    assert view_model.initial_focus_target == "region_identity"
+
+
+def test_saved_mode_requires_a_valid_existing_or_new_profile_name() -> None:
+    view_model = view_model_from_action(
+        {"items": [_V2_ITEM]}, source_profile="default"
+    )
+    assert view_model is not None
+    saved = view_model.with_persist_profile(True)
+    assert saved.destination_errors()
+    assert saved.initial_focus_target == "profile_name"
+    existing = saved.with_profile_destination(
+        "existing",
+        opened_hash="abc123",
+        opened_source_existed=True,
+    )
+    assert not existing.destination_errors()
+    assert not existing.is_creating_profile
+
+
 def test_is_valid_combines_destination_and_region_validity() -> None:
     view_model = _view_model()
     assert view_model.is_valid
@@ -269,7 +334,10 @@ def test_is_creating_profile_reflects_a_changed_destination() -> None:
 def test_initial_focus_target_depends_on_whether_default_was_immutable() -> None:
     from_default = view_model_from_action({"items": [_V2_ITEM]}, source_profile="default")
     assert from_default is not None
-    assert from_default.initial_focus_target == "profile_name"
+    assert from_default.initial_focus_target == "region_identity"
+
+    saving_from_default = from_default.with_persist_profile(True)
+    assert saving_from_default.initial_focus_target == "profile_name"
 
     from_named = view_model_from_action({"items": [_V2_ITEM]}, source_profile="ops")
     assert from_named is not None
@@ -321,6 +389,7 @@ def test_region_to_row_identity_rule_converts_fields_directly() -> None:
     rule = region_to_row_identity_rule(region)
     assert rule == RowIdentityRule(
         anchor_cell="A1",
+        header_row=1,
         identity_columns=["B"],
         ordinal_columns=["A"],
         duplicate_policy="skip",

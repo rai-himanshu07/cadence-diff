@@ -8,12 +8,12 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Optional native Rust/PyO3 XLSB kernel (`native/xlsbkernel/`) that
-  accelerates XLSB value and formula decoding. It is its own, separately
-  versioned package built with maturin, never a build- or install-time
-  dependency of `cadence-diff`: absent, or on any runtime failure, loading
-  falls back to the existing pyxlsb / Excel-COM / LibreOffice paths
-  unchanged, with the fallback disclosed in run coverage.
+- Automatic Rust/PyO3 native engine (`native/cadence_diff_native/`) for XLSB
+  value/formula decoding and high-volume formula-delta classification. The
+  separately built `cadence-diff-native` implementation distribution is an
+  exact dependency of `cadence-diff`: pip selects a precompiled stable-ABI
+  wheel on certified targets and a universal fallback wheel elsewhere, without
+  requiring a local Rust toolchain.
 - Group-first population findings: a homogeneous run of same-shape
   formula/format differences is now summarized as one population finding
   with bounded sampled evidence instead of one atomic finding per cell,
@@ -48,8 +48,9 @@ project uses [Semantic Versioning](https://semver.org/).
   compact) for new cycle comparisons; `profile` keeps today's exact
   behavior and `atomic` is the forensic/advanced lane, explicitly outside
   the interactive SLA.
-- The standalone `xlsbkernel` wheel now targets CPython's 3.11 stable ABI and
-  is installable through the `cadence-diff[native]` extra. Its formula-delta
+- The standalone `cadence-diff-native` wheel now targets CPython's 3.11 stable
+  ABI and installs automatically with `cadence-diff`; the legacy `[native]`
+  extra remains a compatibility alias. Its formula-delta
   classifier uses a 16 MiB batch cap and per-string pre-screen with exact
   per-row Python fallback. A same-tree real Windows A/B reduced formula
   comparison by 51.34% and total time by 32.13%, clearing its ship gates.
@@ -65,7 +66,7 @@ project uses [Semantic Versioning](https://semver.org/).
 - The resolved formula engine and adapter fingerprint are recorded on
   every run and disclosed across Re-QC, carry-forward, and attestation, so
   automatic engine selection never causes an undisclosed evidence change
-  between two machines with different optional kernels installed.
+  between two machines with different native-engine availability.
 - The resolved cached-values decoder is also recorded per workbook role and
   preserved through history, stored-run reconstruction, carry-forward,
   reports, JSON schemas, sign-off, and signed attestation validation.

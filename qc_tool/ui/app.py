@@ -35,6 +35,7 @@ from qc_tool.config.profile import (
     CrosscheckMapping,
     DeliverableProfile,
     NumericTolerance,
+    default_profile,
     list_profiles,
     load_profile,
     load_profile_by_name,
@@ -353,6 +354,9 @@ class SessionState:
     upload_generations: dict[str, int] = field(default_factory=dict)
     passwords: dict[str, str] = field(default_factory=dict)  # role -> password
     profile_name: str = "default"
+    #: Exact stored profile used when Re-QC targets an unsaved/deleted profile.
+    #: Cleared as soon as the analyst explicitly selects a managed profile.
+    profile_override: DeliverableProfile | None = None
     mode: QCRunMode = QCRunMode.CURRENT_FILE_PREFLIGHT
     #: Run-level finding-output contract (plan-20260910). New cycle
     #: comparisons default to the compact `decision` lane; Re-QC prefills
@@ -388,6 +392,57 @@ def _initial_mode(
         return QCRunMode(str(stored))
     except ValueError:
         return QCRunMode.CURRENT_FILE_PREFLIGHT
+
+
+def _rerun_profile_choice(
+    record: RunRecord | None,
+    options: list[str],
+) -> tuple[list[str], str, DeliverableProfile | None]:
+    """Choose a saved profile or the exact stored snapshot for Re-QC."""
+    if record is None:
+        return options, "default", None
+    if record.profile in options:
+        return options, record.profile, None
+    if record.profile_snapshot is not None:
+        return (
+            [*options, record.profile],
+            record.profile,
+            record.profile_snapshot.model_copy(deep=True),
+        )
+    return options, "default", None
+
+
+_TEMPORARY_PROFILE_SUFFIX = " (temporary)"
+
+
+def _temporary_profile_name(name: str) -> str:
+    return name if name.endswith(_TEMPORARY_PROFILE_SUFFIX) else (
+        name + _TEMPORARY_PROFILE_SUFFIX
+    )
+
+
+def _temporary_row_matching_base(
+    profiles_dir: Path,
+    source_profile: str,
+    snapshot: DeliverableProfile | None,
+) -> DeliverableProfile:
+    """Recover the exact or nearest safe base for a one-run row rule."""
+    if snapshot is not None:
+        return snapshot.model_copy(deep=True)
+    candidates = [source_profile]
+    if source_profile.endswith(_TEMPORARY_PROFILE_SUFFIX):
+        candidates.append(source_profile.removesuffix(_TEMPORARY_PROFILE_SUFFIX))
+    for name in candidates:
+        if name == "default":
+            return default_profile()
+        try:
+            return load_profile_by_name(profiles_dir, name)
+        except (OSError, ValueError):
+            continue
+    raise ValueError(
+        "The profile used by this blocked attempt is no longer available. "
+        "Choose Save to profile and select or create a destination."
+    )
 
 
 def _set_desktop_focus_preference(
@@ -702,6 +757,40 @@ def _queue_status_line(record: RunStateRecord) -> str:
     if names:
         parts.append(names)
     return "  —  ".join(parts)
+
+
+def _terminal_request_summary(record: RunStateRecord) -> str:
+    """Persistent, privacy-safe outcome for requests without a results page."""
+    request = f"Last attempt #{record.request_id[:8]}"
+    try:
+        phase = PHASE_LABELS[RunPhase(record.phase)] if record.phase else "processing"
+    except ValueError:
+        phase = record.phase.replace("_", " ") or "processing"
+    if record.status is RunStatus.BLOCKED:
+        action = record.action_required or {}
+        if action.get("reason") == "row_identity_confirmation_required":
+            return (
+                f"{request} paused for row matching. No completed run was recorded; "
+                "review the row-matching dialog to continue."
+            )
+        return f"{request} was blocked. No completed run was recorded."
+    if record.status is RunStatus.FAILED:
+        if record.error.startswith("WorkbookComplexityError:"):
+            return (
+                f"{request} stopped during {phase}: workbook complexity exceeded "
+                "the safety limit. No completed run was recorded. Review Advanced "
+                "comparison and safety options before enabling Override workbook "
+                "workload refusals and retrying."
+            )
+        return f"{request} failed during {phase}. No completed run was recorded."
+    if record.status is RunStatus.CANCELLED:
+        return f"{request} was cancelled. No completed run was recorded."
+    if record.status is RunStatus.ORPHANED:
+        return (
+            f"{request} stopped when the server exited. No completed run was "
+            "recorded; submit it again."
+        )
+    return ""
 
 
 def _cancel_handler(manager: RunQueueManager, request_id: str):
@@ -6605,11 +6694,10 @@ def create_pages(
             ui.link("Profiles and controls guide →", "/guide#profiles").classes(
                 "guide-jump"
             )
-            profile_options = list_profiles(profiles_dir)
-            initial_profile = "default"
-            if rerun_record is not None and rerun_record.profile in profile_options:
-                initial_profile = rerun_record.profile
-                state.profile_name = initial_profile
+            profile_options, initial_profile, state.profile_override = (
+                _rerun_profile_choice(rerun_record, list_profiles(profiles_dir))
+            )
+            state.profile_name = initial_profile
 
             def manage_profiles() -> None:
                 """Profile authoring lives here so routine setup stays a selector."""
@@ -6654,6 +6742,7 @@ def create_pages(
                             profile_select.value = name
                             profile_select.update()
                             state.profile_name = name
+                            state.profile_override = None
                             editing.options = options
                             editing.update()
                             if editor_controller is not None:
@@ -6667,7 +6756,11 @@ def create_pages(
                     editing = (
                         ui.select(
                             list_profiles(profiles_dir),
-                            value=state.profile_name,
+                            value=(
+                                state.profile_name
+                                if state.profile_name in list_profiles(profiles_dir)
+                                else "default"
+                            ),
                             label="Edit profile",
                         )
                         .classes("w-full")
@@ -6681,6 +6774,7 @@ def create_pages(
                         profile_select.options = options
                         if state.profile_name == old_name:
                             state.profile_name = new_name
+                            state.profile_override = None
                             profile_select.value = new_name
                         profile_select.update()
                         refresh_readiness()
@@ -6702,6 +6796,7 @@ def create_pages(
 
             def on_profile_change(e: events.ValueChangeEventArguments) -> None:
                 state.profile_name = str(e.value)
+                state.profile_override = None
                 refresh_readiness()
 
             def on_acceptance_absolute(e: events.ValueChangeEventArguments) -> None:
@@ -7008,10 +7103,22 @@ def create_pages(
                     )
                 queue_row = ui.row().classes("readyqueue")
                 queue_row.visible = False
+                latest_terminal = queue_manager.store.latest_terminal()
+                terminal_message: dict[str, str] = {
+                    "value": (
+                        _terminal_request_summary(latest_terminal)
+                        if latest_terminal is not None
+                        else ""
+                    )
+                }
                 with queue_row:
                     progress_label = ui.label("").classes("hint")
                     queue_actions = ui.row().classes("no-wrap items-center gap-2")
                     completed_links = ui.row().classes("no-wrap items-center gap-2")
+                    terminal_outcome = ui.label(terminal_message["value"]).classes(
+                        "hint preline"
+                    )
+                    terminal_outcome.visible = bool(terminal_message["value"])
 
                 def refresh_readiness() -> None:
                     blockers = _run_blockers(
@@ -7078,6 +7185,9 @@ def create_pages(
                     refresh_readiness()
 
                 def announce(record: RunStateRecord) -> None:
+                    terminal_message["value"] = _terminal_request_summary(record)
+                    terminal_outcome.set_text(terminal_message["value"])
+                    terminal_outcome.visible = bool(terminal_message["value"])
                     if record.status is RunStatus.SUCCEEDED and record.run_id:
                         ui.notify(f"Run #{record.run_id} complete")
                         if record.request_id in own_requests:
@@ -7093,24 +7203,29 @@ def create_pages(
                                     f"Run #{record.run_id} complete — open results",
                                     f"/runs/{record.run_id}",
                                 ).classes("guide-jump")
-                    elif record.status is RunStatus.CANCELLED:
-                        ui.notify(
-                            "Run cancelled; no successful run was recorded",
-                            type="warning",
-                        )
-                    elif record.status is RunStatus.ORPHANED:
-                        ui.notify(
-                            "The server stopped before this run finished; "
-                            "submit it again",
-                            type="warning",
-                        )
+                    elif record.status in {
+                        RunStatus.CANCELLED,
+                        RunStatus.ORPHANED,
+                    }:
+                        ui.notify(terminal_message["value"], type="warning")
                     elif record.status is RunStatus.BLOCKED:
                         action = record.action_required or {}
                         if (
                             action.get("reason")
                             == "row_identity_confirmation_required"
-                            and _open_row_identity_setup(action, record.profile)
+                            and _open_row_identity_setup(
+                                action,
+                                record.profile,
+                                (
+                                    DeliverableProfile.model_validate(
+                                        record.profile_snapshot
+                                    )
+                                    if record.profile_snapshot is not None
+                                    else None
+                                ),
+                            )
                         ):
+                            refresh_readiness()
                             return
                         raw_items = action.get("items")
                         items = raw_items if isinstance(raw_items, list) else []
@@ -7141,16 +7256,18 @@ def create_pages(
                             multi_line=True,
                         )
                     else:
-                        ui.notify(
-                            f"QC run failed: {record.error or 'unknown error'}",
-                            type="negative",
-                        )
+                        ui.notify(terminal_message["value"], type="negative")
+                    refresh_readiness()
 
                 def refresh_queue() -> None:
                     pending = queue_manager.store.pending()
                     lines = [_queue_status_line(record) for record in pending]
                     progress_label.set_text(" || ".join(lines))
-                    queue_row.visible = bool(lines) or bool(completed_links.default_slot.children)
+                    queue_row.visible = (
+                        bool(lines)
+                        or bool(completed_links.default_slot.children)
+                        or bool(terminal_message["value"])
+                    )
                     signature = tuple(
                         (record.request_id, record.status.value) for record in pending
                     )
@@ -7182,7 +7299,9 @@ def create_pages(
 
                 ui.timer(0.5, refresh_queue)
 
-                async def start_run() -> None:
+                async def start_run(
+                    profile_override: DeliverableProfile | None = None,
+                ) -> None:
                     if _run_ui_busy():
                         # single-flight: a request is already projecting, showing
                         # its dialog, or queued/running — ignore the extra click.
@@ -7203,11 +7322,19 @@ def create_pages(
                     try:
                         RunHistory(work_dir / "history.sqlite3").pause_review_sessions()
                         files = _files_for_mode(state.mode, state.files)
-                        try:
-                            profile = load_profile_by_name(profiles_dir, state.profile_name)
-                        except Exception as exc:
-                            ui.notify(f"Profile failed to load: {exc}", type="negative")
-                            return
+                        effective_profile = profile_override or state.profile_override
+                        if effective_profile is None:
+                            try:
+                                profile = load_profile_by_name(
+                                    profiles_dir, state.profile_name
+                                )
+                            except Exception as exc:
+                                ui.notify(
+                                    f"Profile failed to load: {exc}", type="negative"
+                                )
+                                return
+                        else:
+                            profile = effective_profile.model_copy(deep=True)
                         try:
                             manifest = PackageManifest.from_role_files(files)
                         except ValueError as exc:
@@ -7436,7 +7563,9 @@ def create_pages(
             refresh_readiness()
 
             def _open_row_identity_setup(
-                action: dict[str, object], source_profile: str
+                action: dict[str, object],
+                source_profile: str,
+                source_profile_snapshot: DeliverableProfile | None = None,
             ) -> bool:
                 """Review Row Matching: one flat, task-focused dialog for every
                 unconfirmed ranked/sorted-table region a blocked run raised
@@ -7444,10 +7573,18 @@ def create_pages(
                 primary action; column selection is chip-based from each
                 region's own bounded ``available_columns`` for a v2 item, with
                 a free-text fallback for a legacy v1 item (Criterion 11)."""
+                try:
+                    candidate_path = (
+                        None
+                        if source_profile == "default"
+                        else _profile_path(profiles_dir, source_profile)
+                    )
+                except ValueError:
+                    candidate_path = None
                 opened_path = (
-                    None
-                    if source_profile == "default"
-                    else _profile_path(profiles_dir, source_profile)
+                    candidate_path
+                    if candidate_path is not None and candidate_path.exists()
+                    else None
                 )
                 opened_hash = (
                     source_sha256(opened_path)
@@ -7458,6 +7595,7 @@ def create_pages(
                 view_model = view_model_from_action(
                     action,
                     source_profile=source_profile,
+                    source_profile_saved=opened_path is not None,
                     opened_hash=opened_hash,
                     opened_source_existed=opened_exists,
                 )
@@ -7470,16 +7608,21 @@ def create_pages(
                 def _refresh_validation() -> None:
                     vm = dialog_state["view_model"]
                     destination_errors = vm.destination_errors()
-                    profile_name_input.error = (
+                    profile_name_select.visible = vm.persist_profile
+                    profile_name_select.error = (
                         destination_errors[0] if destination_errors else None
                     )
                     destination_note.set_text(
-                        ""
-                        if destination_errors
+                        "Used for this run only; no profile file will be created."
+                        if not vm.persist_profile
                         else (
-                            "Creates a new profile"
-                            if vm.is_creating_profile
-                            else f"Updates {vm.profile_name.strip()!r}"
+                            ""
+                            if destination_errors
+                            else (
+                                "Creates a new profile"
+                                if vm.is_creating_profile
+                                else f"Updates {vm.profile_name.strip()!r}"
+                            )
                         )
                     )
                     for index, controls in enumerate(region_controls):
@@ -7489,12 +7632,38 @@ def create_pages(
                             widget.error = errors[0] if errors else None
                         icon = "check_circle" if region.is_valid else "error"
                         controls["tab"].props(f"icon={icon}")
+                    save_button.set_text(
+                        "Save rule and run QC"
+                        if vm.persist_profile
+                        else "Run QC once"
+                    )
                     save_button.set_enabled(vm.is_valid)
 
+                def _on_persistence_change(
+                    event: events.ValueChangeEventArguments,
+                ) -> None:
+                    dialog_state["view_model"] = dialog_state[
+                        "view_model"
+                    ].with_persist_profile(event.value == "saved")
+                    _refresh_validation()
+
                 def _on_profile_name_change(event: events.ValueChangeEventArguments) -> None:
-                    dialog_state["view_model"] = dialog_state["view_model"].with_profile_name(
-                        str(event.value or "")
-                    )
+                    name = str(event.value or "")
+                    try:
+                        path = _profile_path(profiles_dir, name)
+                    except ValueError:
+                        dialog_state["view_model"] = dialog_state[
+                            "view_model"
+                        ].with_profile_name(name)
+                    else:
+                        exists = path.exists()
+                        dialog_state["view_model"] = dialog_state[
+                            "view_model"
+                        ].with_profile_destination(
+                            name,
+                            opened_hash=source_sha256(path) if exists else None,
+                            opened_source_existed=exists,
+                        )
                     _refresh_validation()
 
                 def _on_columns_change(
@@ -7528,171 +7697,252 @@ def create_pages(
                     )
 
                 with ui.dialog().props("persistent") as dialog, ui.card().classes(
-                    "w-[46rem] max-w-[96vw] max-h-[92vh] overflow-y-auto"
+                    "rankedtable-card"
                 ):
-                    with ui.row().classes("items-baseline justify-between w-full"):
-                        ui.label("Review row matching").classes("runhead")
-                        ui.label("QC paused").classes("hint")
-                    ui.label(
-                        "One or more sheets look like a ranked or sorted table "
-                        "compared by raw position. This is a suggestion, not "
-                        "proof -- review the evidence for each table below "
-                        "before confirming. Physical row order and any ordinal "
-                        "values you ignore are never compared again; formulas, "
-                        "styles, structure, and other business values stay "
-                        "fully checked."
-                    ).classes("note")
+                    with ui.column().classes("rankedtable-head w-full gap-2"):
+                        with ui.row().classes("items-baseline justify-between w-full"):
+                            ui.label("Review row matching").classes("runhead")
+                            ui.label("QC paused").classes("hint")
+                        ui.label(
+                            "One or more sheets look like a ranked or sorted table "
+                            "compared by raw position. This is a suggestion, not "
+                            "proof -- review the evidence for each table below "
+                            "before confirming. Physical row order and any ordinal "
+                            "values you ignore are never compared again; formulas, "
+                            "styles, structure, and other business values stay "
+                            "fully checked."
+                        ).classes("note")
 
-                    destination_note = ui.label().classes("hint")
-                    profile_name_input = (
-                        ui.input(
-                            "Save to profile",
-                            value=view_model.profile_name,
-                            placeholder=(
-                                "Enter a new named profile"
-                                if not view_model.opened_profile_name
-                                else "Profile name"
+                    with ui.column().classes("rankedtable-body w-full gap-2"):
+                        ui.toggle(
+                            {
+                                "temporary": "Run once",
+                                "saved": "Save to profile",
+                            },
+                            value=(
+                                "saved" if view_model.persist_profile else "temporary"
                             ),
-                            on_change=_on_profile_name_change,
-                        )
-                        .classes("w-full")
-                        .props(
-                            "outlined dense autofocus"
-                            if view_model.initial_focus_target == "profile_name"
-                            else "outlined dense"
-                        )
-                    )
-
-                    region_count = view_model.region_count
-                    with ui.tabs().props("dense").classes("w-full") as region_tabs:
-                        tabs = [
-                            ui.tab(
-                                f"region-{index}",
-                                label=f"{index + 1} of {region_count} \u00b7 {region.label}",
+                            on_change=_on_persistence_change,
+                        ).props("no-caps")
+                        destination_note = ui.label().classes("hint")
+                        profile_name_select = (
+                            ui.select(
+                                options=[
+                                    name
+                                    for name in list_profiles(profiles_dir)
+                                    if name != "default"
+                                ],
+                                value=view_model.profile_name or None,
+                                label="Existing profile or new name",
+                                with_input=True,
+                                new_value_mode="add-unique",
+                                on_change=_on_profile_name_change,
                             )
-                            for index, region in enumerate(view_model.regions)
-                        ]
-                    with ui.tab_panels(region_tabs, value="region-0").classes("w-full"):
-                        for index, region in enumerate(view_model.regions):
-                            with ui.tab_panel(f"region-{index}"):
-                                column_widgets: list[Any] = []
-                                ui.label(region.noise_summary).classes("note")
-                                if region.available_columns:
-                                    identity_select = ui.select(
-                                        options=list(region.available_columns),
-                                        multiple=True,
-                                        value=list(region.identity_columns),
-                                        label="Match rows by",
-                                        on_change=lambda e, i=index: _on_columns_change(
-                                            i, identity=list(e.value or [])
-                                        ),
-                                    ).props("use-chips outlined dense").classes("w-full")
-                                    ordinal_select = ui.select(
-                                        options=list(region.available_columns),
-                                        multiple=True,
-                                        value=list(region.ordinal_columns),
-                                        label="Ignore order-only values in",
-                                        on_change=lambda e, i=index: _on_columns_change(
-                                            i, ordinal=list(e.value or [])
-                                        ),
-                                    ).props("use-chips outlined dense").classes("w-full")
-                                    column_widgets = [identity_select, ordinal_select]
-                                else:
-                                    identity_input = ui.input(
-                                        "Match rows by (column letters)",
-                                        value=", ".join(region.identity_columns),
-                                        on_change=lambda e, i=index: _on_columns_change(
-                                            i, identity=_column_letters(str(e.value or ""))
-                                        ),
-                                    ).props("outlined dense").classes("w-full")
-                                    ordinal_input = ui.input(
-                                        "Ignore order-only values in (column letters)",
-                                        value=", ".join(region.ordinal_columns),
-                                        on_change=lambda e, i=index: _on_columns_change(
-                                            i, ordinal=_column_letters(str(e.value or ""))
-                                        ),
-                                    ).props("outlined dense").classes("w-full")
-                                    column_widgets = [identity_input, ordinal_input]
-                                ui.radio(
-                                    {
-                                        policy: DUPLICATE_POLICY_COPY[policy][0]
-                                        for policy in DUPLICATE_POLICIES
-                                    },
-                                    value=region.duplicate_policy,
-                                    on_change=lambda e, i=index: _on_duplicate_policy_change(
-                                        i, cast(DuplicatePolicy, e.value)
-                                    ),
-                                ).props("dense").classes("w-full")
-                                for policy in DUPLICATE_POLICIES:
-                                    label, consequence, risk = DUPLICATE_POLICY_COPY[policy]
-                                    with ui.element("div").classes("note w-full"):
-                                        ui.label(f"{label} \u2014 {risk}").classes("dk")
-                                        ui.label(consequence).classes("hint")
-                                with ui.expansion("Why QC paused", icon="help_outline").classes(
-                                    "w-full"
-                                ):
-                                    ui.label(region.why_paused_detail).classes("hint")
-                                region_controls.append(
-                                    {"tab": tabs[index], "column_widgets": column_widgets}
-                                )
+                            .classes("w-full")
+                            .props(
+                                "outlined dense autofocus"
+                                if view_model.initial_focus_target == "profile_name"
+                                else "outlined dense"
+                            )
+                        )
 
-                    async def save_rules() -> None:
+                        region_count = view_model.region_count
+                        with ui.tabs().props("dense").classes("w-full") as region_tabs:
+                            tabs = [
+                                ui.tab(
+                                    f"region-{index}",
+                                    label=(
+                                        f"{index + 1} of {region_count} \u00b7 "
+                                        f"{region.label}"
+                                    ),
+                                )
+                                for index, region in enumerate(view_model.regions)
+                            ]
+                        with ui.tab_panels(region_tabs, value="region-0").classes(
+                            "w-full"
+                        ):
+                            for index, region in enumerate(view_model.regions):
+                                with ui.tab_panel(f"region-{index}"):
+                                    column_widgets: list[Any] = []
+                                    ui.label(region.noise_summary).classes("note")
+                                    if region.available_columns:
+                                        if region.header_row is not None:
+                                            ui.label(
+                                                f"Likely header row {region.header_row}; "
+                                                "column letters remain the saved rule."
+                                            ).classes("hint")
+                                        identity_select = ui.select(
+                                            options=region.column_options,
+                                            multiple=True,
+                                            value=list(region.identity_columns),
+                                            label="Match rows by",
+                                            on_change=lambda e, i=index: (
+                                                _on_columns_change(
+                                                    i, identity=list(e.value or [])
+                                                )
+                                            ),
+                                        ).props("use-chips outlined dense").classes(
+                                            "w-full"
+                                        )
+                                        ordinal_select = ui.select(
+                                            options=region.column_options,
+                                            multiple=True,
+                                            value=list(region.ordinal_columns),
+                                            label="Ignore order-only values in",
+                                            on_change=lambda e, i=index: (
+                                                _on_columns_change(
+                                                    i, ordinal=list(e.value or [])
+                                                )
+                                            ),
+                                        ).props("use-chips outlined dense").classes(
+                                            "w-full"
+                                        )
+                                        column_widgets = [identity_select, ordinal_select]
+                                    else:
+                                        identity_input = ui.input(
+                                            "Match rows by (column letters)",
+                                            value=", ".join(region.identity_columns),
+                                            on_change=lambda e, i=index: (
+                                                _on_columns_change(
+                                                    i,
+                                                    identity=_column_letters(
+                                                        str(e.value or "")
+                                                    ),
+                                                )
+                                            ),
+                                        ).props("outlined dense").classes("w-full")
+                                        ordinal_input = ui.input(
+                                            "Ignore order-only values in (column letters)",
+                                            value=", ".join(region.ordinal_columns),
+                                            on_change=lambda e, i=index: (
+                                                _on_columns_change(
+                                                    i,
+                                                    ordinal=_column_letters(
+                                                        str(e.value or "")
+                                                    ),
+                                                )
+                                            ),
+                                        ).props("outlined dense").classes("w-full")
+                                        column_widgets = [identity_input, ordinal_input]
+                                    ui.radio(
+                                        {
+                                            policy: DUPLICATE_POLICY_COPY[policy][0]
+                                            for policy in DUPLICATE_POLICIES
+                                        },
+                                        value=region.duplicate_policy,
+                                        on_change=lambda e, i=index: (
+                                            _on_duplicate_policy_change(
+                                                i, cast(DuplicatePolicy, e.value)
+                                            )
+                                        ),
+                                    ).props("dense").classes("w-full")
+                                    for policy in DUPLICATE_POLICIES:
+                                        label, consequence, risk = DUPLICATE_POLICY_COPY[
+                                            policy
+                                        ]
+                                        with ui.element("div").classes("note w-full"):
+                                            ui.label(f"{label} \u2014 {risk}").classes("dk")
+                                            ui.label(consequence).classes("hint")
+                                    with ui.expansion(
+                                        "Why QC paused", icon="help_outline"
+                                    ).classes("w-full"):
+                                        ui.label(region.why_paused_detail).classes("hint")
+                                    region_controls.append(
+                                        {
+                                            "tab": tabs[index],
+                                            "column_widgets": column_widgets,
+                                        }
+                                    )
+
+                    async def apply_rules() -> None:
                         vm = dialog_state["view_model"]
                         if not vm.is_valid:
                             _refresh_validation()
                             return
-                        target_name = vm.profile_name.strip()
-                        target_path = _profile_path(profiles_dir, target_name)
-                        current_exists = target_path.exists()
-                        current_hash = (
-                            source_sha256(target_path) if current_exists else None
+                        workbook_count = max(
+                            1,
+                            sum(
+                                role == "current_excel"
+                                or role.startswith("current_excel:")
+                                for role in state.files
+                            ),
                         )
-                        if vm.has_profile_conflict(
-                            current_hash=current_hash, current_exists=current_exists
-                        ):
-                            ui.notify(
-                                f"Profile {target_name!r} changed while this dialog "
-                                "was open; reopen it and try again",
-                                type="warning",
-                                multi_line=True,
-                            )
-                            return
+                        target_name = vm.profile_name.strip()
+                        target_path: Path | None = None
                         try:
-                            base_profile = (
-                                load_profile(target_path)
-                                if current_exists
-                                else new_profile(target_name)
-                            )
-                            workbook_count = max(
-                                1,
-                                sum(
-                                    role == "current_excel"
-                                    or role.startswith("current_excel:")
-                                    for role in state.files
-                                ),
-                            )
+                            if vm.persist_profile:
+                                target_path = _profile_path(profiles_dir, target_name)
+                                current_exists = target_path.exists()
+                                current_hash = (
+                                    source_sha256(target_path)
+                                    if current_exists
+                                    else None
+                                )
+                                if vm.has_profile_conflict(
+                                    current_hash=current_hash,
+                                    current_exists=current_exists,
+                                ):
+                                    ui.notify(
+                                        f"Profile {target_name!r} changed while this "
+                                        "dialog was open; reopen it and try again",
+                                        type="warning",
+                                        multi_line=True,
+                                    )
+                                    return
+                                base_profile = (
+                                    load_profile(target_path)
+                                    if current_exists
+                                    else new_profile(target_name)
+                                )
+                            else:
+                                base_profile = _temporary_row_matching_base(
+                                    profiles_dir,
+                                    source_profile,
+                                    source_profile_snapshot,
+                                )
                             profile = apply_view_model(
                                 base_profile, vm, workbook_count=workbook_count
                             )
-                            save_profile(profile, target_path)
+                            if vm.persist_profile:
+                                if target_path is None:
+                                    raise ValueError("profile destination is missing")
+                                save_profile(profile, target_path)
+                            else:
+                                profile = profile.model_copy(
+                                    update={
+                                        "name": _temporary_profile_name(
+                                            base_profile.name
+                                        )
+                                    },
+                                    deep=True,
+                                )
                         except (OSError, ValueError) as exc:
                             ui.notify(str(exc), type="warning", multi_line=True)
                             return
-                        options = list_profiles(profiles_dir)
-                        profile_select.options = options
-                        profile_select.value = target_name
-                        profile_select.update()
-                        state.profile_name = target_name
-                        refresh_readiness()
                         dialog.close()
-                        ui.notify(
-                            f"Saved row matching to profile {target_name!r}; Re-QC started"
-                        )
-                        await start_run()
+                        if vm.persist_profile:
+                            options = list_profiles(profiles_dir)
+                            profile_select.options = options
+                            profile_select.value = target_name
+                            profile_select.update()
+                            state.profile_name = target_name
+                            state.profile_override = None
+                            refresh_readiness()
+                            ui.notify(
+                                f"Saved row matching to profile {target_name!r}; "
+                                "Re-QC started"
+                            )
+                            await start_run()
+                        else:
+                            ui.notify(
+                                "Temporary row matching applied; Re-QC started "
+                                "without saving a profile"
+                            )
+                            await start_run(profile_override=profile)
 
                     with ui.row().classes("items-center gap-2 rankedtable-actions"):
                         save_button = ui.button(
-                            "Save rule and run QC", on_click=save_rules
+                            "Save rule and run QC", on_click=apply_rules
                         ).classes("runbtn").props("no-caps")
 
                         def _cancel() -> None:

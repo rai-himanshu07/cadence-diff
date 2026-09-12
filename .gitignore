@@ -17,7 +17,7 @@ htmlcov/
 .venv/
 venv/
 
-# rust / native extension build output (native/xlsbkernel/) — never commit
+# rust / native extension build output (native/cadence_diff_native/) — never commit
 # compiled artifacts; Cargo.lock IS committed for reproducible builds
 native/*/target/
 *.so

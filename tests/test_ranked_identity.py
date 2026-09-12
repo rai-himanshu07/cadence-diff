@@ -124,6 +124,57 @@ def test_sequence_like_rank_column_is_excluded_in_favor_of_real_identity() -> No
     assert candidate.column_letters == ("B",)  # the rank column is never chosen
 
 
+def test_header_row_is_inferred_below_a_bounded_preamble() -> None:
+    n = _LARGE_N
+    headers: list[list[CellValue]] = [
+        ["Internal report", None, None, None, None],
+        ["Updated", None, None, None, None],
+        ["Rank", "Record ID", "Value", "Value 2", "Value 3"],
+    ]
+    base_data = [
+        [i + 1, f"ID{i}", 100.0 + i, 200.0 + i * 2, 300.0 - i]
+        for i in range(n)
+    ]
+    curr_data = [list(row) for row in base_data]
+    random.Random(99).shuffle(curr_data)
+    for position, row in enumerate(curr_data):
+        row[0] = position + 1
+    base_rows = [*headers, *base_data]
+    curr_rows = [*headers, *curr_data]
+    base_sheet = _sheet(base_rows)
+    curr_sheet = _sheet(curr_rows)
+    region = _region(len(base_rows), 5)
+
+    candidate = detect_ranked_table_candidate(base_sheet, curr_sheet, region, region)
+
+    assert candidate is not None
+    assert candidate.column_letters == ("B",)
+    assert candidate.ordinal_column_letters == ("A",)
+    assert candidate.header_row == 3
+
+
+def test_stable_text_data_row_is_not_mistaken_for_a_header() -> None:
+    n = _LARGE_N
+    base_rows = [
+        [f"ID{i}", f"Name{i}", f"Group{i % 10}", 100.0 + i]
+        for i in range(n)
+    ]
+    curr_rows = [list(row) for row in base_rows]
+    random.Random(99).shuffle(curr_rows)
+    # Put one ordinary, text-rich record back at its original position.
+    stable = base_rows[5]
+    stable_index = curr_rows.index(stable)
+    curr_rows[5], curr_rows[stable_index] = curr_rows[stable_index], curr_rows[5]
+    base_sheet = _sheet(base_rows)
+    curr_sheet = _sheet(curr_rows)
+    region = _region(n, 4)
+
+    candidate = detect_ranked_table_candidate(base_sheet, curr_sheet, region, region)
+
+    assert candidate is not None
+    assert candidate.header_row is None
+
+
 def test_sequence_like_rank_does_not_cancel_minimal_table_evidence() -> None:
     n = MIN_PROJECTED_MISMATCHES + 100
     base_rows = [[i + 1, f"ID{i}", 100.0 + i] for i in range(n)]

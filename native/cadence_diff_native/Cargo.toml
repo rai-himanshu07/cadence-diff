@@ -1,11 +1,11 @@
 [package]
-name = "xlsbkernel"
-version = "0.1.0"
+name = "cadence-diff-native"
+version = "2.0.0"
 edition = "2021"
 license = "Apache-2.0"
 
 [lib]
-name = "xlsbkernel"
+name = "cadence_diff_native"
 crate-type = ["cdylib"]
 
 [dependencies]

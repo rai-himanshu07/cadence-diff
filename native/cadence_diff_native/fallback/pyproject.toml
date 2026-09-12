@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cadence-diff-native"
+version = "2.0.0"
+description = "Native Excel analysis accelerator for cadence-diff"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+classifiers = [
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Rust",
+  "Operating System :: Microsoft :: Windows :: Windows 10",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://github.com/rai-himanshu07/cadence-diff"
+Repository = "https://github.com/rai-himanshu07/cadence-diff"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cadence_diff_native"]

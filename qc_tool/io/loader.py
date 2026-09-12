@@ -1334,12 +1334,17 @@ def _load_xlsb(
     _apply_vba(snapshot, data)
     native_values_by_sheet: dict[str, list[tuple[int, int, CellValue]]] = {}
     if resolved_values_engine == "native":
-        from qc_tool.io.native_kernel import native_kernel_available, raw_values_report
+        from qc_tool.io.native_kernel import (
+            native_kernel_available,
+            native_kernel_status,
+            raw_values_report,
+        )
 
         if not native_kernel_available():
             raise RuntimeError(
-                "_xlsb_values_engine='native' was requested but the native "
-                "xlsbkernel extension is not installed"
+                "_xlsb_values_engine='native' was requested but a compatible "
+                f"cadence-diff native engine is unavailable "
+                f"({native_kernel_status().value})"
             )
         try:
             native_values_by_sheet = {

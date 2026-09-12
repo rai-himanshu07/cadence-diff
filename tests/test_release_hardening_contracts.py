@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import qc_tool.io.native_formula as native_formula_module
+import qc_tool.io.native_kernel as native_kernel_module
 from qc_tool.attestation import create_attestation, verify_attestation
 from qc_tool.config.profile import PopulationPolicy, default_profile
 from qc_tool.engine import QCRunResult, compare_findings
@@ -48,6 +49,13 @@ from qc_tool.io.xlsb_formula import XlsbFormulaScan
 from qc_tool.scope import ComparisonScope
 from tests.conftest import fixture_profile
 
+
+def _enable_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(native_kernel_module, "native_kernel_available", lambda: True)
+    monkeypatch.setattr(
+        native_kernel_module, "native_distribution_version", lambda: "9.9.9"
+    )
+
 _TODAY = dt.date(2026, 9, 9)
 
 
@@ -63,7 +71,7 @@ def test_extract_formulas_with_native_kernel_must_not_turn_a_failed_a1_render_in
 ) -> None:
     """Step 2. A Rust-side A1 render failure currently reaches Python as an
     empty string (`render(...).unwrap_or_default()` in
-    `native/xlsbkernel/src/surface.rs`), and `extract_formulas_with_native_
+    `native/cadence_diff_native/src/surface.rs`), and `extract_formulas_with_native_
     kernel` blindly prefixes every cell with '=' -- producing a literal '='
     formula that is accepted as real, complete coverage. It must instead be
     absent, exactly like an unresolved shared-formula follower already is
@@ -82,11 +90,8 @@ def test_extract_formulas_with_native_kernel_must_not_turn_a_failed_a1_render_in
         ),
         defined_names=(),
     )
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", object())
+    _enable_native(monkeypatch)
     monkeypatch.setattr(native_formula_module, "formula_surface_report", lambda data: surface)
-    monkeypatch.setattr(
-        native_formula_module.importlib.metadata, "version", lambda name: "9.9.9"
-    )
 
     extraction = extract_formulas_with_native_kernel(b"unused", _scan())
 
@@ -121,11 +126,8 @@ def test_extract_formulas_with_native_kernel_degrades_on_an_out_of_range_definit
         ),
         defined_names=(),
     )
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", object())
+    _enable_native(monkeypatch)
     monkeypatch.setattr(native_formula_module, "formula_surface_report", lambda data: surface)
-    monkeypatch.setattr(
-        native_formula_module.importlib.metadata, "version", lambda name: "9.9.9"
-    )
 
     with pytest.raises(FormulaEnrichmentError):
         extract_formulas_with_native_kernel(b"unused", _scan())
@@ -153,11 +155,8 @@ def test_extract_formulas_with_native_kernel_degrades_on_mismatched_surface_vect
         ),
         defined_names=(),
     )
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", object())
+    _enable_native(monkeypatch)
     monkeypatch.setattr(native_formula_module, "formula_surface_report", lambda data: surface)
-    monkeypatch.setattr(
-        native_formula_module.importlib.metadata, "version", lambda name: "9.9.9"
-    )
 
     with pytest.raises(FormulaEnrichmentError):
         extract_formulas_with_native_kernel(b"unused", _scan())
@@ -184,7 +183,7 @@ def test_formula_cache_round_trip_preserves_canonical_r1c1_evidence(tmp_path: Pa
         coordinate_digest=coordinate_digest(scan),
         coordinate_count=scan.formula_count,
         adapter_family="native",
-        adapter_fingerprint="native:xlsbkernel:1.2.3",
+        adapter_fingerprint="native:cadence-diff-native:1.2.3",
     )
     cache = FormulaExtractionCache(tmp_path / "formula-cache")
 

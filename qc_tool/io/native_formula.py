@@ -1,18 +1,14 @@
-"""Optional native XLSB formula surface adapter (Rust/PyO3,
-``native/xlsbkernel/``'s `formula_surface_report`).
+"""Native Excel formula surface adapter (Rust/PyO3,
+``native/cadence_diff_native/``'s `formula_surface_report`).
 
 Exposes B2's "definitions + per-cell ids + names surface": per-cell eager A1
 text (every existing `CellRecord.formula` consumer expects per-cell A1),
 canonical R1C1 rendered once per shared/array definition (a `definition_id`
 links each cell to its group), and defined names with rendered A1 targets.
 
-The extension is an optional accelerator, not a runtime dependency: it may be
-absent on any platform without a locally built or (later, per Phase B's
-packaging plan) published matching wheel. Every caller MUST treat
-``native_kernel_available()`` (from `qc_tool.io.native_kernel`) as the single
-source of truth and degrade to the existing formula adapters without
-raising -- never assume the import succeeded just because this module
-imported cleanly.
+The helper distribution can resolve to a native extension or an importable
+pure-Python fallback module. Availability and compatibility are therefore
+owned exclusively by ``qc_tool.io.native_kernel``.
 
 `extract_formulas_with_native_kernel` (B3) is the actual `FormulaExtraction`
 adapter `qc_tool/io/loader.py` dispatches to for `formula_engine: native`;
@@ -24,9 +20,9 @@ for the full design.
 
 from __future__ import annotations
 
-import importlib.metadata
 from dataclasses import dataclass
 
+from qc_tool.io import native_kernel
 from qc_tool.io.formula_enrichment import (
     ExtractedDefinedName,
     FormulaEnrichmentError,
@@ -35,11 +31,6 @@ from qc_tool.io.formula_enrichment import (
     bounded_defined_names,
 )
 from qc_tool.io.xlsb_formula import XlsbFormulaScan
-
-try:
-    import xlsbkernel as _xlsbkernel  # pyright: ignore[reportMissingModuleSource]
-except ImportError:  # pragma: no cover - exercised by an unpatched real env
-    _xlsbkernel = None
 
 
 @dataclass(slots=True)
@@ -74,7 +65,7 @@ class WorkbookFormulaSurface:
 
 
 def native_formula_available() -> bool:
-    return _xlsbkernel is not None
+    return native_kernel.native_kernel_available()
 
 
 def _validate_sheet_surface(sheet: FormulaSheetSurface) -> None:
@@ -93,7 +84,7 @@ def _validate_sheet_surface(sheet: FormulaSheetSurface) -> None:
     }
     if len(lengths) > 1:
         raise FormulaEnrichmentError(
-            "the native XLSB kernel returned a formula surface with "
+            "the cadence-diff native engine returned a formula surface with "
             "mismatched per-cell vector lengths"
         )
     definition_count = len(sheet.definition_r1c1)
@@ -102,7 +93,7 @@ def _validate_sheet_surface(sheet: FormulaSheetSurface) -> None:
         for definition_id in sheet.cell_definition_id
     ):
         raise FormulaEnrichmentError(
-            "the native XLSB kernel returned a formula surface with an "
+            "the cadence-diff native engine returned a formula surface with an "
             "out-of-range definition id"
         )
 
@@ -115,7 +106,7 @@ def _validated_r1c1_cells(sheet: FormulaSheetSurface) -> dict[tuple[int, int], s
     (``definition_r1c1``, indexed by ``cell_definition_id``) -- far cheaper
     than re-tokenizing every cell's A1 text in Python. A narrow, disclosed
     residual gap in the kernel's R1C1 rendering has not been root-caused
-    (see ``native/xlsbkernel/src/ptg.rs``'s module doc comment), so this
+    (see ``native/cadence_diff_native/src/ptg.rs``'s module doc comment), so this
     validates the kernel's per-definition text against the already-Excel-
     proven ``to_r1c1()`` -- using one representative cell's own A1 text --
     exactly once per distinct definition, and falls back to that proven
@@ -154,9 +145,7 @@ def formula_surface_report(data: bytes) -> WorkbookFormulaSurface:
     Excel-COM/LibreOffice adapters instead of relying on this exception as
     control flow.
     """
-    if _xlsbkernel is None:
-        raise RuntimeError("native xlsbkernel extension is not installed")
-    sheets_raw, names_raw = _xlsbkernel.formula_surface_report(data)  # pyright: ignore[reportAttributeAccessIssue]
+    sheets_raw, names_raw = native_kernel.formula_surface_report(data)
     sheets = tuple(
         FormulaSheetSurface(
             name=name,
@@ -173,12 +162,7 @@ def formula_surface_report(data: bytes) -> WorkbookFormulaSurface:
 
 
 def _kernel_version() -> str | None:
-    if _xlsbkernel is None:
-        return None
-    try:
-        return importlib.metadata.version("xlsbkernel")
-    except importlib.metadata.PackageNotFoundError:
-        return None
+    return native_kernel.native_distribution_version()
 
 
 def native_adapter_fingerprint() -> str | None:
@@ -189,7 +173,7 @@ def native_adapter_fingerprint() -> str | None:
     guessing when the installed distribution's version cannot be read.
     """
     version = _kernel_version()
-    return f"xlsbkernel:{version}" if version else None
+    return f"cadence-diff-native:{version}" if version else None
 
 
 def extract_formulas_with_native_kernel(
@@ -220,8 +204,9 @@ def extract_formulas_with_native_kernel(
     """
     if not native_formula_available():
         raise FormulaEnrichmentError(
-            "the 'native' formula engine was requested but the xlsbkernel "
-            "extension is not installed"
+            "the 'native' formula engine was requested but a compatible "
+            f"cadence-diff native engine is unavailable "
+            f"({native_kernel.native_kernel_status().value})"
         )
     try:
         surface = formula_surface_report(data)
@@ -236,7 +221,7 @@ def extract_formulas_with_native_kernel(
         # Never log/include `exc`'s own text -- it could echo a path or
         # other adapter-internal detail; the exception class name is safe.
         raise FormulaEnrichmentError(
-            "the native XLSB kernel failed to decode this workbook's "
+            "the cadence-diff native engine failed to decode this workbook's "
             f"formula surface ({type(exc).__name__})"
         ) from exc
     formulas: FormulaMap = {}

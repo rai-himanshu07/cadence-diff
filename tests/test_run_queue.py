@@ -30,6 +30,7 @@ from qc_tool.history.store import RunHistory
 from qc_tool.package import PackageManifest
 from qc_tool.run_action import (
     MAX_RANKED_TABLE_AVAILABLE_COLUMNS,
+    MAX_RANKED_TABLE_HEADER_CHARS,
     MAX_RUN_ACTION_ITEMS,
     MAX_RUN_ACTION_MESSAGE_CHARS,
     MAX_RUN_ACTION_SHEET_CHARS,
@@ -360,12 +361,21 @@ def test_ranked_table_evidence_is_bounded_before_ipc() -> None:
         available_columns=tuple(
             f"C{i}" for i in range(MAX_RANKED_TABLE_AVAILABLE_COLUMNS + 10)
         ),
+        column_headers=tuple(
+            "  A very long header  " * 20
+            for _ in range(MAX_RANKED_TABLE_AVAILABLE_COLUMNS + 10)
+        ),
         suggested_identity_columns=("B",),
         suggested_ordinal_columns=("A",),
     )
     assert len(evidence.sheet) == MAX_RUN_ACTION_SHEET_CHARS
     assert len(evidence.current_range) == 64
     assert len(evidence.available_columns) == MAX_RANKED_TABLE_AVAILABLE_COLUMNS
+    assert len(evidence.column_headers) == MAX_RANKED_TABLE_AVAILABLE_COLUMNS
+    assert all(
+        len(header) <= MAX_RANKED_TABLE_HEADER_CHARS
+        for header in evidence.column_headers
+    )
 
     with pytest.raises(pydantic.ValidationError):
         RankedTableEvidence(suggested_identity_columns=tuple(f"I{i}" for i in range(20)))
@@ -380,6 +390,7 @@ def test_ranked_table_evidence_is_bounded_before_ipc() -> None:
     message = blocked_message(action.model_dump(mode="json"), [])
     encoded_evidence = message["action_required"]["items"][0]["ranked_table_evidence"]
     assert len(encoded_evidence["available_columns"]) == MAX_RANKED_TABLE_AVAILABLE_COLUMNS
+    assert len(encoded_evidence["column_headers"]) == MAX_RANKED_TABLE_AVAILABLE_COLUMNS
 
 
 def test_sanitize_error_keeps_one_bounded_line_without_paths() -> None:
@@ -638,7 +649,8 @@ def test_blocked_worker_message_reaches_a_terminal_non_active_state(
     make_manager: ManagerFactory,
 ) -> None:
     manager = make_manager(_blocked_worker)
-    request = _request(manager)
+    profile = DeliverableProfile(name="temporary-contract")
+    request = _request(manager, profile=profile.model_dump(mode="json"))
     manager.submit(request)
 
     record = manager.wait(request.request_id)
@@ -647,6 +659,7 @@ def test_blocked_worker_message_reaches_a_terminal_non_active_state(
     assert not record.is_active
     assert record.run_id is None
     assert record.error == ""
+    assert record.profile_snapshot == profile.model_dump(mode="json")
     assert record.action_required is not None
     assert record.action_required["reason"] == "comparison_prerequisite_mismatch"
     items = record.action_required["items"]
@@ -903,6 +916,41 @@ def test_finalize_blocked_is_terminal_non_active_and_assigns_no_run_id(
     assert blocked.finished_at is not None
     assert blocked.action_required == action_required
 
+def test_latest_terminal_survives_refresh_and_ignores_active_requests(
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "terminal-state"
+    work_dir.mkdir()
+    store = RunStateStore(work_dir / "history.sqlite3")
+    blocked = store.enqueue(
+        "blocked-request",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        files={},
+        queue_position=0,
+    )
+    store.finalize_blocked(
+        blocked.request_id,
+        {
+            "version": 2,
+            "reason": "row_identity_confirmation_required",
+            "items": [],
+        },
+    )
+    store.enqueue(
+        "active-request",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        files={},
+        queue_position=0,
+    )
+
+    latest = RunStateStore(work_dir / "history.sqlite3").latest_terminal()
+
+    assert latest is not None
+    assert latest.request_id == blocked.request_id
+    assert latest.status is RunStatus.BLOCKED
+
 
 def test_run_state_migrates_a_legacy_table_missing_action_required(
     tmp_path: Path,
@@ -947,10 +995,12 @@ def test_run_state_migrates_a_legacy_table_missing_action_required(
     with sqlite3.connect(db_path) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(run_state)")}
     assert "action_required" in columns
+    assert "profile_snapshot" in columns
 
     legacy = store.get("legacy-row")
     assert legacy is not None
     assert legacy.action_required is None
+    assert legacy.profile_snapshot is None
 
 
 # --- progress, telemetry, backpressure ---------------------------------------

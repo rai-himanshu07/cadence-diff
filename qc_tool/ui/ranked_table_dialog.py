@@ -11,6 +11,7 @@ ranked/sorted-table regions the analyst may confirm a row identity for.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal
 
 from qc_tool.config.profile import (
@@ -18,6 +19,7 @@ from qc_tool.config.profile import (
     ExcelMemberProfile,
     RowIdentityRule,
     SheetProfile,
+    profile_path,
 )
 
 DuplicatePolicy = Literal["skip", "occurrence", "position"]
@@ -76,6 +78,8 @@ class RegionDraft:
     anchor_cell: str
     current_range: str = ""
     available_columns: tuple[str, ...] = ()
+    column_headers: tuple[str, ...] = ()
+    header_row: int | None = None
     data_row_count: int | None = None
     non_blank_coverage: float | None = None
     unique_ratio: float | None = None
@@ -100,6 +104,18 @@ class RegionDraft:
         if self.current_range:
             return f"{prefix}{self.sheet} / {self.current_range}"
         return f"{prefix}{self.sheet}"
+
+    @property
+    def column_options(self) -> dict[str, str]:
+        headers = dict(zip(self.available_columns, self.column_headers, strict=False))
+        return {
+            column: (
+                f"{column} · {headers[column]}"
+                if headers.get(column)
+                else column
+            )
+            for column in self.available_columns
+        }
 
     @property
     def noise_summary(self) -> str:
@@ -203,6 +219,8 @@ def region_draft_from_item(item: dict[str, object]) -> RegionDraft | None:
             anchor_cell=cell,
             current_range=str(evidence.get("current_range") or ""),
             available_columns=_str_tuple(evidence.get("available_columns")),
+            column_headers=_str_tuple(evidence.get("column_headers")),
+            header_row=_as_int(evidence.get("header_row")),
             data_row_count=_as_int(evidence.get("data_row_count")),
             non_blank_coverage=_as_float(evidence.get("non_blank_coverage")),
             unique_ratio=_as_float(evidence.get("unique_ratio")),
@@ -246,6 +264,7 @@ class DialogViewModel:
     regions: tuple[RegionDraft, ...]
     active_index: int = 0
     profile_name: str = ""
+    persist_profile: bool = False
     opened_profile_name: str = ""
     opened_hash: str | None = None
     opened_source_existed: bool = False
@@ -273,19 +292,46 @@ class DialogViewModel:
     def with_profile_name(self, name: str) -> DialogViewModel:
         return replace(self, profile_name=name)
 
+    def with_persist_profile(self, persist: bool) -> DialogViewModel:
+        return replace(self, persist_profile=persist)
+
+    def with_profile_destination(
+        self,
+        name: str,
+        *,
+        opened_hash: str | None,
+        opened_source_existed: bool,
+    ) -> DialogViewModel:
+        return replace(
+            self,
+            profile_name=name,
+            opened_profile_name=name,
+            opened_hash=opened_hash,
+            opened_source_existed=opened_source_existed,
+        )
+
     def destination_errors(self) -> tuple[str, ...]:
         """Validation errors for the profile destination (Criterion 13)."""
+        if not self.persist_profile:
+            return ()
         name = self.profile_name.strip()
         if not name:
             return ("Enter a profile name to save this match to.",)
         if name == "default":
             return ("Choose a named profile; the built-in default is immutable.",)
+        try:
+            profile_path(Path("."), name)
+        except ValueError as exc:
+            return (str(exc),)
         return ()
 
     @property
     def is_creating_profile(self) -> bool:
         """Create-versus-update wording (Criterion 12)."""
-        return self.profile_name.strip() != self.opened_profile_name
+        return self.persist_profile and (
+            self.profile_name.strip() != self.opened_profile_name
+            or not self.opened_source_existed
+        )
 
     @property
     def is_valid(self) -> bool:
@@ -305,7 +351,11 @@ class DialogViewModel:
         """Criterion 14: focus the new-profile control only when the run's
         profile was the immutable default (so the destination starts
         blank); otherwise focus the first region's identity control."""
-        return "profile_name" if not self.opened_profile_name else "region_identity"
+        return (
+            "profile_name"
+            if self.persist_profile and not self.opened_profile_name
+            else "region_identity"
+        )
 
     def has_profile_conflict(
         self, *, current_hash: str | None, current_exists: bool
@@ -322,6 +372,7 @@ def view_model_from_action(
     action: dict[str, object],
     *,
     source_profile: str,
+    source_profile_saved: bool | None = None,
     opened_hash: str | None = None,
     opened_source_existed: bool = False,
 ) -> DialogViewModel | None:
@@ -342,10 +393,16 @@ def view_model_from_action(
     )
     if not regions:
         return None
-    opened_profile_name = "" if source_profile == "default" else source_profile
+    saved = (
+        source_profile != "default"
+        if source_profile_saved is None
+        else source_profile_saved
+    )
+    opened_profile_name = source_profile if saved else ""
     return DialogViewModel(
         regions=regions,
         profile_name=opened_profile_name,
+        persist_profile=bool(opened_profile_name),
         opened_profile_name=opened_profile_name,
         opened_hash=opened_hash,
         opened_source_existed=opened_source_existed,
@@ -355,6 +412,7 @@ def view_model_from_action(
 def region_to_row_identity_rule(region: RegionDraft) -> RowIdentityRule:
     return RowIdentityRule(
         anchor_cell=region.anchor_cell,
+        header_row=region.header_row,
         identity_columns=list(region.identity_columns),
         ordinal_columns=list(region.ordinal_columns),
         duplicate_policy=region.duplicate_policy,

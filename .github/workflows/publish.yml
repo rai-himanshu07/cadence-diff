@@ -1,115 +1,384 @@
-name: Publish to PyPI
+name: Publish cadence-diff release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing published release tag to retry
+        description: Existing annotated release tag, for example v2.0.0
         required: true
         type: string
 
 permissions:
   contents: read
 
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+  RELEASE_VERSION: "2.0.0"
+
 jobs:
-  build:
-    name: Build release distributions
-    if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      github.event_name == 'workflow_dispatch'
+  preflight:
+    name: Validate immutable release tag
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out release tag
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
-          cache: pip
-
-      - name: Require the deliberate publication commit
-        env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
+          python-version: "3.12"
+      - name: Verify tag and synchronized versions
         run: |
-          if grep -Fq 'Private :: Do Not Upload' pyproject.toml; then
-            echo 'Publication interlock is still enabled.' >&2
-            exit 1
-          fi
+          test "$(git cat-file -t "$RELEASE_TAG")" = tag
+          test "v$(python -c 'import qc_tool; print(qc_tool.__version__)')" = "$RELEASE_TAG"
           python - <<'PY'
-          import json
-          import os
+          import tomllib
+          from pathlib import Path
+
+          cargo = tomllib.loads(Path("native/cadence_diff_native/Cargo.toml").read_text())
+          fallback = tomllib.loads(
+              Path("native/cadence_diff_native/fallback/pyproject.toml").read_text()
+          )
+          assert cargo["package"]["version"] == "2.0.0"
+          assert fallback["project"]["version"] == "2.0.0"
+          PY
+      - name: Require unpublished stable versions
+        run: |
+          python - <<'PY'
+          import urllib.error
           import urllib.request
 
-          import qc_tool
-
-          tag = os.environ['RELEASE_TAG']
-          expected = f"v{qc_tool.__version__}"
-          if tag != expected:
-              raise SystemExit(f"tag {tag!r} does not match package version {expected!r}")
-          if os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch':
-              request = urllib.request.Request(
-                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}"
-                  f"/releases/tags/{tag}",
-                  headers={
-                      "Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
-                  },
-              )
-              with urllib.request.urlopen(request) as response:
-                  release = json.load(response)
-              if release.get('draft') or not release.get('published_at'):
-                  raise SystemExit(f"release {tag!r} is not published")
+          for project in ("cadence-diff-native", "cadence-diff"):
+              url = f"https://pypi.org/pypi/{project}/2.0.0/json"
+              try:
+                  urllib.request.urlopen(url, timeout=15)
+              except urllib.error.HTTPError as exc:
+                  if exc.code == 404:
+                      continue
+                  raise
+              raise SystemExit(f"{project}==2.0.0 already exists; release version is burned")
           PY
 
-      - name: Build and validate once
+  build-native-linux:
+    name: Build native Linux wheel
+    needs: preflight
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          maturin-version: v1.9.6
+          working-directory: native/cadence_diff_native
+          target: x86_64
+          manylinux: 2014
+          args: >-
+            --release --locked --compatibility pypi --out dist
+            --interpreter python3.11
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: helper-linux
+          path: native/cadence_diff_native/dist/*.whl
+          if-no-files-found: error
+
+  build-native-windows:
+    name: Build native Windows wheel
+    needs: preflight
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          maturin-version: v1.9.6
+          working-directory: native/cadence_diff_native
+          target: x64
+          args: --release --locked --compatibility pypi --out dist --interpreter python
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: helper-windows
+          path: native/cadence_diff_native/dist/*.whl
+          if-no-files-found: error
+
+  build-fallback:
+    name: Build universal fallback wheel
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Build fallback wheel only
+        run: |
+          python -m pip install --disable-pip-version-check "build==1.5.0"
+          python -m build --wheel --outdir native/cadence_diff_native/fallback/dist \
+            native/cadence_diff_native/fallback
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: helper-fallback
+          path: native/cadence_diff_native/fallback/dist/*.whl
+          if-no-files-found: error
+
+  build-main:
+    name: Build main wheel and sdist
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Build main distributions once
         run: |
           python -m pip install --disable-pip-version-check "build==1.5.0" "twine==6.2.0"
           python -m build
           python -m twine check dist/*
           python scripts/audit_distributions.py dist
-          cd dist
-          sha256sum *.whl *.tar.gz | tee SHA256SUMS
-
-      - name: Upload exact release artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-distributions
-          path: |
-            dist/*.whl
-            dist/*.tar.gz
-            dist/SHA256SUMS
+          name: main-unverified
+          path: dist/*
           if-no-files-found: error
 
-  publish:
-    name: Publish exact artifacts
-    needs: build
+  audit-native:
+    name: Audit exact native artifact set
+    needs: [build-native-linux, build-native-windows, build-fallback]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: helper-*
+          path: helper-dist
+          merge-multiple: true
+      - name: Audit and hash helper wheels
+        run: |
+          python scripts/audit_native_distributions.py helper-dist
+          cd helper-dist
+          sha256sum *.whl | tee SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-release
+          path: helper-dist/*
+          if-no-files-found: error
+
+  audit-main:
+    name: Hash exact main artifacts
+    needs: build-main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: main-unverified
+          path: main-dist
+      - name: Hash main distributions
+        run: |
+          cd main-dist
+          sha256sum *.whl *.tar.gz | tee SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: main-release
+          path: main-dist/*
+          if-no-files-found: error
+
+  publish-native:
+    name: Publish cadence-diff-native
+    needs: audit-native
+    runs-on: ubuntu-latest
+    environment: pypi-native
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: native-release
+          path: helper-release
+      - name: Verify exact helper hashes
+        run: |
+          cd helper-release
+          sha256sum --check SHA256SUMS
+          rm SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
+        with:
+          packages-dir: helper-release
+          attestations: true
+
+  verify-native:
+    name: Verify native release files, hashes, and payloads
+    needs: publish-native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: native-release
+          path: helper-release
+      - run: >-
+          python scripts/verify_pypi_release.py cadence-diff-native 2.0.0
+          helper-release/SHA256SUMS
+      - name: Download every published helper wheel
+        run: |
+          mkdir published-helper
+          python -m pip download --no-cache-dir --only-binary=:all: --no-deps \
+            --platform manylinux2014_x86_64 --python-version 3.11 \
+            --implementation cp --abi abi3 --dest published-helper \
+            cadence-diff-native==2.0.0
+          python -m pip download --no-cache-dir --only-binary=:all: --no-deps \
+            --platform win_amd64 --python-version 3.11 \
+            --implementation cp --abi abi3 --dest published-helper \
+            cadence-diff-native==2.0.0
+          python -m pip download --no-cache-dir --only-binary=:all: --no-deps \
+            --platform musllinux_1_2_x86_64 --python-version 3.12 \
+            --implementation cp --abi cp312 --dest published-helper \
+            cadence-diff-native==2.0.0
+      - name: Re-audit published helper bytes
+        run: |
+          cd published-helper
+          sha256sum --check ../helper-release/SHA256SUMS
+          cd ..
+          python scripts/audit_native_distributions.py published-helper
+
+  smoke-native:
+    name: Smoke published native / ${{ matrix.os }} / Python ${{ matrix.python }}
+    needs: verify-native
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: >-
+          python -m pip install --disable-pip-version-check --no-cache-dir
+          --only-binary=:all: cadence-diff-native==2.0.0
+      - run: >-
+          python -c "import cadence_diff_native as n;
+          assert n.__native_available__ is True;
+          assert n.__kernel_api_version__ == 1"
+
+  publish-main:
+    name: Publish cadence-diff
+    needs: [audit-main, verify-native, smoke-native]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
-
     steps:
-      - name: Download validated release artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-distributions
-          path: dist
-
-      - name: Verify artifact hashes
+          name: main-release
+          path: main-release
+      - name: Verify exact main hashes
         run: |
-          cd dist
+          cd main-release
           sha256sum --check SHA256SUMS
           rm SHA256SUMS
-
-      - name: Publish with PyPI Trusted Publishing
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
+      - uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # release/v1
         with:
-          packages-dir: dist
+          packages-dir: main-release
           attestations: true
+
+  verify-main:
+    name: Verify main release files and fallback resolution
+    needs: publish-main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: main-release
+          path: main-release
+      - run: >-
+          python scripts/verify_pypi_release.py cadence-diff 2.0.0
+          main-release/SHA256SUMS
+      - name: Verify fallback dependency resolution
+        run: |
+          mkdir fallback-download
+          python -m pip download --no-cache-dir --only-binary=:all: --no-deps \
+            --platform musllinux_1_2_x86_64 --python-version 3.12 \
+            --implementation cp --abi cp312 --dest fallback-download \
+            cadence-diff-native==2.0.0
+          test "$(find fallback-download -name '*-py3-none-any.whl' | wc -l)" -eq 1
+
+  smoke-main:
+    name: Smoke plain cadence-diff install / ${{ matrix.os }} / Python ${{ matrix.python }}
+    needs: verify-main
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: >-
+          python -m pip install --disable-pip-version-check --no-cache-dir
+          --only-binary=:all: cadence-diff==2.0.0
+      - run: python -m pip check
+      - run: >-
+          python -c "import qc_tool, cadence_diff_native as n;
+          assert n.__native_available__ is True;
+          assert n.__kernel_api_version__ == 1"
+
+  smoke-main-fallback:
+    name: Smoke plain cadence-diff fallback / macOS / Python ${{ matrix.python }}
+    needs: verify-main
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: >-
+          python -m pip install --disable-pip-version-check --no-cache-dir
+          --only-binary=:all: cadence-diff==2.0.0
+      - run: python -m pip check
+      - run: >-
+          python -c "import qc_tool, cadence_diff_native as n;
+          from qc_tool.io.native_kernel import NativeKernelStatus, native_kernel_status;
+          assert n.__native_available__ is False;
+          assert n.__kernel_api_version__ == 1;
+          assert native_kernel_status() is NativeKernelStatus.FALLBACK_STUB"
+
+  github-release:
+    name: Publish GitHub Release last
+    needs: [verify-main, smoke-main, smoke-main-fallback]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes
+          --title "cadence-diff $RELEASE_VERSION"

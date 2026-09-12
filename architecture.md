@@ -2,7 +2,7 @@
 
 **Project:** `cadence-diff` (import package `qc_tool`)  
 **Architecture baseline:** `main@e1480b3`  
-**Runtime:** Python 3.11 or 3.12; optional Rust/PyO3 `xlsbkernel`  
+**Runtime:** Python 3.11+; Rust/PyO3 `cadence-diff-native` on supported targets
 **Primary deployment:** local, single-user NiceGUI application bound to loopback  
 **Data posture:** read-only source processing, local persistence, no LLM or remote analysis service
 
@@ -40,7 +40,7 @@ The design is shaped by several non-negotiable constraints:
    current-user-only; queue messages are primitive-only; failures are sanitized;
    optional Office navigation is explicitly gated.
 6. **Cross-platform behavior degrades coherently.** OOXML is native Python;
-   XLSB can use the optional Rust kernel, Excel COM, LibreOffice, or safe
+  XLSB can use the compatible Rust engine, Excel COM, LibreOffice, or safe
    presence-only fallbacks depending on capability.
 
 ## 2. System Context
@@ -59,7 +59,7 @@ flowchart LR
     History[(SQLite history + block blobs)]
     Reports[Excel / HTML / JSON]
     Focus[Optional Office focus helper]
-    Native[Optional Rust xlsbkernel]
+    Native[Rust cadence-diff-native engine or fallback module]
 
     Analyst --> Browser
     Analyst --> CLI
@@ -224,7 +224,7 @@ The intended dependency direction is inward toward stable contracts:
 - **Format adapters** populate snapshots; they do not decide analyst severity or
   review layout.
 - **Reports and UI** consume persisted/domain models; they do not own detection.
-- **Optional native code** sits behind Python adapters and is never imported by
+- **Native code** sits behind Python adapters and is never imported by
   callers directly.
 
 The largest intentional orchestration modules are
@@ -442,7 +442,7 @@ are part of cache identity so results from different adapters do not collide.
 
 After formulas have been extracted and normalized, cycle comparison can batch
 formula pairs into the Rust classifier in
-[`native/xlsbkernel/src/formula_delta.rs`](native/xlsbkernel/src/formula_delta.rs).
+[`native/cadence_diff_native/src/formula_delta.rs`](native/cadence_diff_native/src/formula_delta.rs).
 This is separate from XLSB extraction and also accelerates comparisons whose
 formula text arrived through other adapters.
 
@@ -880,11 +880,14 @@ The system distinguishes four outcomes:
 | Blocked run | Inputs/configuration require analyst action before a meaningful run |
 | Failed/cancelled run | Execution did not produce a completed evidence set |
 
-`RunBlockedError` carries a bounded, value-free `RunActionRequired` payload.
+`RunBlockedError` carries a bounded `RunActionRequired` payload. It normally
+contains only structural labels and aggregates; ranked-table actions may add
+short header labels for local confirmation, never ordinary row values,
+formulas, or paths.
 Examples include mismatched comparison prerequisites and ranked-table identity
 confirmation. A blocked run writes no completed history row or reports.
 
-Optional native and external adapters fail closed:
+Native and external adapters fail closed:
 
 - values `auto` can fall back to pyxlsb with provenance/disclosure;
 - formula enrichment can degrade to structural presence-only coverage;
@@ -947,7 +950,7 @@ envelope.
 
 ### 16.6 Add A Native Capability
 
-1. Put Rust code under [`native/xlsbkernel/src/`](native/xlsbkernel/src).
+1. Put Rust code under [`native/cadence_diff_native/src/`](native/cadence_diff_native/src).
 2. Expose a narrow PyO3 function from `lib.rs`.
 3. Wrap it defensively in `qc_tool/io/native_kernel.py` or a focused adapter.
 4. Define Python fallback and malformed-output behavior first.
@@ -997,8 +1000,9 @@ deploy.
   workbook.
 - Desktop focus requires Windows desktop Office, exact saved bytes, local mode,
   and explicit analyst binding.
-- The optional native wheel is a separately versioned distribution. The main
-  package continues to operate without it using conservative fallbacks.
+- The native helper is an automatic, separately versioned dependency. Its
+  universal fallback wheel keeps the main package operational with conservative
+  Python/platform fallbacks when no native wheel matches.
 
 ## 19. Repository Map
 
@@ -1019,7 +1023,7 @@ deploy.
 | [`qc_tool/attestation.py`](qc_tool/attestation.py), [`qc_tool/signoff.py`](qc_tool/signoff.py) | Signed evidence and immutable finalization |
 | [`qc_tool/ui/`](qc_tool/ui) | NiceGUI pages, theme, guide, profile and ranked-table dialogs |
 | [`qc_tool/focus/`](qc_tool/focus) | Optional secure desktop Office navigation |
-| [`native/xlsbkernel/`](native/xlsbkernel) | Rust BIFF12 and formula-delta accelerator |
+| [`native/cadence_diff_native/`](native/cadence_diff_native) | Rust BIFF12 and formula-delta accelerator |
 | [`scripts/`](scripts) | Audits and bounded diagnostic/acceptance tools |
 | [`tests/`](tests) | Synthetic fixtures, contracts, parity, browser, release gates |
 

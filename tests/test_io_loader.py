@@ -1041,7 +1041,7 @@ def test_xlsb_snapshot(fixture_dir: Path, manifest: FixtureManifest) -> None:
 
 @pytest.mark.skipif(
     not native_kernel_available(),
-    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+    reason="native/cadence_diff_native/ not built in this environment (optional accelerator)",
 )
 def test_xlsb_native_values_engine_matches_pyxlsb(fixture_dir: Path) -> None:
     """Criterion 10 (plan-20260906): the native kernel's values path must be
@@ -1080,14 +1080,14 @@ def test_xlsb_native_values_engine_raises_a_clear_error_when_unavailable(
     """
     import qc_tool.io.native_kernel as native_kernel_module
 
-    monkeypatch.setattr(native_kernel_module, "_xlsbkernel", None)
-    with pytest.raises(RuntimeError, match="native xlsbkernel"):
+    monkeypatch.setattr(native_kernel_module, "_native_module", None)
+    with pytest.raises(RuntimeError, match="cadence-diff native engine"):
         load_workbook_snapshot(fixture_dir / "current.xlsb", _xlsb_values_engine="native")
 
 
 @pytest.mark.skipif(
     not native_kernel_available(),
-    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+    reason="native/cadence_diff_native/ not built in this environment (optional accelerator)",
 )
 def test_xlsb_values_engine_auto_prefers_native_when_available(fixture_dir: Path) -> None:
     """plan-20260908-phase-b-guest-performance-followup.md: `"auto"` must
@@ -1120,7 +1120,7 @@ def test_xlsb_values_engine_auto_degrades_to_pyxlsb_when_unavailable(
     """
     import qc_tool.io.native_kernel as native_kernel_module
 
-    monkeypatch.setattr(native_kernel_module, "_xlsbkernel", None)
+    monkeypatch.setattr(native_kernel_module, "_native_module", None)
     path = fixture_dir / "current.xlsb"
 
     auto_snap = load_workbook_snapshot(path, _xlsb_values_engine="auto")
@@ -1195,7 +1195,7 @@ def test_xlsb_values_engine_explicit_native_raises_instead_of_falling_back(
 
 @pytest.mark.skipif(
     not native_formula_available(),
-    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+    reason="native/cadence_diff_native/ not built in this environment (optional accelerator)",
 )
 def test_xlsb_native_formula_engine_dispatches_through_load_workbook_snapshot(
     tmp_path: Path,
@@ -1253,9 +1253,9 @@ def test_xlsb_native_formula_engine_unavailable_degrades_gracefully(
     "native"`` request the environment cannot satisfy must degrade the same
     way a missing Excel/LibreOffice adapter already does, never crash the run.
     """
-    import qc_tool.io.native_formula as native_formula_module
+    import qc_tool.io.native_kernel as native_kernel_module
 
-    monkeypatch.setattr(native_formula_module, "_xlsbkernel", None)
+    monkeypatch.setattr(native_kernel_module, "_native_module", None)
     path = tmp_path / "native-unavailable.xlsb"
     write_xlsb(path, {"Data": [[StyledCell(1.0), StyledCell(2.0, is_formula=True)]]})
 
@@ -1263,12 +1263,12 @@ def test_xlsb_native_formula_engine_unavailable_degrades_gracefully(
 
     assert snapshot.formula_source is None
     assert not snapshot.formulas_available
-    assert "xlsbkernel" in (snapshot.formula_detail or "")
+    assert "cadence-diff native engine" in (snapshot.formula_detail or "")
 
 
 @pytest.mark.skipif(
     not native_formula_available(),
-    reason="native/xlsbkernel/ not built in this environment (optional accelerator)",
+    reason="native/cadence_diff_native/ not built in this environment (optional accelerator)",
 )
 def test_formula_cache_keys_differ_by_resolved_engine(tmp_path: Path) -> None:
     """Switching `formula_engine` must never reuse a cached entry produced by

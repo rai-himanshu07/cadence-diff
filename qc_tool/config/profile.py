@@ -107,11 +107,18 @@ class RowIdentityRule(BaseModel):
     takes effect only after the analyst saves it and re-runs QC. ``anchor_cell``
     identifies the target region -- a rule matches whichever detected block
     region's bounds contain that cell, so it keeps matching across ordinary
-    row growth. Column letters are used (not header text) so the rule survives
-    header renames and is never confused with a business value.
+    row growth. ``header_row`` excludes a confirmed preamble/header from key
+    matching while preserving its positional comparison. Column letters are
+    used (not header text) so the rule survives header renames and is never
+    confused with a business value.
     """
 
     anchor_cell: str
+    header_row: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
     identity_columns: list[str] = Field(min_length=1)
     ordinal_columns: list[str] = Field(default_factory=list)
     duplicate_policy: Literal["skip", "occurrence", "position"] = "skip"

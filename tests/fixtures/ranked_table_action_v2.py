@@ -1,16 +1,14 @@
 """Forward-reference fixture for the ranked-table run-action v2 payload
 (plan-20260909-release-hardening-and-ranked-table-review.md, Criterion 11).
 
-`RankedTableEvidence` does not exist as production code yet -- Step 8 adds
-it. This module fixes the exact field shape now so Step 8's real model and
-Step 9's dialog view-model are built against one agreed contract instead of
-re-deriving it from plan prose later.
+This module preserves the v2 field shape shared by the production model and
+dialog view-model so tests do not re-derive it from plan prose.
 
 Field names intentionally match `RankedTableCandidate`'s own attributes
 (`qc_tool/excel/ranked_identity.py`) so the real model can be populated by
-direct attribute copy. Every field is either a bounded structural label
-(member id, sheet, region range, column letters) or a plain aggregate number
--- never a cell value, header string, or raw telemetry sentence.
+direct attribute copy. Fields are bounded structural labels, aggregate numbers,
+and short synthetic header labels -- never an ordinary row value, formula,
+path, or raw telemetry sentence.
 """
 
 from __future__ import annotations
@@ -24,7 +22,9 @@ class RankedTableEvidencePayloadV2(TypedDict):
     sheet: str
     current_range: str
     data_row_count: int
+    header_row: int | None
     available_columns: tuple[str, ...]
+    column_headers: tuple[str, ...]
     suggested_identity_columns: tuple[str, ...]
     suggested_ordinal_columns: tuple[str, ...]
     non_blank_coverage: float
@@ -43,7 +43,9 @@ def ranked_table_evidence_payload_v2(
     sheet: str = "Data",
     current_range: str = "A1:E6000",
     data_row_count: int = 5999,
+    header_row: int | None = 1,
     available_columns: tuple[str, ...] = ("A", "B", "C", "D", "E"),
+    column_headers: tuple[str, ...] = ("Rank", "ID", "Value", "Value 2", "Value 3"),
     suggested_identity_columns: tuple[str, ...] = ("B",),
     suggested_ordinal_columns: tuple[str, ...] = ("A",),
     non_blank_coverage: float = 0.999,
@@ -55,7 +57,7 @@ def ranked_table_evidence_payload_v2(
     projected_positional_mismatches: int = 500_000,
     projected_avoided_mismatches: int | None = None,
 ) -> RankedTableEvidencePayloadV2:
-    """One synthetic, value-free v2 payload for dialog/view-model fixtures.
+    """One synthetic, privacy-bounded v2 dialog payload.
 
     Every default describes a plausible ranked-table screen result on a
     bounded synthetic 6,000-row table -- never data read from a real
@@ -67,7 +69,9 @@ def ranked_table_evidence_payload_v2(
         sheet=sheet,
         current_range=current_range,
         data_row_count=data_row_count,
+        header_row=header_row,
         available_columns=available_columns,
+        column_headers=column_headers,
         suggested_identity_columns=suggested_identity_columns,
         suggested_ordinal_columns=suggested_ordinal_columns,
         non_blank_coverage=non_blank_coverage,
