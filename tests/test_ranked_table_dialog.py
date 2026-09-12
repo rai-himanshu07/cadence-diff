@@ -126,6 +126,33 @@ def test_column_options_keep_letters_and_add_detected_headers() -> None:
     }
 
 
+def test_formula_driven_identity_never_uses_a_result_as_its_header() -> None:
+    raw_evidence = _V2_ITEM["ranked_table_evidence"]
+    assert isinstance(raw_evidence, dict)
+    evidence: dict[str, object] = dict(raw_evidence)
+    evidence.update(
+        {
+            "header_row": None,
+            "column_headers": ["", "", "", "", ""],
+            "manual_review": True,
+            "formula_ratio": 1.0,
+        }
+    )
+    region = region_draft_from_item(
+        dict(_V2_ITEM, ranked_table_evidence=evidence)
+    )
+
+    assert region is not None
+    assert region.formula_driven_identity
+    assert region.column_options == {
+        "A": "A",
+        "B": "B · formulas present (header unavailable)",
+        "C": "C",
+        "D": "D",
+        "E": "E",
+    }
+
+
 def test_noise_summary_and_why_paused_use_typed_evidence_not_telemetry() -> None:
     region = region_draft_from_item(_V2_ITEM)
     assert region is not None

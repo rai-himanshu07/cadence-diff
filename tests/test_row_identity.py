@@ -32,6 +32,7 @@ import pytest
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
 
+import qc_tool.engine as engine_module
 from qc_tool.config.profile import (
     DeliverableProfile,
     ExcelProfile,
@@ -40,10 +41,22 @@ from qc_tool.config.profile import (
     default_profile,
 )
 from qc_tool.coverage import QCRunMode
-from qc_tool.engine import _aggregate_ranked_package_actions, run_qc
-from qc_tool.excel.align import AlignmentTrustManifest, AlignmentTrustManifestV2
+from qc_tool.engine import (
+    _aggregate_ranked_package_actions,
+    _ranked_table_suggestions,
+    run_qc,
+)
+from qc_tool.excel.align import (
+    AlignmentTrustManifest,
+    AlignmentTrustManifestV2,
+    AxisAlignment,
+    RegionAlignment,
+    WorkbookAlignment,
+)
+from qc_tool.excel.ranked_identity import RankedTableCandidate
+from qc_tool.excel.regions import TableRegion
 from qc_tool.findings import FindingClass
-from qc_tool.io.model import CellValue
+from qc_tool.io.model import CellRecord, CellValue, SheetSnapshot, WorkbookSnapshot
 from qc_tool.package import (
     PackageArtifact,
     PackageManifest,
@@ -469,6 +482,123 @@ def test_confirmed_identity_never_re_triggers_the_detector(tmp_path: Path) -> No
     )
 
     assert _classes(result, FindingClass.VALUE_CHANGED) == []
+
+
+def test_ranked_suggestions_emit_two_automatic_and_one_manual_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sheet_names = ("Panel A", "Panel B", "Panel C")
+
+    def workbook(source_name: str) -> WorkbookSnapshot:
+        return WorkbookSnapshot(
+            source_name=source_name,
+            file_format="xlsx",
+            formulas_available=True,
+            styles_available=True,
+            sheets=[
+                SheetSnapshot(
+                    name=name,
+                    visibility="visible",
+                    max_row=20,
+                    max_column=3,
+                    cells={
+                        (1, 1): CellRecord(1, 1, "Rank"),
+                        (1, 2): CellRecord(
+                            1,
+                            2,
+                            "First calculated result" if name == "Panel C" else "Record ID",
+                            formula="=A1" if name == "Panel C" else None,
+                        ),
+                        (1, 3): CellRecord(1, 3, "Value"),
+                    },
+                )
+                for name in sheet_names
+            ],
+        )
+
+    regions: dict[str, list[RegionAlignment]] = {}
+    for name in sheet_names:
+        table = TableRegion(name, 1, 1, 20, 3, "block", None, 1, "none")
+        regions[name] = [
+            RegionAlignment(
+                baseline=table,
+                current=table,
+                rows=AxisAlignment(
+                    pairs=[(row, row) for row in range(1, 21)],
+                    method="positional",
+                ),
+                columns=AxisAlignment(pairs=[(column, column) for column in range(1, 4)]),
+            )
+        ]
+    alignment = WorkbookAlignment(
+        common_sheets=list(sheet_names),
+        regions=regions,
+    )
+    calls: list[tuple[str, bool]] = []
+
+    def detect(
+        _base_sheet: SheetSnapshot,
+        curr_sheet: SheetSnapshot,
+        _base_region: TableRegion,
+        _curr_region: TableRegion,
+        *,
+        allow_manual_review: bool = False,
+    ) -> RankedTableCandidate | None:
+        calls.append((curr_sheet.name, allow_manual_review))
+        manual = curr_sheet.name == "Panel C"
+        if manual and not allow_manual_review:
+            return None
+        return RankedTableCandidate(
+            columns=(2,),
+            non_blank_coverage=0.9,
+            unique_ratio=1.0,
+            key_overlap=0.95,
+            formula_ratio=1.0 if manual else 0.0,
+            displaced_ratio=0.9,
+            mismatch_reduction=0.8,
+            projected_positional_mismatches=20_000,
+            header_row=1,
+            manual_review=manual,
+        )
+
+    monkeypatch.setattr(engine_module, "detect_ranked_table_candidate", detect)
+
+    items = _ranked_table_suggestions(
+        alignment,
+        workbook("baseline.xlsx"),
+        workbook("current.xlsx"),
+    )
+
+    assert len(items) == 3
+    assert calls == [
+        ("Panel A", False),
+        ("Panel B", False),
+        ("Panel C", False),
+        ("Panel C", True),
+    ]
+    evidence = [item.ranked_table_evidence for item in items]
+    assert all(item is not None for item in evidence)
+    assert [item.manual_review for item in evidence if item is not None] == [
+        False,
+        False,
+        True,
+    ]
+    assert [item.column_headers for item in evidence if item is not None] == [
+        ("Rank", "Record ID", "Value"),
+        ("Rank", "Record ID", "Value"),
+        ("Rank", "", "Value"),
+    ]
+    view_model = view_model_from_action(
+        {
+            "version": 2,
+            "reason": "row_identity_confirmation_required",
+            "items": [item.model_dump(mode="json") for item in items],
+        },
+        source_profile="default",
+    )
+    assert view_model is not None
+    assert view_model.region_count == 3
+    assert sum(region.manual_review for region in view_model.regions) == 1
 
 
 def test_perform_run_writes_no_history_or_reports_when_blocked_by_detector(

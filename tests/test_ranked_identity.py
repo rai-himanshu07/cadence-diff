@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import random
 
+import pytest
+
 from qc_tool.excel.ranked_identity import (
     MIN_DATA_ROWS,
     MIN_MISMATCH_REDUCTION,
     MIN_PROJECTED_MISMATCHES,
+    _infer_header_row,
     detect_ranked_table_candidate,
 )
 from qc_tool.excel.regions import TableRegion
@@ -151,6 +154,98 @@ def test_header_row_is_inferred_below_a_bounded_preamble() -> None:
     assert candidate.column_letters == ("B",)
     assert candidate.ordinal_column_letters == ("A",)
     assert candidate.header_row == 3
+
+
+def test_header_row_is_inferred_from_identity_data_boundary_without_rank() -> None:
+    n = _LARGE_N
+    preamble: list[list[CellValue]] = [
+        [None, None, "Internal report"],
+        [None, None, "Updated weekly"],
+        ["Record ID", "Name", "Amount"],
+    ]
+    base_data = [[f"ID{i}", f"Name{i}", 100.0 + i] for i in range(n)]
+    curr_data = [list(row) for row in base_data]
+    random.Random(99).shuffle(curr_data)
+    base_sheet = _sheet([*preamble, *base_data])
+    curr_sheet = _sheet([*preamble, *curr_data])
+    region = _region(len(preamble) + n, 3)
+
+    candidate = detect_ranked_table_candidate(base_sheet, curr_sheet, region, region)
+
+    assert candidate is not None
+    assert candidate.ordinal_columns == ()
+    assert candidate.header_row == 3
+
+
+def test_sparse_formula_identity_requires_manual_review_lane() -> None:
+    n = _LARGE_N
+    populated = 2400
+    base_rows = [
+        [
+            i + 1,
+            f"ID{i}" if i < populated else None,
+            *(100.0 * column + i for column in range(1, 9)),
+        ]
+        for i in range(n)
+    ]
+    curr_rows = [list(row) for row in base_rows]
+    random.Random(99).shuffle(curr_rows)
+    for position, row in enumerate(curr_rows):
+        row[0] = position + 1
+    base_formulas = {
+        (row, 2): "=A1" for row in range(1, populated + 1)
+    }
+    curr_formulas = {
+        (row, 2): "=A1"
+        for row, values in enumerate(curr_rows, start=1)
+        if values[1] is not None
+    }
+    base_sheet = _sheet(base_rows, formulas=base_formulas)
+    curr_sheet = _sheet(curr_rows, formulas=curr_formulas)
+    region = _region(n, 10)
+
+    assert detect_ranked_table_candidate(base_sheet, curr_sheet, region, region) is None
+    candidate = detect_ranked_table_candidate(
+        base_sheet,
+        curr_sheet,
+        region,
+        region,
+        allow_manual_review=True,
+    )
+
+    assert candidate is not None
+    assert candidate.column_letters == ("B",)
+    assert candidate.manual_review
+    assert candidate.header_row is None
+    assert candidate.non_blank_coverage == pytest.approx(populated / n)
+    assert candidate.formula_ratio == 1.0
+
+
+def test_ordinal_boundary_does_not_promote_formula_result_to_header() -> None:
+    preamble: list[list[CellValue]] = [
+        ["Internal report", None, None],
+        ["Updated", None, None],
+        ["Rank", "First calculated result", "Value"],
+    ]
+    base_data = [[i + 1, f"ID{i}", 100.0 + i] for i in range(8)]
+    curr_data = [list(row) for row in reversed(base_data)]
+    for position, row in enumerate(curr_data, start=1):
+        row[0] = position
+    formula_cell = {(3, 2): "=A1"}
+    base_sheet = _sheet([*preamble, *base_data], formulas=formula_cell)
+    curr_sheet = _sheet([*preamble, *curr_data], formulas=formula_cell)
+    region = _region(len(preamble) + len(base_data), 3)
+
+    header_row = _infer_header_row(
+        base_sheet,
+        curr_sheet,
+        region,
+        region,
+        identity_columns=(2,),
+        ordinal_columns=(1,),
+    )
+
+    assert header_row is None
 
 
 def test_stable_text_data_row_is_not_mistaken_for_a_header() -> None:

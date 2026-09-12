@@ -123,7 +123,7 @@ from qc_tool.findings_store import (
 )
 from qc_tool.io.formula_cache import FormulaExtractionCache
 from qc_tool.io.loader import load_workbook_snapshot
-from qc_tool.io.model import WorkbookSnapshot, display_cell_value
+from qc_tool.io.model import SheetSnapshot, WorkbookSnapshot, display_cell_value
 from qc_tool.package import PackageArtifact, PackageManifest, PackageSide, paths_by_member
 from qc_tool.ppt.diff import diff_decks
 from qc_tool.ppt.element_match import match_slide_elements
@@ -896,6 +896,17 @@ def _merge_alignment_manifests(
     )
 
 
+def _ranked_header_label(
+    sheet: SheetSnapshot,
+    header_row: int | None,
+    column: int,
+) -> str:
+    if header_row is None:
+        return ""
+    cell = sheet.cells.get((header_row, column))
+    return "" if cell is None or cell.has_formula else display_cell_value(cell.value)
+
+
 def _ranked_table_suggestions(
     alignment: WorkbookAlignment,
     baseline: WorkbookSnapshot,
@@ -925,6 +936,14 @@ def _ranked_table_suggestions(
                 base_sheet, curr_sheet, region.baseline, region.current
             )
             if candidate is None:
+                candidate = detect_ranked_table_candidate(
+                    base_sheet,
+                    curr_sheet,
+                    region.baseline,
+                    region.current,
+                    allow_manual_review=True,
+                )
+            if candidate is None:
                 continue
             anchor_cell = (
                 f"{get_column_letter(region.current.min_col)}{region.current.min_row}"
@@ -934,12 +953,7 @@ def _ranked_table_suggestions(
                 for column in range(region.current.min_col, region.current.max_col + 1)
             )
             column_headers = tuple(
-                display_cell_value(
-                    curr_sheet.cells[(candidate.header_row, column)].value
-                )
-                if candidate.header_row is not None
-                and (candidate.header_row, column) in curr_sheet.cells
-                else ""
+                _ranked_header_label(curr_sheet, candidate.header_row, column)
                 for column in range(region.current.min_col, region.current.max_col + 1)
             )
             data_row_count = (
@@ -960,6 +974,7 @@ def _ranked_table_suggestions(
                         current_range=region.current.cell_range,
                         data_row_count=data_row_count,
                         header_row=candidate.header_row,
+                        manual_review=candidate.manual_review,
                         available_columns=available_columns,
                         column_headers=column_headers,
                         suggested_identity_columns=candidate.column_letters,

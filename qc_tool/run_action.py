@@ -52,6 +52,7 @@ class RankedTableEvidence(BaseModel):
     current_range: str = ""
     data_row_count: int = Field(default=0, ge=0)
     header_row: int | None = Field(default=None, ge=1)
+    manual_review: bool = False
     available_columns: tuple[str, ...] = Field(
         default=(), max_length=MAX_RANKED_TABLE_AVAILABLE_COLUMNS
     )

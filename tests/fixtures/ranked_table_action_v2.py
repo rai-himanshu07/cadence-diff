@@ -23,6 +23,7 @@ class RankedTableEvidencePayloadV2(TypedDict):
     current_range: str
     data_row_count: int
     header_row: int | None
+    manual_review: bool
     available_columns: tuple[str, ...]
     column_headers: tuple[str, ...]
     suggested_identity_columns: tuple[str, ...]
@@ -44,6 +45,7 @@ def ranked_table_evidence_payload_v2(
     current_range: str = "A1:E6000",
     data_row_count: int = 5999,
     header_row: int | None = 1,
+    manual_review: bool = False,
     available_columns: tuple[str, ...] = ("A", "B", "C", "D", "E"),
     column_headers: tuple[str, ...] = ("Rank", "ID", "Value", "Value 2", "Value 3"),
     suggested_identity_columns: tuple[str, ...] = ("B",),
@@ -70,6 +72,7 @@ def ranked_table_evidence_payload_v2(
         current_range=current_range,
         data_row_count=data_row_count,
         header_row=header_row,
+        manual_review=manual_review,
         available_columns=available_columns,
         column_headers=column_headers,
         suggested_identity_columns=suggested_identity_columns,

@@ -80,10 +80,12 @@ class RegionDraft:
     available_columns: tuple[str, ...] = ()
     column_headers: tuple[str, ...] = ()
     header_row: int | None = None
+    manual_review: bool = False
     data_row_count: int | None = None
     non_blank_coverage: float | None = None
     unique_ratio: float | None = None
     key_overlap: float | None = None
+    formula_ratio: float | None = None
     displaced_ratio: float | None = None
     mismatch_reduction: float | None = None
     projected_positional_mismatches: int | None = None
@@ -112,10 +114,17 @@ class RegionDraft:
             column: (
                 f"{column} · {headers[column]}"
                 if headers.get(column)
+                else f"{column} · formulas present (header unavailable)"
+                if column in self.identity_columns
+                and self.formula_driven_identity
                 else column
             )
             for column in self.available_columns
         }
+
+    @property
+    def formula_driven_identity(self) -> bool:
+        return self.formula_ratio is not None and self.formula_ratio > 0.0
 
     @property
     def noise_summary(self) -> str:
@@ -221,10 +230,12 @@ def region_draft_from_item(item: dict[str, object]) -> RegionDraft | None:
             available_columns=_str_tuple(evidence.get("available_columns")),
             column_headers=_str_tuple(evidence.get("column_headers")),
             header_row=_as_int(evidence.get("header_row")),
+            manual_review=bool(evidence.get("manual_review", False)),
             data_row_count=_as_int(evidence.get("data_row_count")),
             non_blank_coverage=_as_float(evidence.get("non_blank_coverage")),
             unique_ratio=_as_float(evidence.get("unique_ratio")),
             key_overlap=_as_float(evidence.get("key_overlap")),
+            formula_ratio=_as_float(evidence.get("formula_ratio")),
             displaced_ratio=_as_float(evidence.get("displaced_ratio")),
             mismatch_reduction=_as_float(evidence.get("mismatch_reduction")),
             projected_positional_mismatches=_as_int(

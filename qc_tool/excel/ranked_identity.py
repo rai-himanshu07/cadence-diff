@@ -32,6 +32,8 @@ MIN_DISPLACED_RATIO = 0.20
 MIN_MISMATCH_REDUCTION = 0.50
 MIN_PROJECTED_MISMATCHES = 10_000
 MIN_PROJECTED_AVOIDED_MISMATCHES = 10_000
+MANUAL_MIN_NON_BLANK_COVERAGE = 0.25
+MANUAL_MIN_PROJECTED_AVOIDED_MISMATCHES = 5_000
 MAX_SINGLE_CANDIDATES = 12
 MAX_COMPOSITE_SIZE = 3
 _SAMPLE_ROWS = 500
@@ -54,6 +56,7 @@ class RankedTableCandidate:
     projected_positional_mismatches: int
     ordinal_columns: tuple[int, ...] = ()
     header_row: int | None = None
+    manual_review: bool = False
 
     @property
     def column_letters(self) -> tuple[str, ...]:
@@ -145,6 +148,14 @@ class _ColumnScreen:
     def score(self) -> float:
         return min(self.unique_base, self.unique_curr)
 
+    @property
+    def manual_safe(self) -> bool:
+        return (
+            not self.sequence_like
+            and self.non_blank_base >= MANUAL_MIN_NON_BLANK_COVERAGE
+            and self.non_blank_curr >= MANUAL_MIN_NON_BLANK_COVERAGE
+        )
+
 
 def _screen_column(
     base_sheet: SheetSnapshot,
@@ -198,14 +209,16 @@ def _infer_header_row(
     curr_region: TableRegion,
     identity_columns: tuple[int, ...],
     ordinal_columns: tuple[int, ...],
+    *,
+    manual_review: bool = False,
 ) -> int | None:
-    """Find a stable text header immediately before displaced data.
+    """Find a stable header immediately before sustained identity data.
 
-    Ranked tables can have titles or metadata above their actual header. The
-    scan is deliberately bounded and cross-cycle: a candidate header must be
-    text-rich and stable in both files, while following identity rows must show
-    the displacement that caused this detector to fire. Unclear cases return
-    ``None`` and preserve the existing first-row behavior.
+    Ranked tables can have titles or metadata above the actual header. The
+    scan is bounded and cross-cycle. A row is accepted when an ordinal column
+    changes from text to a numeric sequence, or when every proposed identity
+    column has the same text label in both files and the following rows show a
+    clear increase in populated key data.
     """
     base_height = base_region.max_row - base_region.min_row + 1
     curr_height = curr_region.max_row - curr_region.min_row + 1
@@ -215,9 +228,7 @@ def _infer_header_row(
         min(curr_region.max_col + 1, curr_region.min_col + _HEADER_SCAN_COLUMNS),
     )
     minimum_text_cells = min(2, curr_region.max_col - curr_region.min_col + 1)
-    if not ordinal_columns:
-        return None
-    candidates: list[tuple[int, float, float, int]] = []
+    candidates: list[tuple[int, float, int, int, float, int]] = []
     for offset in range(scan_rows):
         base_row = base_region.min_row + offset
         curr_row = curr_region.min_row + offset
@@ -235,59 +246,110 @@ def _infer_header_row(
             stable += 1
             if isinstance(curr_value, str) and curr_value.strip():
                 stable_text += 1
-        if (
+        text_rich = not (
             comparable == 0
             or stable_text < minimum_text_cells
             or stable / comparable < 0.75
-        ):
-            continue
-        ordinal_boundary = False
-        for column in ordinal_columns:
-            header_value = _cell_value(curr_sheet, curr_row, column)
-            following_values = [
-                _cell_value(curr_sheet, row, column)
-                for row in range(curr_row + 1, min(curr_region.max_row, curr_row + 4) + 1)
-            ]
-            if (
-                (isinstance(header_value, str) or _is_blank(header_value))
-                and len(following_values) >= 3
-                and _is_sequence_like(following_values)
-            ):
-                ordinal_boundary = True
-                break
-        if not ordinal_boundary:
-            continue
+        )
 
-        following = 0
-        displaced = 0
-        for next_offset in range(
-            offset + 1,
-            min(scan_rows, offset + 1 + _HEADER_LOOKAHEAD_ROWS),
-        ):
-            next_base_row = base_region.min_row + next_offset
-            next_curr_row = curr_region.min_row + next_offset
-            base_values = tuple(
-                _cell_value(base_sheet, next_base_row, column)
-                for column in identity_columns
+        ordinal_boundary = False
+        if text_rich:
+            for column in ordinal_columns:
+                header_value = _cell_value(curr_sheet, curr_row, column)
+                following_values = [
+                    _cell_value(curr_sheet, row, column)
+                    for row in range(
+                        curr_row + 1,
+                        min(curr_region.max_row, curr_row + 4) + 1,
+                    )
+                ]
+                if (
+                    (isinstance(header_value, str) or _is_blank(header_value))
+                    and len(following_values) >= 3
+                    and _is_sequence_like(following_values)
+                ):
+                    ordinal_boundary = True
+                    break
+
+        stable_identity_labels = 0
+        for column in identity_columns:
+            base_cell = base_sheet.cells.get((base_row, column))
+            curr_cell = curr_sheet.cells.get((curr_row, column))
+            base_label = _cell_value(base_sheet, base_row, column)
+            curr_label = _cell_value(curr_sheet, curr_row, column)
+            if not (
+                isinstance(base_label, str)
+                and base_label.strip()
+                and isinstance(curr_label, str)
+                and curr_label.strip()
+                and base_cell is not None
+                and not base_cell.has_formula
+                and curr_cell is not None
+                and not curr_cell.has_formula
+                and _key_component(base_label) == _key_component(curr_label)
+            ):
+                break
+            stable_identity_labels += 1
+        identity_labels_are_literal = bool(identity_columns) and (
+            stable_identity_labels == len(identity_columns)
+        )
+        ordinal_boundary = ordinal_boundary and identity_labels_are_literal
+
+        identity_boundary = False
+        identity_gain = 0.0
+        if offset > 0 and identity_labels_are_literal:
+            next_base_rows = range(
+                base_row + 1, min(base_region.max_row, base_row + 8) + 1
             )
-            curr_values = tuple(
-                _cell_value(curr_sheet, next_curr_row, column)
-                for column in identity_columns
+            next_curr_rows = range(
+                curr_row + 1, min(curr_region.max_row, curr_row + 8) + 1
             )
-            if any(_is_blank(value) for value in (*base_values, *curr_values)):
-                continue
-            base_key = tuple(_key_component(value) for value in base_values)
-            curr_key = tuple(_key_component(value) for value in curr_values)
-            following += 1
-            displaced += base_key != curr_key
-        if following < 3 or displaced / following < MIN_DISPLACED_RATIO:
+            prev_base_rows = range(max(base_region.min_row, base_row - 3), base_row)
+            prev_curr_rows = range(max(curr_region.min_row, curr_row - 3), curr_row)
+
+            def key_coverage(sheet: SheetSnapshot, rows: range) -> float:
+                values = [
+                    _cell_value(sheet, row, column)
+                    for row in rows
+                    for column in identity_columns
+                ]
+                return (
+                    sum(not _is_blank(item) for item in values) / len(values)
+                    if values
+                    else 0.0
+                )
+
+            next_coverage = min(
+                key_coverage(base_sheet, next_base_rows),
+                key_coverage(curr_sheet, next_curr_rows),
+            )
+            previous_coverage = max(
+                key_coverage(base_sheet, prev_base_rows),
+                key_coverage(curr_sheet, prev_curr_rows),
+            )
+            identity_gain = next_coverage - previous_coverage
+            minimum_next_coverage = 0.35 if manual_review else 0.75
+            minimum_coverage_gain = 0.10 if manual_review else 0.25
+            identity_boundary = (
+                next_coverage >= minimum_next_coverage
+                and identity_gain >= minimum_coverage_gain
+            )
+
+        if not ordinal_boundary and not identity_boundary:
             continue
         candidates.append(
-            (stable_text, stable / comparable, displaced / following, offset)
+            (
+                int(ordinal_boundary),
+                identity_gain,
+                stable_identity_labels,
+                stable_text,
+                stable / comparable if comparable else 0.0,
+                -offset,
+            )
         )
     if not candidates:
         return None
-    return curr_region.min_row + max(candidates)[3]
+    return curr_region.min_row - max(candidates)[5]
 
 
 def _sample_mismatch_reduction(
@@ -357,6 +419,8 @@ def _evaluate_combination(
     curr_region: TableRegion,
     columns: tuple[int, ...],
     formula_ratio: float,
+    *,
+    manual_review: bool = False,
 ) -> RankedTableCandidate | None:
     base_keys = _row_keys(base_sheet, base_region, columns)
     curr_keys = _row_keys(curr_sheet, curr_region, columns)
@@ -367,7 +431,12 @@ def _evaluate_combination(
     non_blank_coverage = min(
         len(base_non_blank) / len(base_keys), len(curr_non_blank) / len(curr_keys)
     )
-    if non_blank_coverage < MIN_NON_BLANK_COVERAGE:
+    minimum_coverage = (
+        MANUAL_MIN_NON_BLANK_COVERAGE
+        if manual_review
+        else MIN_NON_BLANK_COVERAGE
+    )
+    if non_blank_coverage < minimum_coverage:
         return None
 
     base_key_counts = Counter(base_non_blank.values())
@@ -420,10 +489,13 @@ def _evaluate_combination(
     )
     if projected_mismatches < MIN_PROJECTED_MISMATCHES:
         return None
-    if (
+    projected_avoided = round(projected_mismatches * mismatch_reduction)
+    if manual_review:
+        if projected_avoided < MANUAL_MIN_PROJECTED_AVOIDED_MISMATCHES:
+            return None
+    elif (
         mismatch_reduction < MIN_MISMATCH_REDUCTION
-        and round(projected_mismatches * mismatch_reduction)
-        < MIN_PROJECTED_AVOIDED_MISMATCHES
+        and projected_avoided < MIN_PROJECTED_AVOIDED_MISMATCHES
     ):
         return None
 
@@ -436,6 +508,7 @@ def _evaluate_combination(
         displaced_ratio=displaced_ratio,
         mismatch_reduction=mismatch_reduction,
         projected_positional_mismatches=projected_mismatches,
+        manual_review=manual_review,
     )
 
 
@@ -444,6 +517,8 @@ def detect_ranked_table_candidate(
     curr_sheet: SheetSnapshot,
     base_region: TableRegion,
     curr_region: TableRegion,
+    *,
+    allow_manual_review: bool = False,
 ) -> RankedTableCandidate | None:
     """Screen one unconfigured positional block region for a composite identity.
 
@@ -459,7 +534,14 @@ def detect_ranked_table_candidate(
         _screen_column(base_sheet, curr_sheet, base_region, curr_region, column)
         for column in columns
     ]
-    safe = sorted((s for s in screens if s.safe), key=lambda s: -s.score)
+    safe = sorted(
+        (
+            screen
+            for screen in screens
+            if screen.safe or (allow_manual_review and screen.manual_safe)
+        ),
+        key=lambda screen: -screen.score,
+    )
     top = safe[:MAX_SINGLE_CANDIDATES]
     if not top:
         return None
@@ -476,6 +558,7 @@ def detect_ranked_table_candidate(
                 curr_region,
                 combo,
                 max(formula_ratio_by_column[column] for column in combo),
+                manual_review=allow_manual_review,
             )
             if candidate is None:
                 continue
@@ -499,5 +582,6 @@ def detect_ranked_table_candidate(
             curr_region,
             best.columns,
             ordinal_columns,
+            manual_review=best.manual_review,
         ),
     )

@@ -244,6 +244,8 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .rankedtable-head, .rankedtable-actions { flex: 0 0 auto; width: 100%; }
 .rankedtable-body { flex: 1 1 auto; min-height: 0; overflow-y: auto;
   overscroll-behavior: contain; padding-right: 0.25rem; }
+.rankedtable-tabs .q-tabs__content { padding-inline: 2rem; }
+.rankedtable-tabs .q-tab { min-width: 5.5rem; }
 .rankedtable-actions { background: var(--panel); border-top: 1px solid var(--line);
   padding: 0.65rem 0 0.2rem; }
 .preline { white-space: pre-line; overflow-wrap: anywhere; }

@@ -479,6 +479,44 @@ def _safe_upload_name(raw_name: str) -> str:
     return name
 
 
+def _managed_request_paths(
+    uploads_dir: Path,
+    files: Mapping[str, str],
+) -> tuple[dict[str, Path], tuple[str, ...]]:
+    """Resolve persisted display names back to validated managed uploads."""
+    managed_root = uploads_dir.resolve()
+    restored: dict[str, Path] = {}
+    unavailable: list[str] = []
+    for role, display_name in files.items():
+        prefix, separator, member_id = role.partition(":")
+        valid_role = prefix in ROLES and (
+            not separator
+            or (
+                prefix in {"baseline_excel", "current_excel"}
+                and re.fullmatch(MEMBER_ID_PATTERN, member_id) is not None
+            )
+        )
+        try:
+            filename = _safe_upload_name(display_name)
+        except (AttributeError, ValueError):
+            filename = ""
+        if not valid_role or filename != display_name:
+            unavailable.append(role)
+            continue
+        candidate = uploads_dir / role.replace(":", "-") / filename
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(managed_root)
+        except (OSError, ValueError):
+            unavailable.append(role)
+            continue
+        if not resolved.is_file():
+            unavailable.append(role)
+            continue
+        restored[role] = resolved
+    return restored, tuple(sorted(unavailable))
+
+
 def _profile_path(profiles_dir: Path, name: str) -> Path:
     """Resolve a validated profile name inside the managed profile directory."""
     return profile_path(profiles_dir, name)
@@ -791,6 +829,22 @@ def _terminal_request_summary(record: RunStateRecord) -> str:
             "recorded; submit it again."
         )
     return ""
+
+
+def _ranked_action_needs_refresh(action: Mapping[str, object]) -> bool:
+    """Identify typed ranked evidence recorded before the current detector."""
+    raw_items = action.get("items")
+    if not isinstance(raw_items, list):
+        return False
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        evidence = item.get("ranked_table_evidence")
+        if not isinstance(evidence, dict):
+            continue
+        if "manual_review" not in evidence:
+            return True
+    return False
 
 
 def _cancel_handler(manager: RunQueueManager, request_id: str):
@@ -6332,7 +6386,7 @@ def create_pages(
                     state.output_mode = FindingOutputMode(e.value)
                     update_output_mode_surface()
 
-                ui.toggle(
+                output_mode_select = ui.toggle(
                     {mode.value: label for mode, label in OUTPUT_MODE_LABELS.items()},
                     value=state.output_mode.value,
                     on_change=on_output_mode_change,
@@ -6859,7 +6913,7 @@ def create_pages(
                     "Cycle-comparison percentage bound (either bound accepts); "
                     "0 keeps the strict default"
                 )
-                ui.checkbox(
+                allow_large_checkbox = ui.checkbox(
                     "Override workbook workload refusals",
                     value=False,
                     on_change=on_allow_large,
@@ -7080,6 +7134,85 @@ def create_pages(
 
             refresh_password_inputs()
 
+            async def _restore_request_context(
+                record: RunStateRecord,
+            ) -> tuple[DeliverableProfile | None, str | None]:
+                restored, unavailable = _managed_request_paths(
+                    uploads_dir, record.files
+                )
+                if unavailable or not restored:
+                    labels = ", ".join(
+                        role_label(role)
+                        for role in unavailable
+                        if role.partition(":")[0] in ROLES
+                    )
+                    requirement = labels or "one or more request files"
+                    return (
+                        None,
+                        "The managed copies used by this attempt are no longer "
+                        f"available for: {requirement}. Re-select those files, "
+                        "then retry.",
+                    )
+                try:
+                    mode = QCRunMode(record.mode)
+                    output_mode = FindingOutputMode(record.requested_output_mode)
+                    profile = (
+                        DeliverableProfile.model_validate(record.profile_snapshot)
+                        if record.profile_snapshot is not None
+                        else _temporary_row_matching_base(
+                            profiles_dir, record.profile, None
+                        )
+                    )
+                    hashes = await asyncio.gather(
+                        *(asyncio.to_thread(sha256_file, path) for path in restored.values())
+                    )
+                except (OSError, ValueError):
+                    return (
+                        None,
+                        "The prior request context is no longer valid. Re-select "
+                        "the required files and profile, then retry.",
+                    )
+
+                state.mode = mode
+                state.output_mode = output_mode
+                state.files = restored
+                state.file_sizes = {
+                    role: path.stat().st_size for role, path in restored.items()
+                }
+                state.file_hashes = dict(zip(restored, hashes, strict=True))
+                state.profile_name = record.profile
+                state.profile_override = profile.model_copy(deep=True)
+                for side in ("baseline", "current"):
+                    state.member_order[side] = sorted(
+                        role.partition(":")[2]
+                        for role in restored
+                        if role.startswith(f"{side}_excel:")
+                    )
+                    render_dynamic_members(side)
+                refresh_password_inputs()
+                mode_select.value = mode.value
+                mode_select.update()
+                output_mode_select.value = output_mode.value
+                output_mode_select.update()
+                profile_options = list_profiles(profiles_dir)
+                if record.profile not in profile_options:
+                    profile_options.append(record.profile)
+                profile_select.options = profile_options
+                profile_select.value = record.profile
+                profile_select.update()
+                for role, path in restored.items():
+                    file_state = file_states.get(role)
+                    if file_state is None:
+                        continue
+                    file_state.text = (
+                        f"{path.name} · {max(1, path.stat().st_size // 1024):,} KB · "
+                        "restored from the prior attempt"
+                    )
+                    file_state.classes(add="ok", remove="err")
+                update_mode_surface()
+                refresh_readiness()
+                return profile, None
+
             # Readiness bar: mode, supplied roles, policy, blockers, and Run QC
             # stay visible while the analyst scrolls the rest of the setup.
             extra_run_buttons: list[ui.button] = []
@@ -7119,6 +7252,9 @@ def create_pages(
                         "hint preline"
                     )
                     terminal_outcome.visible = bool(terminal_message["value"])
+                    terminal_actions = ui.row().classes(
+                        "no-wrap items-center gap-2"
+                    )
 
                 def refresh_readiness() -> None:
                     blockers = _run_blockers(
@@ -7175,6 +7311,7 @@ def create_pages(
                 # enumerated terminal-status list) or the analyst explicitly cancels
                 # the volume-projection dialog.
                 run_lock: dict[str, str | None] = {"phase": "idle", "request_id": None}
+                prompted_complexity_requests: set[str] = set()
 
                 def _run_ui_busy() -> bool:
                     return run_lock["phase"] != "idle"
@@ -7188,6 +7325,7 @@ def create_pages(
                     terminal_message["value"] = _terminal_request_summary(record)
                     terminal_outcome.set_text(terminal_message["value"])
                     terminal_outcome.visible = bool(terminal_message["value"])
+                    _refresh_terminal_actions(record)
                     if record.status is RunStatus.SUCCEEDED and record.run_id:
                         ui.notify(f"Run #{record.run_id} complete")
                         if record.request_id in own_requests:
@@ -7213,6 +7351,7 @@ def create_pages(
                         if (
                             action.get("reason")
                             == "row_identity_confirmation_required"
+                            and not _ranked_action_needs_refresh(action)
                             and _open_row_identity_setup(
                                 action,
                                 record.profile,
@@ -7223,8 +7362,22 @@ def create_pages(
                                     if record.profile_snapshot is not None
                                     else None
                                 ),
+                                source_record=record,
                             )
                         ):
+                            refresh_readiness()
+                            return
+                        if (
+                            action.get("reason")
+                            == "row_identity_confirmation_required"
+                            and _ranked_action_needs_refresh(action)
+                        ):
+                            ui.notify(
+                                "Stored row suggestions predate the current detector. "
+                                "Choose Refresh row suggestions to rebuild them.",
+                                type="warning",
+                                multi_line=True,
+                            )
                             refresh_readiness()
                             return
                         raw_items = action.get("items")
@@ -7255,6 +7408,14 @@ def create_pages(
                             type="warning",
                             multi_line=True,
                         )
+                    elif record.status is RunStatus.FAILED:
+                        ui.notify(terminal_message["value"], type="negative")
+                        if (
+                            record.error.startswith("WorkbookComplexityError:")
+                            and record.request_id not in prompted_complexity_requests
+                        ):
+                            prompted_complexity_requests.add(record.request_id)
+                            _open_complexity_override(record)
                     else:
                         ui.notify(terminal_message["value"], type="negative")
                     refresh_readiness()
@@ -7551,6 +7712,118 @@ def create_pages(
                     )
                     refresh_queue()
 
+                def _open_complexity_override(record: RunStateRecord) -> None:
+                    with ui.dialog().props("persistent") as dialog, ui.card().classes(
+                        "w-[36rem] max-w-[94vw]"
+                    ):
+                        ui.label("Workbook safety limit reached").classes("runhead")
+                        ui.label(
+                            "QC stopped before recording a completed run. Running "
+                            "with the workload override can require substantially "
+                            "more memory and time; source files remain read-only."
+                        ).classes("notecard")
+                        retry_error = ui.label("").classes("notecard")
+                        retry_error.visible = False
+
+                        async def run_with_override() -> None:
+                            profile, error = await _restore_request_context(record)
+                            if error is not None or profile is None:
+                                retry_error.set_text(error or "Retry context unavailable.")
+                                retry_error.visible = True
+                                return
+                            state.allow_large_workbooks = True
+                            allow_large_checkbox.set_value(True)
+                            dialog.close()
+                            terminal_actions.clear()
+                            ui.notify("Workload override confirmed; retrying QC")
+                            await start_run(profile_override=profile)
+
+                        with ui.row().classes("items-center gap-2"):
+                            ui.button(
+                                "Run with override", on_click=run_with_override
+                            ).classes("runbtn").props("no-caps")
+                            ui.button("Cancel", on_click=dialog.close).props(
+                                "flat no-caps"
+                            )
+                    dialog.open()
+
+                def _refresh_terminal_actions(
+                    record: RunStateRecord | None,
+                ) -> None:
+                    terminal_actions.clear()
+                    if record is None:
+                        return
+                    action = record.action_required or {}
+                    if (
+                        record.status is RunStatus.BLOCKED
+                        and action.get("reason")
+                        == "row_identity_confirmation_required"
+                    ):
+
+                        if _ranked_action_needs_refresh(action):
+
+                            async def refresh_row_suggestions() -> None:
+                                profile, error = await _restore_request_context(record)
+                                if error is not None or profile is None:
+                                    ui.notify(
+                                        error or "Retry context unavailable.",
+                                        type="warning",
+                                        multi_line=True,
+                                    )
+                                    return
+                                terminal_actions.clear()
+                                ui.notify("Refreshing row-matching suggestions")
+                                await start_run(profile_override=profile)
+
+                            with terminal_actions:
+                                ui.button(
+                                    "Refresh row suggestions",
+                                    on_click=refresh_row_suggestions,
+                                ).classes("ghostbtn").props("flat no-caps dense")
+                            return
+
+                        def review_row_matching() -> None:
+                            try:
+                                snapshot = (
+                                    DeliverableProfile.model_validate(
+                                        record.profile_snapshot
+                                    )
+                                    if record.profile_snapshot is not None
+                                    else None
+                                )
+                            except ValueError:
+                                ui.notify(
+                                    "The stored profile for this attempt is no "
+                                    "longer valid; start the comparison again.",
+                                    type="warning",
+                                )
+                                return
+                            _open_row_identity_setup(
+                                action,
+                                record.profile,
+                                snapshot,
+                                source_record=record,
+                            )
+
+                        with terminal_actions:
+                            ui.button(
+                                "Review row matching",
+                                on_click=review_row_matching,
+                            ).classes("ghostbtn").props("flat no-caps dense")
+                        return
+                    if not (
+                        record.status is RunStatus.FAILED
+                        and record.error.startswith("WorkbookComplexityError:")
+                    ):
+                        return
+                    with terminal_actions:
+                        ui.button(
+                            "Run with override",
+                            on_click=lambda: _open_complexity_override(record),
+                        ).classes("ghostbtn").props("flat no-caps dense")
+
+                _refresh_terminal_actions(latest_terminal)
+
             if rerun_banner_actions is not None:
                 with rerun_banner_actions:
                     extra_run_buttons.append(
@@ -7566,6 +7839,8 @@ def create_pages(
                 action: dict[str, object],
                 source_profile: str,
                 source_profile_snapshot: DeliverableProfile | None = None,
+                *,
+                source_record: RunStateRecord | None = None,
             ) -> bool:
                 """Review Row Matching: one flat, task-focused dialog for every
                 unconfirmed ranked/sorted-table region a blocked run raised
@@ -7712,18 +7987,29 @@ def create_pages(
                             "styles, structure, and other business values stay "
                             "fully checked."
                         ).classes("note")
+                        ui.label(
+                            "Check filter and parameter selections first. Row matching "
+                            "assumes baseline and current contain the same underlying "
+                            "population. A different dropdown, filter, scenario, or "
+                            "parameter can change reference columns and row membership; "
+                            "QC intentionally will not guess across that change, so the "
+                            "region may not appear here. Align the selections before "
+                            "continuing. For recurring comparisons, pin each selector "
+                            "cell under Comparison prerequisites in a named profile."
+                        ).classes("notecard")
 
                     with ui.column().classes("rankedtable-body w-full gap-2"):
-                        ui.toggle(
+                        ui.label("Use this row-matching rule").classes("dk")
+                        ui.radio(
                             {
-                                "temporary": "Run once",
-                                "saved": "Save to profile",
+                                "temporary": "This run only",
+                                "saved": "Save for future runs",
                             },
                             value=(
                                 "saved" if view_model.persist_profile else "temporary"
                             ),
                             on_change=_on_persistence_change,
-                        ).props("no-caps")
+                        ).props("inline dense")
                         destination_note = ui.label().classes("hint")
                         profile_name_select = (
                             ui.select(
@@ -7747,14 +8033,13 @@ def create_pages(
                         )
 
                         region_count = view_model.region_count
-                        with ui.tabs().props("dense").classes("w-full") as region_tabs:
+                        with ui.tabs().props("dense").classes(
+                            "w-full rankedtable-tabs"
+                        ) as region_tabs:
                             tabs = [
                                 ui.tab(
                                     f"region-{index}",
-                                    label=(
-                                        f"{index + 1} of {region_count} \u00b7 "
-                                        f"{region.label}"
-                                    ),
+                                    label=f"{index + 1} of {region_count}",
                                 )
                                 for index, region in enumerate(view_model.regions)
                             ]
@@ -7764,6 +8049,22 @@ def create_pages(
                             for index, region in enumerate(view_model.regions):
                                 with ui.tab_panel(f"region-{index}"):
                                     column_widgets: list[Any] = []
+                                    ui.label(region.label).classes("dk preline")
+                                    if region.manual_review:
+                                        warning = (
+                                            "Manual review required: this table shows "
+                                            "strong row displacement, but its suggested "
+                                            "identity is sparse or formula-derived and "
+                                            "does not clear the automatic confidence gate."
+                                        )
+                                        if region.formula_driven_identity:
+                                            warning += (
+                                                " The suggested identity includes formulas. "
+                                                "No formula result is used as a column "
+                                                "header; verify matching selector values "
+                                                "before accepting it."
+                                            )
+                                        ui.label(warning).classes("notecard")
                                     ui.label(region.noise_summary).classes("note")
                                     if region.available_columns:
                                         if region.header_row is not None:
@@ -7859,6 +8160,17 @@ def create_pages(
                         if not vm.is_valid:
                             _refresh_validation()
                             return
+                        if source_record is not None:
+                            _restored_profile, restore_error = (
+                                await _restore_request_context(source_record)
+                            )
+                            if restore_error is not None:
+                                ui.notify(
+                                    restore_error,
+                                    type="warning",
+                                    multi_line=True,
+                                )
+                                return
                         workbook_count = max(
                             1,
                             sum(
@@ -7934,6 +8246,15 @@ def create_pages(
                             )
                             await start_run()
                         else:
+                            state.profile_name = profile.name
+                            state.profile_override = profile.model_copy(deep=True)
+                            options = list_profiles(profiles_dir)
+                            if profile.name not in options:
+                                options.append(profile.name)
+                            profile_select.options = options
+                            profile_select.value = profile.name
+                            profile_select.update()
+                            refresh_readiness()
                             ui.notify(
                                 "Temporary row matching applied; Re-QC started "
                                 "without saving a profile"
