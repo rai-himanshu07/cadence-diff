@@ -71,6 +71,11 @@ class AttestationRunMetadata(BaseModel):
     values_engines: dict[str, str] = Field(default_factory=dict)
     requested_output_mode: FindingOutputMode = FindingOutputMode.PROFILE
     resolved_output_policy: ResolvedOutputPolicy | None = None
+    #: Canonical digest of the exact per-run resolved logical configuration
+    #: (plan-20260913); "" for any run with no saved ``input_contract`` --
+    #: purely informational disclosure, present at every schema version,
+    #: never a verifier gate.
+    resolved_input_digest: str = ""
 
     model_config = {"extra": "forbid"}
 
@@ -230,6 +235,11 @@ def create_attestation(
                 if result.resolved_output_policy is not None
                 else None
             ),
+            # Canonical digest of the exact per-run resolved logical
+            # configuration (plan-20260913): purely informational
+            # disclosure, present at every schema version, never a
+            # verifier gate. "" for any run with no saved input_contract.
+            "resolved_input_digest": result.resolved_input_digest,
         },
         "profile_sha256": _sha256_bytes(profile_bytes),
         "inputs": inputs,

@@ -20,13 +20,44 @@ from qc_tool.config.profile import DeliverableProfile
 from qc_tool.coverage import CoverageItem, CoverageState, MappingCoverage, QCRunMode
 from qc_tool.engine import QCRunResult
 from qc_tool.history.review_state import RunFinalizedError
-from qc_tool.history.store import RunHistory
+from qc_tool.history.store import RunHistory, RunRecord
 from qc_tool.run_service import perform_run
 from qc_tool.signoff import (
     SignoffNotReadyError,
     finalize_run,
     required_acknowledgements,
+    review_state_digest,
 )
+
+
+def test_review_state_digest_binds_the_resolved_input_digest() -> None:
+    """plan-20260913 Step 4: two otherwise-identical runs (same run_id,
+    profile, hashes, decisions) whose resolved logical configuration
+    differs must sign a different review-state digest -- the digest is a
+    real binding, not a cosmetic disclosure.
+    """
+
+    def _record(resolved_input_digest: str) -> RunRecord:
+        return RunRecord(
+            run_id=1,
+            started_at=dt.datetime.now(dt.UTC),
+            profile="fixture",
+            mode=QCRunMode.CYCLE_COMPARISON,
+            files={},
+            file_hashes={},
+            counts={},
+            review_counts={},
+            disclosures=[],
+            verified_crosschecks=0,
+            report_paths={},
+            findings=[],
+            resolved_input_digest=resolved_input_digest,
+        )
+
+    first = _record("a" * 64)
+    second = _record("b" * 64)
+
+    assert review_state_digest(first, ()) != review_state_digest(second, ())
 
 
 def _reviewed_run(fixture_dir: Path, work_dir: Path) -> tuple[int, dict[str, Path]]:

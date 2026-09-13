@@ -112,6 +112,7 @@ def review_state_digest(
         "acknowledgements": sorted(acknowledgements),
         "decisions": sorted(decisions, key=lambda item: str(item["finding_id"])),
         "counterfactual_digest": getattr(record, "counterfactual_digest", ""),
+        "resolved_input_digest": getattr(record, "resolved_input_digest", ""),
     }
     if (
         record.package_manifest is not None
@@ -140,6 +141,8 @@ def _result_from_record(record: RunRecord) -> QCRunResult:
         comparison_scope=record.comparison_scope,
         package_manifest=record.package_manifest,
         alignment_trust=record.alignment_trust,
+        resolved_input_configuration=record.resolved_input_configuration,
+        resolved_input_digest=record.resolved_input_digest,
     )
 
 

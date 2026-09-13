@@ -4,6 +4,12 @@ from pathlib import Path
 
 import pytest
 
+from qc_tool.config.profile import (
+    DeliverableProfile,
+    ExcelAvailabilityRule,
+    ExcelProfile,
+    SheetProfile,
+)
 from qc_tool.engine import QCRunResult, compare_findings
 from qc_tool.findings import (
     Finding,
@@ -483,4 +489,121 @@ def test_population_identity_survives_member_set_churn(tmp_path: Path) -> None:
     assert delta.resolved == 0
     assert delta.new == 0
     assert delta.persisting == 1
+
+
+def _availability_rule(required_through: str) -> ExcelAvailabilityRule:
+    return ExcelAvailabilityRule(
+        range="A1:A10", periods="A1:A10", required_through=required_through
+    )
+
+
+def test_scope_policy_change_routes_a_would_be_resolved_finding_to_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """plan-20260913 Step 4: the source finding vanished from ``current``,
+    which would normally mean "resolved" -- but the Data sheet's
+    availability policy changed between the two runs, so it may have only
+    been suppressed. It must route to ``ambiguous``, never ``resolved``.
+    """
+    history = RunHistory(tmp_path / "history.sqlite3")
+    previous_profile = DeliverableProfile(
+        name="fixture",
+        excel=ExcelProfile(
+            sheets={"Data": SheetProfile(availability_rules=[_availability_rule("A1")])}
+        ),
+    )
+    current_profile = DeliverableProfile(
+        name="fixture",
+        excel=ExcelProfile(
+            sheets={"Data": SheetProfile(availability_rules=[_availability_rule("B1")])}
+        ),
+    )
+    previous = QCRunResult(profile_name="fixture", findings=[_finding("F1", "A1", "1")])
+    previous_id = history.record_run(
+        previous, file_hashes={}, report_paths={}, profile_snapshot=previous_profile
+    )
+    history.set_annotations_bulk(previous_id, [("F1", None, "thought resolved")])
+    current = QCRunResult(profile_name="fixture", findings=[])
+    current_id = history.record_run(
+        current,
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+        profile_snapshot=current_profile,
+    )
+
+    preview = preview_carry_forward(history, current_id)
+
+    assert preview.ambiguous == ("F1",)
+    assert preview.resolved == ()
+    assert preview.exact == ()
+
+
+def test_scope_policy_change_routes_a_would_be_exact_finding_to_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """A byte-identical current finding cannot be trusted "exact" either
+    when its scope's policy changed -- the identity/evidence match alone
+    does not prove nothing about comparability changed.
+    """
+    history = RunHistory(tmp_path / "history.sqlite3")
+    previous_profile = DeliverableProfile(
+        name="fixture",
+        excel=ExcelProfile(
+            sheets={"Data": SheetProfile(availability_rules=[_availability_rule("A1")])}
+        ),
+    )
+    current_profile = DeliverableProfile(
+        name="fixture",
+        excel=ExcelProfile(
+            sheets={"Data": SheetProfile(availability_rules=[_availability_rule("B1")])}
+        ),
+    )
+    previous = QCRunResult(profile_name="fixture", findings=[_finding("F1", "A1", "1")])
+    previous_id = history.record_run(
+        previous, file_hashes={}, report_paths={}, profile_snapshot=previous_profile
+    )
+    history.set_annotations_bulk(previous_id, [("F1", "info", "carry me")])
+    current = QCRunResult(
+        profile_name="fixture", findings=[_finding("N1", "A1", "1", message="reworded")]
+    )
+    current_id = history.record_run(
+        current,
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+        profile_snapshot=current_profile,
+    )
+
+    preview = preview_carry_forward(history, current_id)
+
+    assert preview.ambiguous == ("F1",)
+    assert preview.exact == ()
+
+
+def test_byte_identical_profiles_carry_forward_exactly_as_before(tmp_path: Path) -> None:
+    """Regression guard: a real ``profile_snapshot`` pair with nothing
+    scope-affecting changed must behave exactly like the pre-Step-4 legacy
+    path (no ``profile_snapshot`` at all).
+    """
+    history = RunHistory(tmp_path / "history.sqlite3")
+    profile = DeliverableProfile(name="fixture")
+    previous = QCRunResult(profile_name="fixture", findings=[_finding("F1", "A1", "1")])
+    previous_id = history.record_run(
+        previous, file_hashes={}, report_paths={}, profile_snapshot=profile
+    )
+    history.set_annotations_bulk(previous_id, [("F1", None, "resolved")])
+    current = QCRunResult(profile_name="fixture", findings=[])
+    current_id = history.record_run(
+        current,
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+        profile_snapshot=profile.model_copy(deep=True),
+    )
+
+    preview = preview_carry_forward(history, current_id)
+
+    assert preview.resolved == ("F1",)
+    assert preview.ambiguous == ()
 

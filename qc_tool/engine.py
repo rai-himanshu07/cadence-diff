@@ -768,6 +768,17 @@ class QCRunResult:
     package_manifest: PackageManifest | None = None
     #: Filled by the streaming cycle path so `counts` never re-reads the store.
     severity_counts: dict[Severity, int] | None = None
+    #: Run-level scope-affecting overrides actually used (plan-20260913);
+    #: mirrors the identically-named `run_qc()` parameters so history can
+    #: persist them without a second explicit caller-supplied argument.
+    allow_dependency_indexing: bool = False
+    acceptance_absolute: float = 0.0
+    acceptance_relative: float = 0.0
+    #: Exact per-run resolved logical configuration and its canonical
+    #: digest (plan-20260913); `None`/"" for any run with no saved
+    #: `input_contract` -- exactly today's legacy behavior.
+    resolved_input_configuration: ResolvedInputConfigurationV1 | None = None
+    resolved_input_digest: str = ""
 
     @property
     def counts(self) -> dict[Severity, int]:
@@ -1508,6 +1519,9 @@ def _run_multi_package(
         mode=mode,
         requested_output_mode=output_mode,
         resolved_output_policy=resolve_output_policy(output_mode, profile.review_policy),
+        allow_dependency_indexing=allow_dependency_indexing,
+        acceptance_absolute=run_acceptance.absolute if run_acceptance is not None else 0.0,
+        acceptance_relative=run_acceptance.relative if run_acceptance is not None else 0.0,
         files={member.role_key: member.display_name for member in manifest.members},
         formula_engines=formula_engines,
         values_engines=values_engines,
@@ -1594,7 +1608,7 @@ def run_qc(
     _formula_telemetry: FormulaComparisonTelemetry | None = None,
     _pair_key_telemetry: PairKeyTelemetry | None = None,
     _population_telemetry: PopulationTelemetry | None = None,
-    _resolved_input_configuration: ResolvedInputConfigurationV1 | None = None,
+    resolved_input_configuration: ResolvedInputConfigurationV1 | None = None,
 ) -> QCRunResult:
     """Run a full QC comparison. ``passwords`` is keyed by file name.
 
@@ -1631,15 +1645,20 @@ def run_qc(
     conservative built-in policy); ``atomic`` forces population output off
     regardless of profile. The resolved policy is recorded on the returned
     result as ``resolved_output_policy``; ``profile_sha256`` is unaffected.
-    ``_resolved_input_configuration`` (plan-20260913, Step 3) is a private,
-    engine-native execution input: when its logical member matches
-    ``"primary"``, confirmed sheet renames and execution-confirmed keyed
-    regions drive ``align_workbooks`` directly instead of automatic
-    name-equality pairing and detection. ``None`` (the default) is a
-    byte-identical no-op. Not yet threaded through ``_run_multi_package``'s
-    recursive calls -- a disclosed scope decision matching this project's
-    own precedent for ``_native_compat_mode``; every package member besides
-    ``"primary"`` is unaffected until a later step extends it.
+    ``resolved_input_configuration`` (plan-20260913) is the engine-native
+    execution input produced by the run pipeline once a saved input
+    contract is resolved against the actual files for this run: when its
+    logical member matches ``"primary"``, confirmed sheet renames and
+    execution-confirmed keyed regions drive ``align_workbooks`` directly
+    instead of automatic name-equality pairing and detection. ``None``
+    (the default) is a byte-identical no-op -- exactly today's behavior for
+    any profile with no saved ``input_contract``. Not yet threaded through
+    ``_run_multi_package``'s recursive calls -- a disclosed scope decision
+    matching this project's own precedent for ``_native_compat_mode``;
+    every package member besides ``"primary"`` is unaffected until a later
+    step extends it. The exact primitive payload and its canonical digest
+    are recorded on the returned result as ``resolved_input_configuration``
+    / ``resolved_input_digest`` for history persistence.
     """
     check_cancelled(cancellation_token)
     mode = QCRunMode(mode)
@@ -1715,6 +1734,15 @@ def run_qc(
         result.requested_output_mode = output_mode
         result.resolved_output_policy = resolve_output_policy(
             output_mode, profile.review_policy
+        )
+        result.allow_dependency_indexing = allow_dependency_indexing
+        result.acceptance_absolute = run_acceptance.absolute if run_acceptance is not None else 0.0
+        result.acceptance_relative = run_acceptance.relative if run_acceptance is not None else 0.0
+        result.resolved_input_configuration = resolved_input_configuration
+        result.resolved_input_digest = (
+            resolved_input_configuration.canonical_sha256()
+            if resolved_input_configuration is not None
+            else ""
         )
         result.package_manifest = manifest
         if acceptance_requested:
@@ -1902,6 +1930,15 @@ def run_qc(
         result.resolved_output_policy = resolve_output_policy(
             output_mode, profile.review_policy
         )
+        result.allow_dependency_indexing = allow_dependency_indexing
+        result.acceptance_absolute = run_acceptance.absolute if run_acceptance is not None else 0.0
+        result.acceptance_relative = run_acceptance.relative if run_acceptance is not None else 0.0
+        result.resolved_input_configuration = resolved_input_configuration
+        result.resolved_input_digest = (
+            resolved_input_configuration.canonical_sha256()
+            if resolved_input_configuration is not None
+            else ""
+        )
         result.package_manifest = manifest
         if acceptance_requested:
             logger.warning("acceptance threshold ignored in %s", mode.value)
@@ -2004,6 +2041,15 @@ def run_qc(
     resolved_output_policy = resolve_output_policy(output_mode, profile.review_policy)
     result.requested_output_mode = output_mode
     result.resolved_output_policy = resolved_output_policy
+    result.allow_dependency_indexing = allow_dependency_indexing
+    result.acceptance_absolute = run_acceptance.absolute if run_acceptance is not None else 0.0
+    result.acceptance_relative = run_acceptance.relative if run_acceptance is not None else 0.0
+    result.resolved_input_configuration = resolved_input_configuration
+    result.resolved_input_digest = (
+        resolved_input_configuration.canonical_sha256()
+        if resolved_input_configuration is not None
+        else ""
+    )
     result.package_manifest = manifest
     if run_acceptance is not None and (
         run_acceptance.absolute > 0 or run_acceptance.relative > 0
@@ -2110,7 +2156,7 @@ def run_qc(
                 )
         result.files["baseline_excel"] = baseline_excel.name
         result.files["current_excel"] = current_excel.name
-        execution_bindings = build_execution_bindings(_resolved_input_configuration)
+        execution_bindings = build_execution_bindings(resolved_input_configuration)
         if base_wb.formula_source is not None:
             result.formula_engines["baseline_excel"] = base_wb.formula_source
         if curr_wb.formula_source is not None:

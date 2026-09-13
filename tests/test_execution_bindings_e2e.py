@@ -4,8 +4,8 @@ rename plus an execution-confirmed keyed region.
 
 Deliberately exercises the full pipeline (load -> align -> structure ->
 formulas -> values) rather than calling individual producers directly, so
-this is real proof the private ``_resolved_input_configuration`` parameter
-is wired correctly end to end, not just at the ``align_workbooks()`` layer.
+this is real proof the ``resolved_input_configuration`` parameter is wired
+correctly end to end, not just at the ``align_workbooks()`` layer.
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ def test_run_qc_with_resolved_configuration_reports_rename_and_real_change(
         baseline_excel=baseline_path,
         current_excel=current_path,
         mode=QCRunMode.CYCLE_COMPARISON,
-        _resolved_input_configuration=_resolved_configuration(),
+        resolved_input_configuration=_resolved_configuration(),
     )
 
     classes = [f.finding_class for f in result.findings]
@@ -120,7 +120,7 @@ def test_structural_and_formula_findings_carry_a_bounded_logical_address(
         baseline_excel=baseline_path,
         current_excel=current_path,
         mode=QCRunMode.CYCLE_COMPARISON,
-        _resolved_input_configuration=_resolved_configuration(),
+        resolved_input_configuration=_resolved_configuration(),
     )
 
     renamed = next(
@@ -137,7 +137,7 @@ def test_structural_and_formula_findings_carry_a_bounded_logical_address(
 
 
 def test_run_qc_without_resolved_configuration_stays_legacy(tmp_path: Path) -> None:
-    """Guard: omitting ``_resolved_input_configuration`` (the default) keeps
+    """Guard: omitting ``resolved_input_configuration`` (the default) keeps
     a physical rename as ordinary sheet_removed + sheet_added.
     """
     baseline_path, current_path = _write_pair(tmp_path)

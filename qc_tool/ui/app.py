@@ -89,6 +89,7 @@ from qc_tool.history.carry_forward import (
     apply_population_carry_forward,
     preview_carry_forward,
 )
+from qc_tool.history.config_compatibility import compatible_compare_findings
 from qc_tool.history.review_state import AnnotationLineageOutcome
 from qc_tool.history.run_state import RunStateRecord, RunStatus
 from qc_tool.history.store import RunHistory, RunRecord, export_runs_archive, sha256_file
@@ -2539,6 +2540,15 @@ def _rerun_delta(
     looks "resolved" and every atomic member it would have covered looks
     "new", even when nothing about the underlying findings changed. Disclose
     the representation change explicitly instead of showing that noise.
+
+    plan-20260913 Step 4: once output representation is confirmed
+    compatible, findings are further filtered per logical scope through
+    ``compatible_compare_findings`` -- a scope whose comparison policy
+    (tolerance, waivers, availability rules, controls, saved region
+    contract, ...) differs between the two runs is excluded from the delta
+    rather than silently counted resolved/new, with a disclosure note when
+    anything was excluded. A run recorded before ``profile_snapshot`` was
+    persisted falls back to the plain identity-only delta.
     """
     if record.rerun_of is None:
         return None, ""
@@ -2576,7 +2586,24 @@ def _rerun_delta(
             "population and atomic decisions are not directly comparable — "
             "the review queue below reflects this run in full"
         )
-    return compare_findings(previous.findings, record.findings), ""
+    if previous.profile_snapshot is None or record.profile_snapshot is None:
+        return compare_findings(previous.findings, record.findings), ""
+    delta, scope_excluded = compatible_compare_findings(
+        previous.findings,
+        record.findings,
+        previous_profile=previous.profile_snapshot,
+        current_profile=record.profile_snapshot,
+    )
+    note = (
+        (
+            f"change summary vs run #{record.rerun_of} excludes scopes whose "
+            "comparison policy changed since that run — the review queue "
+            "below reflects this run in full"
+        )
+        if scope_excluded
+        else ""
+    )
+    return delta, note
 
 
 def _on_demand_export_button(

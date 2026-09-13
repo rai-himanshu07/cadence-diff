@@ -1,0 +1,343 @@
+"""Tests for the Step 4 scope-semantics compatibility service
+(``qc_tool.history.config_compatibility``).
+
+Plan: docs/plans/plan-20260913-mode-aware-configuration-wizard.md, Step 4.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+
+from qc_tool.config.input_contract import (
+    LogicalMemberContract,
+    LogicalRegionContract,
+    LogicalSheetContract,
+    WorkbookInputContract,
+)
+from qc_tool.config.profile import (
+    DeliverableProfile,
+    ExcelAvailabilityRule,
+    ExcelProfile,
+    FindingWaiver,
+    NumericTolerance,
+    SheetProfile,
+)
+from qc_tool.findings import Finding, FindingClass, LogicalFindingAddress, Severity
+from qc_tool.history.config_compatibility import (
+    compatible_compare_findings,
+    configuration_compatible,
+)
+
+
+def _excel_finding(
+    *,
+    sheet: str = "Data",
+    finding_class: FindingClass = FindingClass.VALUE_CHANGED,
+    logical_address: LogicalFindingAddress | None = None,
+    artifact_member: str = "primary",
+) -> Finding:
+    return Finding(
+        artifact="excel",
+        artifact_member=artifact_member,
+        finding_class=finding_class,
+        severity=Severity.CRITICAL,
+        sheet=sheet,
+        location="A1",
+        message="changed",
+        logical_address=logical_address,
+    )
+
+
+def _ppt_finding() -> Finding:
+    return Finding(
+        artifact="ppt",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        slide="Overview",
+        message="changed",
+    )
+
+
+def _crosscheck_finding() -> Finding:
+    return Finding(
+        artifact="crosscheck",
+        finding_class=FindingClass.CROSSCHECK_MISMATCH,
+        severity=Severity.CRITICAL,
+        message="changed",
+    )
+
+
+def test_byte_identical_profiles_are_fully_compatible() -> None:
+    profile = DeliverableProfile(name="monthly")
+    compat = configuration_compatible(profile, profile.model_copy(deep=True))
+    assert compat.fully_compatible()
+    assert compat.comparable(_excel_finding())
+    assert compat.comparable(_ppt_finding())
+    assert compat.comparable(_crosscheck_finding())
+
+
+def test_alias_only_change_remains_comparable() -> None:
+    """``name``/``description`` are presentation_only; must never gate."""
+    previous = DeliverableProfile(name="monthly")
+    current = DeliverableProfile(name="monthly-renamed", description="new label")
+    compat = configuration_compatible(previous, current)
+    assert compat.fully_compatible()
+    assert compat.comparable(_excel_finding())
+
+
+def test_global_tolerance_relaxation_makes_every_scope_not_comparable() -> None:
+    previous = DeliverableProfile(name="monthly")
+    current = DeliverableProfile(
+        name="monthly", tolerance=NumericTolerance(absolute=5.0)
+    )
+    compat = configuration_compatible(previous, current)
+    assert not compat.fully_compatible()
+    assert not compat.comparable(_excel_finding())
+    assert not compat.comparable(_ppt_finding())
+    assert not compat.comparable(_crosscheck_finding())
+
+
+def test_waiver_reason_only_change_remains_comparable() -> None:
+    """``waivers[].reason`` is presentation_only; expiry/scope fields are not."""
+    previous = DeliverableProfile(
+        name="monthly",
+        waivers=[
+            FindingWaiver(
+                finding_class=FindingClass.VALUE_CHANGED,
+                reason="old reason",
+                expires=dt.date(2030, 1, 1),
+                sheet="Data",
+            )
+        ],
+    )
+    current = DeliverableProfile(
+        name="monthly",
+        waivers=[
+            FindingWaiver(
+                finding_class=FindingClass.VALUE_CHANGED,
+                reason="new reason, more detail",
+                expires=dt.date(2030, 1, 1),
+                sheet="Data",
+            )
+        ],
+    )
+    compat = configuration_compatible(previous, current)
+    assert compat.fully_compatible()
+
+
+def test_waiver_expiry_change_makes_every_scope_not_comparable() -> None:
+    previous = DeliverableProfile(
+        name="monthly",
+        waivers=[
+            FindingWaiver(
+                finding_class=FindingClass.VALUE_CHANGED,
+                reason="r",
+                expires=dt.date(2030, 1, 1),
+                sheet="Data",
+            )
+        ],
+    )
+    current = DeliverableProfile(
+        name="monthly",
+        waivers=[
+            FindingWaiver(
+                finding_class=FindingClass.VALUE_CHANGED,
+                reason="r",
+                expires=dt.date(2030, 6, 1),
+                sheet="Data",
+            )
+        ],
+    )
+    compat = configuration_compatible(previous, current)
+    assert not compat.fully_compatible()
+
+
+def test_per_sheet_availability_rule_change_only_affects_that_sheet() -> None:
+    previous = DeliverableProfile(
+        name="monthly",
+        excel=ExcelProfile(
+            sheets={
+                "Data": SheetProfile(availability_rules=[_availability_rule("A1")]),
+                "Other": SheetProfile(),
+            }
+        ),
+    )
+    current = DeliverableProfile(
+        name="monthly",
+        excel=ExcelProfile(
+            sheets={
+                "Data": SheetProfile(availability_rules=[_availability_rule("B1")]),
+                "Other": SheetProfile(),
+            }
+        ),
+    )
+    compat = configuration_compatible(previous, current)
+    assert compat.fully_compatible()  # global gate is unaffected
+    assert not compat.comparable(_excel_finding(sheet="Data"))
+    assert compat.comparable(_excel_finding(sheet="Other"))
+    assert compat.comparable(_ppt_finding())
+
+
+def _availability_rule(required_through: str) -> ExcelAvailabilityRule:
+    return ExcelAvailabilityRule(
+        range="A1:A10", periods="A1:A10", required_through=required_through
+    )
+
+
+def test_sheet_rename_alone_stays_comparable_via_logical_address() -> None:
+    """Step 3's whole point: a confirmed rename must never itself break
+    comparability. The legacy per-physical-name entry differs (different
+    dict key) but the finding carries a stable ``sheet_id``, so only the
+    saved contract entry for that id is consulted.
+    """
+    contract = WorkbookInputContract(
+        members=(
+            LogicalMemberContract(
+                member_id="primary",
+                sheets=(
+                    LogicalSheetContract(
+                        sheet_id="ledger",
+                        regions=(
+                            LogicalRegionContract(
+                                region_id="r1", anchor_cell="A1", mode="keyed"
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    previous = DeliverableProfile(
+        name="monthly",
+        input_contract=contract,
+        excel=ExcelProfile(sheets={"Ledger2025": SheetProfile(ignore=True)}),
+    )
+    current = DeliverableProfile(
+        name="monthly",
+        input_contract=contract,
+        excel=ExcelProfile(sheets={"Ledger2026": SheetProfile(ignore=True)}),
+    )
+    address = LogicalFindingAddress(member_id="primary", sheet_id="ledger")
+    compat = configuration_compatible(previous, current)
+    assert compat.comparable(_excel_finding(sheet="Ledger2026", logical_address=address))
+
+
+def test_logical_sheet_region_change_makes_that_scope_not_comparable() -> None:
+    previous = DeliverableProfile(
+        name="monthly",
+        input_contract=WorkbookInputContract(
+            members=(
+                LogicalMemberContract(
+                    member_id="primary",
+                    sheets=(
+                        LogicalSheetContract(
+                            sheet_id="ledger",
+                            regions=(
+                                LogicalRegionContract(
+                                    region_id="r1", anchor_cell="A1", mode="keyed"
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    current = DeliverableProfile(
+        name="monthly",
+        input_contract=WorkbookInputContract(
+            members=(
+                LogicalMemberContract(
+                    member_id="primary",
+                    sheets=(
+                        LogicalSheetContract(
+                            sheet_id="ledger",
+                            regions=(
+                                LogicalRegionContract(
+                                    region_id="r1",
+                                    anchor_cell="A1",
+                                    mode="positional",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    address = LogicalFindingAddress(member_id="primary", sheet_id="ledger")
+    compat = configuration_compatible(previous, current)
+    assert not compat.comparable(_excel_finding(sheet="Ledger", logical_address=address))
+
+
+def test_logical_sheet_alias_only_change_remains_comparable() -> None:
+    def _contract(alias: str) -> WorkbookInputContract:
+        return WorkbookInputContract(
+            members=(
+                LogicalMemberContract(
+                    member_id="primary",
+                    sheets=(LogicalSheetContract(sheet_id="ledger", alias=alias),),
+                ),
+            )
+        )
+
+    previous = DeliverableProfile(name="monthly", input_contract=_contract("Ledger"))
+    current = DeliverableProfile(name="monthly", input_contract=_contract("Ledger (v2)"))
+    address = LogicalFindingAddress(member_id="primary", sheet_id="ledger")
+    compat = configuration_compatible(previous, current)
+    assert compat.comparable(_excel_finding(sheet="Ledger", logical_address=address))
+
+
+def test_compatible_compare_findings_excludes_only_the_changed_scope() -> None:
+    previous_profile = DeliverableProfile(
+        name="monthly",
+        excel=ExcelProfile(
+            sheets={
+                "Data": SheetProfile(availability_rules=[_availability_rule("A1")]),
+                "Other": SheetProfile(),
+            }
+        ),
+    )
+    current_profile = DeliverableProfile(
+        name="monthly",
+        excel=ExcelProfile(
+            sheets={
+                "Data": SheetProfile(availability_rules=[_availability_rule("B1")]),
+                "Other": SheetProfile(),
+            }
+        ),
+    )
+    # "Data" gained a finding purely because of the scope change (not a real
+    # workbook difference) -- must not count as "new". "Other" is untouched
+    # and its resolved finding must still count.
+    previous_findings = [
+        _excel_finding(sheet="Data"),
+        _excel_finding(sheet="Other"),
+    ]
+    current_findings = [_excel_finding(sheet="Data")]
+    delta, any_excluded = compatible_compare_findings(
+        previous_findings,
+        current_findings,
+        previous_profile=previous_profile,
+        current_profile=current_profile,
+    )
+    assert any_excluded
+    assert delta.resolved == 1  # "Other" resolved
+    assert delta.new == 0
+    assert delta.persisting == 0
+
+
+def test_compatible_compare_findings_is_a_true_delta_when_nothing_scope_related_changed() -> None:
+    profile = DeliverableProfile(name="monthly")
+    previous_findings = [_excel_finding(sheet="Data")]
+    current_findings = [_excel_finding(sheet="Data"), _excel_finding(sheet="Other")]
+    delta, any_excluded = compatible_compare_findings(
+        previous_findings,
+        current_findings,
+        previous_profile=profile,
+        current_profile=profile.model_copy(deep=True),
+    )
+    assert not any_excluded
+    assert delta.persisting == 1
+    assert delta.new == 1
+    assert delta.resolved == 0

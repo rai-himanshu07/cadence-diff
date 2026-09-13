@@ -83,6 +83,11 @@ class RunRequest:
     # New fields for multi-workbook intake (primitive-only payloads)
     package_manifest: dict[str, Any] = field(default_factory=dict)
     compare_member_sheets: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: Exact primitive `ResolvedInputConfigurationV1` payload for this run
+    #: (plan-20260913) and its canonical digest; `{}`/"" means a legacy
+    #: request with no saved input contract.
+    resolved_input_configuration: dict[str, Any] = field(default_factory=dict)
+    resolved_input_digest: str = ""
 
 
 @dataclass(slots=True)
@@ -167,6 +172,12 @@ class RunQueueManager:
                 queue_position=position,
                 profile_snapshot=dict(request.profile),
                 requested_output_mode=request.requested_output_mode,
+                resolved_input_configuration=(
+                    dict(request.resolved_input_configuration)
+                    if request.resolved_input_configuration
+                    else None
+                ),
+                resolved_input_digest=request.resolved_input_digest,
             )
             self._pending.append((request, held))
             self._ensure_supervisor()

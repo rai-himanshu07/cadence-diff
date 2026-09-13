@@ -26,6 +26,7 @@ from qc_tool.config.profile import (
     canonical_profile_json,
     profile_sha256,
 )
+from qc_tool.config.resolved_input import ResolvedInputConfigurationV1
 from qc_tool.coverage import CoverageItem, FindingOutputMode, MappingCoverage, QCRunMode
 from qc_tool.crosscheck.trace import MappingSuggestion
 from qc_tool.engine import QCRunResult
@@ -313,6 +314,30 @@ _MIGRATIONS = {
         "ALTER TABLE runs ADD COLUMN resolved_output_policy TEXT "
         "NOT NULL DEFAULT 'null'"
     ),
+    #: Run-level scope-affecting overrides (plan-20260913); defaults exactly
+    #: match `run_qc()`'s own pre-existing defaults, so a legacy run reads
+    #: as "nothing was overridden" -- its own historical truth.
+    "allow_dependency_indexing": (
+        "ALTER TABLE runs ADD COLUMN allow_dependency_indexing INTEGER "
+        "NOT NULL DEFAULT 0"
+    ),
+    "acceptance_absolute": (
+        "ALTER TABLE runs ADD COLUMN acceptance_absolute REAL NOT NULL DEFAULT 0.0"
+    ),
+    "acceptance_relative": (
+        "ALTER TABLE runs ADD COLUMN acceptance_relative REAL NOT NULL DEFAULT 0.0"
+    ),
+    #: Exact primitive `ResolvedInputConfigurationV1` payload and its
+    #: canonical digest (plan-20260913); `null`/"" for any run committed
+    #: before this pair of columns existed -- the explicit legacy-absent
+    #: default the compatibility service treats as "no logical contract".
+    "resolved_input_configuration": (
+        "ALTER TABLE runs ADD COLUMN resolved_input_configuration TEXT "
+        "NOT NULL DEFAULT 'null'"
+    ),
+    "resolved_input_digest": (
+        "ALTER TABLE runs ADD COLUMN resolved_input_digest TEXT NOT NULL DEFAULT ''"
+    ),
 }
 
 
@@ -430,6 +455,18 @@ class RunRecord:
     #: The effective population policy this run actually used, and why;
     #: `None` for any run recorded before this contract existed.
     resolved_output_policy: ResolvedOutputPolicy | None = None
+    #: Run-level scope-affecting overrides (plan-20260913); `False`/`0.0`
+    #: for any run recorded before these columns existed -- exactly the
+    #: pre-existing `run_qc()` defaults, so a legacy row reads as its own
+    #: historical truth.
+    allow_dependency_indexing: bool = False
+    acceptance_absolute: float = 0.0
+    acceptance_relative: float = 0.0
+    #: Exact per-run resolved logical configuration and its canonical
+    #: digest (plan-20260913); `None`/"" is the explicit legacy-absent
+    #: default for any run with no saved `input_contract`.
+    resolved_input_configuration: ResolvedInputConfigurationV1 | None = None
+    resolved_input_digest: str = ""
 
     def focus_sidecar(self) -> FocusTargetSidecar:
         """Decode the private sidecar on first focus use, never at row read.
@@ -867,10 +904,14 @@ class RunHistory:
                     story_counts, comparison_scope, package_manifest, focus_targets,
                     profile_snapshot, profile_sha256, counterfactual_digest,
                     series_anchor_digest, formula_engines, values_engines,
-                    requested_output_mode, resolved_output_policy
+                    requested_output_mode, resolved_output_policy,
+                    allow_dependency_indexing, acceptance_absolute, acceptance_relative,
+                    resolved_input_configuration, resolved_input_digest
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
                 )
                 """,
                 (
@@ -928,6 +969,15 @@ class RunHistory:
                         if result.resolved_output_policy is not None
                         else None
                     ),
+                    result.allow_dependency_indexing,
+                    result.acceptance_absolute,
+                    result.acceptance_relative,
+                    json.dumps(
+                        result.resolved_input_configuration.model_dump(mode="json")
+                        if result.resolved_input_configuration is not None
+                        else None
+                    ),
+                    result.resolved_input_digest,
                 ),
             )
             run_id = cursor.lastrowid
@@ -1195,6 +1245,22 @@ class RunHistory:
                 is not None
                 else None
             ),
+            allow_dependency_indexing=bool(row["allow_dependency_indexing"]),
+            acceptance_absolute=row["acceptance_absolute"],
+            acceptance_relative=row["acceptance_relative"],
+            resolved_input_configuration=(
+                ResolvedInputConfigurationV1.model_validate(
+                    resolved_input_configuration_payload
+                )
+                if (
+                    resolved_input_configuration_payload := json.loads(
+                        row["resolved_input_configuration"]
+                    )
+                )
+                is not None
+                else None
+            ),
+            resolved_input_digest=row["resolved_input_digest"],
         )
 
     def list_runs(self, limit: int = 50, *, include_archived: bool = True) -> list[RunRecord]:

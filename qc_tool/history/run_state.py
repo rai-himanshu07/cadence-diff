@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS run_state (
     phases TEXT NOT NULL DEFAULT '[]',
     action_required TEXT NOT NULL DEFAULT '{}',
     profile_snapshot TEXT NOT NULL DEFAULT 'null',
-    requested_output_mode TEXT NOT NULL DEFAULT 'profile'
+    requested_output_mode TEXT NOT NULL DEFAULT 'profile',
+    resolved_input_configuration TEXT NOT NULL DEFAULT 'null',
+    resolved_input_digest TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -86,6 +88,16 @@ _MIGRATIONS = {
         "ALTER TABLE run_state ADD COLUMN requested_output_mode TEXT "
         "NOT NULL DEFAULT 'profile'"
     ),
+    #: Exact primitive per-run resolved configuration (plan-20260913); a
+    #: legacy row queued before this column existed has none.
+    "resolved_input_configuration": (
+        "ALTER TABLE run_state ADD COLUMN resolved_input_configuration TEXT "
+        "NOT NULL DEFAULT 'null'"
+    ),
+    "resolved_input_digest": (
+        "ALTER TABLE run_state ADD COLUMN resolved_input_digest TEXT "
+        "NOT NULL DEFAULT ''"
+    ),
 }
 
 
@@ -119,6 +131,11 @@ class RunStateRecord:
     #: string mirroring `mode` -- "profile" for any row queued before this
     #: column existed.
     requested_output_mode: str = "profile"
+    #: Exact primitive `ResolvedInputConfigurationV1` payload submitted to
+    #: this request (plan-20260913), and its canonical digest. `None`/"" for
+    #: a legacy request queued before this column existed.
+    resolved_input_configuration: dict[str, object] | None = None
+    resolved_input_digest: str = ""
 
     @property
     def is_active(self) -> bool:
@@ -151,6 +168,14 @@ def _record(row: sqlite3.Row) -> RunStateRecord:
         profile_snapshot = json.loads(row["profile_snapshot"])
     except (KeyError, IndexError, json.JSONDecodeError):
         profile_snapshot = None
+    try:
+        resolved_input_configuration = json.loads(row["resolved_input_configuration"])
+    except (KeyError, IndexError, json.JSONDecodeError):
+        resolved_input_configuration = None
+    try:
+        resolved_input_digest = row["resolved_input_digest"]
+    except (KeyError, IndexError):
+        resolved_input_digest = ""
     return RunStateRecord(
         request_id=row["request_id"],
         created_at=dt.datetime.fromisoformat(row["created_at"]),
@@ -174,6 +199,12 @@ def _record(row: sqlite3.Row) -> RunStateRecord:
             profile_snapshot if isinstance(profile_snapshot, dict) else None
         ),
         requested_output_mode=row["requested_output_mode"],
+        resolved_input_configuration=(
+            resolved_input_configuration
+            if isinstance(resolved_input_configuration, dict)
+            else None
+        ),
+        resolved_input_digest=resolved_input_digest,
     )
 
 
@@ -208,14 +239,17 @@ class RunStateStore:
         queue_position: int,
         profile_snapshot: dict[str, object] | None = None,
         requested_output_mode: str = "profile",
+        resolved_input_configuration: dict[str, object] | None = None,
+        resolved_input_digest: str = "",
     ) -> RunStateRecord:
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO run_state (
                     request_id, created_at, status, queue_position, mode, profile, files,
-                    profile_snapshot, requested_output_mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    profile_snapshot, requested_output_mode,
+                    resolved_input_configuration, resolved_input_digest
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -227,6 +261,8 @@ class RunStateStore:
                     json.dumps(files),
                     json.dumps(profile_snapshot),
                     requested_output_mode,
+                    json.dumps(resolved_input_configuration),
+                    resolved_input_digest,
                 ),
             )
         record = self.get(request_id)

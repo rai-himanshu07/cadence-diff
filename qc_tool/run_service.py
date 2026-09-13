@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from qc_tool.config.profile import DeliverableProfile, NumericTolerance
+from qc_tool.config.resolved_input import ResolvedInputConfigurationV1
 from qc_tool.coverage import FindingOutputMode, QCRunMode
 from qc_tool.engine import (
     FindingsDelta,
@@ -24,6 +25,7 @@ from qc_tool.engine import (
 )
 from qc_tool.excel.formulas import FormulaComparisonTelemetry, PairKeyTelemetry
 from qc_tool.excel.population import PopulationTelemetry
+from qc_tool.history.config_compatibility import compatible_compare_findings
 from qc_tool.history.store import RunHistory
 from qc_tool.io.formula_cache import FormulaExtractionCache
 from qc_tool.package import PackageManifest, paths_by_member
@@ -113,6 +115,7 @@ def perform_run(
     write_reports: bool = False,
     on_subphase: Callable[[str, float], None] | None = None,
     formula_cache_enabled: bool = True,
+    resolved_input_configuration: ResolvedInputConfigurationV1 | None = None,
     _perform_run_telemetry: PerformRunTelemetry | None = None,
     _formula_telemetry: FormulaComparisonTelemetry | None = None,
     _pair_key_telemetry: PairKeyTelemetry | None = None,
@@ -141,6 +144,12 @@ def perform_run(
     (plan-20260910, Step 7 precondition evidence) passed straight through to
     ``run_qc()``'s own ``_formula_telemetry`` param; never set by production
     callers.
+    ``resolved_input_configuration`` (plan-20260913) is the engine-native
+    execution input produced by the setup pipeline once a saved input
+    contract is resolved against the actual files for this run; passed
+    straight through to ``run_qc()`` and persisted with the run for later
+    Re-QC/carry-forward scope-compatibility checks. ``None`` (the default)
+    is a byte-identical no-op.
     """
     _telemetry_start = (
         time.perf_counter() if _perform_run_telemetry is not None else 0.0
@@ -205,6 +214,7 @@ def perform_run(
         _formula_telemetry=_formula_telemetry,
         _pair_key_telemetry=_pair_key_telemetry,
         _population_telemetry=_population_telemetry,
+        resolved_input_configuration=resolved_input_configuration,
     )
     if _perform_run_telemetry is not None:
         _perform_run_telemetry.qc_seconds += time.perf_counter() - _qc_start
@@ -288,7 +298,22 @@ def perform_run(
                         result.findings,
                     )
                 ):
-                    delta = compare_findings(previous.findings, result.findings)
+                    previous_profile = previous.profile_snapshot
+                    if previous_profile is not None:
+                        delta, scope_excluded = compatible_compare_findings(
+                            previous.findings,
+                            result.findings,
+                            previous_profile=previous_profile,
+                            current_profile=profile,
+                        )
+                        if scope_excluded:
+                            result.disclosures.append(
+                                f"change summary vs run #{rerun_of} excludes scopes "
+                                "whose comparison policy changed since that run -- "
+                                "the review queue below reflects this run in full"
+                            )
+                    else:
+                        delta = compare_findings(previous.findings, result.findings)
             except KeyError:
                 logger.warning("re-QC referenced missing run %s", rerun_of)
                 rerun_of = None

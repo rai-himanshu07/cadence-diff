@@ -6,6 +6,10 @@ from collections import defaultdict
 from collections.abc import Sequence
 
 from qc_tool.findings import Finding
+from qc_tool.history.config_compatibility import (
+    ConfigurationCompatibility,
+    configuration_compatible,
+)
 from qc_tool.history.review_state import (
     AnnotationLineageOutcome,
     CarryForwardCandidate,
@@ -102,6 +106,15 @@ def _population_candidate(
 
 
 def preview_carry_forward(history: RunHistory, run_id: int) -> CarryForwardPreview:
+    """Classify every annotated source finding's carry-forward disposition.
+
+    plan-20260913 Step 4: a source (or, for populations, current) finding
+    whose logical scope's comparison policy differs between the two runs
+    is routed to ``ambiguous`` (atomics) or dropped (populations) rather
+    than ``exact``/``resolved`` -- a policy change can make a finding
+    disappear or look identical by pure identity/evidence-digest matching
+    without anything in the underlying workbook actually changing.
+    """
     current = history.get_raw_run(run_id)
     if current.rerun_of is None:
         raise ValueError("run is not a Re-QC run")
@@ -115,6 +128,18 @@ def preview_carry_forward(history: RunHistory, run_id: int) -> CarryForwardPrevi
     for finding in source.findings:
         source_by_identity[requeue_identity_key(finding)].append(finding)
 
+    #: plan-20260913 Step 4: a scope whose comparison policy changed between
+    #: the source and current run cannot safely resolve/carry an
+    #: annotation -- a suppressed (not fixed) finding must never look
+    #: "resolved", and an identical-looking match cannot be trusted "exact"
+    #: either. `None` when either run predates `profile_snapshot`
+    #: persistence -- legacy behavior, unchanged.
+    compatibility: ConfigurationCompatibility | None = None
+    if source.profile_snapshot is not None and current.profile_snapshot is not None:
+        compatibility = configuration_compatible(
+            source.profile_snapshot, current.profile_snapshot
+        )
+
     exact: list[CarryForwardCandidate] = []
     changed: list[str] = []
     resolved: list[str] = []
@@ -122,6 +147,9 @@ def preview_carry_forward(history: RunHistory, run_id: int) -> CarryForwardPrevi
     for source_finding_id, (severity, comment) in sorted(annotations.items()):
         source_finding = source_by_id.get(source_finding_id)
         if source_finding is None:
+            ambiguous.append(source_finding_id)
+            continue
+        if compatibility is not None and not compatibility.comparable(source_finding):
             ambiguous.append(source_finding_id)
             continue
         identity = requeue_identity_key(source_finding)
@@ -164,6 +192,8 @@ def preview_carry_forward(history: RunHistory, run_id: int) -> CarryForwardPrevi
     for finding in current.findings:
         if finding.population is None or finding.finding_id in identity_handled:
             continue
+        if compatibility is not None and not compatibility.comparable(finding):
+            continue  # scope's comparison policy changed -- nothing safe to carry
         if source_by_identity.get(requeue_identity_key(finding)):
             continue  # an unannotated source population; nothing to carry
         candidate = _population_candidate(

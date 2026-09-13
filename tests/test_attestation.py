@@ -26,6 +26,29 @@ from qc_tool.ui.app import perform_run
 from tests.conftest import fixture_profile
 
 
+def test_attestation_binds_the_resolved_input_digest(tmp_path: Path) -> None:
+    """plan-20260913 Step 4: the exact per-run resolved logical
+    configuration digest is a signed, informational disclosure -- present
+    for every run (empty string for a run with no saved input contract).
+    """
+    profile = fixture_profile()
+    result = QCRunResult(profile_name=profile.name, resolved_input_digest="a" * 64)
+    _, key = load_or_create_attestation_key(tmp_path)
+    bundle = create_attestation(
+        tmp_path / "run.qca",
+        result=result,
+        profile=profile,
+        input_files={},
+        report_paths={},
+        key=key,
+    )
+
+    assert verify_attestation(bundle, key=key).valid
+    with zipfile.ZipFile(bundle) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["run"]["resolved_input_digest"] == "a" * 64
+
+
 def test_attestation_verifies_and_detects_member_tampering(
     fixture_dir: Path, tmp_path: Path
 ) -> None:

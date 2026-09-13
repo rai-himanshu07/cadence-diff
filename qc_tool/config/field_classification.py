@@ -41,7 +41,7 @@ FieldCategory = Literal[
 _MAX_WALK_DEPTH = 12
 
 
-def _unwrap_optional(annotation: object) -> object:
+def unwrap_optional(annotation: object) -> object:
     if get_origin(annotation) is not None and type(None) in get_args(annotation):
         remaining = [arg for arg in get_args(annotation) if arg is not type(None)]
         if len(remaining) == 1:
@@ -49,13 +49,13 @@ def _unwrap_optional(annotation: object) -> object:
     return annotation
 
 
-def _model_item_type(annotation: object) -> tuple[type[BaseModel], str] | None:
+def model_item_type(annotation: object) -> tuple[type[BaseModel], str] | None:
     """If ``annotation`` is a container of exactly one BaseModel subtype
     (``list[M]``, ``tuple[M, ...]``, or ``dict[K, M]``), return
     ``(M, suffix)`` where ``suffix`` is ``"[]"`` for a list/tuple and
     ``"{}"`` for a dict (so a discovered path names its own shape).
     """
-    annotation = _unwrap_optional(annotation)
+    annotation = unwrap_optional(annotation)
     origin = get_origin(annotation)
     if origin is None:
         return None
@@ -77,11 +77,11 @@ def _walk_model(
     for field_name, field_info in model_cls.model_fields.items():
         annotation = field_info.annotation
         path = f"{prefix}.{field_name}" if prefix else field_name
-        direct = _unwrap_optional(annotation)
+        direct = unwrap_optional(annotation)
         if isinstance(direct, type) and issubclass(direct, BaseModel):
             _walk_model(direct, prefix=path, depth=depth + 1, out=out)
             continue
-        nested = _model_item_type(annotation)
+        nested = model_item_type(annotation)
         if nested is not None:
             nested_cls, suffix = nested
             _walk_model(nested_cls, prefix=f"{path}{suffix}", depth=depth + 1, out=out)
@@ -357,6 +357,10 @@ RUN_REQUEST_FIELD_CLASSIFICATION: dict[str, FieldCategory] = {
     "rerun_of": "operational_only",
     "package_manifest": "scope_semantics",
     "compare_member_sheets": "scope_semantics",
+    #: Content governed by ResolvedInputConfigurationV1 itself, not this
+    #: registry; the digest is a pure derived value.
+    "resolved_input_configuration": "operational_only",
+    "resolved_input_digest": "operational_only",
 }
 
 
