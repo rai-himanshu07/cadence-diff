@@ -20,6 +20,7 @@ import yaml
 from openpyxl.utils.cell import column_index_from_string, coordinate_to_tuple
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from qc_tool.config.input_contract import WorkbookInputContract
 from qc_tool.coverage import FindingOutputMode
 from qc_tool.findings import FindingClass, Materiality, Severity
 from qc_tool.package import MEMBER_ID_PATTERN
@@ -497,6 +498,13 @@ class DeliverableProfile(BaseModel):
     review_policy: ReviewPolicy = Field(
         default_factory=ReviewPolicy,
         exclude_if=lambda value: not value.populations.enabled,
+    )
+    #: Saved logical Excel input contract (plan-20260913). Absent (``None``,
+    #: the default) means every scope uses legacy physical-name profile
+    #: fields and automatic detection, byte-identical canonical hash.
+    input_contract: WorkbookInputContract | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
     )
 
     def sheet_profile(self, sheet_name: str) -> SheetProfile | None:

@@ -815,7 +815,7 @@ def diff_workbook_values(
     findings: list[Finding] = []
     for sheet_name, regions in alignment.regions.items():
         check_cancelled(cancellation_token)
-        base_sheet = baseline.sheet(sheet_name)
+        base_sheet = baseline.sheet(alignment.baseline_sheet_name_for(sheet_name))
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name) if profile else None
         for region in regions:

@@ -308,3 +308,40 @@ def test_blank_to_blank_transitions_are_not_value_changes() -> None:
     assert _values_differ(cell(""), cell("x"), tolerance)
     assert _values_differ(cell(0), cell(""), tolerance)
     assert _values_differ(None, cell(0), tolerance)
+
+
+# --- plan-20260913 Step 3: confirmed sheet rename structural finding -------
+
+
+def test_confirmed_rename_emits_one_sheet_renamed_finding_no_cascade() -> None:
+    from qc_tool.excel.diff_structure import _sheet_findings
+
+    alignment = WorkbookAlignment(
+        common_sheets=["Sheet2026"],
+        renamed_sheets={"Sheet2026": "Sheet2025"},
+    )
+
+    findings = _sheet_findings(alignment)
+
+    assert [f.finding_class for f in findings] == [FindingClass.SHEET_RENAMED]
+    renamed = findings[0]
+    assert renamed.sheet == "Sheet2026"
+    assert renamed.baseline_location == "Sheet2025"
+    assert _by_class(findings, FindingClass.SHEET_ADDED) == []
+    assert _by_class(findings, FindingClass.SHEET_REMOVED) == []
+
+
+def test_an_unmapped_rename_stays_ordinary_add_plus_remove() -> None:
+    from qc_tool.excel.diff_structure import _sheet_findings
+
+    alignment = WorkbookAlignment(
+        added_sheets=["Sheet2026"],
+        removed_sheets=["Sheet2025"],
+    )
+
+    findings = _sheet_findings(alignment)
+
+    assert {f.finding_class for f in findings} == {
+        FindingClass.SHEET_ADDED,
+        FindingClass.SHEET_REMOVED,
+    }

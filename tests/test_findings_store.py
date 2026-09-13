@@ -180,6 +180,7 @@ def test_trusted_constructor_equals_validation_on_every_field(
         FindingSubtype,
         FindingTemporalContext,
         GridExcerpt,
+        LogicalFindingAddress,
         Materiality,
         NumericCounterfactualBasis,
         SeriesAnchorV2,
@@ -239,6 +240,10 @@ def test_trusted_constructor_equals_validation_on_every_field(
             sheet="Data", current_region_id="r1", period_axis="rows",
             series_index=2, period_index=3, segment="new_period",
         ),
+        logical_address=LogicalFindingAddress(
+            member_id="primary", sheet_id="data", region_id="r1", column_id="id",
+            row_key_digest="a" * 64,
+        ),
     )
     payload = json.loads(json.dumps(finding_payload(full)))
     trusted = Finding.from_trusted_payload(payload)
@@ -247,6 +252,7 @@ def test_trusted_constructor_equals_validation_on_every_field(
     assert trusted.model_dump(mode="json") == validated.model_dump(mode="json")
     assert trusted.counterfactual_basis == validated.counterfactual_basis
     assert trusted.series_anchor == validated.series_anchor
+    assert trusted.logical_address == validated.logical_address
     assert trusted.expected_growth is True  # derived flag must still derive
 
     # drift guard: a new model field forces this test to know about it
@@ -260,7 +266,7 @@ def test_trusted_constructor_equals_validation_on_every_field(
         "message", "impacts", "baseline_excerpt", "current_excerpt",
         "analyst_comment", "severity_overridden", "root_cause_key",
         "waiver_reason", "waiver_expires", "counterfactual_basis",
-        "series_anchor", "population",
+        "series_anchor", "population", "logical_address",
     }
     assert set(Finding.model_fields) == known
 

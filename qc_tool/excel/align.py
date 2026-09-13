@@ -19,7 +19,7 @@ than producing unreliable correspondences.
 import logging
 import re
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -27,6 +27,7 @@ from openpyxl.utils import column_index_from_string
 from openpyxl.utils.cell import coordinate_to_tuple
 from pydantic import BaseModel, Field
 
+from qc_tool.config.execution import ExecutionBindings
 from qc_tool.config.profile import DeliverableProfile, RowIdentityRule, SheetProfile
 from qc_tool.excel.periods import Period, is_period_after, is_period_label, parse_period
 from qc_tool.excel.regions import TableRegion, detect_regions
@@ -106,6 +107,18 @@ class WorkbookAlignment:
     unpaired_baseline_regions: list[TableRegion] = field(default_factory=list)
     unpaired_current_regions: list[TableRegion] = field(default_factory=list)
     low_confidence_regions: list[str] = field(default_factory=list)
+    #: ``{current_sheet_name: baseline_sheet_name}`` for every sheet paired
+    #: by a confirmed logical rename (plan-20260913, Step 3) rather than by
+    #: matching physical names. Empty for every legacy (no execution
+    #: bindings) alignment.
+    renamed_sheets: dict[str, str] = field(default_factory=dict)
+
+    def baseline_sheet_name_for(self, current_sheet_name: str) -> str:
+        """Resolve the BASELINE physical sheet name backing a CURRENT sheet
+        name inside this alignment. Identity for every ordinary same-name
+        pairing; only differs for a confirmed logical rename.
+        """
+        return self.renamed_sheets.get(current_sheet_name, current_sheet_name)
 
 
 # --- alignment trust manifest ---------------------------------------------
@@ -614,13 +627,30 @@ def _block_labels_overlap(
 
 
 def _matching_row_identity_rule(
-    sheet_profile: SheetProfile | None, region: TableRegion
+    sheet_profile: SheetProfile | None,
+    region: TableRegion,
+    extra_rules: Sequence[RowIdentityRule] = (),
 ) -> RowIdentityRule | None:
     """The first confirmed rule whose anchor cell falls inside ``region``.
 
     Matching by anchor cell (not region id) lets a rule keep applying across
     ordinary row growth, which shifts a region's ``max_row`` every cycle.
+    ``extra_rules`` -- execution-confirmed keyed regions from the new saved
+    logical contract (plan-20260913, Step 3) -- are checked FIRST, ahead of
+    legacy ``sheet_profile.row_identity_rules``; the Step 2 lint guard
+    already refuses to save a profile where both would conflict for the
+    same physical sheet, so this precedence is safe.
     """
+    for rule in extra_rules:
+        try:
+            anchor_row, anchor_col = coordinate_to_tuple(rule.anchor_cell)
+        except ValueError:
+            continue
+        if (
+            region.min_row <= anchor_row <= region.max_row
+            and region.min_col <= anchor_col <= region.max_col
+        ):
+            return rule
     if sheet_profile is None:
         return None
     for rule in sheet_profile.row_identity_rules:
@@ -799,8 +829,9 @@ def _align_block(
     base_region: TableRegion,
     curr_region: TableRegion,
     sheet_profile: SheetProfile | None = None,
+    extra_row_identity_rules: Sequence[RowIdentityRule] = (),
 ) -> RegionAlignment:
-    rule = _matching_row_identity_rule(sheet_profile, curr_region)
+    rule = _matching_row_identity_rule(sheet_profile, curr_region, extra_row_identity_rules)
     label_base = [base_region.key_col or base_region.min_col]
     label_curr = [curr_region.key_col or curr_region.min_col]
     if rule is not None:
@@ -841,13 +872,21 @@ def align_regions(
     base_region: TableRegion,
     curr_region: TableRegion,
     sheet_profile: SheetProfile | None = None,
+    extra_row_identity_rules: Sequence[RowIdentityRule] = (),
 ) -> RegionAlignment:
     orientation = curr_region.orientation
     if orientation == "long":
         return _align_long(base_sheet, curr_sheet, base_region, curr_region)
     if orientation == "wide":
         return _align_wide(base_sheet, curr_sheet, base_region, curr_region)
-    return _align_block(base_sheet, curr_sheet, base_region, curr_region, sheet_profile)
+    return _align_block(
+        base_sheet,
+        curr_sheet,
+        base_region,
+        curr_region,
+        sheet_profile,
+        extra_row_identity_rules,
+    )
 
 
 # --- workbook alignment ---------------------------------------------------
@@ -932,15 +971,41 @@ def align_workbooks(
     *,
     cancellation_token: CancellationToken | None = None,
     on_sheet: Callable[[int, int, str], None] | None = None,
+    execution_bindings: ExecutionBindings | None = None,
+    member_id: str = "primary",
 ) -> WorkbookAlignment:
     ignore = set(profile.excel.ignore_sheets) if profile else set()
     base_names = [n for n in baseline.sheet_names if n not in ignore]
     curr_names = [n for n in current.sheet_names if n not in ignore]
+    base_name_set = set(base_names)
+    curr_name_set = set(curr_names)
+
+    common_sheets = [n for n in base_names if n in curr_name_set]
+    added_sheets = [n for n in curr_names if n not in base_name_set]
+    removed_sheets = [n for n in base_names if n not in curr_name_set]
+    renamed_sheets: dict[str, str] = {}
+
+    if execution_bindings is not None:
+        for curr_name, base_name in execution_bindings.confirmed_sheet_renames(
+            member_id
+        ).items():
+            if (
+                curr_name in curr_name_set
+                and base_name in base_name_set
+                and curr_name not in common_sheets
+            ):
+                if curr_name in added_sheets:
+                    added_sheets.remove(curr_name)
+                if base_name in removed_sheets:
+                    removed_sheets.remove(base_name)
+                common_sheets.append(curr_name)
+                renamed_sheets[curr_name] = base_name
 
     result = WorkbookAlignment(
-        common_sheets=[n for n in base_names if n in set(curr_names)],
-        added_sheets=[n for n in curr_names if n not in set(base_names)],
-        removed_sheets=[n for n in base_names if n not in set(curr_names)],
+        common_sheets=common_sheets,
+        added_sheets=added_sheets,
+        removed_sheets=removed_sheets,
+        renamed_sheets=renamed_sheets,
     )
 
     total = len(result.common_sheets)
@@ -951,7 +1016,7 @@ def align_workbooks(
         sheet_profile = profile.sheet_profile(sheet_name) if profile else None
         if sheet_profile is not None and sheet_profile.ignore:
             continue
-        base_sheet = baseline.sheet(sheet_name)
+        base_sheet = baseline.sheet(result.baseline_sheet_name_for(sheet_name))
         curr_sheet = current.sheet(sheet_name)
         base_regions = detect_regions(base_sheet, sheet_profile)
         curr_regions = detect_regions(curr_sheet, sheet_profile)
@@ -960,8 +1025,20 @@ def align_workbooks(
         )
         result.unpaired_baseline_regions.extend(unpaired_base)
         result.unpaired_current_regions.extend(unpaired_curr)
+        extra_row_identity_rules = (
+            execution_bindings.row_identity_rules(member_id, sheet_name)
+            if execution_bindings is not None
+            else ()
+        )
         region_alignments = [
-            align_regions(base_sheet, curr_sheet, base_region, curr_region, sheet_profile)
+            align_regions(
+                base_sheet,
+                curr_sheet,
+                base_region,
+                curr_region,
+                sheet_profile,
+                extra_row_identity_rules,
+            )
             for base_region, curr_region in pairs
         ]
         result.regions[sheet_name] = region_alignments

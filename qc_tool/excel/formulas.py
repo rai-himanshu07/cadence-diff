@@ -33,6 +33,7 @@ import logging
 import re
 import time
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from openpyxl.formula.tokenizer import TokenizerError
@@ -123,12 +124,64 @@ def to_r1c1(formula: str, host_row: int, host_col: int) -> str:
     return "=" + "".join(rendered)
 
 
-def _normalize_formula(cell: CellRecord, row: int, col: int) -> str:
+def rewrite_renamed_sheet_references(
+    formula: str, rename_map: Mapping[str, str]
+) -> str:
+    """Rewrite RANGE-subtype sheet-qualified references in ``formula`` (A1
+    text) from an old sheet name to its confirmed new name (plan-20260913,
+    Step 3), leaving every other token -- including string literals and
+    function/name tokens that merely contain the old name as a substring --
+    untouched.
+
+    Used only when a confirmed logical sheet rename applies to the sheet
+    being normalized; the rewritten text then feeds ``to_r1c1`` so a pure
+    rename never manufactures a spurious formula-text difference. An empty
+    ``rename_map`` is a no-op, returning ``formula`` unchanged.
+    """
+    if not rename_map:
+        return formula
+    try:
+        tokens = tokenize_formula(formula)
+    except Exception:
+        return formula
+    rendered: list[str] = []
+    changed = False
+    for token in tokens:
+        if token.type == "OPERAND" and token.subtype == "RANGE" and "!" in token.value:
+            sheet_prefix, sep, ref = token.value.rpartition("!")
+            bare = sheet_prefix.strip("'")
+            new_name = rename_map.get(bare)
+            if new_name is not None and new_name != bare:
+                rendered.append(sheet_prefix.replace(bare, new_name, 1) + sep + ref)
+                changed = True
+                continue
+        rendered.append(token.value)
+    if not changed:
+        return formula
+    return "=" + "".join(rendered)
+
+
+def _normalize_formula(
+    cell: CellRecord,
+    row: int,
+    col: int,
+    rename_map: Mapping[str, str] | None = None,
+) -> str:
     """R1C1 text for a cell: the adapter-supplied value when present
     (currently only the cadence-diff native engine, already validated per definition
     -- see `qc_tool.io.native_formula._validated_r1c1_cells`), else computed
     here from `cell.formula`.
+
+    ``rename_map`` -- non-empty only when a confirmed logical sheet rename
+    applies to this cell's sheet -- always forces a fresh recompute from
+    rewritten A1 text, bypassing any adapter-supplied ``formula_r1c1``,
+    since a cached/adapter R1C1 value cannot know about a rename that
+    happened after it was produced.
     """
+    if rename_map:
+        return to_r1c1(
+            rewrite_renamed_sheet_references(cell.formula or "", rename_map), row, col
+        )
     if cell.formula_r1c1 is not None:
         return cell.formula_r1c1
     return to_r1c1(cell.formula or "", row, col)
@@ -865,7 +918,11 @@ def _error_findings(
     for sheet in current.sheets:
         sheet_profile = profile.sheet_profile(sheet.name) if profile is not None else None
         regions = aligned.get(sheet.name, [])
-        base_sheet = baseline.sheet(sheet.name) if regions else None
+        base_sheet = (
+            baseline.sheet(alignment.baseline_sheet_name_for(sheet.name))
+            if regions
+            else None
+        )
         saved_error_findings: list[tuple[Finding, int, int, str, CellRecord]] = []
         for (row, col), cell in sorted(sheet.cells.items()):
             if _ignored(sheet_profile, row, col):
@@ -1301,6 +1358,7 @@ def _paired_cell_findings(
     pair_key_telemetry: PairKeyTelemetry | None = None,
     pair_analysis_memo: FormulaPairAnalysisMemo | None = None,
     use_native_delta: bool = True,
+    rename_map: Mapping[str, str] | None = None,
 ) -> list[Finding]:
     findings = []
     sheet_name = curr_sheet.name
@@ -1420,13 +1478,24 @@ def _paired_cell_findings(
                     telemetry.exact_text_same_host_pairs += 1
                 continue
             norm_start = time.perf_counter()
-            base_r1c1 = base_cell.formula_r1c1 if base_cell is not None else None
-            base_norm = (
-                base_r1c1
-                if base_r1c1 is not None
-                else to_r1c1(base_formula, base_row, base_col)
-            )
-            calls = 0 if base_r1c1 is not None else 1
+            if rename_map:
+                # A confirmed sheet rename applies here: any cached/adapter
+                # R1C1 was computed before the rename was known, so always
+                # recompute from rewritten A1 text rather than trusting it.
+                base_norm = to_r1c1(
+                    rewrite_renamed_sheet_references(base_formula, rename_map),
+                    base_row,
+                    base_col,
+                )
+                calls = 1
+            else:
+                base_r1c1 = base_cell.formula_r1c1 if base_cell is not None else None
+                base_norm = (
+                    base_r1c1
+                    if base_r1c1 is not None
+                    else to_r1c1(base_formula, base_row, base_col)
+                )
+                calls = 0 if base_r1c1 is not None else 1
             if current_memo is not None:
                 curr_r1c1 = curr_cell.formula_r1c1 if curr_cell is not None else None
                 curr_norm, memo_hit = current_memo.normalize(
@@ -1807,9 +1876,16 @@ def diff_workbook_formulas(
             baseline.formula_source,
             current.formula_source,
         )
+    #: Full workbook rename map (baseline name -> current name), covering
+    #: every confirmed logical sheet rename -- a formula on any sheet may
+    #: cross-reference another renamed sheet, not only its own.
+    rename_map = {
+        baseline_name: current_name
+        for current_name, baseline_name in alignment.renamed_sheets.items()
+    }
     for sheet_name, regions in alignment.regions.items():
         check_cancelled(cancellation_token)
-        base_sheet = baseline.sheet(sheet_name)
+        base_sheet = baseline.sheet(alignment.baseline_sheet_name_for(sheet_name))
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name) if profile is not None else None
         for region in regions:
@@ -1833,6 +1909,7 @@ def diff_workbook_formulas(
                     pair_key_telemetry=pair_key_telemetry,
                     pair_analysis_memo=pair_analysis_memo,
                     use_native_delta=_use_native_delta,
+                    rename_map=rename_map,
                 )
             )
             if compare_text:

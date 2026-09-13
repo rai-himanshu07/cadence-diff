@@ -29,6 +29,7 @@ from qc_tool.availability import (
     excel_availability_issues,
     ppt_availability_issues,
 )
+from qc_tool.config.execution import ExecutionBindings, build_execution_bindings
 from qc_tool.config.profile import (
     CrosscheckProfile,
     DeliverableProfile,
@@ -38,6 +39,7 @@ from qc_tool.config.profile import (
     profile_for_excel_member,
     resolve_output_policy,
 )
+from qc_tool.config.resolved_input import ResolvedInputConfigurationV1
 from qc_tool.coverage import (
     CoverageItem,
     CoverageState,
@@ -112,7 +114,7 @@ from qc_tool.excel.workbook_risks import (
     external_link_reachability_coverage,
     workbook_risk_findings,
 )
-from qc_tool.findings import Finding, FindingClass, Severity
+from qc_tool.findings import Finding, FindingClass, LogicalFindingAddress, Severity
 from qc_tool.findings_store import (
     BLOCK_FINDINGS,
     FindingSequence,
@@ -638,7 +640,7 @@ def _run_value_parts(
     part_index = 0
     for sheet_name, regions in alignment.regions.items():
         check_cancelled(cancellation_token)
-        base_sheet = baseline.sheet(sheet_name)
+        base_sheet = baseline.sheet(alignment.baseline_sheet_name_for(sheet_name))
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name)
         for region in regions:
@@ -925,7 +927,7 @@ def _ranked_table_suggestions(
     """
     items: list[RunActionItem] = []
     for sheet_name, regions in alignment.regions.items():
-        base_sheet = baseline.sheet(sheet_name)
+        base_sheet = baseline.sheet(alignment.baseline_sheet_name_for(sheet_name))
         curr_sheet = current.sheet(sheet_name)
         for region in regions:
             if region.current.orientation != "block":
@@ -1538,6 +1540,33 @@ def _run_multi_package(
     return result
 
 
+def _attach_logical_addresses(
+    findings: list[Finding],
+    execution_bindings: ExecutionBindings | None,
+    member_id: str,
+) -> None:
+    """Attach a bounded, content-free ``LogicalFindingAddress`` (sheet-level
+    granularity; plan-20260913, Step 3) to every finding whose sheet
+    resolves to a logical sheet id under ``execution_bindings``. A no-op
+    when bindings are absent, matching every other execution-binding
+    consumer's legacy-preserving default.
+
+    Region/column/row-key granularity is deferred to Step 8, which deepens
+    region and column semantics for value-diffing; only the member/sheet
+    level is populated here.
+    """
+    if execution_bindings is None:
+        return
+    for finding in findings:
+        if finding.sheet is None:
+            continue
+        sheet_id = execution_bindings.logical_sheet_id(member_id, finding.sheet)
+        if sheet_id is not None:
+            finding.logical_address = LogicalFindingAddress(
+                member_id=member_id, sheet_id=sheet_id
+            )
+
+
 def run_qc(
     *,
     baseline_excel: Path | None = None,
@@ -1565,6 +1594,7 @@ def run_qc(
     _formula_telemetry: FormulaComparisonTelemetry | None = None,
     _pair_key_telemetry: PairKeyTelemetry | None = None,
     _population_telemetry: PopulationTelemetry | None = None,
+    _resolved_input_configuration: ResolvedInputConfigurationV1 | None = None,
 ) -> QCRunResult:
     """Run a full QC comparison. ``passwords`` is keyed by file name.
 
@@ -1601,6 +1631,15 @@ def run_qc(
     conservative built-in policy); ``atomic`` forces population output off
     regardless of profile. The resolved policy is recorded on the returned
     result as ``resolved_output_policy``; ``profile_sha256`` is unaffected.
+    ``_resolved_input_configuration`` (plan-20260913, Step 3) is a private,
+    engine-native execution input: when its logical member matches
+    ``"primary"``, confirmed sheet renames and execution-confirmed keyed
+    regions drive ``align_workbooks`` directly instead of automatic
+    name-equality pairing and detection. ``None`` (the default) is a
+    byte-identical no-op. Not yet threaded through ``_run_multi_package``'s
+    recursive calls -- a disclosed scope decision matching this project's
+    own precedent for ``_native_compat_mode``; every package member besides
+    ``"primary"`` is unaffected until a later step extends it.
     """
     check_cancelled(cancellation_token)
     mode = QCRunMode(mode)
@@ -2071,6 +2110,7 @@ def run_qc(
                 )
         result.files["baseline_excel"] = baseline_excel.name
         result.files["current_excel"] = current_excel.name
+        execution_bindings = build_execution_bindings(_resolved_input_configuration)
         if base_wb.formula_source is not None:
             result.formula_engines["baseline_excel"] = base_wb.formula_source
         if curr_wb.formula_source is not None:
@@ -2129,6 +2169,7 @@ def run_qc(
             profile,
             cancellation_token=cancellation_token,
             on_sheet=_align_tick,
+            execution_bindings=execution_bindings,
         )
         result.alignment_trust = build_alignment_trust_manifest(alignment)
         alignment_manifest = result.alignment_trust
@@ -2245,6 +2286,7 @@ def run_qc(
             profile,
         )
         check_cancelled(cancellation_token)
+        _attach_logical_addresses(structure_findings, execution_bindings, "primary")
         post_batches.append(structure_findings)
         base_chart_state, base_chart_detail = chart_reference_coverage(base_wb)
         curr_chart_state, curr_chart_detail = chart_reference_coverage(curr_wb)
@@ -2380,6 +2422,7 @@ def run_qc(
             pair_analysis_memo=pair_analysis_memo,
         )
         check_cancelled(cancellation_token)
+        _attach_logical_addresses(formula_findings, execution_bindings, "primary")
         post_batches.append(formula_findings)
         # Measured while COMPARING_FORMULAS is still open (not
         # INDEXING_DEPENDENCIES): on a large real workbook this cost-driver

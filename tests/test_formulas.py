@@ -22,6 +22,7 @@ from qc_tool.excel.formulas import (
     diff_workbook_formulas,
     formula_text_comparable,
     formula_token_diff,
+    rewrite_renamed_sheet_references,
     to_r1c1,
 )
 from qc_tool.excel.regions import TableRegion
@@ -89,6 +90,117 @@ def test_to_r1c1(formula: str, row: int, col: int, expected: str) -> None:
 )
 def test_differs_only_by_extension(base: str, curr: str, expected: bool) -> None:
     assert _differs_only_by_extension(base, curr) is expected
+
+
+# --- plan-20260913 Step 3: confirmed-rename formula normalization ----------
+
+
+@pytest.mark.parametrize(
+    ("formula", "rename_map", "expected"),
+    [
+        ("=Sheet2025!A1", {"Sheet2025": "Sheet2026"}, "=Sheet2026!A1"),
+        ("='Sheet 2025'!A1", {"Sheet 2025": "Sheet 2026"}, "='Sheet 2026'!A1"),
+        # Untouched: no rename applies to this sheet.
+        ("=Other!A1", {"Sheet2025": "Sheet2026"}, "=Other!A1"),
+        # Untouched: same-sheet reference has no qualifying prefix at all.
+        ("=A1+B1", {"Sheet2025": "Sheet2026"}, "=A1+B1"),
+        # A string literal that happens to contain the old name is untouched.
+        ('="Sheet2025 report"', {"Sheet2025": "Sheet2026"}, '="Sheet2025 report"'),
+        # Empty map is always a no-op.
+        ("=Sheet2025!A1", {}, "=Sheet2025!A1"),
+    ],
+)
+def test_rewrite_renamed_sheet_references(
+    formula: str, rename_map: Mapping[str, str], expected: str
+) -> None:
+    assert rewrite_renamed_sheet_references(formula, rename_map) == expected
+
+
+def test_a_pure_rename_produces_no_formula_logic_changed_finding() -> None:
+    """A formula that only differs because its own sheet was renamed must
+    not be reported -- the rename itself is a separate structural finding
+    (SHEET_RENAMED), not a per-cell formula cascade.
+    """
+    base_sheet = SheetSnapshot(
+        name="Sheet2025",
+        visibility="visible",
+        max_row=1,
+        max_column=1,
+        cells={(1, 1): CellRecord(row=1, column=1, value=10, formula="=Sheet2025!B1")},
+    )
+    curr_sheet = SheetSnapshot(
+        name="Sheet2026",
+        visibility="visible",
+        max_row=1,
+        max_column=1,
+        cells={(1, 1): CellRecord(row=1, column=1, value=10, formula="=Sheet2026!B1")},
+    )
+    baseline = WorkbookSnapshot(
+        "b.xlsx", "xlsx", True, True, formula_presence_available=True
+    )
+    baseline.sheets = [base_sheet]
+    current = WorkbookSnapshot(
+        "c.xlsx", "xlsx", True, True, formula_presence_available=True
+    )
+    current.sheets = [curr_sheet]
+    region = RegionAlignment(
+        baseline=TableRegion("Sheet2025", 1, 1, 1, 1, "block", None, None, "none"),
+        current=TableRegion("Sheet2026", 1, 1, 1, 1, "block", None, None, "none"),
+        rows=AxisAlignment(pairs=[(1, 1)]),
+        columns=AxisAlignment(pairs=[(1, 1)]),
+    )
+    alignment = WorkbookAlignment(
+        common_sheets=["Sheet2026"],
+        renamed_sheets={"Sheet2026": "Sheet2025"},
+        regions={"Sheet2026": [region]},
+    )
+
+    findings = diff_workbook_formulas(baseline, current, alignment)
+
+    assert [f.finding_class for f in findings] == []
+
+
+def test_a_real_logic_change_still_reports_despite_a_confirmed_rename() -> None:
+    """A rename must never mask a genuine formula-logic change on the same
+    sheet -- unmapped/real differences remain findings.
+    """
+    base_sheet = SheetSnapshot(
+        name="Sheet2025",
+        visibility="visible",
+        max_row=1,
+        max_column=1,
+        cells={(1, 1): CellRecord(row=1, column=1, value=10, formula="=Sheet2025!B1")},
+    )
+    curr_sheet = SheetSnapshot(
+        name="Sheet2026",
+        visibility="visible",
+        max_row=1,
+        max_column=1,
+        cells={(1, 1): CellRecord(row=1, column=1, value=10, formula="=Sheet2026!B2")},
+    )
+    baseline = WorkbookSnapshot(
+        "b.xlsx", "xlsx", True, True, formula_presence_available=True
+    )
+    baseline.sheets = [base_sheet]
+    current = WorkbookSnapshot(
+        "c.xlsx", "xlsx", True, True, formula_presence_available=True
+    )
+    current.sheets = [curr_sheet]
+    region = RegionAlignment(
+        baseline=TableRegion("Sheet2025", 1, 1, 1, 1, "block", None, None, "none"),
+        current=TableRegion("Sheet2026", 1, 1, 1, 1, "block", None, None, "none"),
+        rows=AxisAlignment(pairs=[(1, 1)]),
+        columns=AxisAlignment(pairs=[(1, 1)]),
+    )
+    alignment = WorkbookAlignment(
+        common_sheets=["Sheet2026"],
+        renamed_sheets={"Sheet2026": "Sheet2025"},
+        regions={"Sheet2026": [region]},
+    )
+
+    findings = diff_workbook_formulas(baseline, current, alignment)
+
+    assert [f.finding_class for f in findings] == [FindingClass.FORMULA_LOGIC_CHANGED]
 
 
 def test_formula_token_diff_marks_one_reference_replacement() -> None:

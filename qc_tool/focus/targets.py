@@ -88,6 +88,9 @@ FINDING_CLASS_RULES: dict[FindingClass, TargetRule] = {
     # --- Excel sheet-level evidence ------------------------------------------
     FindingClass.SHEET_ADDED: TargetRule.EXCEL_SHEET_CURRENT,
     FindingClass.SHEET_REMOVED: TargetRule.EXCEL_SHEET_BASELINE,
+    #: A rename's content lives in the current sheet; the same convention
+    #: SHEET_ADDED already uses.
+    FindingClass.SHEET_RENAMED: TargetRule.EXCEL_SHEET_CURRENT,
     FindingClass.WORKBOOK_ADDED: TargetRule.NONE,
     FindingClass.WORKBOOK_REMOVED: TargetRule.NONE,
     # Focus never unhides a worksheet, so a hidden-state change has no target.

@@ -166,6 +166,7 @@ FINDING_EVIDENCE_FIELDS: dict[str, EvidenceFieldRole] = {
     "waiver_expires": EvidenceFieldRole.INCLUDED,
     "counterfactual_basis": EvidenceFieldRole.EXCLUDED,
     "series_anchor": EvidenceFieldRole.EXCLUDED,
+    "logical_address": EvidenceFieldRole.EXCLUDED,
     "population": EvidenceFieldRole.INCLUDED,
 }
 

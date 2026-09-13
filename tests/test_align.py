@@ -5,7 +5,15 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
+from qc_tool.config.execution import ExecutionBindings
 from qc_tool.config.profile import DeliverableProfile
+from qc_tool.config.resolved_input import (
+    ResolvedColumn,
+    ResolvedInputConfigurationV1,
+    ResolvedMember,
+    ResolvedRegion,
+    ResolvedSheet,
+)
 from qc_tool.coverage import CoverageState
 from qc_tool.engine import run_qc
 from qc_tool.excel.align import (
@@ -344,3 +352,129 @@ def test_full_cycle_result_carries_alignment_trust(qc_result) -> None:
     assert trust.version == 1
     assert trust.regions
     assert sum(region.comparable_cell_pairs for region in trust.regions) > 0
+
+
+# --- plan-20260913 Step 3: execution bindings drive alignment directly -----
+
+
+def _write_renamed_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """A tiny keyed table on a sheet named ``Sheet2025`` in baseline and
+    ``Sheet2026`` in current -- the same rows, shuffled, one value changed.
+    """
+    baseline_path = tmp_path / "renamed_baseline.xlsx"
+    current_path = tmp_path / "renamed_current.xlsx"
+
+    base_wb = Workbook()
+    base_ws = base_wb.active
+    assert base_ws is not None
+    base_ws.title = "Sheet2025"
+    base_ws.append(["ID", "Amount"])
+    base_ws.append(["A1", 10])
+    base_ws.append(["A2", 20])
+    base_ws.append(["A3", 30])
+    base_wb.save(baseline_path)
+
+    curr_wb = Workbook()
+    curr_ws = curr_wb.active
+    assert curr_ws is not None
+    curr_ws.title = "Sheet2026"
+    curr_ws.append(["ID", "Amount"])
+    curr_ws.append(["A3", 30])
+    curr_ws.append(["A1", 10])
+    curr_ws.append(["A2", 25])  # genuine value change
+    curr_wb.save(current_path)
+    return baseline_path, current_path
+
+
+def _renamed_execution_bindings() -> ExecutionBindings:
+    resolved = ResolvedInputConfigurationV1(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        baseline_sheet_name="Sheet2025",
+                        current_sheet_name="Sheet2026",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="r1",
+                                mode="keyed",
+                                header_intent="first_data_row",
+                                current_data_range="A2:B4",
+                                current_first_data_row=2,
+                                columns=(
+                                    ResolvedColumn(
+                                        column_id="id",
+                                        current_letter="A",
+                                        alignment_role="identity",
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    return ExecutionBindings(resolved)
+
+
+def test_confirmed_rename_pairs_sheets_with_no_add_remove(tmp_path: Path) -> None:
+    baseline_path, current_path = _write_renamed_pair(tmp_path)
+    base_snapshot = load_workbook_snapshot(baseline_path)
+    curr_snapshot = load_workbook_snapshot(current_path)
+
+    alignment = align_workbooks(
+        base_snapshot,
+        curr_snapshot,
+        execution_bindings=_renamed_execution_bindings(),
+    )
+
+    assert alignment.added_sheets == []
+    assert alignment.removed_sheets == []
+    assert alignment.renamed_sheets == {"Sheet2026": "Sheet2025"}
+    assert "Sheet2026" in alignment.common_sheets
+
+
+def test_execution_bound_keyed_region_drives_row_alignment(tmp_path: Path) -> None:
+    baseline_path, current_path = _write_renamed_pair(tmp_path)
+    base_snapshot = load_workbook_snapshot(baseline_path)
+    curr_snapshot = load_workbook_snapshot(current_path)
+
+    alignment = align_workbooks(
+        base_snapshot,
+        curr_snapshot,
+        execution_bindings=_renamed_execution_bindings(),
+    )
+
+    region = _single_region(alignment, "Sheet2026")
+    assert region.rows.method == "keys"
+    assert region.rows.identity_columns == ("A",)
+    # Row 1 (the header) pairs positionally, remaining visible outside keyed
+    # matching. Shuffled data rows pair by identity: baseline row 4 (A3)
+    # pairs with current row 2, baseline row 2 (A1) pairs with current row
+    # 3, baseline row 3 (A2) pairs with current row 4 -- pure reorder, zero
+    # deletions/insertions.
+    assert sorted(region.rows.pairs) == [(1, 1), (2, 3), (3, 4), (4, 2)]
+    assert region.rows.deleted == []
+    assert region.rows.inserted == []
+
+
+def test_without_execution_bindings_a_renamed_sheet_is_add_plus_remove(
+    tmp_path: Path,
+) -> None:
+    """Legacy behavior guard: with no execution bindings, a physical rename
+    is still ordinary sheet_removed + sheet_added -- byte-identical to
+    before this module existed.
+    """
+    baseline_path, current_path = _write_renamed_pair(tmp_path)
+    base_snapshot = load_workbook_snapshot(baseline_path)
+    curr_snapshot = load_workbook_snapshot(current_path)
+
+    alignment = align_workbooks(base_snapshot, curr_snapshot)
+
+    assert alignment.added_sheets == ["Sheet2026"]
+    assert alignment.removed_sheets == ["Sheet2025"]
+    assert alignment.renamed_sheets == {}
+    assert alignment.regions == {}

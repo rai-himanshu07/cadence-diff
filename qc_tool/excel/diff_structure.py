@@ -45,6 +45,19 @@ def _sheet_findings(alignment: WorkbookAlignment) -> list[Finding]:
         )
         for name in alignment.removed_sheets
     )
+    findings.extend(
+        Finding(
+            artifact="excel",
+            finding_class=FindingClass.SHEET_RENAMED,
+            sheet=current_name,
+            baseline_location=baseline_name,
+            message=(
+                f"sheet {baseline_name!r} renamed to {current_name!r} "
+                "(confirmed mapping)"
+            ),
+        )
+        for current_name, baseline_name in sorted(alignment.renamed_sheets.items())
+    )
     return findings
 
 
@@ -53,7 +66,7 @@ def _visibility_findings(
 ) -> list[Finding]:
     findings = []
     for name in alignment.common_sheets:
-        base_state = baseline.sheet(name).visibility
+        base_state = baseline.sheet(alignment.baseline_sheet_name_for(name)).visibility
         curr_state = current.sheet(name).visibility
         if base_state != curr_state:
             findings.append(

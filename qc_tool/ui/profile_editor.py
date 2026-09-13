@@ -51,6 +51,7 @@ EDITOR_SECTIONS: dict[str, tuple[tuple[str, ...], ...]] = {
         ("excel", "members"),
         ("ppt",),
         ("review_policy",),
+        ("input_contract",),
     ),
 }
 

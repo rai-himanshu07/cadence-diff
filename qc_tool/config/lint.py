@@ -15,6 +15,7 @@ from typing import Literal
 from openpyxl.utils import column_index_from_string
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
+from qc_tool.config.compat import region_authority_conflicts
 from qc_tool.config.profile import (
     DeliverableProfile,
     legacy_excel_profile_is_empty,
@@ -283,6 +284,9 @@ def lint_profile(
 ) -> list[LintIssue]:
     issues: list[LintIssue] = []
     sheet_names = set(workbook.sheet_names) if workbook is not None else None
+
+    for conflict in region_authority_conflicts(profile):
+        issues.append(LintIssue("error", "input_contract", conflict))
 
     def check_sheet_exists(where: str, name: str) -> None:
         if sheet_names is not None and name not in sheet_names:

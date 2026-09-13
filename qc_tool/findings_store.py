@@ -54,6 +54,8 @@ def finding_payload(finding: Finding) -> dict[str, Any]:
         )
     if finding.series_anchor is not None:
         payload["series_anchor"] = finding.series_anchor.model_dump(mode="json")
+    if finding.logical_address is not None:
+        payload["logical_address"] = finding.logical_address.model_dump(mode="json")
     return payload
 
 
@@ -63,6 +65,7 @@ _PRIVATE_PAYLOAD_KEYS = frozenset(
         "baseline_focus_shape_id",
         "counterfactual_basis",
         "series_anchor",
+        "logical_address",
     }
 )
 

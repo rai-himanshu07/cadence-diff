@@ -119,6 +119,8 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.CHART_GEOMETRY_CHANGED: Severity.INFO,
     FindingClass.PPT_SHAPE_GEOMETRY_CHANGED: Severity.INFO,
     FindingClass.SHEET_ADDED: Severity.INFO,
+    #: A confirmed, analyst-recognized logical rename -- not a surprise.
+    FindingClass.SHEET_RENAMED: Severity.INFO,
     FindingClass.WORKBOOK_ADDED: Severity.INFO,
     FindingClass.SLIDE_ADDED: Severity.INFO,
     FindingClass.SLIDE_REORDERED: Severity.INFO,

@@ -45,6 +45,9 @@ class FindingClass(StrEnum):
     COLUMN_GROWTH = "column_growth"
     SHEET_ADDED = "sheet_added"
     SHEET_REMOVED = "sheet_removed"
+    #: One analyst-confirmed logical rename, replacing what would otherwise
+    #: be a SHEET_REMOVED+SHEET_ADDED pair (plan-20260913, Step 3).
+    SHEET_RENAMED = "sheet_renamed"
     WORKBOOK_ADDED = "workbook_added"
     WORKBOOK_REMOVED = "workbook_removed"
     HIDDEN_CHANGED = "hidden_changed"
@@ -298,6 +301,26 @@ class SeriesAnchorV2(BaseModel):
     model_config = {"frozen": True}
 
 
+class LogicalFindingAddress(BaseModel):
+    """Bounded, content-free private address tying a finding to the saved
+    logical member/sheet/region/column bindings that produced it
+    (plan-20260913, Step 3).
+
+    Never a sheet name, range, formula, or cell value -- only stable logical
+    ids and, for a keyed row, a one-way digest of its identity key (never
+    the raw key values themselves).
+    """
+
+    version: Literal[1] = 1
+    member_id: str = Field(min_length=1, max_length=64)
+    sheet_id: str = Field(min_length=1, max_length=64)
+    region_id: str | None = Field(default=None, max_length=64)
+    column_id: str | None = Field(default=None, max_length=64)
+    row_key_digest: str | None = Field(default=None, min_length=64, max_length=64)
+
+    model_config = {"frozen": True}
+
+
 #: Readable anchor versions. V1 payloads keep their exact stored digest.
 SeriesAnchor = SeriesAnchorV1 | SeriesAnchorV2
 
@@ -426,6 +449,12 @@ class Finding(BaseModel):
         default=None, exclude=True
     )
 
+    #: Private logical member/sheet/region/column address, attached only
+    #: when an execution-bound region produced this finding (Step 3).
+    logical_address: LogicalFindingAddress | None = Field(
+        default=None, exclude=True
+    )
+
     #: Group-first population evidence. None means atomic (the legacy,
     #: always-on default). When set, ``element`` is "population" and
     #: ``location`` is the bounding range of the current-side rectangles.
@@ -486,6 +515,9 @@ class Finding(BaseModel):
                 SeriesAnchorV2 if anchor.get("version") == 2 else SeriesAnchorV1
             )
             data["series_anchor"] = anchor_model.model_construct(**anchor)
+        address = data.get("logical_address")
+        if address is not None:
+            data["logical_address"] = LogicalFindingAddress.model_construct(**address)
         population = data.get("population")
         if isinstance(population, dict):
             membership = population["membership"]
