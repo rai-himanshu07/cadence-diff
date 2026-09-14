@@ -14,7 +14,7 @@ from qc_tool.engine import QCRunResult, run_qc
 from qc_tool.findings import Finding, FindingClass
 from qc_tool.history.store import RunHistory
 from qc_tool.io.loader import load_workbook_snapshot
-from qc_tool.io.peek import peek_sheet_names, peek_slide_titles
+from qc_tool.io.peek import peek_sheet_names, peek_sheet_visibility, peek_slide_titles
 from qc_tool.package import PackageManifest
 from qc_tool.report.json_report import result_payload
 from qc_tool.review import build_pattern_groups
@@ -85,6 +85,34 @@ def test_peek_sheet_names(tmp_path: Path) -> None:
     baseline, _ = _write_pair(tmp_path)
     assert peek_sheet_names(baseline) == ["Alpha", "Beta"]
     assert peek_sheet_names(tmp_path / "missing.xlsx") == []
+
+
+def test_peek_sheet_visibility_reports_hidden_and_very_hidden(tmp_path: Path) -> None:
+    workbook = Workbook()
+    workbook.remove(workbook.active)  # type: ignore[arg-type]
+    visible_sheet = workbook.create_sheet("Visible")
+    visible_sheet.append(["a"])
+    hidden_sheet = workbook.create_sheet("Hidden")
+    hidden_sheet.append(["b"])
+    hidden_sheet.sheet_state = "hidden"
+    very_hidden_sheet = workbook.create_sheet("VeryHidden")
+    very_hidden_sheet.append(["c"])
+    very_hidden_sheet.sheet_state = "veryHidden"
+    path = tmp_path / "visibility.xlsx"
+    workbook.save(path)
+
+    assert peek_sheet_visibility(path) == {
+        "Visible": "visible",
+        "Hidden": "hidden",
+        "VeryHidden": "veryHidden",
+    }
+
+
+def test_peek_sheet_visibility_is_empty_for_unsupported_or_missing(
+    tmp_path: Path,
+) -> None:
+    assert peek_sheet_visibility(tmp_path / "missing.xlsx") == {}
+    assert peek_sheet_visibility(tmp_path / "missing.xlsb") == {}
 
 
 def test_peek_slide_titles_unreadable_is_empty(tmp_path: Path) -> None:

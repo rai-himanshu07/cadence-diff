@@ -41,6 +41,28 @@ def peek_sheet_names(path: Path) -> list[str]:
     return []
 
 
+def peek_sheet_visibility(path: Path) -> dict[str, str]:
+    """Worksheet name -> ``"visible"``/``"hidden"``/``"veryHidden"`` for an
+    xlsx/xlsm workbook, or {} when unreadable or unsupported (xlsb: the
+    full structural scan already reports visibility via
+    ``SheetSnapshot.visibility`` regardless of this lightweight peek path).
+    """
+    suffix = path.suffix.lower()
+    if suffix not in (".xlsx", ".xlsm"):
+        return {}
+    try:
+        with zipfile.ZipFile(path) as archive:
+            root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        return {
+            name: sheet.get("state", "visible")
+            for sheet in root.iter(f"{_MAIN_NS}sheet")
+            if (name := sheet.get("name"))
+        }
+    except Exception as exc:
+        logger.info("sheet visibility peek unavailable for %s: %s", path.name, exc)
+        return {}
+
+
 def peek_slide_titles(path: Path) -> list[tuple[int, str]]:
     """(1-based index, title) per slide, or [] when unreadable."""
     try:
