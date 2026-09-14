@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import datetime as dt
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,10 +39,9 @@ from qc_tool.config.profile import (
     save_profile,
 )
 from qc_tool.coverage import QCRunMode
-from qc_tool.history.config_session import ConfigSessionStore, session_key_for
+from qc_tool.history.config_session import ConfigSessionStore
 from qc_tool.history.store import sha256_file
 from qc_tool.package import PackageManifest
-from qc_tool.projection import project_cycle_volume
 from qc_tool.runqueue import QueueBusyError, RunQueueManager, run_exclusive
 from qc_tool.setup.models import MemberSetupProfile, SetupAnalysisResult
 from qc_tool.setup.preview_worker import (
@@ -54,19 +52,27 @@ from qc_tool.setup.preview_worker import (
 )
 from qc_tool.ui.config_review import (
     ConfigWorkspaceState,
-    DiffEntry,
     MemberReview,
+    SelectorDecision,
+    add_selector,
     apply_anchor_click,
     apply_manual_range,
     apply_region_transform,
     build_input_contract,
     build_resolved_configuration,
+    compute_sheet_pairing_warnings,
     compute_warnings,
     confirm_all_regions,
     diff_profile_against_scan,
     is_clean_profile_diff,
     member_review_from_scan,
     parse_a1_cell,
+    remove_selector,
+    set_expected_refresh_columns,
+    set_identity_columns,
+    set_ignore_columns,
+    set_ordinal_columns,
+    set_sheet_rename,
     sheet_pairing,
     unresolved_blockers,
     update_region_decision,
@@ -439,6 +445,12 @@ def _coerce_float(value: object, default: float) -> float:
     return float(value)
 
 
+def _coerce_int(value: object, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return value
+
+
 def _coerce_optional_int(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -457,11 +469,21 @@ def _serialize_region(region) -> dict[str, object]:
         "region_id": region.region_id,
         "mode": region.mode,
         "header_intent": region.header_intent,
+        "first_data_row": region.first_data_row,
+        "preamble_rows": region.preamble_rows,
+        "footer_rows": region.footer_rows,
+        "baseline_range": region.baseline_range,
         "identity_columns": list(region.identity_columns),
         "ordinal_columns": list(region.ordinal_columns),
+        "ignore_columns": list(region.ignore_columns),
+        "expected_refresh_columns": list(region.expected_refresh_columns),
+        "trim_identity_whitespace": region.trim_identity_whitespace,
+        "blank_key_policy": region.blank_key_policy,
         "duplicate_key_policy": region.duplicate_key_policy,
         "exclusion_reason": region.exclusion_reason,
         "exclusion_expires_on": region.exclusion_expires_on,
+        "ignore_columns_reason": region.ignore_columns_reason,
+        "ignore_columns_expires_on": region.ignore_columns_expires_on,
         "confirmed": region.confirmed,
     }
 
@@ -489,17 +511,87 @@ def _apply_saved_region_choices(
                     region,
                     mode=saved_region.get("mode", region.mode),
                     header_intent=saved_region.get("header_intent", region.header_intent),
+                    first_data_row=(
+                        _coerce_optional_int(saved_region["first_data_row"])
+                        if "first_data_row" in saved_region
+                        else region.first_data_row
+                    ),
+                    preamble_rows=_coerce_int(
+                        saved_region.get("preamble_rows"), region.preamble_rows
+                    ),
+                    footer_rows=_coerce_int(saved_region.get("footer_rows"), region.footer_rows),
+                    baseline_range=str(
+                        saved_region.get("baseline_range", region.baseline_range) or ""
+                    ),
                     identity_columns=_coerce_str_tuple(saved_region.get("identity_columns", ())),
                     ordinal_columns=_coerce_str_tuple(saved_region.get("ordinal_columns", ())),
+                    ignore_columns=_coerce_str_tuple(saved_region.get("ignore_columns", ())),
+                    expected_refresh_columns=_coerce_str_tuple(
+                        saved_region.get("expected_refresh_columns", ())
+                    ),
+                    trim_identity_whitespace=bool(
+                        saved_region.get(
+                            "trim_identity_whitespace", region.trim_identity_whitespace
+                        )
+                    ),
+                    blank_key_policy=saved_region.get("blank_key_policy", region.blank_key_policy),
                     duplicate_key_policy=saved_region.get(
                         "duplicate_key_policy", region.duplicate_key_policy
                     ),
                     exclusion_reason=saved_region.get("exclusion_reason", ""),
                     exclusion_expires_on=saved_region.get("exclusion_expires_on", ""),
+                    ignore_columns_reason=saved_region.get("ignore_columns_reason", ""),
+                    ignore_columns_expires_on=saved_region.get("ignore_columns_expires_on", ""),
                     confirmed=bool(saved_region.get("confirmed", False)),
                 )
             )
         new_sheets.append(_replace(sheet, regions=tuple(new_regions)))
+    return _replace(member, current_sheets=tuple(new_sheets))
+
+
+def _serialize_selectors(member: MemberReview) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    for sheet in member.current_sheets:
+        for selector in sheet.selectors:
+            entries.append(
+                {
+                    "sheet_name": sheet.sheet_name,
+                    "selector_id": selector.selector_id,
+                    "label": selector.label,
+                    "cell": selector.cell,
+                }
+            )
+    return entries
+
+
+def _apply_saved_selectors(member: MemberReview, saved: list[dict[str, object]]) -> MemberReview:
+    """Restore analyst-declared selector prerequisites (draft recovery),
+    matched by sheet name -- the scan is authoritative for which sheets
+    exist, the session store only for which selectors an analyst added.
+    """
+    from dataclasses import replace as _replace
+
+    by_sheet: dict[str, list[SelectorDecision]] = {}
+    for entry in saved:
+        sheet_name = str(entry.get("sheet_name", ""))
+        if not sheet_name:
+            continue
+        by_sheet.setdefault(sheet_name, []).append(
+            SelectorDecision(
+                selector_id=str(entry.get("selector_id", "")),
+                label=str(entry.get("label", "")),
+                cell=str(entry.get("cell", "")),
+            )
+        )
+    if not by_sheet:
+        return member
+    new_sheets = []
+    for sheet in member.current_sheets:
+        restored = by_sheet.get(sheet.sheet_name)
+        if not restored:
+            new_sheets.append(sheet)
+            continue
+        new_sheets.append(_replace(sheet, selectors=tuple(restored)))
     return _replace(member, current_sheets=tuple(new_sheets))
 
 
@@ -508,41 +600,40 @@ def _render_preview_grid(outcome: Any, *, on_cell_click) -> None:
     Every cell is clickable (Step 7's "click controls" criterion) so an
     armed anchor-pick action can resolve a cell without drag selection.
     """
-    with ui.element("div").classes("previewscroll"):
-        with ui.element("table").classes("previewgrid"):
-            with ui.element("thead"), ui.element("tr"):
-                ui.element("th")
-                for col_offset in range(len(outcome.rows[0]) if outcome.rows else 0):
-                    col_number = outcome.resolved_min_col + col_offset
+    with ui.element("div").classes("previewscroll"), ui.element("table").classes("previewgrid"):
+        with ui.element("thead"), ui.element("tr"):
+            ui.element("th")
+            for col_offset in range(len(outcome.rows[0]) if outcome.rows else 0):
+                col_number = outcome.resolved_min_col + col_offset
+                with ui.element("th"):
+                    ui.label(get_column_letter(col_number))
+        with ui.element("tbody"):
+            for row_offset, row_values in enumerate(outcome.rows):
+                row_number = outcome.resolved_min_row + row_offset
+                formula_row = (
+                    outcome.formula_cells[row_offset]
+                    if row_offset < len(outcome.formula_cells)
+                    else []
+                )
+                with ui.element("tr"):
                     with ui.element("th"):
-                        ui.label(get_column_letter(col_number))
-            with ui.element("tbody"):
-                for row_offset, row_values in enumerate(outcome.rows):
-                    row_number = outcome.resolved_min_row + row_offset
-                    formula_row = (
-                        outcome.formula_cells[row_offset]
-                        if row_offset < len(outcome.formula_cells)
-                        else []
-                    )
-                    with ui.element("tr"):
-                        with ui.element("th"):
-                            ui.label(str(row_number))
-                        for col_offset, text in enumerate(row_values):
-                            col_number = outcome.resolved_min_col + col_offset
-                            is_formula = (
-                                bool(formula_row[col_offset])
-                                if col_offset < len(formula_row)
-                                else False
-                            )
-                            cell = ui.element("td").classes("previewcell")
-                            if is_formula:
-                                cell.classes("previewcell-formula")
-                            with cell:
-                                ui.label(text if text else "\u00a0")
-                            cell.on(
-                                "click",
-                                lambda _event, r=row_number, c=col_number: on_cell_click(r, c),
-                            )
+                        ui.label(str(row_number))
+                    for col_offset, text in enumerate(row_values):
+                        col_number = outcome.resolved_min_col + col_offset
+                        is_formula = (
+                            bool(formula_row[col_offset])
+                            if col_offset < len(formula_row)
+                            else False
+                        )
+                        cell = ui.element("td").classes("previewcell")
+                        if is_formula:
+                            cell.classes("previewcell-formula")
+                        with cell:
+                            ui.label(text if text else "\u00a0")
+                        cell.on(
+                            "click",
+                            lambda _event, r=row_number, c=col_number: on_cell_click(r, c),
+                        )
 
 
 def render_config_workspace(
@@ -638,7 +729,9 @@ def render_config_workspace(
         actions_box = ui.row().classes("items-center gap-2 flex-wrap")
 
         workspace_state: dict[str, ConfigWorkspaceState] = {
-            "value": ConfigWorkspaceState(mode=mode, profile_name=str(choices.get("profile_name", "default")))
+            "value": ConfigWorkspaceState(
+                mode=mode, profile_name=str(choices.get("profile_name", "default"))
+            )
         }
         selected_profile: dict[str, DeliverableProfile | None] = {"value": None}
         #: One in-memory preview panel: member/sheet/window position plus the
@@ -662,14 +755,26 @@ def render_config_workspace(
         def _persist_choices() -> None:
             state = workspace_state["value"]
             region_choices: dict[str, dict[str, object]] = {}
+            selector_choices: dict[str, list[dict[str, object]]] = {}
+            rename_choices: dict[str, dict[str, str]] = {}
             for member in state.member_reviews:
                 for sheet in member.current_sheets:
                     for region in sheet.regions:
                         region_choices[region.region_id] = _serialize_region(region)
+                member_selectors = _serialize_selectors(member)
+                if member_selectors:
+                    selector_choices[member.member_id] = member_selectors
+                if member.sheet_renames:
+                    rename_choices[member.member_id] = dict(member.sheet_renames)
             session_store.save_choices(
                 session_key,
                 profile_name=state.profile_name,
-                choices={**choices, "region_decisions": region_choices},
+                choices={
+                    **choices,
+                    "region_decisions": region_choices,
+                    "selectors": selector_choices,
+                    "sheet_renames": rename_choices,
+                },
             )
 
         def _seed_member_reviews() -> None:
@@ -680,11 +785,28 @@ def render_config_workspace(
             saved_regions: dict[str, dict[str, object]] = (
                 dict(saved_regions_raw) if isinstance(saved_regions_raw, dict) else {}
             )
+            saved_selectors_raw = choices.get("selectors", {})
+            saved_selectors: dict[str, object] = (
+                dict(saved_selectors_raw) if isinstance(saved_selectors_raw, dict) else {}
+            )
+            saved_renames_raw = choices.get("sheet_renames", {})
+            saved_renames: dict[str, object] = (
+                dict(saved_renames_raw) if isinstance(saved_renames_raw, dict) else {}
+            )
             reviews = []
             for member_id, member_profile in result.members.items():
                 review = member_review_from_scan(member_id, member_profile)
                 if saved_regions:
                     review = _apply_saved_region_choices(review, saved_regions)
+                member_selectors = saved_selectors.get(member_id)
+                if isinstance(member_selectors, list):
+                    review = _apply_saved_selectors(review, member_selectors)
+                member_renames = saved_renames.get(member_id)
+                if isinstance(member_renames, dict):
+                    review = dataclasses.replace(
+                        review,
+                        sheet_renames={str(k): str(v) for k, v in member_renames.items()},
+                    )
                 reviews.append(review)
             workspace_state["value"] = dataclasses.replace(
                 workspace_state["value"], member_reviews=tuple(reviews)
@@ -708,7 +830,9 @@ def render_config_workspace(
             _persist_choices()
             refresh()
 
-        def _apply_region_transform(member_id: str, sheet_name: str, region_id: str, transform) -> None:
+        def _apply_region_transform(
+            member_id: str, sheet_name: str, region_id: str, transform
+        ) -> None:
             """Backs the "click controls"/"A1 controls" criterion: a
             transform that must recompute several region fields together
             (anchor, range, available columns) instead of one field at a
@@ -738,6 +862,121 @@ def render_config_workspace(
             workspace_state["value"] = dataclasses.replace(state, member_reviews=new_reviews)
             _persist_choices()
             refresh()
+
+        def _update_sheet_rename(
+            member_id: str, current_name: str, baseline_name: str | None
+        ) -> None:
+            """Declare or clear a renamed-sheet pairing (Step 8's "renamed
+            sheets require explicit mapping" criterion).
+            """
+            state = workspace_state["value"]
+            member = state.member_review(member_id)
+            if member is None:
+                return
+            updated_member = set_sheet_rename(member, current_name, baseline_name)
+            workspace_state["value"] = state.with_member_review(updated_member)
+            _persist_choices()
+            refresh()
+
+        def _render_sheet_rename_controls(
+            member: MemberReview, added: tuple[str, ...], removed: tuple[str, ...]
+        ) -> None:
+            """One dropdown per added (current-only) sheet, offering every
+            still-unclaimed removed (baseline-only) sheet as a rename
+            target -- promotes an added+removed pair into one logical sheet
+            instead of two separate acknowledgements.
+            """
+            claimed = set(member.sheet_renames.values())
+            for current_name in added:
+                declared = member.sheet_renames.get(current_name)
+                options = {"": "New sheet (no rename)"}
+                for baseline_name in removed:
+                    if baseline_name == declared or baseline_name not in claimed:
+                        options[baseline_name] = f"Same as {baseline_name!r}"
+
+                def _on_rename_change(
+                    event: events.ValueChangeEventArguments,
+                    member_id=member.member_id,
+                    current_name=current_name,
+                ) -> None:
+                    value = str(event.value or "")
+                    _update_sheet_rename(member_id, current_name, value or None)
+
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(f"{current_name!r} (new)").classes("note")
+                    ui.select(
+                        options, value=declared or "", on_change=_on_rename_change
+                    ).props("outlined dense").classes("w-56")
+            still_removed = [name for name in removed if name not in claimed]
+            for baseline_name in still_removed:
+                ui.label(f"{baseline_name!r} removed from the current file").classes("note")
+
+        def _add_selector(member_id: str, sheet_name: str, label: str, cell: str) -> None:
+            state = workspace_state["value"]
+            member = state.member_review(member_id)
+            if member is None:
+                return
+            try:
+                updated_member = add_selector(member, sheet_name, label=label, cell=cell)
+            except ValueError as exc:
+                ui.notify(str(exc), type="warning")
+                return
+            workspace_state["value"] = state.with_member_review(updated_member)
+            _persist_choices()
+            refresh()
+
+        def _remove_selector(member_id: str, sheet_name: str, selector_id: str) -> None:
+            state = workspace_state["value"]
+            member = state.member_review(member_id)
+            if member is None:
+                return
+            updated_member = remove_selector(member, sheet_name, selector_id)
+            workspace_state["value"] = state.with_member_review(updated_member)
+            _persist_choices()
+            refresh()
+
+        def _render_add_selector_control(member: MemberReview) -> None:
+            """A compact, always-available control (Step 8's "explicit
+            selector prerequisites for dropdown/filter/scenario/parameter
+            cells" criterion) -- reachable even for a sheet with no
+            detected table regions, since a selector cell rarely lives
+            inside one.
+            """
+            sheet_names = [sheet.sheet_name for sheet in member.current_sheets]
+            if not sheet_names:
+                return
+            with ui.row().classes("items-center gap-2 flex-wrap"):
+                ui.label("Add selector prerequisite:").classes("note")
+                sheet_select = (
+                    ui.select(sheet_names, value=sheet_names[0], label="Sheet")
+                    .props("outlined dense")
+                    .classes("w-40")
+                )
+                cell_input = ui.input("Cell (A1)").props("outlined dense").classes("w-32")
+                label_input = ui.input("Label").props("outlined dense").classes("w-40")
+
+                def _on_add(member_id=member.member_id) -> None:
+                    _add_selector(
+                        member_id,
+                        str(sheet_select.value),
+                        str(label_input.value or ""),
+                        str(cell_input.value or ""),
+                    )
+                    cell_input.set_value("")
+                    label_input.set_value("")
+
+                ui.button("Add", on_click=_on_add).props("flat dense no-caps")
+
+        def _render_selector_row(member_id: str, sheet_name: str, selector) -> None:
+            with ui.row().classes("items-center gap-2"):
+                ui.label(f"{selector.label} ({selector.cell})").classes("note")
+
+                def _on_remove(
+                    member_id=member_id, sheet_name=sheet_name, selector_id=selector.selector_id
+                ) -> None:
+                    _remove_selector(member_id, sheet_name, selector_id)
+
+                ui.button(icon="close", on_click=_on_remove).props("flat dense round size=sm")
 
         def _toggle_warning(code: str, value: bool) -> None:
             state = workspace_state["value"]
@@ -814,7 +1053,10 @@ def render_config_workspace(
                     refresh()
 
                 ui.select(
-                    options, value=current_name, label="Deliverable profile", on_change=_on_profile_change
+                    options,
+                    value=current_name,
+                    label="Deliverable profile",
+                    on_change=_on_profile_change,
                 ).classes("w-64").props("outlined dense")
                 try:
                     profile = load_profile_by_name(profiles_dir, current_name)
@@ -843,7 +1085,9 @@ def render_config_workspace(
                 if job.overall_status != "done" or not state.member_reviews:
                     return
                 any_region = any(
-                    sheet.regions for member in state.member_reviews for sheet in member.current_sheets
+                    sheet.regions
+                    for member in state.member_reviews
+                    for sheet in member.current_sheets
                 )
                 if any_region:
                     ui.button(
@@ -855,24 +1099,33 @@ def render_config_workspace(
                         note = []
                         if pairs:
                             note.append(f"{len(pairs)} sheet(s) matched by name")
-                        if added:
-                            note.append(f"{len(added)} new: {', '.join(added)}")
-                        if removed:
-                            note.append(f"{len(removed)} removed: {', '.join(removed)}")
                         ui.label(f"[{member.member_id}] " + "; ".join(note)).classes("note")
+                        _render_sheet_rename_controls(member, added, removed)
+                    _render_add_selector_control(member)
                     for sheet in member.current_sheets:
-                        if not sheet.regions:
+                        if not sheet.regions and not sheet.selectors:
                             continue
                         with ui.card().classes("w-full p-3"):
                             visibility = (
-                                "very hidden" if sheet.very_hidden else "hidden" if sheet.hidden else "visible"
+                                "very hidden"
+                                if sheet.very_hidden
+                                else "hidden"
+                                if sheet.hidden
+                                else "visible"
                             )
                             ui.label(f"{sheet.sheet_name} ({visibility})").classes("runhead")
                             for region in sheet.regions:
                                 _render_region_row(member.member_id, sheet.sheet_name, region)
+                            if sheet.selectors:
+                                ui.label("Selector prerequisites").classes("dk")
+                                for selector in sheet.selectors:
+                                    _render_selector_row(
+                                        member.member_id, sheet.sheet_name, selector
+                                    )
 
         def _render_region_row(member_id: str, sheet_name: str, region) -> None:
-            with ui.row().classes("items-center gap-2 flex-wrap w-full"):
+            with ui.column().classes("gap-1 w-full"), ui.card().classes("p-2 w-full"):
+              with ui.row().classes("items-center gap-2 flex-wrap w-full"):
                 ui.label(f"anchor {region.anchor_cell}").classes("dk")
 
                 def _on_range_change(
@@ -907,7 +1160,7 @@ def render_config_workspace(
                     "Click preview to set anchor" if is_armed else "Pick anchor from preview",
                     on_click=_on_pick_anchor,
                 ).props("flat dense no-caps" + (" color=primary" if is_armed else ""))
-                if region.ranked_candidate_pending:
+                if region.ranked_candidate_pending and region.mode == "automatic":
                     ui.label("looks ranked/sorted").classes("notecard")
 
                 def _on_mode_change(
@@ -930,12 +1183,14 @@ def render_config_workspace(
                         sheet_name=sheet_name,
                         region_id=region.region_id,
                     ) -> None:
-                        _update_region(
+                        cols = tuple(event.value or ())
+                        _apply_region_transform(
                             member_id,
                             sheet_name,
                             region_id,
-                            identity_columns=tuple(event.value or ()),
-                            confirmed=True,
+                            lambda r: dataclasses.replace(
+                                set_identity_columns(r, cols), confirmed=True
+                            ),
                         )
 
                     ui.select(
@@ -952,11 +1207,9 @@ def render_config_workspace(
                         sheet_name=sheet_name,
                         region_id=region.region_id,
                     ) -> None:
-                        _update_region(
-                            member_id,
-                            sheet_name,
-                            region_id,
-                            ordinal_columns=tuple(event.value or ()),
+                        cols = tuple(event.value or ())
+                        _apply_region_transform(
+                            member_id, sheet_name, region_id, lambda r: set_ordinal_columns(r, cols)
                         )
 
                     ui.select(
@@ -966,6 +1219,46 @@ def render_config_workspace(
                         label="Ignore order in",
                         on_change=_on_ordinal_change,
                     ).props("outlined dense use-chips").classes("w-56")
+
+                    def _on_trim_change(
+                        event: events.ValueChangeEventArguments,
+                        member_id=member_id,
+                        sheet_name=sheet_name,
+                        region_id=region.region_id,
+                    ) -> None:
+                        _update_region(
+                            member_id,
+                            sheet_name,
+                            region_id,
+                            trim_identity_whitespace=bool(event.value),
+                        )
+
+                    ui.checkbox(
+                        "Trim outer whitespace",
+                        value=region.trim_identity_whitespace,
+                        on_change=_on_trim_change,
+                    )
+
+                    def _on_blank_key_change(
+                        event: events.ValueChangeEventArguments,
+                        member_id=member_id,
+                        sheet_name=sheet_name,
+                        region_id=region.region_id,
+                    ) -> None:
+                        _update_region(
+                            member_id, sheet_name, region_id, blank_key_policy=str(event.value)
+                        )
+
+                    ui.select(
+                        {
+                            "system_default": "System default",
+                            "tolerate": "Tolerate blank keys",
+                            "block": "Block on blank keys",
+                        },
+                        value=region.blank_key_policy,
+                        label="Blank key policy",
+                        on_change=_on_blank_key_change,
+                    ).props("outlined dense").classes("w-48")
                 elif region.mode == "excluded":
 
                     def _on_reason_change(
@@ -975,10 +1268,15 @@ def render_config_workspace(
                         region_id=region.region_id,
                     ) -> None:
                         _update_region(
-                            member_id, sheet_name, region_id, exclusion_reason=str(event.value or "")
+                            member_id,
+                            sheet_name,
+                            region_id,
+                            exclusion_reason=str(event.value or ""),
                         )
 
-                    ui.input("Reason", value=region.exclusion_reason, on_change=_on_reason_change).props(
+                    ui.input(
+                        "Reason", value=region.exclusion_reason, on_change=_on_reason_change
+                    ).props(
                         "outlined dense"
                     ).classes("w-56")
 
@@ -1001,6 +1299,186 @@ def render_config_workspace(
                     ).props('outlined dense type=date').classes("w-40")
                 if not region.is_valid:
                     ui.label("needs more detail").classes("notecard")
+
+              with ui.row().classes("items-center gap-2 flex-wrap w-full"):
+
+                def _on_header_intent_change(
+                    event: events.ValueChangeEventArguments,
+                    member_id=member_id,
+                    sheet_name=sheet_name,
+                    region_id=region.region_id,
+                ) -> None:
+                    _update_region(member_id, sheet_name, region_id, header_intent=str(event.value))
+
+                ui.select(
+                    {
+                        "automatic": "Header: automatic",
+                        "no_header": "Header: none",
+                        "first_data_row": "Header: first data row",
+                    },
+                    value=region.header_intent,
+                    on_change=_on_header_intent_change,
+                ).props("outlined dense").classes("w-52")
+
+                if region.header_intent == "first_data_row":
+
+                    def _on_first_data_row_change(
+                        event: events.ValueChangeEventArguments,
+                        member_id=member_id,
+                        sheet_name=sheet_name,
+                        region_id=region.region_id,
+                    ) -> None:
+                        raw = str(event.value or "").strip()
+                        _update_region(
+                            member_id,
+                            sheet_name,
+                            region_id,
+                            first_data_row=int(raw) if raw.isdigit() else None,
+                        )
+
+                    ui.input(
+                        "First data row",
+                        value=str(region.first_data_row or ""),
+                        on_change=_on_first_data_row_change,
+                    ).props("outlined dense type=number").classes("w-32")
+
+                def _on_preamble_change(
+                    event: events.ValueChangeEventArguments,
+                    member_id=member_id,
+                    sheet_name=sheet_name,
+                    region_id=region.region_id,
+                ) -> None:
+                    raw = str(event.value or "0").strip()
+                    _update_region(
+                        member_id,
+                        sheet_name,
+                        region_id,
+                        preamble_rows=int(raw) if raw.isdigit() else 0,
+                    )
+
+                ui.input(
+                    "Preamble rows", value=str(region.preamble_rows), on_change=_on_preamble_change
+                ).props("outlined dense type=number").classes("w-32")
+
+                def _on_footer_change(
+                    event: events.ValueChangeEventArguments,
+                    member_id=member_id,
+                    sheet_name=sheet_name,
+                    region_id=region.region_id,
+                ) -> None:
+                    raw = str(event.value or "0").strip()
+                    _update_region(
+                        member_id,
+                        sheet_name,
+                        region_id,
+                        footer_rows=int(raw) if raw.isdigit() else 0,
+                    )
+
+                ui.input(
+                    "Footer rows", value=str(region.footer_rows), on_change=_on_footer_change
+                ).props("outlined dense type=number").classes("w-32")
+
+                def _on_baseline_range_change(
+                    event: events.ValueChangeEventArguments,
+                    member_id=member_id,
+                    sheet_name=sheet_name,
+                    region_id=region.region_id,
+                ) -> None:
+                    _update_region(
+                        member_id, sheet_name, region_id, baseline_range=str(event.value or "")
+                    )
+
+                ui.input(
+                    "Baseline range override (A1)",
+                    value=region.baseline_range,
+                    on_change=_on_baseline_range_change,
+                ).props("outlined dense").classes("w-56")
+
+              with (
+                  ui.expansion("Ignore / expected-refresh columns").classes("w-full"),
+                  ui.row().classes("items-center gap-2 flex-wrap w-full"),
+              ):
+
+                    def _on_ignore_change(
+                        event: events.ValueChangeEventArguments,
+                        member_id=member_id,
+                        sheet_name=sheet_name,
+                        region_id=region.region_id,
+                    ) -> None:
+                        cols = tuple(event.value or ())
+                        _apply_region_transform(
+                            member_id, sheet_name, region_id, lambda r: set_ignore_columns(r, cols)
+                        )
+
+                    ui.select(
+                        list(region.available_columns),
+                        value=list(region.ignore_columns),
+                        multiple=True,
+                        label="Ignore columns",
+                        on_change=_on_ignore_change,
+                    ).props("outlined dense use-chips").classes("w-56")
+
+                    if region.ignore_columns:
+
+                        def _on_ignore_reason_change(
+                            event: events.ValueChangeEventArguments,
+                            member_id=member_id,
+                            sheet_name=sheet_name,
+                            region_id=region.region_id,
+                        ) -> None:
+                            _update_region(
+                                member_id,
+                                sheet_name,
+                                region_id,
+                                ignore_columns_reason=str(event.value or ""),
+                            )
+
+                        ui.input(
+                            "Reason",
+                            value=region.ignore_columns_reason,
+                            on_change=_on_ignore_reason_change,
+                        ).props("outlined dense").classes("w-56")
+
+                        def _on_ignore_expiry_change(
+                            event: events.ValueChangeEventArguments,
+                            member_id=member_id,
+                            sheet_name=sheet_name,
+                            region_id=region.region_id,
+                        ) -> None:
+                            _update_region(
+                                member_id,
+                                sheet_name,
+                                region_id,
+                                ignore_columns_expires_on=str(event.value or ""),
+                            )
+
+                        ui.input(
+                            "Expires on",
+                            value=region.ignore_columns_expires_on,
+                            on_change=_on_ignore_expiry_change,
+                        ).props("outlined dense type=date").classes("w-40")
+
+                    def _on_expected_refresh_change(
+                        event: events.ValueChangeEventArguments,
+                        member_id=member_id,
+                        sheet_name=sheet_name,
+                        region_id=region.region_id,
+                    ) -> None:
+                        cols = tuple(event.value or ())
+                        _apply_region_transform(
+                            member_id,
+                            sheet_name,
+                            region_id,
+                            lambda r: set_expected_refresh_columns(r, cols),
+                        )
+
+                    ui.select(
+                        list(region.available_columns),
+                        value=list(region.expected_refresh_columns),
+                        multiple=True,
+                        label="Expected-refresh columns",
+                        on_change=_on_expected_refresh_change,
+                    ).props("outlined dense use-chips").classes("w-56")
 
         def render_preview_section() -> None:
             """Current-first preview with an explicit baseline toggle (Step
@@ -1074,9 +1552,6 @@ def render_config_workspace(
                             value=state.preview_side,
                             on_change=_on_side_change,
                         ).props("dense")
-                    active_side = (
-                        state.preview_side if mode is QCRunMode.CYCLE_COMPARISON else "current"
-                    )
 
                     def _on_jump_change(event: events.ValueChangeEventArguments) -> None:
                         try:
@@ -1219,7 +1694,7 @@ def render_config_workspace(
             with warnings_box:
                 if job.overall_status != "done" or job.result is None:
                     return
-                warnings = compute_warnings(job.result)
+                warnings = current_warnings()
                 if not warnings:
                     return
                 ui.label("Warnings").classes("runhead")
@@ -1234,7 +1709,11 @@ def render_config_workspace(
                         )
 
         def current_warnings():
-            return compute_warnings(job.result) if job.result is not None else ()
+            if job.result is None:
+                return ()
+            return compute_warnings(job.result) + compute_sheet_pairing_warnings(
+                workspace_state["value"]
+            )
 
         async def do_run_once() -> None:
             await _finalize(save=False, run=True, as_new_name=None)
@@ -1293,7 +1772,9 @@ def render_config_workspace(
                         type="warning",
                     )
                     return
-                saved_profile = profile.model_copy(update={"name": target_name, "input_contract": contract})
+                saved_profile = profile.model_copy(
+                    update={"name": target_name, "input_contract": contract}
+                )
                 try:
                     save_profile(saved_profile, profile_path(profiles_dir, target_name))
                 except Exception as exc:
@@ -1311,7 +1792,9 @@ def render_config_workspace(
                 warnings_acknowledged=tuple(sorted(workspace_state["value"].warnings_acknowledged)),
             )
             try:
-                manifest = PackageManifest.from_role_files({role: str(path) for role, path in files.items()})
+                manifest = PackageManifest.from_role_files(
+                    {role: str(path) for role, path in files.items()}
+                )
             except ValueError as exc:
                 ui.notify(str(exc), type="negative")
                 return
@@ -1372,7 +1855,9 @@ def render_config_workspace(
                 )
                 ui.button(
                     "Export configuration", on_click=do_export_configuration
-                ).classes("ghostbtn").props("no-caps flat").set_enabled(job.overall_status == "done")
+                ).classes("ghostbtn").props("no-caps flat").set_enabled(
+                    job.overall_status == "done"
+                )
                 if blockers:
                     ui.label("; ".join(blockers)).classes("notecard")
 

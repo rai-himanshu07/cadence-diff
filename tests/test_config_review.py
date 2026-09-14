@@ -23,14 +23,22 @@ from qc_tool.ui.config_review import (
     apply_region_transform,
     build_input_contract,
     build_resolved_configuration,
+    compute_sheet_pairing_warnings,
     compute_warnings,
     confirm_all_regions,
     diff_profile_against_scan,
+    effective_sheet_pairing,
     format_a1_range,
     is_clean_profile_diff,
     member_review_from_scan,
     parse_a1_cell,
     parse_a1_range,
+    regions_overlap,
+    set_expected_refresh_columns,
+    set_identity_columns,
+    set_ignore_columns,
+    set_ordinal_columns,
+    set_sheet_rename,
     sheet_pairing,
     slugify,
     unresolved_blockers,
@@ -393,3 +401,291 @@ def test_confirm_all_regions_only_touches_valid_regions() -> None:
     )
     confirmed_valid = confirm_all_regions(valid_member)
     assert confirmed_valid.current_sheets[0].regions[0].confirmed is True
+
+
+def test_baseline_regions_are_detected_alongside_current_regions() -> None:
+    """Step 8: baseline-side regions are no longer discarded -- they seed
+    the baseline auto-match used by build_resolved_configuration.
+    """
+    profile = MemberSetupProfile(
+        member_id="primary",
+        baseline_hash="a" * 64,
+        current_hash="b" * 64,
+        baseline_sheets=(SheetSetupProfile(sheet_name="Data", regions=(_region("Data"),)),),
+        current_sheets=(SheetSetupProfile(sheet_name="Data", regions=(_region("Data"),)),),
+    )
+    review = member_review_from_scan("primary", profile)
+    baseline_sheet = review.baseline_sheets[0]
+    assert len(baseline_sheet.regions) == 1
+    assert baseline_sheet.regions[0].current_range == "A1:C5"
+
+
+def test_set_sheet_rename_declares_and_clears_a_pairing() -> None:
+    review = member_review_from_scan(
+        "primary",
+        MemberSetupProfile(
+            member_id="primary",
+            baseline_hash="a" * 64,
+            current_hash="b" * 64,
+            baseline_sheets=(SheetSetupProfile(sheet_name="2025"),),
+            current_sheets=(SheetSetupProfile(sheet_name="2026"),),
+        ),
+    )
+    renamed = set_sheet_rename(review, "2026", "2025")
+    assert renamed.sheet_renames == {"2026": "2025"}
+    cleared = set_sheet_rename(renamed, "2026", None)
+    assert cleared.sheet_renames == {}
+
+
+def test_set_sheet_rename_enforces_one_to_one_baseline_claim() -> None:
+    review = member_review_from_scan(
+        "primary",
+        MemberSetupProfile(
+            member_id="primary",
+            baseline_hash="a" * 64,
+            current_hash="b" * 64,
+            baseline_sheets=(SheetSetupProfile(sheet_name="Old"),),
+            current_sheets=(
+                SheetSetupProfile(sheet_name="New1"),
+                SheetSetupProfile(sheet_name="New2"),
+            ),
+        ),
+    )
+    first = set_sheet_rename(review, "New1", "Old")
+    second = set_sheet_rename(first, "New2", "Old")
+    # New2 claiming "Old" releases New1's earlier claim.
+    assert second.sheet_renames == {"New2": "Old"}
+
+
+def test_effective_sheet_pairing_promotes_a_declared_rename() -> None:
+    review = member_review_from_scan(
+        "primary",
+        MemberSetupProfile(
+            member_id="primary",
+            baseline_hash="a" * 64,
+            current_hash="b" * 64,
+            baseline_sheets=(SheetSetupProfile(sheet_name="2025 Data"),),
+            current_sheets=(SheetSetupProfile(sheet_name="2026 Data"),),
+        ),
+    )
+    _pairs, added, removed = sheet_pairing(review)
+    assert added == ("2026 Data",)
+    assert removed == ("2025 Data",)
+
+    renamed = set_sheet_rename(review, "2026 Data", "2025 Data")
+    pairs, added, removed = effective_sheet_pairing(renamed)
+    assert pairs == (("2025 Data", "2026 Data"),)
+    assert added == ()
+    assert removed == ()
+
+
+def test_compute_sheet_pairing_warnings_flags_unacknowledged_added_and_removed() -> None:
+    review = member_review_from_scan(
+        "primary",
+        MemberSetupProfile(
+            member_id="primary",
+            baseline_hash="a" * 64,
+            current_hash="b" * 64,
+            baseline_sheets=(SheetSetupProfile(sheet_name="Old"),),
+            current_sheets=(SheetSetupProfile(sheet_name="New"),),
+        ),
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(review,))
+    warnings = compute_sheet_pairing_warnings(state)
+    codes = {w.code for w in warnings}
+    assert "sheet_added:primary:New" in codes
+    assert "sheet_removed:primary:Old" in codes
+
+
+def test_compute_sheet_pairing_warnings_excludes_a_declared_rename() -> None:
+    review = member_review_from_scan(
+        "primary",
+        MemberSetupProfile(
+            member_id="primary",
+            baseline_hash="a" * 64,
+            current_hash="b" * 64,
+            baseline_sheets=(SheetSetupProfile(sheet_name="Old"),),
+            current_sheets=(SheetSetupProfile(sheet_name="New"),),
+        ),
+    )
+    renamed = set_sheet_rename(review, "New", "Old")
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(renamed,))
+    assert compute_sheet_pairing_warnings(state) == ()
+
+
+def test_column_roles_are_mutually_exclusive() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = review.current_sheets[0].regions[0]
+    region = set_identity_columns(region, ("A", "B"))
+    assert region.identity_columns == ("A", "B")
+    # Assigning B as ordinal evicts it from identity.
+    region = set_ordinal_columns(region, ("B",))
+    assert region.identity_columns == ("A",)
+    assert region.ordinal_columns == ("B",)
+    # Assigning A to ignore evicts it from identity.
+    region = set_ignore_columns(region, ("A",))
+    assert region.identity_columns == ()
+    assert region.ignore_columns == ("A",)
+    # Assigning A to expected_refresh evicts it from ignore.
+    region = set_expected_refresh_columns(region, ("A",))
+    assert region.ignore_columns == ()
+    assert region.expected_refresh_columns == ("A",)
+
+
+def test_is_valid_requires_first_data_row_when_header_intent_is_first_data_row() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review, "Data", region_id, header_intent="first_data_row"
+    )
+    region = updated.current_sheets[0].regions[0]
+    assert region.is_valid is False
+    fixed = update_region_decision(
+        updated, "Data", region_id, header_intent="first_data_row", first_data_row=2
+    )
+    assert fixed.current_sheets[0].regions[0].is_valid is True
+
+
+def test_is_valid_requires_reason_and_expiry_for_ignored_columns() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(review, "Data", region_id, ignore_columns=("A",))
+    assert updated.current_sheets[0].regions[0].is_valid is False
+    fixed = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        ignore_columns=("A",),
+        ignore_columns_reason="legacy scratch column",
+        ignore_columns_expires_on="2027-01-01",
+    )
+    assert fixed.current_sheets[0].regions[0].is_valid is True
+
+
+def test_regions_overlap_detects_overlapping_and_non_overlapping_ranges() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_a = review.current_sheets[0].regions[0]
+    region_b = replace(region_a, region_id="other", current_range="B3:D8")
+    region_c = replace(region_a, region_id="far", current_range="F1:G2")
+    assert regions_overlap(region_a, region_b) is True
+    assert regions_overlap(region_a, region_c) is False
+
+
+def test_apply_region_transform_rejects_an_overlapping_manual_range() -> None:
+    profile = MemberSetupProfile(
+        member_id="primary",
+        baseline_hash="a" * 64,
+        current_hash="b" * 64,
+        current_sheets=(
+            SheetSetupProfile(
+                sheet_name="Data",
+                regions=(
+                    _region("Data", min_row=1, min_col=1, max_row=5, max_col=3),
+                    _region("Data", min_row=10, min_col=1, max_row=15, max_col=3),
+                ),
+            ),
+        ),
+    )
+    review = member_review_from_scan("primary", profile)
+    first_id = review.current_sheets[0].regions[0].region_id
+    second_range = review.current_sheets[0].regions[1].current_range
+    try:
+        apply_region_transform(
+            review, "Data", first_id, lambda r: apply_manual_range(r, second_range)
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for an overlapping range")
+
+
+def test_build_resolved_configuration_auto_matches_a_baseline_region() -> None:
+    profile = MemberSetupProfile(
+        member_id="primary",
+        baseline_hash="a" * 64,
+        current_hash="b" * 64,
+        baseline_sheets=(
+            SheetSetupProfile(
+                sheet_name="Data",
+                regions=(_region("Data", min_row=1, min_col=1, max_row=4, max_col=3),),
+            ),
+        ),
+        current_sheets=(
+            SheetSetupProfile(
+                sheet_name="Data",
+                regions=(_region("Data", min_row=1, min_col=1, max_row=5, max_col=3),),
+            ),
+        ),
+    )
+    review = member_review_from_scan("primary", profile)
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(review,))
+    resolved = build_resolved_configuration(
+        state, profile=DeliverableProfile(name="default"), profile_sha256="deadbeef"
+    )
+    region = resolved.members[0].sheets[0].regions[0]
+    assert region.current_outer_range == "A1:C5"
+    assert region.baseline_outer_range == "A1:C4"  # auto-matched, smaller baseline table
+
+
+def test_build_resolved_configuration_carries_preamble_footer_and_first_data_row() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        header_intent="first_data_row",
+        first_data_row=2,
+        preamble_rows=1,
+        footer_rows=1,
+        blank_key_policy="block",
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    resolved = build_resolved_configuration(
+        state, profile=DeliverableProfile(name="default"), profile_sha256="deadbeef"
+    )
+    region = resolved.members[0].sheets[0].regions[0]
+    assert region.current_first_data_row == 2
+    assert region.current_preamble_rows == 1
+    assert region.current_footer_rows == 1
+
+
+def test_build_input_contract_carries_blank_key_policy_and_first_data_row() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="keyed",
+        identity_columns=("A",),
+        header_intent="first_data_row",
+        first_data_row=2,
+        blank_key_policy="tolerate",
+        confirmed=True,
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    contract = build_input_contract(state)
+    region_contract = contract.members[0].sheets[0].regions[0]
+    assert region_contract.blank_key_policy == "tolerate"
+    assert region_contract.preferred_first_data_row == 2
+
+
+def test_build_input_contract_carries_ignore_column_exclusion() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        ignore_columns=("A",),
+        ignore_columns_reason="legacy scratch column",
+        ignore_columns_expires_on="2027-01-01",
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    contract = build_input_contract(state)
+    region_contract = contract.members[0].sheets[0].regions[0]
+    ignore_column = next(c for c in region_contract.columns if c.column_id.endswith("_a"))
+    assert ignore_column.comparison_policy == "ignore"
+    assert ignore_column.exclusion is not None
+    assert ignore_column.exclusion.reason == "legacy scratch column"

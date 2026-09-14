@@ -102,18 +102,47 @@ def _write_panel_with_preamble(
     rows: list[list[CellValue]],
     *,
     title: str,
+    extra_preamble_row: str | None = None,
 ) -> None:
     workbook = Workbook()
     sheet = workbook.active
     assert sheet is not None
     sheet.title = "Panel"
-    sheet.cell(row=1, column=3, value=title)
-    sheet.cell(row=2, column=3, value="Updated weekly")
+    next_row = 1
+    if extra_preamble_row is not None:
+        sheet.cell(row=next_row, column=3, value=extra_preamble_row)
+        next_row += 1
+    sheet.cell(row=next_row, column=3, value=title)
+    sheet.cell(row=next_row + 1, column=3, value="Updated weekly")
+    header_row = next_row + 2
     for column, header in enumerate(("Rank", "ID", "Value"), start=1):
-        sheet.cell(row=3, column=column, value=header)
-    for row_index, row in enumerate(rows, start=4):
+        sheet.cell(row=header_row, column=column, value=header)
+    for row_index, row in enumerate(rows, start=header_row + 1):
         for column, value in enumerate(row, start=1):
             sheet.cell(row=row_index, column=column, value=value)
+    workbook.save(path)
+
+
+def _write_panel_with_footer(
+    path: Path,
+    rows: list[list[CellValue]],
+    *,
+    total_value: float,
+) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.title = "Panel"
+    for column, header in enumerate(("Rank", "ID", "Value"), start=1):
+        sheet.cell(row=1, column=column, value=header)
+    footer_row = 1
+    for row_index, row in enumerate(rows, start=2):
+        for column, value in enumerate(row, start=1):
+            sheet.cell(row=row_index, column=column, value=value)
+        footer_row = row_index
+    footer_row += 1
+    sheet.cell(row=footer_row, column=2, value="Total")
+    sheet.cell(row=footer_row, column=3, value=total_value)
     workbook.save(path)
 
 
@@ -240,6 +269,78 @@ def test_confirmed_header_keeps_preamble_in_positional_comparison(
     assert len(value_findings) == 1
     assert value_findings[0].location == "C1"
     assert _classes(result, FindingClass.ROW_INSERTED, FindingClass.ROW_DELETED) == []
+
+
+def test_confirmed_footer_keeps_trailer_in_positional_comparison(tmp_path: Path) -> None:
+    """Step 8: a footer_row excludes the trailing total row from key
+    matching (a "Total" label has no identity column value) while still
+    comparing it positionally -- mirrors the header/preamble test above.
+    """
+    rows = _base_rows(30)
+    current_rows = _shuffled(rows, seed=1234)
+    baseline, current = tmp_path / "baseline.xlsx", tmp_path / "current.xlsx"
+    _write_panel_with_footer(baseline, rows, total_value=1000.0)
+    _write_panel_with_footer(current, current_rows, total_value=1234.0)
+    profile = _profile_with_rule(
+        RowIdentityRule(
+            anchor_cell="B2",
+            footer_row=32,
+            identity_columns=["B"],
+            ordinal_columns=["A"],
+        )
+    )
+
+    result = run_qc(
+        baseline_excel=baseline,
+        current_excel=current,
+        profile=profile,
+        mode=QCRunMode.CYCLE_COMPARISON,
+    )
+
+    value_findings = _classes(result, FindingClass.VALUE_CHANGED)
+    assert len(value_findings) == 1
+    assert value_findings[0].location == "C32"
+    assert _classes(result, FindingClass.ROW_INSERTED, FindingClass.ROW_DELETED) == []
+
+
+def test_baseline_header_row_lets_a_grown_preamble_surface_as_one_insertion(
+    tmp_path: Path,
+) -> None:
+    """Step 8: baseline's preamble is 2 rows, current's is 3 (one note was
+    added at the top). Without a per-side override the shared header_row
+    would misalign every data row by one; with `baseline_header_row` set to
+    baseline's own correct boundary, the extra current row surfaces as
+    exactly one bottom-aligned insertion at the top of the preamble and
+    every data row still matches by identity with zero spurious noise.
+    """
+    rows = _base_rows(30)
+    current_rows = _shuffled(rows, seed=1234)
+    baseline, current = tmp_path / "baseline.xlsx", tmp_path / "current.xlsx"
+    _write_panel_with_preamble(baseline, rows, title="Internal report")
+    _write_panel_with_preamble(
+        current, current_rows, title="Internal report", extra_preamble_row="Draft"
+    )
+    profile = _profile_with_rule(
+        RowIdentityRule(
+            anchor_cell="B5",
+            header_row=4,
+            baseline_header_row=3,
+            identity_columns=["B"],
+            ordinal_columns=["A"],
+        )
+    )
+
+    result = run_qc(
+        baseline_excel=baseline,
+        current_excel=current,
+        profile=profile,
+        mode=QCRunMode.CYCLE_COMPARISON,
+    )
+
+    assert _classes(result, FindingClass.VALUE_CHANGED) == []
+    inserted = _classes(result, FindingClass.ROW_INSERTED)
+    assert len(inserted) == 1
+    assert _classes(result, FindingClass.ROW_DELETED) == []
 
 
 def test_composite_identity_resolves_single_column_ambiguity(tmp_path: Path) -> None:

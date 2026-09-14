@@ -67,6 +67,14 @@ class AxisAlignment:
     skipped_duplicate_groups: int = 0
     skipped_duplicate_rows: int = 0
     reordered_rows: int = 0
+    #: Rows (both sides combined) excluded from key matching because at
+    #: least one identity-column component was blank (plan-20260913, Step
+    #: 8's ``blank_key_policy`` criterion). Always computed for a keyed
+    #: alignment regardless of policy -- disclosure is unconditional; only
+    #: a ``"block"`` policy turns a nonzero count into a run refusal, via a
+    #: separate post-alignment check (`qc_tool.excel.prerequisites.
+    #: check_blank_identity_keys`), never inside this function.
+    blank_key_rows: int = 0
 
 
 @dataclass(slots=True)
@@ -666,8 +674,12 @@ def _matching_row_identity_rule(
     return None
 
 
-def _identity_key_component(value: object) -> object:
+def _identity_key_component(
+    value: object, *, exact_typed_equality: bool = False, trim_identity_whitespace: bool = False
+) -> object:
     if isinstance(value, str):
+        if exact_typed_equality:
+            return value.strip() if trim_identity_whitespace else value
         return value.strip().casefold()
     return value
 
@@ -678,11 +690,14 @@ def _identity_row_keys(
     columns: list[int],
     *,
     first_row: int | None = None,
+    last_row: int | None = None,
+    exact_typed_equality: bool = False,
+    trim_identity_whitespace: bool = False,
 ) -> dict[int, tuple[object, ...]]:
     """Row -> composite identity key. A row with any blank component is
     excluded entirely -- it is never guessed at, only left unmatched."""
     keys: dict[int, tuple[object, ...]] = {}
-    for row in range(first_row or region.min_row, region.max_row + 1):
+    for row in range(first_row or region.min_row, (last_row or region.max_row) + 1):
         parts: list[object] = []
         blank = False
         for col in columns:
@@ -691,7 +706,13 @@ def _identity_row_keys(
             if value is None or (isinstance(value, str) and not value.strip()):
                 blank = True
                 break
-            parts.append(_identity_key_component(value))
+            parts.append(
+                _identity_key_component(
+                    value,
+                    exact_typed_equality=exact_typed_equality,
+                    trim_identity_whitespace=trim_identity_whitespace,
+                )
+            )
         if not blank:
             keys[row] = tuple(parts)
     return keys
@@ -715,25 +736,71 @@ def _align_rows_by_identity(
 
     Identity rows are rarely period-valued, so unmatched current rows are
     always classified as insertions here, never as expected cadence growth.
+
+    Preamble (above ``header_row``) and footer (from ``footer_row`` onward)
+    rows never enter key matching but still compare positionally -- a
+    preamble is bottom-aligned toward the data start (so a genuinely added
+    preamble row surfaces at the TOP, the row closest to the data stays
+    stable) and a footer is top-aligned away from the data end (so an added
+    footer row surfaces at the BOTTOM). ``baseline_header_row``/
+    ``baseline_footer_row`` let the two sides' preamble/footer sizes
+    genuinely differ (plan-20260913, Step 8); when unset the baseline side
+    falls back to the shared ``header_row``/``footer_row`` value.
     """
     identity_columns = [
         column_index_from_string(letter) for letter in rule.identity_columns
     ]
+    curr_header_row = rule.header_row
+    base_header_row = (
+        rule.baseline_header_row if rule.baseline_header_row is not None else rule.header_row
+    )
+    curr_footer_row = rule.footer_row
+    base_footer_row = (
+        rule.baseline_footer_row if rule.baseline_footer_row is not None else rule.footer_row
+    )
     base_first_row = (
-        max(base_region.min_row, rule.header_row + 1)
-        if rule.header_row is not None
+        max(base_region.min_row, base_header_row + 1)
+        if base_header_row is not None
         else base_region.min_row
     )
     curr_first_row = (
-        max(curr_region.min_row, rule.header_row + 1)
-        if rule.header_row is not None
+        max(curr_region.min_row, curr_header_row + 1)
+        if curr_header_row is not None
         else curr_region.min_row
     )
+    base_last_row = (
+        min(base_region.max_row, base_footer_row - 1)
+        if base_footer_row is not None
+        else base_region.max_row
+    )
+    curr_last_row = (
+        min(curr_region.max_row, curr_footer_row - 1)
+        if curr_footer_row is not None
+        else curr_region.max_row
+    )
     base_keys = _identity_row_keys(
-        base_sheet, base_region, identity_columns, first_row=base_first_row
+        base_sheet,
+        base_region,
+        identity_columns,
+        first_row=base_first_row,
+        last_row=base_last_row,
+        exact_typed_equality=rule.exact_typed_equality,
+        trim_identity_whitespace=rule.trim_identity_whitespace,
     )
     curr_keys = _identity_row_keys(
-        curr_sheet, curr_region, identity_columns, first_row=curr_first_row
+        curr_sheet,
+        curr_region,
+        identity_columns,
+        first_row=curr_first_row,
+        last_row=curr_last_row,
+        exact_typed_equality=rule.exact_typed_equality,
+        trim_identity_whitespace=rule.trim_identity_whitespace,
+    )
+    blank_key_rows = (
+        (base_last_row - base_first_row + 1)
+        - len(base_keys)
+        + (curr_last_row - curr_first_row + 1)
+        - len(curr_keys)
     )
 
     base_rows_by_key: dict[tuple[object, ...], list[int]] = {}
@@ -748,25 +815,43 @@ def _align_rows_by_identity(
         identity_columns=tuple(rule.identity_columns),
         ordinal_columns=tuple(rule.ordinal_columns),
         duplicate_policy=rule.duplicate_policy,
+        blank_key_rows=blank_key_rows,
     )
     matched_base: set[int] = set()
     matched_current: set[int] = set()
     ambiguous_keys: set[tuple[object, ...]] = set()
 
-    if rule.header_row is not None:
+    if base_header_row is not None or curr_header_row is not None:
+        # Bottom-aligned: the row closest to the data start pairs first, so
+        # a genuinely added/removed preamble row surfaces at the top.
         base_prefix = list(range(base_region.min_row, base_first_row))
         curr_prefix = list(range(curr_region.min_row, curr_first_row))
         shared_prefix = min(len(base_prefix), len(curr_prefix))
         for base_row, curr_row in zip(
-            base_prefix[:shared_prefix],
-            curr_prefix[:shared_prefix],
+            base_prefix[len(base_prefix) - shared_prefix :],
+            curr_prefix[len(curr_prefix) - shared_prefix :],
             strict=True,
         ):
             alignment.pairs.append((base_row, curr_row))
             matched_base.add(base_row)
             matched_current.add(curr_row)
-        alignment.deleted.extend(base_prefix[shared_prefix:])
-        alignment.inserted.extend(curr_prefix[shared_prefix:])
+        alignment.deleted.extend(base_prefix[: len(base_prefix) - shared_prefix])
+        alignment.inserted.extend(curr_prefix[: len(curr_prefix) - shared_prefix])
+
+    if base_footer_row is not None or curr_footer_row is not None:
+        # Top-aligned: the row closest to the data end pairs first, so a
+        # genuinely added/removed footer row surfaces at the bottom.
+        base_suffix = list(range(base_last_row + 1, base_region.max_row + 1))
+        curr_suffix = list(range(curr_last_row + 1, curr_region.max_row + 1))
+        shared_suffix = min(len(base_suffix), len(curr_suffix))
+        for base_row, curr_row in zip(
+            base_suffix[:shared_suffix], curr_suffix[:shared_suffix], strict=True
+        ):
+            alignment.pairs.append((base_row, curr_row))
+            matched_base.add(base_row)
+            matched_current.add(curr_row)
+        alignment.deleted.extend(base_suffix[shared_suffix:])
+        alignment.inserted.extend(curr_suffix[shared_suffix:])
 
     for key in sorted(base_rows_by_key.keys() | curr_rows_by_key.keys(), key=repr):
         base_rows = base_rows_by_key.get(key, [])
@@ -813,10 +898,10 @@ def _align_rows_by_identity(
         matched_current |= skipped_curr
 
     alignment.pairs.sort()
-    for row in range(base_first_row, base_region.max_row + 1):
+    for row in range(base_first_row, base_last_row + 1):
         if row not in matched_base:
             alignment.deleted.append(row)
-    for row in range(curr_first_row, curr_region.max_row + 1):
+    for row in range(curr_first_row, curr_last_row + 1):
         if row in matched_current:
             continue
         alignment.inserted.append(row)

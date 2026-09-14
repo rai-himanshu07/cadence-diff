@@ -107,7 +107,11 @@ from qc_tool.excel.population import (
     finalize_populations,
 )
 from qc_tool.excel.preflight import defined_name_scope_coverage, preflight_workbook
-from qc_tool.excel.prerequisites import check_comparison_prerequisites
+from qc_tool.excel.prerequisites import (
+    check_blank_identity_keys,
+    check_comparison_prerequisites,
+    check_resolved_selectors,
+)
 from qc_tool.excel.ranked_identity import detect_ranked_table_candidate
 from qc_tool.excel.regions import internal_period_band_suggestions
 from qc_tool.excel.workbook_risks import (
@@ -618,6 +622,8 @@ def _run_value_parts(
     cancellation_token: CancellationToken | None,
     on_progress: ProgressCallback | None,
     candidate_sink: CandidateSpill | None = None,
+    execution_bindings: ExecutionBindings | None = None,
+    member_id: str = "primary",
 ) -> int:
     """Region-batched value diff with per-sheet memory release.
 
@@ -643,9 +649,16 @@ def _run_value_parts(
         base_sheet = baseline.sheet(alignment.baseline_sheet_name_for(sheet_name))
         curr_sheet = current.sheet(sheet_name)
         sheet_profile = profile.sheet_profile(sheet_name)
+        column_policies = (
+            execution_bindings.column_policies(member_id, sheet_name)
+            if execution_bindings is not None
+            else ()
+        )
         for region in regions:
             check_cancelled(cancellation_token)
-            ignore, refresh, value_only_ignore = region_range_sets(sheet_profile, region)
+            ignore, refresh, value_only_ignore = region_range_sets(
+                sheet_profile, region, column_policies=column_policies
+            )
             chunk: list[Finding] = []
             for finding in iter_region_findings(
                 base_sheet,
@@ -2088,6 +2101,7 @@ def run_qc(
     loaded_decks: list[DeckSnapshot] = []
     alignment: WorkbookAlignment | None = None
     values_coverage: CoverageItem | None = None
+    execution_bindings: ExecutionBindings | None = None
 
     # Decks load before the Excel part loop so chunk enrichment can attach
     # PPT chart impacts while every sheet's cells are still resident.
@@ -2142,6 +2156,9 @@ def run_qc(
                 base_wb,
                 curr_wb,
                 profile.excel.comparison_prerequisites,
+            )
+            mismatches.extend(
+                check_resolved_selectors(base_wb, curr_wb, resolved_input_configuration)
             )
             if mismatches:
                 raise RunBlockedError(
@@ -2217,6 +2234,20 @@ def run_qc(
             on_sheet=_align_tick,
             execution_bindings=execution_bindings,
         )
+        blank_key_blockers = check_blank_identity_keys(
+            alignment, resolved_input_configuration
+        )
+        if blank_key_blockers:
+            raise RunBlockedError(
+                RunActionRequired(
+                    reason=RunActionReason.BLANK_IDENTITY_KEY_BLOCKED,
+                    items=blank_key_blockers,
+                    message=(
+                        "Resolve or exclude the blank identity-key rows, or "
+                        "change this region's blank-key policy, before comparing."
+                    ),
+                )
+            )
         result.alignment_trust = build_alignment_trust_manifest(alignment)
         alignment_manifest = result.alignment_trust
         low_confidence = sum(
@@ -2890,6 +2921,7 @@ def run_qc(
                 cancellation_token=cancellation_token,
                 on_progress=on_progress,
                 candidate_sink=candidate_sink,
+                execution_bindings=execution_bindings,
             )
             if values_coverage is not None:
                 values_coverage.findings = produced

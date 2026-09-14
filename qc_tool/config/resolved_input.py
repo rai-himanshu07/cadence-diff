@@ -69,6 +69,10 @@ class ResolvedColumn(BaseModel):
     current_letter: str | None = None
     alignment_role: Literal["none", "identity", "ordinal"] = "none"
     comparison_policy: Literal["normal", "ignore", "expected_refresh"] = "normal"
+    #: Optional outer-whitespace trim for an identity column's equality
+    #: check (mirrors ``LogicalColumnContract.trim_outer_whitespace``); only
+    #: meaningful when ``alignment_role == "identity"``.
+    trim_outer_whitespace: bool = False
     coverage: ConfigurationCoverageState = "automatic_confirmed"
 
     model_config = {"frozen": True}
@@ -100,6 +104,13 @@ class ResolvedRegion(BaseModel):
     #: Resolved duplicate-key policy for a keyed region (mirrors the saved
     #: `LogicalRegionContract.duplicate_key_policy`); irrelevant otherwise.
     duplicate_key_policy: Literal["skip", "occurrence", "position"] = "skip"
+    #: Resolved blank-identity-key policy for a keyed region (mirrors the
+    #: saved `LogicalRegionContract.blank_key_policy`); irrelevant otherwise.
+    #: ``"system_default"``/``"tolerate"`` both mean today's existing
+    #: behavior (a blank-keyed row is excluded from key matching, surfacing
+    #: as an ordinary insert/delete); only ``"block"`` changes anything --
+    #: it refuses the run before alignment instead of silently excluding.
+    blank_key_policy: Literal["system_default", "tolerate", "block"] = "system_default"
     coverage: ConfigurationCoverageState = "automatic_confirmed"
     degraded_reason: str = ""
 

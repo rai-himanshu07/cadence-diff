@@ -12,7 +12,7 @@ import math
 from collections.abc import Iterable, Iterator
 
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.cell import range_boundaries
+from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
 from qc_tool.availability import excel_blank_allowed
 from qc_tool.config.profile import (
@@ -771,9 +771,33 @@ def iter_region_findings(
     )
 
 
+def _matching_column_policies(
+    policies,
+    region,
+):
+    """The first ``RegionColumnPolicies`` whose anchor cell falls inside
+    ``region`` -- mirrors ``qc_tool.excel.align._matching_row_identity_rule``'s
+    own anchor-containment matching exactly, so a region's column policies
+    keep applying across ordinary growth.
+    """
+    for policy in policies:
+        try:
+            anchor_row, anchor_col = coordinate_to_tuple(policy.anchor_cell)
+        except ValueError:
+            continue
+        if (
+            region.min_row <= anchor_row <= region.max_row
+            and region.min_col <= anchor_col <= region.max_col
+        ):
+            return policy
+    return None
+
+
 def region_range_sets(
     sheet_profile: SheetProfile | None,
     region: RegionAlignment | None = None,
+    *,
+    column_policies=(),
 ) -> tuple[_RangeSet, _RangeSet, _RangeSet]:
     """The (ignore, refresh, value_only_ignore) range sets one region diffs
     against.
@@ -785,18 +809,38 @@ def region_range_sets(
     cells populate ``value_only_ignore`` instead: ordinal values are
     display-only rank markers, so only their cached-value comparison is
     suppressed there -- number-format and style findings, and all formula
-    checks (a separate pass), remain fully active.
+    checks (a separate pass), remain fully active. ``column_policies``
+    (Step 8: ignore/expected-refresh columns declared through the mode-aware
+    configuration workspace) fold into the SAME ``ignore``/``refresh`` range
+    sets a legacy profile's ``ignore_ranges``/``refresh_ranges`` already
+    populate -- one unified mechanism, not a parallel one.
     """
     value_only_ranges: list[str] = []
+    extra_ignore_ranges: list[str] = []
+    extra_refresh_ranges: list[str] = []
     if region is not None and region.rows.ordinal_columns:
         curr = region.current
         value_only_ranges.extend(
             f"{letter}{curr.min_row}:{letter}{curr.max_row}"
             for letter in region.rows.ordinal_columns
         )
+    if region is not None and column_policies:
+        policy = _matching_column_policies(column_policies, region.current)
+        if policy is not None:
+            curr = region.current
+            extra_ignore_ranges.extend(
+                f"{letter}{curr.min_row}:{letter}{curr.max_row}"
+                for letter in policy.ignore_columns
+            )
+            extra_refresh_ranges.extend(
+                f"{letter}{curr.min_row}:{letter}{curr.max_row}"
+                for letter in policy.expected_refresh_columns
+            )
     return (
-        _RangeSet(sheet_profile.ignore_ranges if sheet_profile else []),
-        _RangeSet(sheet_profile.refresh_ranges if sheet_profile else []),
+        _RangeSet([*(sheet_profile.ignore_ranges if sheet_profile else []), *extra_ignore_ranges]),
+        _RangeSet(
+            [*(sheet_profile.refresh_ranges if sheet_profile else []), *extra_refresh_ranges]
+        ),
         _RangeSet(value_only_ranges),
     )
 

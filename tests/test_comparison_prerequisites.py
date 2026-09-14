@@ -227,3 +227,79 @@ def test_perform_run_writes_no_history_or_reports_when_blocked(tmp_path: Path) -
         assert RunHistory(history_db).list_runs() == []
     runs_dir = work_dir / "runs"
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
+
+
+def _resolved_configuration_with_selector():
+    from qc_tool.config.resolved_input import (
+        ResolvedInputConfigurationV1,
+        ResolvedMember,
+        ResolvedSelector,
+        ResolvedSheet,
+    )
+
+    return ResolvedInputConfigurationV1(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="config",
+                        baseline_sheet_name="Config",
+                        current_sheet_name="Config",
+                        selectors=(
+                            ResolvedSelector(
+                                selector_id="scenario",
+                                baseline_cell="B2",
+                                current_cell="B2",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def test_matching_resolved_selector_does_not_block(tmp_path: Path) -> None:
+    """Step 8: a selector prerequisite declared through the mode-aware
+    configuration workspace (a ``ResolvedInputConfigurationV1``, not a
+    legacy ``ComparisonPrerequisite``) gates the run identically.
+    """
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _book(baseline, "Base Case")
+    _book(current, "Base Case")
+
+    result = run_qc(
+        baseline_excel=baseline,
+        current_excel=current,
+        profile=default_profile(),
+        mode=QCRunMode.CYCLE_COMPARISON,
+        resolved_input_configuration=_resolved_configuration_with_selector(),
+    )
+
+    assert result is not None
+
+
+def test_mismatched_resolved_selector_blocks_before_analysis(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _book(baseline, "Base Case")
+    _book(current, "Upside Case")
+
+    with pytest.raises(RunBlockedError) as excinfo:
+        run_qc(
+            baseline_excel=baseline,
+            current_excel=current,
+            profile=default_profile(),
+            mode=QCRunMode.CYCLE_COMPARISON,
+            resolved_input_configuration=_resolved_configuration_with_selector(),
+        )
+
+    action = excinfo.value.action_required
+    assert action.reason is RunActionReason.COMPARISON_PREREQUISITE_MISMATCH
+    assert action.items[0].label == "scenario"
+    serialized = action.model_dump_json()
+    assert "Base Case" not in serialized
+    assert "Upside Case" not in serialized

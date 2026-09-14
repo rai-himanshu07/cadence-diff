@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from nicegui import ui
 from nicegui.testing import User
 from openpyxl import Workbook
 
@@ -123,3 +124,55 @@ async def test_confirm_all_regions_persists_confirmed_true_for_a_valid_region(
     assert isinstance(region_decisions, dict)
     assert region_decisions
     assert all(decision["confirmed"] is True for decision in region_decisions.values())
+
+
+@pytest.mark.asyncio
+async def test_selector_prerequisite_is_added_and_survives_a_session_reload(
+    user: User, tmp_path: Path
+) -> None:
+    """Step 8: an analyst-declared selector prerequisite must round-trip
+    through the session store, not just live in the running page's
+    in-memory state -- otherwise resuming a saved configuration session
+    (this store's whole purpose) would silently drop it.
+    """
+    work_dir = tmp_path / "work"
+    session_key = _stage_session(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Add selector prerequisite:", retries=_SUBPROCESS_RETRIES)
+
+    cell_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "Cell (A1)"
+    )
+    label_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "Label"
+    )
+    cell_input.value = "B5"
+    label_input.value = "Scenario"
+    user.find(kind=ui.button, content="Add").click()
+
+    await user.should_see("Scenario (B5)")
+
+    store = ConfigSessionStore(work_dir / "history.sqlite3")
+    record = store.get(session_key)
+    assert record is not None
+    selectors = record.choices.get("selectors")
+    assert isinstance(selectors, dict)
+    saved_entries = selectors.get("primary")
+    assert isinstance(saved_entries, list) and len(saved_entries) == 1
+    assert saved_entries[0]["sheet_name"] == "Data"
+    assert saved_entries[0]["label"] == "Scenario"
+    assert saved_entries[0]["cell"] == "B5"
+
+    # Simulate resuming the session later (a fresh page load re-runs the
+    # scan from scratch): the persisted selector must be restored, not
+    # silently dropped.
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Scenario (B5)")

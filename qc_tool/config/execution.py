@@ -13,11 +13,11 @@ Every consumer of ``ExecutionBindings`` treats it as fully optional
 legacy run with no saved ``input_contract`` -- and therefore no resolved
 member/sheet/region bindings -- stays byte-identical.
 
-Known Step 3 scope boundary: the adapted ``RowIdentityRule`` carries one
-shared ``header_row`` for both sides (a legacy-shape limitation), so a
-region with genuinely different baseline/current first-data-rows is not
-yet fully exploited here -- Step 8 extends alignment to consume
-per-side boundaries directly rather than through this adapter.
+Step 8 extends the adapter to consume ``ResolvedRegion``'s per-side
+preamble/footer/first-data-row facts directly, producing genuinely
+independent ``baseline_header_row``/``baseline_footer_row`` overrides
+(``qc_tool.excel.align``'s bottom/top-aligned positional comparison) instead
+of assuming one shared boundary for both sides.
 """
 
 from __future__ import annotations
@@ -51,6 +51,48 @@ def _top_left(cell_range: str) -> tuple[int, int] | None:
         return None
 
 
+def _bottom_row(cell_range: str) -> int | None:
+    """The max row of a range or single-cell string, or ``None`` if
+    unparseable.
+    """
+    if not cell_range:
+        return None
+    try:
+        if ":" in cell_range:
+            _, _, _, max_row = range_boundaries(cell_range)
+            return max_row
+        row, _ = coordinate_to_tuple(cell_range)
+        return row
+    except ValueError:
+        return None
+
+
+def _side_header_row(
+    *, outer_range: str | None, first_data_row: int | None, preamble_rows: int
+) -> int | None:
+    """The last preamble row for one side, or ``None`` when this side has no
+    explicit preamble boundary at all (an untouched automatic region).
+    """
+    if first_data_row is not None:
+        return first_data_row - 1
+    if preamble_rows > 0 and outer_range:
+        top = _top_left(outer_range)
+        if top is not None:
+            return top[0] + preamble_rows - 1
+    return None
+
+
+def _side_footer_row(*, outer_range: str | None, footer_rows: int) -> int | None:
+    """The first footer row for one side, or ``None`` when this side has no
+    explicit footer boundary.
+    """
+    if footer_rows > 0 and outer_range:
+        bottom = _bottom_row(outer_range)
+        if bottom is not None:
+            return bottom - footer_rows + 1
+    return None
+
+
 def region_as_row_identity_rule(region: ResolvedRegion) -> RowIdentityRule | None:
     """Adapt one keyed, execution-confirmed ``ResolvedRegion`` into a
     ``RowIdentityRule``, or ``None`` when this region carries no
@@ -79,15 +121,97 @@ def region_as_row_identity_rule(region: ResolvedRegion) -> RowIdentityRule | Non
         return None
     anchor_row, anchor_col = anchor
     anchor_cell = f"{get_column_letter(anchor_col)}{anchor_row}"
-    header_row: int | None = None
-    if region.header_intent == "first_data_row" and region.current_first_data_row:
-        header_row = region.current_first_data_row - 1
+    current_header_row = _side_header_row(
+        outer_range=region.current_outer_range,
+        first_data_row=region.current_first_data_row,
+        preamble_rows=region.current_preamble_rows,
+    )
+    current_footer_row = _side_footer_row(
+        outer_range=region.current_outer_range, footer_rows=region.current_footer_rows
+    )
+    baseline_header_row = _side_header_row(
+        outer_range=region.baseline_outer_range,
+        first_data_row=region.baseline_first_data_row,
+        preamble_rows=region.baseline_preamble_rows,
+    )
+    baseline_footer_row = _side_footer_row(
+        outer_range=region.baseline_outer_range, footer_rows=region.baseline_footer_rows
+    )
+    trim_identity_whitespace = any(
+        column.trim_outer_whitespace
+        for column in region.columns
+        if column.alignment_role == "identity"
+    )
     return RowIdentityRule(
         anchor_cell=anchor_cell,
-        header_row=header_row,
+        header_row=current_header_row,
+        footer_row=current_footer_row,
+        # Only carry an explicit per-side override when this region actually
+        # has independent baseline-side facts; otherwise the alignment
+        # layer's own "fall back to the shared value" default applies.
+        baseline_header_row=baseline_header_row if region.baseline_outer_range else None,
+        baseline_footer_row=baseline_footer_row if region.baseline_outer_range else None,
         identity_columns=identity_columns,
         ordinal_columns=ordinal_columns,
         duplicate_policy=region.duplicate_key_policy,
+        # This adapter is the ONLY producer of execution-confirmed rules
+        # from the mode-aware configuration workspace; every rule saved
+        # through the legacy YAML profile editor bypasses this function
+        # entirely and keeps its original strip+casefold behavior (Step 8's
+        # "exact typed equality plus optional outer-whitespace trim only"
+        # criterion applies only to this new pathway, never retroactively).
+        exact_typed_equality=True,
+        trim_identity_whitespace=trim_identity_whitespace,
+    )
+
+
+class RegionColumnPolicies:
+    """One region's non-normal column comparison policies, keyed by its
+    stable anchor cell (Step 8) -- consumed by
+    ``qc_tool.excel.diff_values.region_range_sets`` the same way a
+    confirmed ``RowIdentityRule``'s ordinal columns already are.
+    """
+
+    __slots__ = ("anchor_cell", "expected_refresh_columns", "ignore_columns")
+
+    def __init__(
+        self,
+        anchor_cell: str,
+        ignore_columns: tuple[str, ...] = (),
+        expected_refresh_columns: tuple[str, ...] = (),
+    ) -> None:
+        self.anchor_cell = anchor_cell
+        self.ignore_columns = ignore_columns
+        self.expected_refresh_columns = expected_refresh_columns
+
+
+def region_column_policies(region: ResolvedRegion) -> RegionColumnPolicies | None:
+    """Adapt one region's ignore/expected-refresh column columns into
+    ``RegionColumnPolicies``, or ``None`` when it declares neither.
+    """
+    ignore_columns = tuple(
+        column.current_letter
+        for column in region.columns
+        if column.comparison_policy == "ignore" and column.current_letter
+    )
+    expected_refresh_columns = tuple(
+        column.current_letter
+        for column in region.columns
+        if column.comparison_policy == "expected_refresh" and column.current_letter
+    )
+    if not ignore_columns and not expected_refresh_columns:
+        return None
+    anchor_source = region.current_data_range or region.current_outer_range
+    if not anchor_source:
+        return None
+    anchor = _top_left(anchor_source)
+    if anchor is None:
+        return None
+    anchor_row, anchor_col = anchor
+    return RegionColumnPolicies(
+        anchor_cell=f"{get_column_letter(anchor_col)}{anchor_row}",
+        ignore_columns=ignore_columns,
+        expected_refresh_columns=expected_refresh_columns,
     )
 
 
@@ -123,6 +247,25 @@ class ExecutionBindings:
             ):
                 renames[sheet.current_sheet_name] = sheet.baseline_sheet_name
         return renames
+
+    def column_policies(
+        self, member_id: str, current_sheet_name: str
+    ) -> tuple[RegionColumnPolicies, ...]:
+        """Ignore/expected-refresh column policies for every region on
+        ``current_sheet_name`` that declares at least one (Step 8).
+        """
+        member = self._members.get(member_id)
+        if member is None:
+            return ()
+        policies: list[RegionColumnPolicies] = []
+        for sheet in member.sheets:
+            if sheet.current_sheet_name != current_sheet_name:
+                continue
+            for region in sheet.regions:
+                policy = region_column_policies(region)
+                if policy is not None:
+                    policies.append(policy)
+        return tuple(policies)
 
     def row_identity_rules(
         self, member_id: str, current_sheet_name: str

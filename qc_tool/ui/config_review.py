@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Literal
 
@@ -34,6 +34,7 @@ from qc_tool.config.input_contract import (
     LogicalRegionContract,
     LogicalSheetContract,
     RegionMode,
+    SelectorPrerequisiteContract,
     StructuralExclusionContract,
     WorkbookInputContract,
 )
@@ -43,6 +44,7 @@ from qc_tool.config.resolved_input import (
     ResolvedInputConfigurationV1,
     ResolvedMember,
     ResolvedRegion,
+    ResolvedSelector,
     ResolvedSheet,
 )
 from qc_tool.coverage import QCRunMode
@@ -86,12 +88,48 @@ class RegionDecision:
     anchor_cell: str
     mode: RegionMode = "automatic"
     header_intent: HeaderIntent = "automatic"
+    #: Only meaningful when ``header_intent == "first_data_row"``.
+    first_data_row: int | None = None
+    #: Explicit preamble/footer row COUNTS -- an alternative, additive way to
+    #: express the same boundary as ``first_data_row`` (Step 8's "bottom-
+    #: aligned preamble / top-aligned footer" criterion). Either or both may
+    #: be set; they compose (the engine adapter treats ``first_data_row`` as
+    #: authoritative over ``preamble_rows`` when both are present).
+    preamble_rows: int = 0
+    footer_rows: int = 0
+    #: An analyst-entered override for the region's BASELINE-side range,
+    #: independent of ``current_range`` (Step 8's "dynamic side-specific
+    #: outer/data ranges" criterion). Empty means "use the auto-matched
+    #: baseline region, if any."
+    baseline_range: str = ""
     identity_columns: tuple[str, ...] = ()
     ordinal_columns: tuple[str, ...] = ()
+    #: Columns excluded from the value-diff engine (requires a reason +
+    #: expiry, like region-level exclusion). Scope boundary (disclosed,
+    #: plan-20260913 Step 8): suppresses cached-value/number-format
+    #: findings via the same ``ignore_ranges`` mechanism a legacy profile
+    #: already uses; does NOT yet suppress a formula-text-changed finding
+    #: for the same cell (the formula-diff engine has no comparable
+    #: region-scoped ignore hook yet) -- an ignored formula cell may still
+    #: surface a formula finding today.
+    ignore_columns: tuple[str, ...] = ()
+    #: Columns whose cached-value changes stay visible Expected rather than
+    #: hidden (Step 8's "expected_refresh remains visible Expected" rule).
+    expected_refresh_columns: tuple[str, ...] = ()
+    #: Outer-whitespace trim for identity-column equality (Step 8's "exact
+    #: typed equality plus optional outer-whitespace trim only" rule).
+    #: Applies to every identity column in this region -- a deliberate
+    #: region-level simplification of the contract's per-column field,
+    #: disclosed since real-world identity columns in one region are
+    #: almost always formatted consistently.
+    trim_identity_whitespace: bool = False
+    blank_key_policy: Literal["system_default", "tolerate", "block"] = "system_default"
     available_columns: tuple[str, ...] = ()
     duplicate_key_policy: Literal["skip", "occurrence", "position"] = "skip"
     exclusion_reason: str = ""
     exclusion_expires_on: str = ""  # ISO date, "" = not set
+    ignore_columns_reason: str = ""
+    ignore_columns_expires_on: str = ""
     #: A detected ranked-table candidate existed for this region but has not
     #: yet been reviewed -- surfaced as a warning until the analyst
     #: explicitly picks a mode (never auto-applied).
@@ -106,7 +144,28 @@ class RegionDecision:
     def is_valid(self) -> bool:
         if self.mode == "excluded" and (not self.exclusion_reason or not self.exclusion_expires_on):
             return False
-        return not (self.mode == "keyed" and not self.identity_columns)
+        if self.mode == "keyed" and not self.identity_columns:
+            return False
+        if self.header_intent == "first_data_row" and self.first_data_row is None:
+            return False
+        return not (
+            self.ignore_columns
+            and (not self.ignore_columns_reason or not self.ignore_columns_expires_on)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SelectorDecision:
+    """One analyst-declared selector/scenario prerequisite cell (Step 8's
+    "explicit selector prerequisites for dropdown/filter/scenario/parameter
+    cells" criterion). Never carries a value -- only a label and a
+    current-side cell location; the run-time engine check compares the two
+    files' actual saved values without ever persisting either one.
+    """
+
+    selector_id: str
+    label: str
+    cell: str  # current-side A1 cell
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +178,7 @@ class SheetReview:
     side: Literal["baseline", "current"]
     regions: tuple[RegionDecision, ...] = ()
     failure_detail: str = ""
+    selectors: tuple[SelectorDecision, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +187,10 @@ class MemberReview:
     current_sheets: tuple[SheetReview, ...] = ()
     baseline_sheets: tuple[SheetReview, ...] = ()
     failure_detail: str = ""
+    #: current_sheet_name -> baseline_sheet_name for an analyst-declared
+    #: rename (Step 8), promoting an added+removed pair into one logical
+    #: sheet. Never guessed -- only ever set by an explicit UI choice.
+    sheet_renames: dict[str, str] = field(default_factory=dict)
 
 
 def _region_columns(min_col: int, max_col: int) -> tuple[str, ...]:
@@ -183,6 +247,7 @@ def member_review_from_scan(
             hidden=sheet.hidden,
             very_hidden=sheet.very_hidden,
             side="baseline",
+            regions=region_decisions_from_sheet(sheet, taken_ids=taken_ids),
             failure_detail=sheet.failure_detail,
         )
         for sheet in profile.baseline_sheets
@@ -210,6 +275,164 @@ def sheet_pairing(
     added = tuple(sorted(current_names - baseline_names))
     removed = tuple(sorted(baseline_names - current_names))
     return tuple((name, name) for name in paired), added, removed
+
+
+def set_sheet_rename(
+    member: MemberReview, current_name: str, baseline_name: str | None
+) -> MemberReview:
+    """Declare (``baseline_name`` not None) or clear (``None``) that
+    ``current_name`` is a rename of ``baseline_name`` (Step 8's "renamed
+    sheets require explicit mapping" criterion). One-to-one by construction:
+    claiming a baseline name here silently releases whichever OTHER current
+    sheet previously claimed it.
+    """
+    renames = dict(member.sheet_renames)
+    renames.pop(current_name, None)
+    if baseline_name is not None:
+        for other_current, other_baseline in list(renames.items()):
+            if other_baseline == baseline_name:
+                del renames[other_current]
+        renames[current_name] = baseline_name
+    return replace(member, sheet_renames=renames)
+
+
+def effective_sheet_pairing(
+    member: MemberReview,
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...], tuple[str, ...]]:
+    """``sheet_pairing`` plus every analyst-declared rename promoted from
+    added/removed into a real pair -- what the resolved configuration and
+    the workspace's own acknowledgement warnings both use.
+    """
+    pairs, added, removed = sheet_pairing(member)
+    renamed_pairs = tuple(
+        (baseline_name, current_name)
+        for current_name, baseline_name in sorted(member.sheet_renames.items())
+        if current_name in added and baseline_name in removed
+    )
+    if not renamed_pairs:
+        return pairs, added, removed
+    renamed_currents = {current for _, current in renamed_pairs}
+    renamed_baselines = {baseline for baseline, _ in renamed_pairs}
+    return (
+        tuple(sorted((*pairs, *renamed_pairs))),
+        tuple(name for name in added if name not in renamed_currents),
+        tuple(name for name in removed if name not in renamed_baselines),
+    )
+
+
+def add_selector(
+    member: MemberReview, sheet_name: str, *, label: str, cell: str
+) -> MemberReview:
+    """Declare a new selector prerequisite on one current sheet (Step 8).
+    Raises ``ValueError`` for an unparseable cell or a blank label --
+    surfaced to the analyst, never silently ignored.
+    """
+    if not label.strip():
+        raise ValueError("enter a label for this selector")
+    parse_a1_cell(cell)  # validates; raises ValueError with a plain message
+    taken_ids = {
+        selector.selector_id
+        for sheet in member.current_sheets
+        for selector in sheet.selectors
+    }
+    selector_id = _unique_id(slugify(label, prefix="selector"), taken_ids)
+    new_sheets = []
+    for sheet in member.current_sheets:
+        if sheet.sheet_name != sheet_name:
+            new_sheets.append(sheet)
+            continue
+        new_sheets.append(
+            replace(
+                sheet,
+                selectors=(
+                    *sheet.selectors,
+                    SelectorDecision(
+                        selector_id=selector_id, label=label.strip(), cell=cell.upper()
+                    ),
+                ),
+            )
+        )
+    return replace(member, current_sheets=tuple(new_sheets))
+
+
+def remove_selector(member: MemberReview, sheet_name: str, selector_id: str) -> MemberReview:
+    new_sheets = []
+    for sheet in member.current_sheets:
+        if sheet.sheet_name != sheet_name:
+            new_sheets.append(sheet)
+            continue
+        new_sheets.append(
+            replace(
+                sheet,
+                selectors=tuple(s for s in sheet.selectors if s.selector_id != selector_id),
+            )
+        )
+    return replace(member, current_sheets=tuple(new_sheets))
+
+
+_ColumnRole = Literal["identity", "ordinal", "ignore", "expected_refresh"]
+
+
+def _set_column_role(
+    region: RegionDecision, role: _ColumnRole, columns: tuple[str, ...]
+) -> RegionDecision:
+    """Assign the full set of columns holding one role, evicting every one
+    of them from the other three roles (disjoint by construction -- Step
+    8's "identity and ordinal columns are disjoint" criterion, generalized
+    to all four column roles).
+    """
+    roles: dict[_ColumnRole, tuple[str, ...]] = {
+        "identity": region.identity_columns,
+        "ordinal": region.ordinal_columns,
+        "ignore": region.ignore_columns,
+        "expected_refresh": region.expected_refresh_columns,
+    }
+    roles[role] = columns
+    for other_role in roles:
+        if other_role != role:
+            roles[other_role] = tuple(c for c in roles[other_role] if c not in columns)
+    return replace(
+        region,
+        identity_columns=roles["identity"],
+        ordinal_columns=roles["ordinal"],
+        ignore_columns=roles["ignore"],
+        expected_refresh_columns=roles["expected_refresh"],
+    )
+
+
+def set_identity_columns(region: RegionDecision, columns: tuple[str, ...]) -> RegionDecision:
+    return _set_column_role(region, "identity", columns)
+
+
+def set_ordinal_columns(region: RegionDecision, columns: tuple[str, ...]) -> RegionDecision:
+    return _set_column_role(region, "ordinal", columns)
+
+
+def set_ignore_columns(region: RegionDecision, columns: tuple[str, ...]) -> RegionDecision:
+    return _set_column_role(region, "ignore", columns)
+
+
+def set_expected_refresh_columns(
+    region: RegionDecision, columns: tuple[str, ...]
+) -> RegionDecision:
+    return _set_column_role(region, "expected_refresh", columns)
+
+
+def regions_overlap(a: RegionDecision, b: RegionDecision) -> bool:
+    """Whether two regions' current-side ranges occupy any shared cell
+    (Step 8's "overlapping regions are rejected" criterion).
+    """
+    try:
+        a_min_row, a_min_col, a_max_row, a_max_col = parse_a1_range(a.current_range)
+        b_min_row, b_min_col, b_max_row, b_max_col = parse_a1_range(b.current_range)
+    except ValueError:
+        return False
+    return (
+        a_min_col <= b_max_col
+        and b_min_col <= a_max_col
+        and a_min_row <= b_max_row
+        and b_min_row <= a_max_row
+    )
 
 
 class WizardStep(StrEnum):
@@ -304,6 +527,40 @@ def compute_warnings(result: SetupAnalysisResult) -> tuple[WarningItem, ...]:
                         "(external links or unrecognized content) that keep "
                         "formula-text enrichment degraded to presence-only checks."
                     ),
+                )
+            )
+    return tuple(warnings)
+
+
+def compute_sheet_pairing_warnings(state: ConfigWorkspaceState) -> tuple[WarningItem, ...]:
+    """Added/removed-sheet acknowledgements (Step 8's "added and removed
+    sheets surface as acknowledgements before run" criterion). A sheet the
+    analyst has explicitly paired via a rename (``set_sheet_rename``) is
+    excluded here -- it is no longer "added" or "removed", it is renamed.
+    """
+    warnings: list[WarningItem] = []
+    for member in state.member_reviews:
+        _pairs, added, removed = effective_sheet_pairing(member)
+        for name in added:
+            warnings.append(
+                WarningItem(
+                    code=f"sheet_added:{member.member_id}:{name}",
+                    message=(
+                        f"{name!r} is a new sheet in the current file, not present "
+                        "in the baseline file."
+                    ),
+                    severity="block",
+                )
+            )
+        for name in removed:
+            warnings.append(
+                WarningItem(
+                    code=f"sheet_removed:{member.member_id}:{name}",
+                    message=(
+                        f"{name!r} from the baseline file is missing from the "
+                        "current file."
+                    ),
+                    severity="block",
                 )
             )
     return tuple(warnings)
@@ -488,8 +745,8 @@ def region_with_bounds(
     """Rebuild a region's anchor/range/available-columns from explicit
     bounds -- the shared tail end of both the "click a preview cell" and
     "type an A1 range" controls (Step 7's "click/A1 controls" criterion).
-    Identity/ordinal columns that fall outside the new column span are
-    dropped (they no longer name a real column); mode, header intent,
+    Every column-role assignment that falls outside the new column span is
+    dropped (it no longer names a real column); mode, header intent,
     exclusion detail, and confirmed all survive unchanged.
     """
     columns = _region_columns(min_col, max_col)
@@ -500,6 +757,10 @@ def region_with_bounds(
         available_columns=columns,
         identity_columns=tuple(c for c in region.identity_columns if c in columns),
         ordinal_columns=tuple(c for c in region.ordinal_columns if c in columns),
+        ignore_columns=tuple(c for c in region.ignore_columns if c in columns),
+        expected_refresh_columns=tuple(
+            c for c in region.expected_refresh_columns if c in columns
+        ),
     )
 
 
@@ -535,18 +796,32 @@ def apply_region_transform(
     """Like `update_region_decision` but for edits that must recompute
     several fields together -- `apply_anchor_click`/`apply_manual_range` are
     the intended `transform` callables. Propagates a `ValueError` raised by
-    `transform` (e.g. an unparseable typed range) to the caller unchanged.
+    `transform` (e.g. an unparseable typed range) to the caller unchanged,
+    and raises one itself when the transformed region would overlap a
+    sibling region on the same sheet (Step 8's "overlapping regions are
+    rejected" criterion).
     """
     new_sheets = []
     for sheet in member.current_sheets:
         if sheet.sheet_name != sheet_name:
             new_sheets.append(sheet)
             continue
-        new_regions = tuple(
-            transform(region) if region.region_id == region_id else region
-            for region in sheet.regions
-        )
-        new_sheets.append(replace(sheet, regions=new_regions))
+        new_regions: list[RegionDecision] = []
+        transformed: RegionDecision | None = None
+        for region in sheet.regions:
+            if region.region_id == region_id:
+                transformed = transform(region)
+                new_regions.append(transformed)
+            else:
+                new_regions.append(region)
+        if transformed is not None:
+            for other in new_regions:
+                if other.region_id != region_id and regions_overlap(transformed, other):
+                    raise ValueError(
+                        f"this range overlaps region {other.region_id!r} "
+                        f"({other.current_range})"
+                    )
+        new_sheets.append(replace(sheet, regions=tuple(new_regions)))
     return replace(member, current_sheets=tuple(new_sheets))
 
 
@@ -588,37 +863,92 @@ def unresolved_blockers(
 
 def _resolved_column(region: RegionDecision, letter: str) -> ResolvedColumn:
     role: AlignmentRole = "none"
+    policy: Literal["normal", "ignore", "expected_refresh"] = "normal"
     if letter in region.identity_columns:
         role = "identity"
     elif letter in region.ordinal_columns:
         role = "ordinal"
+    elif letter in region.ignore_columns:
+        policy = "ignore"
+    elif letter in region.expected_refresh_columns:
+        policy = "expected_refresh"
     return ResolvedColumn(
         column_id=slugify(f"{region.region_id}_{letter}", prefix="col"),
         baseline_letter=letter,
         current_letter=letter,
         alignment_role=role,
-        coverage="confirmed" if role != "none" else "automatic_confirmed",
+        comparison_policy=policy,
+        trim_outer_whitespace=region.trim_identity_whitespace and role == "identity",
+        coverage="confirmed" if (role != "none" or policy != "normal") else "automatic_confirmed",
     )
 
 
-def _resolved_region(region: RegionDecision) -> ResolvedRegion:
+def _matching_baseline_region(
+    member: MemberReview, current_sheet: SheetReview, region_index: int
+) -> RegionDecision | None:
+    """The baseline region auto-matched to one current region -- by ordinal
+    position within the paired baseline sheet's own detected regions, the
+    same conservative heuristic ``qc_tool.setup.analysis.analyze_member``
+    already uses for its own ranked-candidate pairing. ``None`` when no
+    baseline sheet is paired, or its region count does not line up simply.
+    """
+    pairs, _added, _removed = effective_sheet_pairing(member)
+    baseline_name = next(
+        (base for base, curr in pairs if curr == current_sheet.sheet_name), None
+    )
+    if baseline_name is None:
+        return None
+    baseline_sheet = next(
+        (sheet for sheet in member.baseline_sheets if sheet.sheet_name == baseline_name), None
+    )
+    if baseline_sheet is None or region_index >= len(baseline_sheet.regions):
+        return None
+    return baseline_sheet.regions[region_index]
+
+
+def _resolved_region(
+    region: RegionDecision, baseline_region: RegionDecision | None
+) -> ResolvedRegion:
     columns = tuple(
         _resolved_column(region, letter)
-        for letter in region.identity_columns + region.ordinal_columns
+        for letter in (
+            *region.identity_columns,
+            *region.ordinal_columns,
+            *region.ignore_columns,
+            *region.expected_refresh_columns,
+        )
     )
     coverage = "confirmed" if region.confirmed else "automatic_confirmed"
     if region.mode == "excluded":
         coverage = "degraded_acknowledged" if region.confirmed else "automatic_confirmed"
     elif region.mode == "positional":
         coverage = "positional"
+    baseline_outer_range = region.baseline_range or (
+        baseline_region.current_range if baseline_region is not None else None
+    )
     return ResolvedRegion(
         region_id=region.region_id,
         mode=region.mode,
         header_intent=region.header_intent,
+        baseline_outer_range=baseline_outer_range,
         current_outer_range=region.current_range,
+        baseline_data_range=baseline_outer_range,
         current_data_range=region.current_range,
+        baseline_first_data_row=(
+            baseline_region.first_data_row if baseline_region is not None else None
+        ),
+        current_first_data_row=region.first_data_row,
+        baseline_preamble_rows=(
+            baseline_region.preamble_rows if baseline_region is not None else region.preamble_rows
+        ),
+        current_preamble_rows=region.preamble_rows,
+        baseline_footer_rows=(
+            baseline_region.footer_rows if baseline_region is not None else region.footer_rows
+        ),
+        current_footer_rows=region.footer_rows,
         columns=columns,
         duplicate_key_policy=region.duplicate_key_policy,
+        blank_key_policy=region.blank_key_policy,
         coverage=coverage,
         degraded_reason=region.exclusion_reason,
     )
@@ -640,17 +970,29 @@ def build_resolved_configuration(
     members: list[ResolvedMember] = []
     for member in state.member_reviews:
         sheets: list[ResolvedSheet] = []
-        pairs, _added, _removed = sheet_pairing(member)
-        paired_current = {current for _, current in pairs}
+        pairs, _added, _removed = effective_sheet_pairing(member)
+        baseline_by_current = {curr: base for base, curr in pairs}
         for sheet in member.current_sheets:
-            baseline_name = sheet.sheet_name if sheet.sheet_name in paired_current else None
-            regions = tuple(_resolved_region(region) for region in sheet.regions)
+            baseline_name = baseline_by_current.get(sheet.sheet_name)
+            regions = tuple(
+                _resolved_region(region, _matching_baseline_region(member, sheet, index))
+                for index, region in enumerate(sheet.regions)
+            )
+            selectors = tuple(
+                ResolvedSelector(
+                    selector_id=selector.selector_id,
+                    baseline_cell=selector.cell if baseline_name else None,
+                    current_cell=selector.cell,
+                )
+                for selector in sheet.selectors
+            )
             sheets.append(
                 ResolvedSheet(
                     sheet_id=sheet_id_for(member.member_id, sheet.sheet_name),
                     baseline_sheet_name=baseline_name,
                     current_sheet_name=sheet.sheet_name,
                     regions=regions,
+                    selectors=selectors,
                     coverage="automatic_confirmed" if regions else "confirmed",
                 )
             )
@@ -672,13 +1014,26 @@ def build_resolved_configuration(
 
 def _column_contract(region: RegionDecision, letter: str) -> LogicalColumnContract:
     role: AlignmentRole = "none"
+    policy: Literal["normal", "ignore", "expected_refresh"] = "normal"
+    exclusion: StructuralExclusionContract | None = None
     if letter in region.identity_columns:
         role = "identity"
     elif letter in region.ordinal_columns:
         role = "ordinal"
+    elif letter in region.ignore_columns:
+        policy = "ignore"
+        exclusion = StructuralExclusionContract(
+            reason=region.ignore_columns_reason or "ignored via the configuration workspace",
+            expires_on=_parse_iso_date(region.ignore_columns_expires_on),
+        )
+    elif letter in region.expected_refresh_columns:
+        policy = "expected_refresh"
     return LogicalColumnContract(
         column_id=slugify(f"{region.region_id}_{letter}", prefix="col"),
         alignment_role=role,
+        comparison_policy=policy,
+        trim_outer_whitespace=region.trim_identity_whitespace and role == "identity",
+        exclusion=exclusion,
     )
 
 
@@ -691,7 +1046,12 @@ def _region_contract(region: RegionDecision) -> LogicalRegionContract:
         )
     columns = tuple(
         _column_contract(region, letter)
-        for letter in (*region.identity_columns, *region.ordinal_columns)
+        for letter in (
+            *region.identity_columns,
+            *region.ordinal_columns,
+            *region.ignore_columns,
+            *region.expected_refresh_columns,
+        )
     )
     return LogicalRegionContract(
         region_id=region.region_id,
@@ -699,7 +1059,9 @@ def _region_contract(region: RegionDecision) -> LogicalRegionContract:
         header_intent=region.header_intent,
         anchor_cell=region.anchor_cell,
         preferred_current_range=region.current_range,
+        preferred_first_data_row=region.first_data_row,
         columns=columns,
+        blank_key_policy=region.blank_key_policy,
         duplicate_key_policy=region.duplicate_key_policy,
         exclusion=exclusion,
     )
@@ -720,31 +1082,58 @@ def sheet_id_for(member_id: str, sheet_name: str) -> str:
     return slugify(f"{member_id}_{sheet_name}", prefix="sheet")
 
 
+def _region_is_touched(region: RegionDecision) -> bool:
+    """Whether a region carries ANY analyst decision worth saving -- the
+    "only regions the analyst actually touched" test `build_input_contract`
+    applies before recording a logical region.
+    """
+    return bool(
+        region.mode != "automatic"
+        or region.header_intent != "automatic"
+        or region.identity_columns
+        or region.ordinal_columns
+        or region.ignore_columns
+        or region.expected_refresh_columns
+        or region.preamble_rows
+        or region.footer_rows
+        or region.blank_key_policy != "system_default"
+        or region.baseline_range
+    )
+
+
 def build_input_contract(state: ConfigWorkspaceState) -> WorkbookInputContract:
     """Project the workspace's own decisions into a durable saved
     ``WorkbookInputContract`` for ``Save profile``/``Update profile``.
 
-    Only regions the analyst actually touched (``mode != "automatic"`` or
-    carrying at least one identity/ordinal column) become saved logical
-    regions -- an untouched, still-automatic sheet is recorded as a bare
-    logical sheet hint (no regions), matching the architecture's own "a
-    bare identity/preference hint... never conflicts with legacy fields"
-    rule.
+    Only regions the analyst actually touched (see ``_region_is_touched``)
+    become saved logical regions -- an untouched, still-automatic sheet is
+    recorded as a bare logical sheet hint (no regions), matching the
+    architecture's own "a bare identity/preference hint... never conflicts
+    with legacy fields" rule.
     """
     members: list[LogicalMemberContract] = []
     for member in state.member_reviews:
         sheets: list[LogicalSheetContract] = []
         for sheet in member.current_sheets:
             regions = tuple(
-                _region_contract(region)
-                for region in sheet.regions
-                if region.mode != "automatic" or region.identity_columns or region.ordinal_columns
+                _region_contract(region) for region in sheet.regions if _region_is_touched(region)
+            )
+            sheet_id = sheet_id_for(member.member_id, sheet.sheet_name)
+            selectors = tuple(
+                SelectorPrerequisiteContract(
+                    selector_id=selector.selector_id,
+                    label=selector.label,
+                    owner_sheet_id=sheet_id,
+                    preferred_current_cell=selector.cell,
+                )
+                for selector in sheet.selectors
             )
             sheets.append(
                 LogicalSheetContract(
-                    sheet_id=sheet_id_for(member.member_id, sheet.sheet_name),
+                    sheet_id=sheet_id,
                     preferred_sheet_name=sheet.sheet_name,
                     regions=regions,
+                    selectors=selectors,
                 )
             )
         members.append(LogicalMemberContract(member_id=member.member_id, sheets=tuple(sheets)))

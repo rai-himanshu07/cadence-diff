@@ -109,9 +109,14 @@ class RowIdentityRule(BaseModel):
     identifies the target region -- a rule matches whichever detected block
     region's bounds contain that cell, so it keeps matching across ordinary
     row growth. ``header_row`` excludes a confirmed preamble/header from key
-    matching while preserving its positional comparison. Column letters are
-    used (not header text) so the rule survives header renames and is never
-    confused with a business value.
+    matching while preserving its positional comparison; ``footer_row`` (the
+    first footer row) does the same at the bottom of the region
+    (plan-20260913, Step 8). ``baseline_header_row``/``baseline_footer_row``
+    let the two sides' preamble/footer sizes genuinely differ -- when unset,
+    the baseline side falls back to the shared ``header_row``/``footer_row``
+    value, preserving byte-identical behavior for every rule saved before
+    Step 8. Column letters are used (not header text) so the rule survives
+    header renames and is never confused with a business value.
     """
 
     anchor_cell: str
@@ -120,9 +125,32 @@ class RowIdentityRule(BaseModel):
         ge=1,
         exclude_if=lambda value: value is None,
     )
+    footer_row: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    baseline_header_row: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
+    baseline_footer_row: int | None = Field(
+        default=None,
+        ge=1,
+        exclude_if=lambda value: value is None,
+    )
     identity_columns: list[str] = Field(min_length=1)
     ordinal_columns: list[str] = Field(default_factory=list)
     duplicate_policy: Literal["skip", "occurrence", "position"] = "skip"
+    #: Step 8: when False (the default -- every rule saved before Step 8),
+    #: preserves this engine's original strip+casefold string identity
+    #: normalization unchanged. When True (only ever set by the mode-aware
+    #: configuration workspace's execution-bindings adapter), identity
+    #: comparison is exact typed equality, optionally trimmed via
+    #: ``trim_identity_whitespace`` -- never case-folded.
+    exact_typed_equality: bool = False
+    trim_identity_whitespace: bool = False
 
     @field_validator("anchor_cell")
     @classmethod

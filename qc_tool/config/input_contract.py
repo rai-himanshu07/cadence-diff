@@ -175,6 +175,12 @@ class LogicalColumnContract(BaseModel):
     ``alignment_role`` and ``comparison_policy`` are orthogonal dimensions
     represented as two independent enum fields (never two booleans), so
     identity and ordinal are disjoint by construction.
+
+    Scope boundary (disclosed, plan-20260913 Step 8): ``comparison_policy
+    == "ignore"`` reaches the value-diff engine (cached-value/number-
+    format findings are suppressed); it does not yet reach the formula-
+    diff engine, so a formula-text change in an ignored column may still
+    surface a finding.
     """
 
     column_id: str

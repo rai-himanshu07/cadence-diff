@@ -176,6 +176,57 @@ def test_region_with_no_resolvable_anchor_range_produces_no_rule() -> None:
     assert region_as_row_identity_rule(region) is None
 
 
+def test_current_preamble_rows_yields_a_header_row_relative_to_the_outer_range() -> None:
+    """Step 8: an analyst-entered preamble ROW COUNT (not just an explicit
+    first-data-row) also produces a header_row, computed from the region's
+    own outer-range top.
+    """
+    region = _keyed_region(current_outer_range="A1:C10", current_preamble_rows=2)
+    rule = region_as_row_identity_rule(region)
+    assert rule is not None
+    assert rule.header_row == 2  # rows 1-2 preamble, data starts row 3
+
+
+def test_current_footer_rows_yields_a_footer_row_relative_to_the_outer_range() -> None:
+    region = _keyed_region(current_outer_range="A1:C10", current_footer_rows=2)
+    rule = region_as_row_identity_rule(region)
+    assert rule is not None
+    assert rule.footer_row == 9  # rows 9-10 footer
+
+
+def test_baseline_side_facts_produce_independent_overrides() -> None:
+    """Step 8: genuinely different baseline preamble/footer sizes produce
+    real baseline_header_row/baseline_footer_row overrides, not the shared
+    current-side value.
+    """
+    region = _keyed_region(
+        current_outer_range="A1:C10",
+        current_preamble_rows=2,
+        current_footer_rows=1,
+        baseline_outer_range="A1:C9",
+        baseline_preamble_rows=1,
+        baseline_footer_rows=1,
+    )
+    rule = region_as_row_identity_rule(region)
+    assert rule is not None
+    assert rule.header_row == 2
+    assert rule.footer_row == 10
+    assert rule.baseline_header_row == 1
+    assert rule.baseline_footer_row == 9
+
+
+def test_absent_baseline_outer_range_leaves_the_per_side_overrides_unset() -> None:
+    """When this region has no independently-detected baseline facts at
+    all, the overrides stay None so the alignment layer's own fallback
+    (share the current-side value) applies -- never a wrong guess.
+    """
+    region = _keyed_region(current_outer_range="A1:C10", current_preamble_rows=2)
+    rule = region_as_row_identity_rule(region)
+    assert rule is not None
+    assert rule.baseline_header_row is None
+    assert rule.baseline_footer_row is None
+
+
 # --- row_identity_rules lookup ----------------------------------------------
 
 

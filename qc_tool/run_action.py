@@ -32,6 +32,7 @@ MAX_RANKED_TABLE_HEADER_CHARS = 80
 class RunActionReason(StrEnum):
     COMPARISON_PREREQUISITE_MISMATCH = "comparison_prerequisite_mismatch"
     ROW_IDENTITY_CONFIRMATION_REQUIRED = "row_identity_confirmation_required"
+    BLANK_IDENTITY_KEY_BLOCKED = "blank_identity_key_blocked"
 
 
 class RankedTableEvidence(BaseModel):
