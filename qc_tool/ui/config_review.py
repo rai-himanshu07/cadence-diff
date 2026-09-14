@@ -19,7 +19,7 @@ bindings together.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Literal
@@ -567,6 +567,225 @@ def compute_sheet_pairing_warnings(state: ConfigWorkspaceState) -> tuple[Warning
 
 
 @dataclass(frozen=True, slots=True)
+class SlideDecision:
+    """One slide's analyst-facing configuration decision (Step 9) --
+    PowerPoint's counterpart to a keyed row/column decision. ``included``
+    is only meaningful on the CURRENT side (Step 9's "cycle slide
+    inclusion" criterion); a baseline-side entry always stays included,
+    since it exists purely to compute added/removed acknowledgements.
+    """
+
+    slide_index: int  # 1-based
+    title: str
+    included: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class DeckReview:
+    """One PowerPoint deck's slide inventory and decisions -- a single
+    global review (mirrors ``DeliverableProfile.ppt`` being one profile-
+    wide section, unlike Excel's per-member ``MemberReview``). Absent
+    (``None`` at the ``ConfigWorkspaceState`` level) whenever the current
+    mode/role selection has no PPT file at all.
+    """
+
+    baseline_slides: tuple[SlideDecision, ...] = ()
+    current_slides: tuple[SlideDecision, ...] = ()
+    #: current title -> baseline title, mirrors ``MemberReview.sheet_renames``.
+    slide_renames: dict[str, str] = field(default_factory=dict)
+    failure_detail: str = ""
+
+
+def deck_review_from_titles(
+    baseline_titles: Sequence[tuple[int, str]],
+    current_titles: Sequence[tuple[int, str]],
+) -> DeckReview:
+    """Seed a fresh ``DeckReview`` from ``qc_tool.io.peek.peek_slide_titles``
+    -shaped ``(1-based index, title)`` pairs -- every slide defaults to
+    included, mirroring every region's ``automatic`` default.
+    """
+    return DeckReview(
+        baseline_slides=tuple(
+            SlideDecision(slide_index=index, title=title) for index, title in baseline_titles
+        ),
+        current_slides=tuple(
+            SlideDecision(slide_index=index, title=title) for index, title in current_titles
+        ),
+    )
+
+
+def set_slide_included(deck: DeckReview, slide_index: int, included: bool) -> DeckReview:
+    """Toggle one CURRENT-side slide's inclusion (Step 9's "cycle slide
+    inclusion" criterion)."""
+    new_slides = tuple(
+        replace(slide, included=included) if slide.slide_index == slide_index else slide
+        for slide in deck.current_slides
+    )
+    return replace(deck, current_slides=new_slides)
+
+
+def slide_pairing(
+    deck: DeckReview,
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...], tuple[str, ...]]:
+    """``(same_title_pairs, added_current_only, removed_baseline_only)`` --
+    PowerPoint's counterpart to ``sheet_pairing``: same-title slides
+    pre-pair automatically, anything else needs an explicit rename or
+    acknowledgement, never a guessed split/merge.
+    """
+    current_titles = {slide.title for slide in deck.current_slides}
+    baseline_titles = {slide.title for slide in deck.baseline_slides}
+    paired = tuple(sorted(current_titles & baseline_titles))
+    added = tuple(sorted(current_titles - baseline_titles))
+    removed = tuple(sorted(baseline_titles - current_titles))
+    return tuple((name, name) for name in paired), added, removed
+
+
+def set_slide_rename(
+    deck: DeckReview, current_title: str, baseline_title: str | None
+) -> DeckReview:
+    """Declare (``baseline_title`` not None) or clear (``None``) that
+    ``current_title`` is a rename of ``baseline_title`` (Step 9's "explicit
+    renamed-slide pins" criterion). One-to-one by construction, mirrors
+    ``set_sheet_rename`` exactly.
+    """
+    renames = dict(deck.slide_renames)
+    renames.pop(current_title, None)
+    if baseline_title is not None:
+        for other_current, other_baseline in list(renames.items()):
+            if other_baseline == baseline_title:
+                del renames[other_current]
+        renames[current_title] = baseline_title
+    return replace(deck, slide_renames=renames)
+
+
+def effective_slide_pairing(
+    deck: DeckReview,
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...], tuple[str, ...]]:
+    """``slide_pairing`` plus every analyst-declared rename promoted from
+    added/removed into a real pair -- mirrors ``effective_sheet_pairing``.
+    """
+    pairs, added, removed = slide_pairing(deck)
+    renamed_pairs = tuple(
+        (baseline_title, current_title)
+        for current_title, baseline_title in sorted(deck.slide_renames.items())
+        if current_title in added and baseline_title in removed
+    )
+    if not renamed_pairs:
+        return pairs, added, removed
+    renamed_currents = {current for _, current in renamed_pairs}
+    renamed_baselines = {baseline for baseline, _ in renamed_pairs}
+    return (
+        tuple(sorted((*pairs, *renamed_pairs))),
+        tuple(name for name in added if name not in renamed_currents),
+        tuple(name for name in removed if name not in renamed_baselines),
+    )
+
+
+def compute_slide_pairing_warnings(deck: DeckReview | None) -> tuple[WarningItem, ...]:
+    """Added/removed-slide acknowledgements for cycle mode (Step 9's "cycle
+    slide inclusion and explicit renamed-slide pins" criterion) -- mirrors
+    ``compute_sheet_pairing_warnings`` exactly. Never fires for a single-
+    sided deck review (preflight/final-package have no baseline deck).
+    """
+    if deck is None or not deck.baseline_slides:
+        return ()
+    warnings: list[WarningItem] = []
+    _pairs, added, removed = effective_slide_pairing(deck)
+    for title in added:
+        warnings.append(
+            WarningItem(
+                code=f"slide_added:{title}",
+                message=(
+                    f"{title!r} is a new slide in the current deck, not present "
+                    "in the baseline deck."
+                ),
+                severity="block",
+            )
+        )
+    for title in removed:
+        warnings.append(
+            WarningItem(
+                code=f"slide_removed:{title}",
+                message=(
+                    f"{title!r} from the baseline deck is missing from the "
+                    "current deck."
+                ),
+                severity="block",
+            )
+        )
+    return tuple(warnings)
+
+
+def compute_required_slide_warnings(
+    deck: DeckReview | None, required_slides: Sequence[str]
+) -> tuple[WarningItem, ...]:
+    """Required-slide consistency (Step 9): every profile-required slide
+    title must exist among the CURRENT deck's slides. A caution, never a
+    hard block here -- the engine's own required-slide check remains
+    authoritative for what actually fails a real run.
+    """
+    if deck is None or not required_slides:
+        return ()
+    current_titles = {slide.title for slide in deck.current_slides}
+    return tuple(
+        WarningItem(
+            code=f"required_slide_missing:{title}",
+            message=f"Required slide {title!r} was not found in the current deck.",
+        )
+        for title in required_slides
+        if title not in current_titles
+    )
+
+
+def resolve_slide_anchors(
+    deck: DeckReview | None, anchor_titles: Sequence[str]
+) -> tuple[WarningItem, ...]:
+    """Final-package logical slide-anchor resolution (Step 9): for each
+    DISTINCT saved anchor title (a ``CrosscheckMapping.slide`` value),
+    resolve it against the current deck's slide titles from title alone
+    (no ordinal is stored on a saved mapping today). Zero matches is
+    "missing"; two or more matches is "ambiguous" -- both are warning-only
+    disclosures, NEVER a blocker and NEVER a guess. Normal QC's own
+    mapping-verification findings remain authoritative for what actually
+    reconciles at run time; this is purely a pre-run heads-up.
+    """
+    if deck is None:
+        return ()
+    counts: dict[str, int] = {}
+    for slide in deck.current_slides:
+        counts[slide.title] = counts.get(slide.title, 0) + 1
+    warnings: list[WarningItem] = []
+    seen: set[str] = set()
+    for title in anchor_titles:
+        if not title or title in seen:
+            continue
+        seen.add(title)
+        count = counts.get(title, 0)
+        if count == 0:
+            warnings.append(
+                WarningItem(
+                    code=f"slide_anchor_missing:{title}",
+                    message=(
+                        f"Saved reference to slide {title!r} was not found in "
+                        "the current deck -- this mapping is stale."
+                    ),
+                )
+            )
+        elif count > 1:
+            warnings.append(
+                WarningItem(
+                    code=f"slide_anchor_ambiguous:{title}",
+                    message=(
+                        f"{count} slides in the current deck share the title "
+                        f"{title!r} -- the saved reference is ambiguous and "
+                        "will not be guessed."
+                    ),
+                )
+            )
+    return tuple(warnings)
+
+
+@dataclass(frozen=True, slots=True)
 class DiffEntry:
     scope: str
     kind: Literal["matches", "new_in_scan", "missing_from_profile", "conflict"]
@@ -661,6 +880,13 @@ class ConfigWorkspaceState:
     member_reviews: tuple[MemberReview, ...] = ()
     warnings_acknowledged: frozenset[str] = frozenset()
     preview_side: Literal["baseline", "current"] = "current"
+    #: Absent whenever the current mode/role selection has no PPT file.
+    deck_review: DeckReview | None = None
+    #: Run-only workload/dependency safety overrides (Step 9's "run-only
+    #: workload/dependency overrides" criterion) -- editable live in the
+    #: workspace rather than fixed at session-creation time.
+    allow_large_workbooks: bool = False
+    allow_dependency_indexing: bool = False
 
     def member_review(self, member_id: str) -> MemberReview | None:
         for member in self.member_reviews:

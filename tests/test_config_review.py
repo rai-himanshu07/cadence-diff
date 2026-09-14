@@ -23,23 +23,31 @@ from qc_tool.ui.config_review import (
     apply_region_transform,
     build_input_contract,
     build_resolved_configuration,
+    compute_required_slide_warnings,
     compute_sheet_pairing_warnings,
+    compute_slide_pairing_warnings,
     compute_warnings,
     confirm_all_regions,
+    deck_review_from_titles,
     diff_profile_against_scan,
     effective_sheet_pairing,
+    effective_slide_pairing,
     format_a1_range,
     is_clean_profile_diff,
     member_review_from_scan,
     parse_a1_cell,
     parse_a1_range,
     regions_overlap,
+    resolve_slide_anchors,
     set_expected_refresh_columns,
     set_identity_columns,
     set_ignore_columns,
     set_ordinal_columns,
     set_sheet_rename,
+    set_slide_included,
+    set_slide_rename,
     sheet_pairing,
+    slide_pairing,
     slugify,
     unresolved_blockers,
     update_region_decision,
@@ -689,3 +697,131 @@ def test_build_input_contract_carries_ignore_column_exclusion() -> None:
     assert ignore_column.comparison_policy == "ignore"
     assert ignore_column.exclusion is not None
     assert ignore_column.exclusion.reason == "legacy scratch column"
+
+
+def test_deck_review_from_titles_seeds_every_slide_included() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[(1, "Cover"), (2, "Revenue")],
+        current_titles=[(1, "Cover"), (2, "Revenue"), (3, "Appendix")],
+    )
+    assert [s.title for s in deck.baseline_slides] == ["Cover", "Revenue"]
+    assert [s.title for s in deck.current_slides] == ["Cover", "Revenue", "Appendix"]
+    assert all(s.included for s in deck.current_slides)
+
+
+def test_set_slide_included_toggles_only_the_target_current_slide() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[], current_titles=[(1, "Cover"), (2, "Revenue")]
+    )
+    updated = set_slide_included(deck, 2, False)
+    statuses = {s.slide_index: s.included for s in updated.current_slides}
+    assert statuses == {1: True, 2: False}
+
+
+def test_slide_pairing_pairs_by_exact_title() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[(1, "Cover"), (2, "Old Name")],
+        current_titles=[(1, "Cover"), (2, "New Name")],
+    )
+    pairs, added, removed = slide_pairing(deck)
+    assert pairs == (("Cover", "Cover"),)
+    assert added == ("New Name",)
+    assert removed == ("Old Name",)
+
+
+def test_set_slide_rename_enforces_one_to_one_baseline_claim() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[(1, "Old")],
+        current_titles=[(1, "New1"), (2, "New2")],
+    )
+    first = set_slide_rename(deck, "New1", "Old")
+    second = set_slide_rename(first, "New2", "Old")
+    assert second.slide_renames == {"New2": "Old"}
+
+
+def test_effective_slide_pairing_promotes_a_declared_rename() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[(1, "2025 Overview")],
+        current_titles=[(1, "2026 Overview")],
+    )
+    _pairs, added, removed = slide_pairing(deck)
+    assert added == ("2026 Overview",)
+    assert removed == ("2025 Overview",)
+
+    renamed = set_slide_rename(deck, "2026 Overview", "2025 Overview")
+    pairs, added, removed = effective_slide_pairing(renamed)
+    assert pairs == (("2025 Overview", "2026 Overview"),)
+    assert added == ()
+    assert removed == ()
+
+
+def test_compute_slide_pairing_warnings_flags_unacknowledged_added_and_removed() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[(1, "Old")], current_titles=[(1, "New")]
+    )
+    warnings = compute_slide_pairing_warnings(deck)
+    codes = {w.code for w in warnings}
+    assert "slide_added:New" in codes
+    assert "slide_removed:Old" in codes
+    assert all(w.severity == "block" for w in warnings)
+
+
+def test_compute_slide_pairing_warnings_excludes_a_declared_rename() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[(1, "Old")], current_titles=[(1, "New")]
+    )
+    renamed = set_slide_rename(deck, "New", "Old")
+    assert compute_slide_pairing_warnings(renamed) == ()
+
+
+def test_compute_slide_pairing_warnings_is_silent_for_a_single_sided_deck() -> None:
+    # Preflight/final-package: no baseline deck at all.
+    deck = deck_review_from_titles(baseline_titles=[], current_titles=[(1, "Cover")])
+    assert compute_slide_pairing_warnings(deck) == ()
+    assert compute_slide_pairing_warnings(None) == ()
+
+
+def test_compute_required_slide_warnings_flags_a_missing_required_slide() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[], current_titles=[(1, "Cover"), (2, "Revenue")]
+    )
+    warnings = compute_required_slide_warnings(deck, ("Revenue", "Appendix"))
+    assert len(warnings) == 1
+    assert warnings[0].code == "required_slide_missing:Appendix"
+    assert warnings[0].severity == "caution"
+
+
+def test_compute_required_slide_warnings_empty_when_all_present() -> None:
+    deck = deck_review_from_titles(baseline_titles=[], current_titles=[(1, "Cover")])
+    assert compute_required_slide_warnings(deck, ("Cover",)) == ()
+
+
+def test_resolve_slide_anchors_flags_a_missing_anchor() -> None:
+    deck = deck_review_from_titles(baseline_titles=[], current_titles=[(1, "Revenue")])
+    warnings = resolve_slide_anchors(deck, ("Old Summary",))
+    assert len(warnings) == 1
+    assert warnings[0].code == "slide_anchor_missing:Old Summary"
+    assert warnings[0].severity == "caution"
+
+
+def test_resolve_slide_anchors_flags_an_ambiguous_duplicate_title_never_guessing() -> None:
+    deck = deck_review_from_titles(
+        baseline_titles=[],
+        current_titles=[(1, "Regional Summary"), (2, "Regional Summary")],
+    )
+    warnings = resolve_slide_anchors(deck, ("Regional Summary",))
+    assert len(warnings) == 1
+    assert warnings[0].code == "slide_anchor_ambiguous:Regional Summary"
+    assert warnings[0].severity == "caution"
+
+
+def test_resolve_slide_anchors_is_silent_for_a_unique_resolved_anchor() -> None:
+    deck = deck_review_from_titles(baseline_titles=[], current_titles=[(1, "Revenue")])
+    assert resolve_slide_anchors(deck, ("Revenue",)) == ()
+
+
+def test_resolve_slide_anchors_deduplicates_repeated_anchor_titles() -> None:
+    # Two saved mappings on the SAME slide must not double-report.
+    deck = deck_review_from_titles(baseline_titles=[], current_titles=[])
+    warnings = resolve_slide_anchors(deck, ("Missing", "Missing"))
+    assert len(warnings) == 1

@@ -68,6 +68,53 @@ def _stage_session(work_dir: Path) -> str:
     return session_key
 
 
+def _write_simple_deck(path: Path, titles: list[str]) -> None:
+    from pptx import Presentation
+
+    deck = Presentation()
+    layout = deck.slide_layouts[0]
+    for title in titles:
+        slide = deck.slides.add_slide(layout)
+        title_shape = slide.shapes.title
+        assert title_shape is not None
+        title_shape.text = title
+    deck.save(str(path))
+
+
+def _stage_session_with_ppt(work_dir: Path) -> str:
+    files = {
+        "baseline_excel": work_dir / "uploads" / "baseline_excel" / "baseline.xlsx",
+        "current_excel": work_dir / "uploads" / "current_excel" / "current.xlsx",
+        "baseline_ppt": work_dir / "uploads" / "baseline_ppt" / "baseline.pptx",
+        "current_ppt": work_dir / "uploads" / "current_ppt" / "current.pptx",
+    }
+    for role, path in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if role.endswith("_ppt"):
+            continue
+        _write_simple_workbook(path)
+    _write_simple_deck(files["baseline_ppt"], ["Cover", "Old Summary"])
+    _write_simple_deck(files["current_ppt"], ["Cover", "New Summary"])
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    choices = build_session_choices(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="default",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode="decision",
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+    )
+    session_key = session_key_for(file_hashes)
+    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
+        session_key, profile_name="default", choices=choices
+    )
+    return session_key
+
+
 @pytest.mark.asyncio
 async def test_configure_page_reports_an_unknown_session(
     user: User, tmp_path: Path
@@ -176,3 +223,125 @@ async def test_selector_prerequisite_is_added_and_survives_a_session_reload(
     await user.open(f"/configure?session={session_key}")
     await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
     await user.should_see("Scenario (B5)")
+
+
+@pytest.mark.asyncio
+async def test_ppt_slide_review_shows_inventory_and_added_removed_warning(
+    user: User, tmp_path: Path
+) -> None:
+    """Step 9: cycle mode's PowerPoint slide review shows the deck's slide
+    titles and flags an unpaired added/removed slide as an unresolved
+    (blocking) warning, exactly mirroring the Excel sheet-pairing
+    criterion. Slides are peeked directly (no subprocess), so this
+    exercises the section immediately after the Excel scan completes.
+    """
+    work_dir = tmp_path / "work"
+    session_key = _stage_session_with_ppt(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("PowerPoint slides")
+    await user.should_see("Cover")
+    await user.should_see("New Summary")
+    # An unpaired added/removed slide is an unresolved blocker until the
+    # analyst either declares a rename or acknowledges it.
+    await user.should_see("Old Summary")
+
+
+@pytest.mark.asyncio
+async def test_ppt_slide_inclusion_toggle_persists_across_a_session_reload(
+    user: User, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    session_key = _stage_session_with_ppt(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Cover")
+
+    user.find(marker="slide-include-1").click()
+
+    store = ConfigSessionStore(work_dir / "history.sqlite3")
+    record = store.get(session_key)
+    assert record is not None
+    assert record.choices.get("excluded_slides") == [1]
+
+    # Reopening the same session must restore the exclusion, not silently
+    # re-include the slide.
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Cover", retries=_SUBPROCESS_RETRIES)
+    excluded_checkbox = next(iter(user.find(marker="slide-include-1").elements))
+    assert isinstance(excluded_checkbox, ui.checkbox)
+    assert excluded_checkbox.value is False
+
+
+@pytest.mark.asyncio
+async def test_final_package_flags_a_stale_saved_slide_anchor_as_a_warning(
+    user: User, tmp_path: Path
+) -> None:
+    """Step 9: final-package mode resolves a saved crosscheck mapping's
+    slide title against the current deck. A title with zero matches is
+    disclosed as a stale, warning-only mismatch -- never a blocker, and
+    never guessed at (no other slide is substituted for it).
+    """
+    from qc_tool.config.profile import (
+        CrosscheckMapping,
+        CrosscheckProfile,
+        DeliverableProfile,
+        save_profile,
+    )
+    from qc_tool.config.profile import profile_path as _profile_path
+
+    work_dir = tmp_path / "work"
+    profiles_dir = work_dir / "profiles"
+    stale_profile = DeliverableProfile(
+        name="stale-mapping",
+        crosscheck=CrosscheckProfile(
+            mappings=[
+                CrosscheckMapping(
+                    slide="Old Summary",
+                    line_skeleton="Revenue was #",
+                    source_sheet="Data",
+                    source_cell="B2",
+                )
+            ]
+        ),
+    )
+    save_profile(stale_profile, _profile_path(profiles_dir, "stale-mapping"))
+
+    files = {
+        "current_excel": work_dir / "uploads" / "current_excel" / "current.xlsx",
+        "current_ppt": work_dir / "uploads" / "current_ppt" / "current.pptx",
+    }
+    for path in files.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    _write_simple_workbook(files["current_excel"])
+    _write_simple_deck(files["current_ppt"], ["Cover", "New Summary"])
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    choices = build_session_choices(
+        mode=QCRunMode.FINAL_PACKAGE,
+        profile_name="stale-mapping",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode="decision",
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+    )
+    session_key = session_key_for(file_hashes)
+    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
+        session_key, profile_name="stale-mapping", choices=choices
+    )
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("New Summary", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Warnings")
+    await user.should_see("Old Summary")
+    await user.should_see("stale")

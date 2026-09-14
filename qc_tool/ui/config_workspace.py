@@ -52,6 +52,7 @@ from qc_tool.setup.preview_worker import (
 )
 from qc_tool.ui.config_review import (
     ConfigWorkspaceState,
+    DeckReview,
     MemberReview,
     SelectorDecision,
     add_selector,
@@ -60,29 +61,38 @@ from qc_tool.ui.config_review import (
     apply_region_transform,
     build_input_contract,
     build_resolved_configuration,
+    compute_required_slide_warnings,
     compute_sheet_pairing_warnings,
+    compute_slide_pairing_warnings,
     compute_warnings,
     confirm_all_regions,
+    deck_review_from_titles,
     diff_profile_against_scan,
+    effective_slide_pairing,
     is_clean_profile_diff,
     member_review_from_scan,
     parse_a1_cell,
     remove_selector,
+    resolve_slide_anchors,
     set_expected_refresh_columns,
     set_identity_columns,
     set_ignore_columns,
     set_ordinal_columns,
     set_sheet_rename,
+    set_slide_included,
+    set_slide_rename,
     sheet_pairing,
     unresolved_blockers,
     update_region_decision,
 )
 from qc_tool.ui.theme import page_frame, section, status_chip
 
-#: Excel role prefixes this workspace's setup scan understands. PowerPoint
-#: slide review is Step 9's job (disclosed scope boundary above).
+#: Excel role prefixes this workspace's setup scan understands.
 _EXCEL_BASELINE_PREFIX = "baseline_excel"
 _EXCEL_CURRENT_PREFIX = "current_excel"
+#: PowerPoint role prefixes (Step 9's own slide-review scope).
+_PPT_BASELINE_PREFIX = "baseline_ppt"
+_PPT_CURRENT_PREFIX = "current_ppt"
 
 #: One preview "window" fetched at a time -- comfortably inside
 #: `preview_worker.MAX_PREVIEW_ROWS`/`MAX_PREVIEW_COLS`, small enough to stay
@@ -723,14 +733,19 @@ def render_config_workspace(
         scan_status_box = ui.column().classes("gap-2 w-full")
         profile_box = ui.column().classes("gap-2 w-full")
         regions_box = ui.column().classes("gap-2 w-full")
+        deck_box = ui.column().classes("gap-2 w-full")
         section("3 · Preview data")
         preview_box = ui.column().classes("gap-2 w-full")
         warnings_box = ui.column().classes("gap-2 w-full")
+        advanced_box = ui.column().classes("gap-2 w-full")
         actions_box = ui.row().classes("items-center gap-2 flex-wrap")
 
         workspace_state: dict[str, ConfigWorkspaceState] = {
             "value": ConfigWorkspaceState(
-                mode=mode, profile_name=str(choices.get("profile_name", "default"))
+                mode=mode,
+                profile_name=str(choices.get("profile_name", "default")),
+                allow_large_workbooks=bool(choices.get("allow_large_workbooks", False)),
+                allow_dependency_indexing=bool(choices.get("allow_dependency_indexing", False)),
             )
         }
         selected_profile: dict[str, DeliverableProfile | None] = {"value": None}
@@ -766,6 +781,13 @@ def render_config_workspace(
                     selector_choices[member.member_id] = member_selectors
                 if member.sheet_renames:
                     rename_choices[member.member_id] = dict(member.sheet_renames)
+            deck = state.deck_review
+            excluded_slides = (
+                [s.slide_index for s in deck.current_slides if not s.included]
+                if deck is not None
+                else []
+            )
+            slide_renames = dict(deck.slide_renames) if deck is not None else {}
             session_store.save_choices(
                 session_key,
                 profile_name=state.profile_name,
@@ -774,6 +796,10 @@ def render_config_workspace(
                     "region_decisions": region_choices,
                     "selectors": selector_choices,
                     "sheet_renames": rename_choices,
+                    "excluded_slides": excluded_slides,
+                    "slide_renames": slide_renames,
+                    "allow_large_workbooks": state.allow_large_workbooks,
+                    "allow_dependency_indexing": state.allow_dependency_indexing,
                 },
             )
 
@@ -810,6 +836,54 @@ def render_config_workspace(
                 reviews.append(review)
             workspace_state["value"] = dataclasses.replace(
                 workspace_state["value"], member_reviews=tuple(reviews)
+            )
+
+        def _seed_deck_review() -> None:
+            """Peek PowerPoint slide titles (Step 9's "cycle slide inclusion
+            and explicit renamed-slide pins" / "preflight current-side
+            setup" criteria) -- a cheap, direct, in-process read (unlike
+            Excel's disposable-subprocess setup scan; a deck is small
+            enough that no bounded worker is warranted). Runs exactly
+            once: `deck_review` starts `None` and this always leaves it a
+            real `DeckReview` (empty when there is no PPT file at all), so
+            the `poll()` guard below never re-seeds and silently discards
+            an analyst's in-progress inclusion/rename choices.
+            """
+            from qc_tool.io.peek import peek_slide_titles
+
+            current_ppt = files.get(_PPT_CURRENT_PREFIX)
+            if current_ppt is None:
+                workspace_state["value"] = dataclasses.replace(
+                    workspace_state["value"], deck_review=DeckReview()
+                )
+                return
+            baseline_ppt = files.get(_PPT_BASELINE_PREFIX)
+            baseline_titles = peek_slide_titles(baseline_ppt) if baseline_ppt is not None else []
+            current_titles = peek_slide_titles(current_ppt)
+            deck = deck_review_from_titles(baseline_titles, current_titles)
+            saved_excluded_raw = choices.get("excluded_slides", [])
+            if isinstance(saved_excluded_raw, list):
+                excluded = {int(i) for i in saved_excluded_raw if str(i).lstrip("-").isdigit()}
+                if excluded:
+                    deck = dataclasses.replace(
+                        deck,
+                        current_slides=tuple(
+                            dataclasses.replace(s, included=False)
+                            if s.slide_index in excluded
+                            else s
+                            for s in deck.current_slides
+                        ),
+                    )
+            saved_slide_renames_raw = choices.get("slide_renames", {})
+            if isinstance(saved_slide_renames_raw, dict):
+                deck = dataclasses.replace(
+                    deck,
+                    slide_renames={
+                        str(k): str(v) for k, v in saved_slide_renames_raw.items()
+                    },
+                )
+            workspace_state["value"] = dataclasses.replace(
+                workspace_state["value"], deck_review=deck
             )
 
         def _region_by_id(region_id: str):
@@ -910,6 +984,60 @@ def render_config_workspace(
             still_removed = [name for name in removed if name not in claimed]
             for baseline_name in still_removed:
                 ui.label(f"{baseline_name!r} removed from the current file").classes("note")
+
+        def _set_slide_included(slide_index: int, included: bool) -> None:
+            state = workspace_state["value"]
+            deck = state.deck_review
+            if deck is None:
+                return
+            workspace_state["value"] = dataclasses.replace(
+                state, deck_review=set_slide_included(deck, slide_index, included)
+            )
+            _persist_choices()
+            refresh()
+
+        def _update_slide_rename(current_title: str, baseline_title: str | None) -> None:
+            """Declare or clear a renamed-slide pin (Step 9's "explicit
+            renamed-slide pins" criterion) -- mirrors `_update_sheet_rename`.
+            """
+            state = workspace_state["value"]
+            deck = state.deck_review
+            if deck is None:
+                return
+            workspace_state["value"] = dataclasses.replace(
+                state, deck_review=set_slide_rename(deck, current_title, baseline_title)
+            )
+            _persist_choices()
+            refresh()
+
+        def _render_slide_rename_controls(
+            deck: DeckReview, added: tuple[str, ...], removed: tuple[str, ...]
+        ) -> None:
+            """Mirrors `_render_sheet_rename_controls` exactly, for slide
+            titles instead of sheet names.
+            """
+            claimed = set(deck.slide_renames.values())
+            for current_title in added:
+                declared = deck.slide_renames.get(current_title)
+                options = {"": "New slide (no rename)"}
+                for baseline_title in removed:
+                    if baseline_title == declared or baseline_title not in claimed:
+                        options[baseline_title] = f"Same as {baseline_title!r}"
+
+                def _on_rename_change(
+                    event: events.ValueChangeEventArguments, current_title=current_title
+                ) -> None:
+                    value = str(event.value or "")
+                    _update_slide_rename(current_title, value or None)
+
+                with ui.row().classes("items-center gap-2"):
+                    ui.label(f"{current_title!r} (new)").classes("note")
+                    ui.select(
+                        options, value=declared or "", on_change=_on_rename_change
+                    ).props("outlined dense").classes("w-56")
+            still_removed = [title for title in removed if title not in claimed]
+            for baseline_title in still_removed:
+                ui.label(f"{baseline_title!r} removed from the current deck").classes("note")
 
         def _add_selector(member_id: str, sheet_name: str, label: str, cell: str) -> None:
             state = workspace_state["value"]
@@ -1122,6 +1250,38 @@ def render_config_workspace(
                                     _render_selector_row(
                                         member.member_id, sheet.sheet_name, selector
                                     )
+
+        def render_deck_section() -> None:
+            """PowerPoint slide review (Step 9): cycle slide inclusion plus
+            explicit renamed-slide pins for CYCLE_COMPARISON; a plain
+            current-side inventory for preflight/final-package (no
+            baseline deck, so no pairing/inclusion concept applies).
+            """
+            deck_box.clear()
+            state = workspace_state["value"]
+            deck = state.deck_review
+            with deck_box:
+                if deck is None or not deck.current_slides:
+                    return
+                ui.label("PowerPoint slides").classes("dk")
+                if mode is QCRunMode.CYCLE_COMPARISON and deck.baseline_slides:
+                    pairs, added, removed = effective_slide_pairing(deck)
+                    if pairs:
+                        ui.label(f"{len(pairs)} slide(s) matched by title").classes("note")
+                    if added or removed:
+                        _render_slide_rename_controls(deck, added, removed)
+                for slide in deck.current_slides:
+                    with ui.row().classes("items-center gap-2"):
+                        if mode is QCRunMode.CYCLE_COMPARISON:
+                            ui.checkbox(
+                                value=slide.included,
+                                on_change=(
+                                    lambda event, idx=slide.slide_index: _set_slide_included(
+                                        idx, bool(event.value)
+                                    )
+                                ),
+                            ).mark(f"slide-include-{slide.slide_index}")
+                        ui.label(f"{slide.slide_index}. {slide.title}").classes("note")
 
         def _render_region_row(member_id: str, sheet_name: str, region) -> None:
             with ui.column().classes("gap-1 w-full"), ui.card().classes("p-2 w-full"):
@@ -1711,9 +1871,21 @@ def render_config_workspace(
         def current_warnings():
             if job.result is None:
                 return ()
-            return compute_warnings(job.result) + compute_sheet_pairing_warnings(
-                workspace_state["value"]
-            )
+            state = workspace_state["value"]
+            warnings = compute_warnings(job.result) + compute_sheet_pairing_warnings(state)
+            deck = state.deck_review
+            warnings += compute_slide_pairing_warnings(deck)
+            profile = selected_profile["value"]
+            if profile is not None:
+                warnings += compute_required_slide_warnings(
+                    deck, tuple(profile.ppt.required_slides)
+                )
+                if mode is QCRunMode.FINAL_PACKAGE:
+                    anchor_titles = tuple(
+                        dict.fromkeys(m.slide for m in profile.crosscheck.mappings)
+                    )
+                    warnings += resolve_slide_anchors(deck, anchor_titles)
+            return warnings
 
         async def do_run_once() -> None:
             await _finalize(save=False, run=True, as_new_name=None)
@@ -1800,17 +1972,31 @@ def render_config_workspace(
                 return
             from qc_tool.ui.app import SessionState, build_run_request
 
+            live_state = workspace_state["value"]
+            deck = live_state.deck_review
+            available_slides = (
+                [(s.slide_index, s.title) for s in deck.current_slides]
+                if deck is not None
+                else []
+            )
+            selected_slides = (
+                {s.slide_index for s in deck.current_slides if s.included}
+                if deck is not None
+                else set()
+            )
             run_state = SessionState(
                 files=files,
                 file_hashes=file_hashes,
                 profile_name=profile.name,
                 mode=mode,
                 output_mode=_output_mode_from_choices(choices),
-                allow_large_workbooks=bool(choices.get("allow_large_workbooks", False)),
-                allow_dependency_indexing=bool(choices.get("allow_dependency_indexing", False)),
+                allow_large_workbooks=live_state.allow_large_workbooks,
+                allow_dependency_indexing=live_state.allow_dependency_indexing,
                 acceptance_absolute=_coerce_float(choices.get("acceptance_absolute"), 0.0),
                 acceptance_percent=_coerce_float(choices.get("acceptance_percent"), 0.0),
                 rerun_of=_coerce_optional_int(choices.get("rerun_of")),
+                available_slides=available_slides,
+                selected_slides=selected_slides,
             )
             request = build_run_request(
                 work_dir=work_dir,
@@ -1829,12 +2015,73 @@ def render_config_workspace(
             ui.notify("Run started")
             ui.navigate.to("/")
 
+        def _set_allow_large_workbooks(value: bool) -> None:
+            workspace_state["value"] = dataclasses.replace(
+                workspace_state["value"], allow_large_workbooks=value
+            )
+            _persist_choices()
+
+        def _set_allow_dependency_indexing(value: bool) -> None:
+            workspace_state["value"] = dataclasses.replace(
+                workspace_state["value"], allow_dependency_indexing=value
+            )
+            _persist_choices()
+
+        def render_advanced_section() -> None:
+            """Compact tolerance/materiality/waiver + availability summary
+            (Step 9) plus run-only workload/dependency safety overrides.
+            The full profile editor remains the place to actually CHANGE
+            tolerance/waiver/availability policy -- this is read-only.
+            """
+            advanced_box.clear()
+            state = workspace_state["value"]
+            with advanced_box:
+                if job.overall_status == "done":
+                    profile = selected_profile["value"]
+                    if profile is not None:
+                        with ui.expansion(
+                            "Advanced controls & policy summary", value=False
+                        ).classes("w-full"):
+                            ui.label(
+                                f"Tolerance: ±{profile.tolerance.absolute:g} "
+                                f"absolute, ±{profile.tolerance.relative:g} "
+                                "relative"
+                            ).classes("note")
+                            ui.label(
+                                f"{len(profile.waivers)} waiver(s), "
+                                f"{len(profile.materiality_severity)} materiality "
+                                "severity override(s)"
+                            ).classes("note")
+                            ui.label(
+                                f"{len(profile.ppt.availability_rules)} PowerPoint "
+                                "availability rule(s)"
+                            ).classes("note")
+                            ui.link(
+                                "Edit tolerance, waivers, and availability rules "
+                                "in Manage profiles",
+                                "/",
+                            ).classes("guide-jump")
+                with ui.row().classes("items-center gap-2"):
+                    ui.checkbox(
+                        "Allow large workbooks (override the workload safety gate)",
+                        value=state.allow_large_workbooks,
+                        on_change=lambda event: _set_allow_large_workbooks(bool(event.value)),
+                    )
+                with ui.row().classes("items-center gap-2"):
+                    ui.checkbox(
+                        "Force full dependency indexing (override the size gate)",
+                        value=state.allow_dependency_indexing,
+                        on_change=lambda event: _set_allow_dependency_indexing(bool(event.value)),
+                    )
+
         def refresh() -> None:
             render_scan_status()
             render_profile_section()
             render_regions_section()
+            render_deck_section()
             render_preview_section()
             render_warnings_section()
+            render_advanced_section()
             actions_box.clear()
             with actions_box:
                 blockers = unresolved_blockers(workspace_state["value"], current_warnings())
@@ -1862,14 +2109,18 @@ def render_config_workspace(
                     ui.label("; ".join(blockers)).classes("notecard")
 
         if scan_members and job.overall_status == "idle":
-            passwords = {}  # browser-supplied credentials mid-scan are Step 8/9 scope
+            passwords = {}  # browser-supplied credentials mid-scan remain out of scope
             start_setup_scan(work_dir, job, scan_members, passwords)
 
         def poll() -> None:
+            seeded = False
             if job.overall_status == "done" and not workspace_state["value"].member_reviews:
                 _seed_member_reviews()
-                refresh()
-            elif job.overall_status in {"running"}:
+                seeded = True
+            if job.overall_status == "done" and workspace_state["value"].deck_review is None:
+                _seed_deck_review()
+                seeded = True
+            if seeded or job.overall_status == "running":
                 refresh()
 
         refresh()
