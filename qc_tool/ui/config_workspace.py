@@ -467,6 +467,19 @@ def _coerce_optional_int(value: object) -> int | None:
     return value
 
 
+def _profile_hash_or_none(profiles_dir: Path, name: str) -> str | None:
+    """The saved profile file's content hash, or `None` when no file exists
+    under that name yet (Step 11's "optimistic conflict protection"
+    criterion: this is the value captured at the moment a profile name was
+    selected in this session, compared against the file's hash again right
+    before a save actually overwrites it).
+    """
+    path = profile_path(profiles_dir, name)
+    if not path.exists():
+        return None
+    return sha256_file(path)
+
+
 def _role_display_name(path_str: str) -> str:
     try:
         return Path(path_str).name
@@ -746,6 +759,9 @@ def render_config_workspace(
                 profile_name=str(choices.get("profile_name", "default")),
                 allow_large_workbooks=bool(choices.get("allow_large_workbooks", False)),
                 allow_dependency_indexing=bool(choices.get("allow_dependency_indexing", False)),
+                profile_opened_hash=_profile_hash_or_none(
+                    profiles_dir, str(choices.get("profile_name", "default"))
+                ),
             )
         }
         selected_profile: dict[str, DeliverableProfile | None] = {"value": None}
@@ -1174,8 +1190,11 @@ def render_config_workspace(
                 current_name = state.profile_name if state.profile_name in options else "default"
 
                 def _on_profile_change(event: events.ValueChangeEventArguments) -> None:
+                    new_name = str(event.value)
                     workspace_state["value"] = dataclasses.replace(
-                        workspace_state["value"], profile_name=str(event.value)
+                        workspace_state["value"],
+                        profile_name=new_name,
+                        profile_opened_hash=_profile_hash_or_none(profiles_dir, new_name),
                     )
                     _persist_choices()
                     refresh()
@@ -1944,6 +1963,28 @@ def render_config_workspace(
                         type="warning",
                     )
                     return
+                if target_name == state.profile_name:
+                    # Updating the same profile this session opened --
+                    # Step 11's "optimistic conflict protection" criterion:
+                    # refuse rather than silently clobber a concurrent edit
+                    # from another tab/session (mirrors the standalone
+                    # profile editor's own `save_draft` staleness check).
+                    current_hash = _profile_hash_or_none(profiles_dir, target_name)
+                    if current_hash != state.profile_opened_hash:
+                        ui.notify(
+                            f"Profile {target_name!r} changed elsewhere "
+                            "while this workspace was open -- reopen it to "
+                            "see the latest version before saving.",
+                            type="negative",
+                        )
+                        return
+                elif profile_path(profiles_dir, target_name).exists():
+                    ui.notify(
+                        f"Profile {target_name!r} already exists -- choose "
+                        "a different name.",
+                        type="negative",
+                    )
+                    return
                 saved_profile = profile.model_copy(
                     update={"name": target_name, "input_contract": contract}
                 )
@@ -1953,7 +1994,11 @@ def render_config_workspace(
                     ui.notify(f"Profile could not be saved: {exc}", type="negative")
                     return
                 profile = saved_profile
-                workspace_state["value"] = dataclasses.replace(state, profile_name=target_name)
+                workspace_state["value"] = dataclasses.replace(
+                    state,
+                    profile_name=target_name,
+                    profile_opened_hash=_profile_hash_or_none(profiles_dir, target_name),
+                )
                 ui.notify(f"Profile {target_name!r} saved")
             if not run:
                 return

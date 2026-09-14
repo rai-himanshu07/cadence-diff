@@ -43,6 +43,7 @@ from qc_tool.ui.config_review import (
     effective_sheet_pairing,
     effective_slide_pairing,
     format_a1_range,
+    input_contract_from_resolved_configuration,
     is_clean_profile_diff,
     member_review_from_scan,
     parse_a1_cell,
@@ -59,6 +60,7 @@ from qc_tool.ui.config_review import (
     sheet_pairing,
     slide_pairing,
     slugify,
+    summarize_contract_promotion,
     unresolved_blockers,
     update_region_decision,
 )
@@ -1037,3 +1039,187 @@ def test_resolve_slide_anchors_deduplicates_repeated_anchor_titles() -> None:
     deck = deck_review_from_titles(baseline_titles=[], current_titles=[])
     warnings = resolve_slide_anchors(deck, ("Missing", "Missing"))
     assert len(warnings) == 1
+
+
+def test_input_contract_from_resolved_configuration_reconstructs_a_region() -> None:
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="s1",
+                        baseline_sheet_name="Data",
+                        current_sheet_name="Data",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="r1",
+                                mode="keyed",
+                                header_intent="first_data_row",
+                                current_outer_range="A1:C10",
+                                current_first_data_row=2,
+                                columns=(
+                                    ResolvedColumn(
+                                        column_id="c1", alignment_role="identity"
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    contract = input_contract_from_resolved_configuration(resolved)
+    assert len(contract.members) == 1
+    sheet = contract.members[0].sheets[0]
+    assert sheet.sheet_id == "s1"
+    assert sheet.preferred_sheet_name == "Data"
+    assert len(sheet.regions) == 1
+    region = sheet.regions[0]
+    assert region.mode == "keyed"
+    assert region.anchor_cell == "A1"
+    assert region.preferred_current_range == "A1:C10"
+    assert region.preferred_first_data_row == 2
+    assert len(region.columns) == 1
+    assert region.columns[0].alignment_role == "identity"
+
+
+def test_input_contract_from_resolved_configuration_skips_an_excluded_region() -> None:
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="s1",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="r1",
+                                mode="excluded",
+                                current_outer_range="A1:C10",
+                                degraded_reason="not comparable this run",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    contract = input_contract_from_resolved_configuration(resolved)
+    assert contract.members[0].sheets[0].regions == ()
+
+
+def test_input_contract_from_resolved_configuration_skips_an_ignored_column() -> None:
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="s1",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="r1",
+                                current_outer_range="A1:C10",
+                                columns=(
+                                    ResolvedColumn(
+                                        column_id="c1", comparison_policy="ignore"
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    contract = input_contract_from_resolved_configuration(resolved)
+    assert contract.members[0].sheets[0].regions[0].columns == ()
+
+
+def test_input_contract_from_resolved_configuration_skips_a_valueless_selector() -> None:
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="s1",
+                        selectors=(
+                            ResolvedSelector(selector_id="scenario", current_cell=None),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    contract = input_contract_from_resolved_configuration(resolved)
+    assert contract.members[0].sheets[0].selectors == ()
+
+
+def test_summarize_contract_promotion_describes_a_brand_new_profile() -> None:
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(ResolvedSheet(sheet_id="s1"), ResolvedSheet(sheet_id="s2")),
+            ),
+        ),
+    )
+    new_contract = input_contract_from_resolved_configuration(resolved)
+    lines = summarize_contract_promotion(None, new_contract)
+    assert len(lines) == 1
+    assert "new profile with 2 configured sheet(s)" in lines[0]
+
+
+def test_summarize_contract_promotion_reports_a_no_op_when_identical() -> None:
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(ResolvedMember(member_id="primary", sheets=(ResolvedSheet(sheet_id="s1"),)),),
+    )
+    contract = input_contract_from_resolved_configuration(resolved)
+    assert summarize_contract_promotion(contract, contract) == (
+        "No configuration changes -- saving would be a no-op.",
+    )
+
+
+def test_summarize_contract_promotion_flags_added_removed_and_changed_sheets() -> None:
+    existing = input_contract_from_resolved_configuration(
+        ResolvedInputConfigurationV1(
+            inspection_contract_version=INPUT_CONTRACT_VERSION,
+            members=(
+                ResolvedMember(
+                    member_id="primary",
+                    sheets=(
+                        ResolvedSheet(sheet_id="keep_changed", current_sheet_name="A"),
+                        ResolvedSheet(sheet_id="removed_only"),
+                    ),
+                ),
+            ),
+        )
+    )
+    new = input_contract_from_resolved_configuration(
+        ResolvedInputConfigurationV1(
+            inspection_contract_version=INPUT_CONTRACT_VERSION,
+            members=(
+                ResolvedMember(
+                    member_id="primary",
+                    sheets=(
+                        ResolvedSheet(sheet_id="keep_changed", current_sheet_name="B"),
+                        ResolvedSheet(sheet_id="added_only"),
+                    ),
+                ),
+            ),
+        )
+    )
+    lines = summarize_contract_promotion(existing, new)
+    joined = " ".join(lines)
+    assert "1 sheet(s) gain saved configuration" in joined
+    assert "1 sheet(s) lose their saved configuration" in joined
+    assert "1 sheet(s) have different saved configuration" in joined

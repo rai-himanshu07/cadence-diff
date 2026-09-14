@@ -1119,6 +1119,14 @@ class ConfigWorkspaceState:
     #: workspace rather than fixed at session-creation time.
     allow_large_workbooks: bool = False
     allow_dependency_indexing: bool = False
+    #: The saved profile file's content hash at the moment `profile_name`
+    #: was last set in this session (`None` when no file exists under that
+    #: name yet, e.g. the built-in unsaved "default"). Step 11's
+    #: "optimistic conflict protection" criterion: a save compares this
+    #: against the file's CURRENT hash immediately before writing, so a
+    #: concurrent edit from another tab/session is never silently
+    #: clobbered. Never the file's bytes themselves -- only a digest.
+    profile_opened_hash: str | None = None
 
     def member_review(self, member_id: str) -> MemberReview | None:
         for member in self.member_reviews:
@@ -1596,4 +1604,129 @@ def build_input_contract(state: ConfigWorkspaceState) -> WorkbookInputContract:
             )
         members.append(LogicalMemberContract(member_id=member.member_id, sheets=tuple(sheets)))
     return WorkbookInputContract(members=tuple(members))
+
+
+def _resolved_region_to_contract(region: ResolvedRegion) -> LogicalRegionContract | None:
+    """One resolved region reconstructed as a durable logical region, or
+    ``None`` when it cannot be reconstructed faithfully.
+
+    ``mode == "excluded"`` is never reconstructed: ``ResolvedRegion`` only
+    ever carries a bare disclosure string (``degraded_reason``), never the
+    exclusion's required expiry date, so inventing one here would
+    fabricate data this function has never actually seen -- the analyst
+    can always re-apply an exclusion with its own reason/expiry in the
+    workspace before saving. The same reasoning excludes any column whose
+    ``comparison_policy == "ignore"``.
+    """
+    if region.mode == "excluded":
+        return None
+    outer_range = region.current_outer_range or region.current_data_range
+    if outer_range is None:
+        return None
+    min_row, min_col, _max_row, _max_col = parse_a1_range(outer_range)
+    anchor_cell = f"{get_column_letter(min_col)}{min_row}"
+    columns = tuple(
+        LogicalColumnContract(
+            column_id=column.column_id,
+            alignment_role=column.alignment_role,
+            comparison_policy=column.comparison_policy,
+            trim_outer_whitespace=column.trim_outer_whitespace,
+        )
+        for column in region.columns
+        if column.comparison_policy != "ignore"
+    )
+    return LogicalRegionContract(
+        region_id=region.region_id,
+        mode=region.mode,
+        header_intent=region.header_intent,
+        anchor_cell=anchor_cell,
+        preferred_current_range=outer_range,
+        preferred_first_data_row=(
+            region.current_first_data_row
+            if region.header_intent == "first_data_row"
+            else None
+        ),
+        columns=columns,
+        blank_key_policy=region.blank_key_policy,
+        duplicate_key_policy=region.duplicate_key_policy,
+    )
+
+
+def input_contract_from_resolved_configuration(
+    resolved: ResolvedInputConfigurationV1,
+) -> WorkbookInputContract:
+    """Reconstruct a durable ``WorkbookInputContract`` from a completed
+    run's own resolved configuration -- the inverse of
+    ``build_resolved_configuration``, used for POST-RUN profile saving
+    (Step 11's "a successful temporary run can later create or update a
+    named profile" criterion) rather than the live workspace session.
+    """
+    members: list[LogicalMemberContract] = []
+    for member in resolved.members:
+        sheets: list[LogicalSheetContract] = []
+        for sheet in member.sheets:
+            regions = tuple(
+                contract
+                for region in sheet.regions
+                if (contract := _resolved_region_to_contract(region)) is not None
+            )
+            selectors = tuple(
+                SelectorPrerequisiteContract(
+                    selector_id=selector.selector_id,
+                    label=selector.selector_id,
+                    owner_sheet_id=sheet.sheet_id,
+                    preferred_current_cell=selector.current_cell,
+                )
+                for selector in sheet.selectors
+                if selector.current_cell is not None
+            )
+            sheets.append(
+                LogicalSheetContract(
+                    sheet_id=sheet.sheet_id,
+                    preferred_sheet_name=sheet.current_sheet_name,
+                    regions=regions,
+                    selectors=selectors,
+                )
+            )
+        members.append(
+            LogicalMemberContract(member_id=member.member_id, sheets=tuple(sheets))
+        )
+    return WorkbookInputContract(members=tuple(members))
+
+
+def summarize_contract_promotion(
+    existing: WorkbookInputContract | None,
+    new: WorkbookInputContract,
+) -> tuple[str, ...]:
+    """Plain-English lines describing what saving ``new`` over ``existing``
+    would change (Step 11's "only after diff confirmation" criterion).
+    Coarse -- sheet presence/count, not a full field diff -- proportionate
+    to a one-time confirmation prompt, not a forensic report. Never a
+    filesystem path, sheet NAME, or cell value; only counts and stable
+    logical ids already present on the contracts being compared.
+    """
+    if existing is None:
+        sheet_count = sum(len(member.sheets) for member in new.members)
+        return (f"Creates a new profile with {sheet_count} configured sheet(s).",)
+    existing_sheets = {
+        sheet.sheet_id: sheet for member in existing.members for sheet in member.sheets
+    }
+    new_sheets = {sheet.sheet_id: sheet for member in new.members for sheet in member.sheets}
+    added = sorted(set(new_sheets) - set(existing_sheets))
+    removed = sorted(set(existing_sheets) - set(new_sheets))
+    changed = sorted(
+        sheet_id
+        for sheet_id in set(existing_sheets) & set(new_sheets)
+        if existing_sheets[sheet_id] != new_sheets[sheet_id]
+    )
+    lines: list[str] = []
+    if added:
+        lines.append(f"{len(added)} sheet(s) gain saved configuration.")
+    if removed:
+        lines.append(f"{len(removed)} sheet(s) lose their saved configuration.")
+    if changed:
+        lines.append(f"{len(changed)} sheet(s) have different saved configuration.")
+    if not lines:
+        lines.append("No configuration changes -- saving would be a no-op.")
+    return tuple(lines)
 

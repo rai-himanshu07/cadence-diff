@@ -345,3 +345,127 @@ async def test_final_package_flags_a_stale_saved_slide_anchor_as_a_warning(
     await user.should_see("Warnings")
     await user.should_see("Old Summary")
     await user.should_see("stale")
+
+
+@pytest.mark.asyncio
+async def test_save_profile_rejects_a_concurrent_edit_from_another_session(
+    user: User, tmp_path: Path
+) -> None:
+    """plan-20260913 Step 11: "optimistic conflict protection" -- saving a
+    profile this workspace session opened must refuse, not silently
+    clobber, when the file on disk changed since it was opened (e.g. a
+    second browser tab saved first).
+    """
+    from qc_tool.config.profile import DeliverableProfile, NumericTolerance, save_profile
+    from qc_tool.config.profile import profile_path as _profile_path
+
+    work_dir = tmp_path / "work"
+    profiles_dir = work_dir / "profiles"
+    profiles_dir.mkdir(parents=True)
+    save_profile(
+        DeliverableProfile(name="acme"), _profile_path(profiles_dir, "acme")
+    )
+
+    files = {
+        "baseline_excel": work_dir / "uploads" / "baseline_excel" / "baseline.xlsx",
+        "current_excel": work_dir / "uploads" / "current_excel" / "current.xlsx",
+    }
+    for path in files.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_simple_workbook(path)
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    choices = build_session_choices(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="acme",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode="decision",
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+    )
+    session_key = session_key_for(file_hashes)
+    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
+        session_key, profile_name="acme", choices=choices
+    )
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Confirm all detected regions", retries=_SUBPROCESS_RETRIES)
+    user.find("Confirm all detected regions").click()
+
+    # A "concurrent" edit: another session/tab saves the same profile name
+    # with different content while this workspace stays open.
+    save_profile(
+        DeliverableProfile(
+            name="acme", tolerance=NumericTolerance(absolute=99.0)
+        ),
+        _profile_path(profiles_dir, "acme"),
+    )
+
+    user.find(kind=ui.button, content="Save profile").click()
+
+    await user.should_see("changed elsewhere while this workspace was open")
+    # The concurrent edit's tolerance must survive untouched -- the click
+    # above must not have overwritten it.
+    from qc_tool.config.profile import load_profile_by_name
+
+    reloaded = load_profile_by_name(profiles_dir, "acme")
+    assert reloaded.tolerance.absolute == 99.0
+
+
+@pytest.mark.asyncio
+async def test_save_profile_succeeds_when_nothing_changed_underneath(
+    user: User, tmp_path: Path
+) -> None:
+    """The inverse control: a save with no concurrent edit must still
+    succeed normally -- conflict protection must not become a false
+    positive on the ordinary, unchanged-file path.
+    """
+    from qc_tool.config.profile import DeliverableProfile, save_profile
+    from qc_tool.config.profile import profile_path as _profile_path
+
+    work_dir = tmp_path / "work"
+    profiles_dir = work_dir / "profiles"
+    profiles_dir.mkdir(parents=True)
+    save_profile(
+        DeliverableProfile(name="acme"), _profile_path(profiles_dir, "acme")
+    )
+
+    files = {
+        "baseline_excel": work_dir / "uploads" / "baseline_excel" / "baseline.xlsx",
+        "current_excel": work_dir / "uploads" / "current_excel" / "current.xlsx",
+    }
+    for path in files.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_simple_workbook(path)
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    choices = build_session_choices(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="acme",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode="decision",
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+    )
+    session_key = session_key_for(file_hashes)
+    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
+        session_key, profile_name="acme", choices=choices
+    )
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Confirm all detected regions", retries=_SUBPROCESS_RETRIES)
+    user.find("Confirm all detected regions").click()
+
+    user.find(kind=ui.button, content="Save profile").click()
+
+    await user.should_see("Profile 'acme' saved")

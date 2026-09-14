@@ -2993,6 +2993,88 @@ async def test_run_page_renders_a_predecessor_configuration_diff(
 
 
 @pytest.mark.asyncio
+async def test_run_page_saves_a_new_profile_from_the_runs_configuration(
+    user: User, tmp_path: Path
+) -> None:
+    """plan-20260913 Step 11: a completed run's own resolved configuration
+    can be saved as a named profile's configuration through the run-detail
+    page. The run's own recorded evidence is untouched -- this only writes
+    a NEW saved profile file.
+    """
+    from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
+    from qc_tool.config.profile import load_profile_by_name
+    from qc_tool.config.resolved_input import (
+        ResolvedInputConfigurationV1,
+        ResolvedMember,
+        ResolvedRegion,
+        ResolvedSheet,
+    )
+
+    work_dir = tmp_path / "work"
+    (work_dir / "profiles").mkdir(parents=True)
+    history = RunHistory(work_dir / "history.sqlite3")
+    finding = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        sheet="Data",
+        location="B2",
+        baseline_value="1",
+        current_value="2",
+        message="changed",
+    )
+    run_id = history.record_run(
+        QCRunResult(
+            profile_name="default",
+            findings=[finding],
+            resolved_input_configuration=ResolvedInputConfigurationV1(
+                inspection_contract_version=INPUT_CONTRACT_VERSION,
+                members=(
+                    ResolvedMember(
+                        member_id="primary",
+                        sheets=(
+                            ResolvedSheet(
+                                sheet_id="sheet_data",
+                                current_sheet_name="Data",
+                                regions=(
+                                    ResolvedRegion(
+                                        region_id="region_data",
+                                        mode="keyed",
+                                        current_outer_range="A1:C10",
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    create_pages(work_dir)
+
+    await user.open(f"/runs/{run_id}")
+    user.find("Save configuration to profile").click()
+
+    await user.should_see("Save this run's configuration to a profile")
+    name_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "Profile name"
+    )
+    name_input.value = "from-this-run"
+    user.find(marker="save-configuration-to-profile-confirm").click()
+
+    await user.should_see("Profile 'from-this-run' saved from this run's configuration")
+    saved = load_profile_by_name(work_dir / "profiles", "from-this-run")
+    assert saved.input_contract is not None
+    assert len(saved.input_contract.members[0].sheets[0].regions) == 1
+    assert saved.input_contract.members[0].sheets[0].regions[0].mode == "keyed"
+
+
+@pytest.mark.asyncio
 async def test_final_package_detail_shows_mapping_review(
     user: User, fixture_dir: Path, tmp_path: Path
 ) -> None:

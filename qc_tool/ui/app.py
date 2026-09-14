@@ -185,7 +185,11 @@ from qc_tool.triage.preview import (
     PreviewReviewFloor,
     preview_policy,
 )
-from qc_tool.ui.config_review import diff_resolved_configurations
+from qc_tool.ui.config_review import (
+    diff_resolved_configurations,
+    input_contract_from_resolved_configuration,
+    summarize_contract_promotion,
+)
 from qc_tool.ui.guide import render_guide
 from qc_tool.ui.profile_editor import ProfileEditorController, open_profile_editor
 from qc_tool.ui.ranked_table_dialog import (
@@ -3079,6 +3083,16 @@ def _render_result_view(
                     on_click=lambda: ui.navigate.to(f"/?rerun={run_id}"),
                 ).classes("ghostbtn").props("no-caps flat dense")
             if (
+                history is not None
+                and run_id is not None
+                and profiles_dir is not None
+                and result.resolved_input_configuration is not None
+            ):
+                ui.button(
+                    "Save configuration to profile",
+                    on_click=lambda: open_configuration_promotion_dialog(),
+                ).classes("ghostbtn").props("no-caps flat dense")
+            if (
                 mutable
                 and history is not None
                 and run_id is not None
@@ -5143,6 +5157,114 @@ def _render_result_view(
             on_click=lambda: open_promotion_dialog(finding),
         ).classes("ghostbtn").props("flat no-caps dense")
 
+    def open_configuration_promotion_dialog() -> None:
+        """Save this run's OWN resolved configuration (region/sheet/column/
+        selector decisions it actually used) as a named profile's saved
+        configuration for future runs (Step 11's "a successful temporary
+        run can later create or update a named profile through an explicit
+        configuration diff" criterion). Never changes this run's own
+        recorded evidence -- only a future preference.
+        """
+        if (
+            history is None
+            or run_id is None
+            or profiles_dir is None
+            or result.resolved_input_configuration is None
+        ):
+            return
+        active_profiles_dir = profiles_dir
+        new_contract = input_contract_from_resolved_configuration(
+            result.resolved_input_configuration
+        )
+        last_previewed_hash: dict[str, str | None] = {}
+
+        def current_hash(name: str) -> str | None:
+            path = _profile_path(active_profiles_dir, name)
+            if not path.exists():
+                return None
+            return profile_sha256(load_profile_by_name(active_profiles_dir, name))
+
+        default_name = "" if result.profile_name == "default" else result.profile_name
+        with ui.dialog() as dialog, ui.card().classes("w-[42rem] max-w-full"):
+            ui.label("Save this run's configuration to a profile").classes("runhead")
+            ui.label(
+                "This saves the region, sheet, column, and selector decisions "
+                "this run actually used as a named profile's configuration for "
+                "future runs. It never changes this run's own recorded evidence."
+            ).classes("note")
+            name_input = ui.input("Profile name", value=default_name).classes(
+                "w-full"
+            ).props("outlined dense")
+            preview_box = ui.column().classes("gap-1 w-full")
+
+            def render_preview() -> None:
+                preview_box.clear()
+                target_name = str(name_input.value or "").strip()
+                with preview_box:
+                    if not target_name or target_name == "default":
+                        ui.label(
+                            "Enter a profile name (the built-in \"default\" "
+                            "profile cannot be overwritten)."
+                        ).classes("note")
+                        return
+                    last_previewed_hash[target_name] = current_hash(target_name)
+                    existing_path = _profile_path(active_profiles_dir, target_name)
+                    existing_contract = (
+                        load_profile_by_name(active_profiles_dir, target_name).input_contract
+                        if existing_path.exists()
+                        else None
+                    )
+                    for line in summarize_contract_promotion(
+                        existing_contract, new_contract
+                    ):
+                        ui.label(line).classes("note")
+
+            name_input.on_value_change(lambda: render_preview())
+            render_preview()
+
+            def do_save() -> None:
+                target_name = str(name_input.value or "").strip()
+                if not target_name or target_name == "default":
+                    ui.notify(
+                        "Choose a profile name before saving (the built-in "
+                        "default profile cannot be overwritten).",
+                        type="warning",
+                    )
+                    return
+                if current_hash(target_name) != last_previewed_hash.get(target_name):
+                    ui.notify(
+                        f"Profile {target_name!r} changed elsewhere while this "
+                        "dialog was open -- reopen it to see the latest version "
+                        "before saving.",
+                        type="negative",
+                    )
+                    return
+                target_path = _profile_path(active_profiles_dir, target_name)
+                try:
+                    base_profile = (
+                        load_profile_by_name(active_profiles_dir, target_name)
+                        if target_path.exists()
+                        else new_profile(target_name)
+                    )
+                    updated = base_profile.model_copy(
+                        update={"name": target_name, "input_contract": new_contract}
+                    )
+                    save_profile(updated, target_path)
+                except Exception as exc:
+                    ui.notify(str(exc), type="negative")
+                    return
+                dialog.close()
+                ui.notify(
+                    f"Profile {target_name!r} saved from this run's configuration"
+                )
+
+            with ui.row().classes("items-center gap-2"):
+                ui.button("Save", on_click=do_save).classes("runbtn").props(
+                    "no-caps"
+                ).mark("save-configuration-to-profile-confirm")
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+        dialog.open()
+
     def render_population_excerpt_action(finding: Finding) -> None:
         """Button that reopens this run's recorded sources on demand and
         builds sample excerpts -- only available where `history`/`run_id`
@@ -5881,6 +6003,8 @@ def _result_from_record(record: RunRecord) -> QCRunResult:
         comparison_scope=record.comparison_scope,
         package_manifest=record.package_manifest,
         alignment_trust=record.alignment_trust,
+        resolved_input_configuration=record.resolved_input_configuration,
+        resolved_input_digest=record.resolved_input_digest,
         # Stored counts keep `.counts` O(1); a lazy sequence would otherwise
         # revalidate every finding just to draw the header stats.
         severity_counts={
