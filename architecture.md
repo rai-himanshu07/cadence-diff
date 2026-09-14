@@ -387,6 +387,14 @@ top of the physical, name-keyed profile fields in 5.3:
   bytes. It has its own canonical digest, independent of `profile_sha256`, and
   persists with the run (see Persistence Model below) for later Re-QC/carry-
   forward scope-compatibility checks and report/attestation binding.
+  `ResolvedColumn.baseline_letter`/`current_letter` and `ResolvedSelector.
+  baseline_cell`/`current_cell` can already differ (an analyst-entered
+  override in the `/configure` workspace), but this is disclosure/reporting
+  data only today -- the alignment engine's own column axis
+  (`qc_tool/excel/align.py`'s `_align_block`) still pairs columns by
+  POSITION within a region, not by letter, so a baseline-letter override does
+  not yet change which physical cells are actually compared at run time. See
+  "Deliberate Boundaries And Known Limitations" below.
 
 [`qc_tool/ui/config_review.py`](qc_tool/ui/config_review.py) is the pure (no
 NiceGUI import) view-model layer the `/configure` workspace is built
@@ -1069,15 +1077,31 @@ deploy.
   Python/platform fallbacks when no native wheel matches.
 - Explicitly mapped sheet movement/rename produces a `SHEET_RENAMED` finding
   (`qc_tool/findings.py`), but there is no equivalent region- or
-  column-movement finding class yet; a mapped region/column move is absorbed
-  silently (no cell-cascade noise) rather than surfaced as its own structural
-  finding.
+  column-movement finding class yet; the alignment engine also has no
+  concept of a confirmed region/column mapping at all (unlike its existing
+  `execution_bindings.confirmed_sheet_renames()` for sheets) -- a region or
+  column that moved is neither explicitly mapped nor guaranteed noise-free
+  today.
+- Column/selector baseline-side overrides
+  (`ResolvedColumn.baseline_letter`/`ResolvedSelector.baseline_cell`, an
+  analyst-entered `/configure` workspace choice) persist in the resolved
+  configuration and reports, but are not yet consumed by the alignment
+  engine: `qc_tool/excel/align.py`'s `_align_block` still pairs a region's
+  columns by POSITION within the region on each side, never by letter, so
+  entering a baseline-letter override does not yet change which physical
+  current cell a given baseline cell is actually compared against. Closing
+  this needs a `confirmed_column_mappings`-style hook on `ExecutionBindings`
+  threaded into column-axis alignment, mirroring the existing sheet-rename
+  and row-identity hooks -- a real engine change, not attempted yet.
 - Low key-overlap/uniqueness for a keyed region has no dedicated,
   separately-acknowledged run-only warning in the `/configure` workspace.
   `unique_ratio`/`key_overlap` evidence exists only in the older, separate
   ranked-table dialog (`qc_tool/ui/ranked_table_dialog.py`) and in setup
   analysis's own key-candidate ranking, not as a workspace acknowledgement
-  gate.
+  gate. Building a general version for an arbitrary analyst-chosen key
+  needs new bounded value-level overlap computation; today's detector
+  only computes overlap for its own candidate, and only when it clears a
+  90% threshold (so it never reports genuinely LOW overlap by construction).
 
 ## 19. Repository Map
 
