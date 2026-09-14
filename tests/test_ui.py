@@ -46,8 +46,9 @@ from qc_tool.findings import (
     Materiality,
     Severity,
 )
+from qc_tool.history.config_session import ConfigSessionStore, session_key_for
 from qc_tool.history.run_state import RunStateRecord, RunStateStore, RunStatus
-from qc_tool.history.store import RunHistory, RunRecord
+from qc_tool.history.store import RunHistory, RunRecord, sha256_file
 from qc_tool.progress import CancellationToken, ProgressEvent, RunCancelled, RunPhase
 from qc_tool.review import (
     ReviewGroup,
@@ -1396,6 +1397,83 @@ async def test_stale_row_suggestions_refresh_with_restored_request_context(
     assert request.requested_output_mode == FindingOutputMode.ATOMIC.value
     assert request.allow_large_workbooks is False
     assert credentials == {}
+
+
+@pytest.mark.asyncio
+async def test_review_setup_button_is_blocked_with_no_files_selected(
+    user: User, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    create_pages(work_dir)
+
+    await user.open("/")
+    user.find("Review setup before running").click()
+
+    await user.should_see("Upload a current Excel workbook")
+    # No configuration session was created for a blocked click.
+    store = ConfigSessionStore(work_dir / "history.sqlite3")
+    assert store.get(session_key_for({})) is None
+
+
+@pytest.mark.asyncio
+async def test_review_setup_button_creates_a_configuration_session(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_dir = tmp_path / "work"
+    files = _write_managed_retry_pair(work_dir)
+    store = RunStateStore(work_dir / "history.sqlite3")
+    profile = DeliverableProfile(name="temporary-rule")
+    record = store.enqueue(
+        "stale-row-suggestions",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile=profile.name,
+        files={role: path.name for role, path in files.items()},
+        queue_position=0,
+        profile_snapshot=profile.model_dump(mode="json"),
+        requested_output_mode=FindingOutputMode.ATOMIC.value,
+    )
+    old_evidence = dict(ranked_table_evidence_payload_v2())
+    old_evidence.pop("manual_review")
+    store.finalize_blocked(
+        record.request_id,
+        {
+            "version": 2,
+            "reason": "row_identity_confirmation_required",
+            "items": [
+                {
+                    "member_id": "primary",
+                    "sheet": "Panel",
+                    "cell": "A1",
+                    "ranked_table_evidence": old_evidence,
+                }
+            ],
+        },
+    )
+    manager = _RecordingQueueManager(store)
+    monkeypatch.setattr(app_module, "get_manager", lambda _work_dir: manager)
+    monkeypatch.setattr(app_module, "project_cycle_volume", lambda *_args: None)
+    create_pages(work_dir)
+
+    await user.open("/")
+    await user.should_see("Refresh row suggestions")
+    # Populate state.files/state.file_hashes the same established way this
+    # file's own row-suggestions-refresh test does, without depending on a
+    # real browser upload widget (none exists in this test suite).
+    user.find("Refresh row suggestions").click()
+    await user.should_see("Run started")
+
+    user.find("Review setup before running").click()
+
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    expected_key = session_key_for(file_hashes)
+    config_store = ConfigSessionStore(work_dir / "history.sqlite3")
+    record = config_store.get(expected_key)
+    assert record is not None
+    assert record.choices["mode"] == QCRunMode.CYCLE_COMPARISON.value
+    assert record.choices["files"] == {
+        role: str(path.resolve()) for role, path in files.items()
+    }
+
 
 
 @pytest.mark.asyncio

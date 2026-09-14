@@ -90,6 +90,7 @@ from qc_tool.history.carry_forward import (
     preview_carry_forward,
 )
 from qc_tool.history.config_compatibility import compatible_compare_findings
+from qc_tool.history.config_session import ConfigSessionStore, session_key_for
 from qc_tool.history.review_state import AnnotationLineageOutcome
 from qc_tool.history.run_state import RunStateRecord, RunStatus
 from qc_tool.history.store import RunHistory, RunRecord, export_runs_archive, sha256_file
@@ -687,6 +688,59 @@ def _acceptance_summary(state: SessionState) -> str:
     if state.acceptance_percent > 0:
         bounds.append(f"±{state.acceptance_percent:g}%")
     return "acceptance: " + (" or ".join(bounds) if bounds else "strict")
+
+
+def build_run_request(
+    *,
+    work_dir: Path,
+    state: SessionState,
+    files: dict[str, Path],
+    profile: DeliverableProfile,
+    manifest: PackageManifest,
+    resolved_input_configuration: dict[str, Any] | None = None,
+    resolved_input_digest: str = "",
+) -> RunRequest:
+    """Build the primitive-only `RunRequest` for one submission.
+
+    Shared by the main intake page's own retry/override paths and the
+    mode-aware configuration workspace (plan-20260913, Step 7) so both
+    routes construct an identical request shape.
+    """
+    return RunRequest(
+        request_id=new_request_id(),
+        work_dir=str(work_dir),
+        mode=state.mode.value,
+        profile_name=profile.name,
+        profile=profile.model_dump(mode="json"),
+        files={role: str(path) for role, path in files.items()},
+        display_files={role: path.name for role, path in files.items()},
+        package_manifest=manifest.model_dump(mode="json"),
+        requested_output_mode=state.output_mode.value,
+        compare_member_sheets={
+            key: tuple(sorted(value))
+            for key, value in state.selected_member_sheets.items()
+            if value
+        },
+        allow_large_workbooks=state.allow_large_workbooks,
+        allow_dependency_indexing=state.allow_dependency_indexing,
+        acceptance_absolute=max(state.acceptance_absolute, 0.0),
+        acceptance_relative=max(state.acceptance_percent, 0.0) / 100.0,
+        compare_sheets=(
+            tuple(sorted(state.selected_sheets))
+            if state.selected_sheets
+            and set(state.available_sheets) != state.selected_sheets
+            else ()
+        ),
+        compare_slides=(
+            tuple(sorted(state.selected_slides))
+            if state.selected_slides
+            and {i for i, _ in state.available_slides} != state.selected_slides
+            else ()
+        ),
+        rerun_of=state.rerun_of,
+        resolved_input_configuration=resolved_input_configuration or {},
+        resolved_input_digest=resolved_input_digest,
+    )
 
 
 def _input_cautions(state: SessionState) -> list[str]:
@@ -7283,6 +7337,20 @@ def create_pages(
                         "Runs execute one at a time; extra submissions queue and "
                         "survive a browser refresh"
                     )
+                    configure_button = (
+                        # late-bound: open_configuration_workspace is defined
+                        # below, mirroring start_run's own forward reference
+                        ui.button(
+                            "Review setup before running",
+                            on_click=lambda: open_configuration_workspace(),
+                        )
+                        .classes("ghostbtn")
+                        .props("no-caps flat")
+                    )
+                    configure_button.tooltip(
+                        "Opens the full setup review: structure, saved-profile "
+                        "diff, and a bounded data preview before QC runs"
+                    )
                 queue_row = ui.row().classes("readyqueue")
                 queue_row.visible = False
                 latest_terminal = queue_manager.store.latest_terminal()
@@ -7343,6 +7411,9 @@ def create_pages(
                         remove="" if cautions and not blockers else "caution",
                     )
                     run_button.set_enabled(not blockers and not _run_ui_busy())
+                    # Reviewing setup is a navigation, not a submission, so it
+                    # is not gated on the single-flight submission lock.
+                    configure_button.set_enabled(not blockers)
                     for button in extra_run_buttons:
                         button.set_enabled(not blockers and not _run_ui_busy())
 
@@ -7705,39 +7776,12 @@ def create_pages(
                     profile: DeliverableProfile,
                     manifest: PackageManifest,
                 ) -> None:
-                    request = RunRequest(
-                        request_id=new_request_id(),
-                        work_dir=str(work_dir),
-                        mode=state.mode.value,
-                        profile_name=profile.name,
-                        profile=profile.model_dump(mode="json"),
-                        files={role: str(path) for role, path in files.items()},
-                        display_files={role: path.name for role, path in files.items()},
-                        package_manifest=manifest.model_dump(mode="json"),
-                        requested_output_mode=state.output_mode.value,
-                        compare_member_sheets={
-                            key: tuple(sorted(value))
-                            for key, value in state.selected_member_sheets.items()
-                            if value
-                        },
-                        allow_large_workbooks=state.allow_large_workbooks,
-                        allow_dependency_indexing=state.allow_dependency_indexing,
-                        acceptance_absolute=max(state.acceptance_absolute, 0.0),
-                        acceptance_relative=max(state.acceptance_percent, 0.0) / 100.0,
-                        compare_sheets=(
-                            tuple(sorted(state.selected_sheets))
-                            if state.selected_sheets
-                            and set(state.available_sheets) != state.selected_sheets
-                            else ()
-                        ),
-                        compare_slides=(
-                            tuple(sorted(state.selected_slides))
-                            if state.selected_slides
-                            and {i for i, _ in state.available_slides}
-                            != state.selected_slides
-                            else ()
-                        ),
-                        rerun_of=state.rerun_of,
+                    request = build_run_request(
+                        work_dir=work_dir,
+                        state=state,
+                        files=files,
+                        profile=profile,
+                        manifest=manifest,
                     )
                     credentials = {
                         role: password
@@ -7760,6 +7804,56 @@ def create_pages(
                         else f"Run queued at position {record.queue_position}"
                     )
                     refresh_queue()
+
+                def open_configuration_workspace() -> None:
+                    """Create a private configuration session for the
+                    currently selected files/profile and hand off to the
+                    full-page mode-aware setup review (plan-20260913, Step
+                    7). Additive alongside "Run QC" -- migrating the ranked-
+                    table/complexity-override retry paths into this
+                    workspace is Step 8/9's job, not this button's.
+                    """
+                    blockers = _run_blockers(
+                        state.mode,
+                        state.files,
+                        file_hashes=state.file_hashes,
+                        rerun_of=state.rerun_of,
+                        rerun_required=state.rerun_required,
+                    )
+                    if blockers:
+                        ui.notify("; ".join(blockers), type="warning")
+                        return
+                    try:
+                        files = _files_for_mode(state.mode, state.files)
+                    except ValueError as exc:
+                        ui.notify(str(exc), type="warning")
+                        return
+                    file_hashes = {
+                        role: state.file_hashes[role]
+                        for role in files
+                        if role in state.file_hashes
+                    }
+                    from qc_tool.ui.config_workspace import build_session_choices
+
+                    choices = build_session_choices(
+                        mode=state.mode,
+                        profile_name=state.profile_name,
+                        files={role: str(path) for role, path in files.items()},
+                        file_hashes=file_hashes,
+                        output_mode=state.output_mode.value,
+                        allow_large_workbooks=state.allow_large_workbooks,
+                        allow_dependency_indexing=state.allow_dependency_indexing,
+                        acceptance_absolute=state.acceptance_absolute,
+                        acceptance_percent=state.acceptance_percent,
+                        rerun_of=state.rerun_of,
+                    )
+                    config_session_key = session_key_for(file_hashes)
+                    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
+                        config_session_key,
+                        profile_name=state.profile_name,
+                        choices=choices,
+                    )
+                    ui.navigate.to(f"/configure?session={config_session_key}")
 
                 def _open_complexity_override(record: RunStateRecord) -> None:
                     with ui.dialog().props("persistent") as dialog, ui.card().classes(
@@ -8334,6 +8428,20 @@ def create_pages(
                 return True
 
             results = ui.column().classes("w-full")
+
+    @ui.page("/configure")
+    def configure_page(session: str = "") -> None:  # pyright: ignore[reportUnusedFunction]
+        from qc_tool.ui.config_workspace import render_config_workspace
+
+        render_config_workspace(
+            work_dir,
+            profiles_dir,
+            session,
+            queue_manager=queue_manager,
+            network_mode=network_mode.value,
+            on_settings=open_app_settings,
+            on_shutdown=request_shutdown,
+        )
 
     @ui.page("/guide")
     def guide_page() -> None:  # pyright: ignore[reportUnusedFunction]

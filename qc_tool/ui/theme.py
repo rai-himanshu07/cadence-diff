@@ -498,6 +498,18 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 .ctxlegend .swatch.sev-warning { border-color: var(--warning); border-style: dashed; }
 .ctxlegend .swatch.sev-info { border-color: var(--info); border-style: dotted; }
 .ctxlegend .swatch.sev-expected { border-color: var(--expected); border-width: 1px; }
+/* setup-workspace bounded preview grid (Step 7): same visual language as
+   .ctxgrid, plus a pointer cursor since cells are clickable anchor targets */
+.previewscroll { max-width: 100%; overflow-x: auto; margin-top: 0.4rem; }
+.previewgrid { border-collapse: collapse; font-family: var(--font-mono);
+  font-size: var(--fs-meta); }
+.previewgrid th { background: var(--surface2); color: var(--ink-soft); font-weight: 500;
+  padding: 1px 6px; border: 1px solid var(--line-soft); }
+.previewcell { border: 1px solid var(--line-soft); padding: 1px 6px;
+  background: var(--panel); max-width: 9rem; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; cursor: pointer; }
+.previewcell:hover { background: var(--surface2); }
+.previewcell-formula { font-style: italic; color: var(--ink-soft); }
 /* related-series lens rows */
 .review-groups-table tr.clusterrow > td { background: var(--surface2); font-weight: 500; }
 .review-groups-table tr.clusterrow > td:first-child { white-space: normal; }

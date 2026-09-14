@@ -23,6 +23,7 @@ import dataclasses
 import json
 import multiprocessing as mp
 import queue as queue_module
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,9 @@ from typing import Any
 DEFAULT_TIMEOUT_SECONDS = 90.0
 #: How long to wait for a terminated/killed child to actually exit.
 _JOIN_TIMEOUT_SECONDS = 5.0
+#: Poll granularity while waiting for the child so an external cancel
+#: (plan-20260913, Step 7) is honored promptly instead of only at timeout.
+_POLL_INTERVAL_SECONDS = 0.15
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +174,7 @@ def run_setup_scan_worker(
     request: SetupScanRequest,
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> SetupScanOutcome:
     """Spawn a disposable child process to run the setup-analysis scan.
 
@@ -178,6 +183,11 @@ def run_setup_scan_worker(
     responsible for holding the shared exclusive slot
     (``qc_tool.runqueue.run_exclusive``/``ExclusiveWorkSlot``) for the
     duration of this call -- this function does not acquire it itself.
+
+    ``cancel_event``, when supplied and set before the child finishes,
+    escalates through the same terminate/kill ladder the timeout path uses
+    and returns a cancellation disclosure instead of waiting out the full
+    timeout (plan-20260913, Step 7's "auto-start/cancel" requirement).
     """
     ctx = mp.get_context("spawn")
     result_queue: mp.Queue[dict[str, Any]] = ctx.Queue(maxsize=1)
@@ -191,6 +201,214 @@ def run_setup_scan_worker(
         "allow_manual_review": request.allow_manual_review,
     }
     process = ctx.Process(target=_worker_entry, args=(payload, result_queue), daemon=True)
+    process.start()
+    raw: dict[str, Any] | None = None
+    cancelled = False
+    elapsed = 0.0
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+            step = min(_POLL_INTERVAL_SECONDS, max(0.0, timeout_seconds - elapsed))
+            try:
+                raw = result_queue.get(timeout=step)
+                break
+            except queue_module.Empty:
+                elapsed += step
+                if elapsed >= timeout_seconds:
+                    break
+    finally:
+        process.join(timeout=_JOIN_TIMEOUT_SECONDS)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=_JOIN_TIMEOUT_SECONDS)
+            if process.is_alive():
+                process.kill()
+                process.join()
+        result_queue.close()
+    if cancelled:
+        return SetupScanOutcome(disclosure="setup scan cancelled")
+    if raw is None:
+        return SetupScanOutcome(disclosure="setup scan worker timed out")
+    if not raw.get("ok"):
+        missing = raw.get("missing_credential_roles")
+        if missing:
+            return SetupScanOutcome(missing_credential_roles=tuple(missing))
+        return SetupScanOutcome(disclosure=str(raw.get("disclosure") or "setup scan failed"))
+    payload_result = raw.get("result_payload")
+    return SetupScanOutcome(
+        result_payload=payload_result if isinstance(payload_result, dict) else None
+    )
+
+
+#: Strict bounds on one preview-window fetch -- a large workbook must never
+#: turn a "peek" into an unbounded materialization.
+MAX_PREVIEW_ROWS = 200
+MAX_PREVIEW_COLS = 40
+#: A revealed formula's text is bounded per cell (matches this project's own
+#: "content-free/bounded" disclosure convention elsewhere).
+MAX_FORMULA_TEXT_CHARS = 256
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewWindowRequest:
+    """Every input the child process needs to fetch ONE bounded grid window
+    from ONE side (baseline/current) of one already-uploaded source.
+    """
+
+    side: str  # "baseline" | "current"
+    path: str
+    source_hash: str
+    sheet: str
+    min_row: int = 1
+    min_col: int = 1
+    max_row: int = 40
+    max_col: int = 12
+    password: str = ""
+    #: Formula text is opt-in ("reveal") -- absent by default; only the
+    #: boolean formula-presence grid is returned otherwise.
+    reveal_formulas: bool = False
+
+
+@dataclass(slots=True)
+class PreviewWindowOutcome:
+    """A bounded grid of display strings plus a parallel formula-presence
+    grid, or a plain reason none was built. Never a raw ``CellValue``, a
+    filesystem path, or (unless explicitly revealed) formula text.
+    """
+
+    rows: list[list[str]] = field(default_factory=list)
+    formula_cells: list[list[bool]] = field(default_factory=list)
+    #: ``"r,c"`` (1-based, absolute) -> bounded formula text; populated only
+    #: when the request set ``reveal_formulas``.
+    formula_text: dict[str, str] = field(default_factory=dict)
+    resolved_min_row: int = 1
+    resolved_min_col: int = 1
+    resolved_max_row: int = 0
+    resolved_max_col: int = 0
+    missing_credential: bool = False
+    disclosure: str = ""
+
+
+def _preview_worker_entry(
+    payload: dict[str, Any], result_queue: mp.Queue[dict[str, Any]]
+) -> None:
+    try:
+        from qc_tool.history.store import sha256_file
+        from qc_tool.io.decrypt import InvalidPasswordError, PasswordRequiredError
+        from qc_tool.io.loader import (
+            OOXMLWorkloadError,
+            UnsupportedFormatError,
+            XLSBWorkloadError,
+            load_workbook_snapshot,
+        )
+        from qc_tool.io.model import display_cell_value
+
+        path = Path(str(payload["path"]))
+        if not path.exists():
+            result_queue.put(
+                {"ok": False, "disclosure": "source is no longer at its recorded location"}
+            )
+            return
+        expected_hash = str(payload["source_hash"])
+        if expected_hash and sha256_file(path) != expected_hash:
+            result_queue.put({"ok": False, "disclosure": "source changed since it was uploaded"})
+            return
+        password = str(payload.get("password") or "") or None
+        try:
+            snapshot = load_workbook_snapshot(path, password=password)
+        except (PasswordRequiredError, InvalidPasswordError):
+            result_queue.put({"ok": False, "missing_credential": True})
+            return
+        except (OOXMLWorkloadError, XLSBWorkloadError):
+            result_queue.put({"ok": False, "disclosure": "source is too large to preview"})
+            return
+        except UnsupportedFormatError:
+            result_queue.put({"ok": False, "disclosure": "source format is not supported"})
+            return
+        sheet_name = str(payload["sheet"])
+        try:
+            sheet = snapshot.sheet(sheet_name)
+        except KeyError:
+            result_queue.put({"ok": False, "disclosure": f"sheet not found: {sheet_name!r}"})
+            return
+        min_row = max(1, int(payload["min_row"]))
+        min_col = max(1, int(payload["min_col"]))
+        max_row = min(
+            int(payload["max_row"]), min_row + MAX_PREVIEW_ROWS - 1, sheet.max_row or min_row
+        )
+        max_col = min(
+            int(payload["max_col"]), min_col + MAX_PREVIEW_COLS - 1, sheet.max_column or min_col
+        )
+        max_row = max(max_row, min_row)
+        max_col = max(max_col, min_col)
+        reveal_formulas = bool(payload["reveal_formulas"])
+        rows: list[list[str]] = []
+        formula_cells: list[list[bool]] = []
+        formula_text: dict[str, str] = {}
+        for row in range(min_row, max_row + 1):
+            value_row: list[str] = []
+            formula_row: list[bool] = []
+            for col in range(min_col, max_col + 1):
+                record = sheet.cells.get((row, col))
+                if record is None:
+                    value_row.append("")
+                    formula_row.append(False)
+                    continue
+                value_row.append(display_cell_value(record.value))
+                has_formula = record.has_formula
+                formula_row.append(has_formula)
+                if reveal_formulas and has_formula and record.formula:
+                    formula_text[f"{row},{col}"] = record.formula[:MAX_FORMULA_TEXT_CHARS]
+            rows.append(value_row)
+            formula_cells.append(formula_row)
+        result_queue.put(
+            {
+                "ok": True,
+                "rows": rows,
+                "formula_cells": formula_cells,
+                "formula_text": formula_text,
+                "resolved_min_row": min_row,
+                "resolved_min_col": min_col,
+                "resolved_max_row": max_row,
+                "resolved_max_col": max_col,
+            }
+        )
+    except BaseException as exc:  # the child must never crash silently
+        result_queue.put(
+            {"ok": False, "disclosure": f"preview worker failed ({type(exc).__name__})"}
+        )
+
+
+def run_preview_window_worker(
+    request: PreviewWindowRequest,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> PreviewWindowOutcome:
+    """Spawn a disposable child process to fetch one bounded grid window.
+
+    Blocking; callers on an event loop must run this via a thread/executor.
+    Loads only the ONE requested side, never both -- a preview toggle asks
+    for one side at a time. Callers are responsible for holding the shared
+    exclusive slot for the duration of this call.
+    """
+    ctx = mp.get_context("spawn")
+    result_queue: mp.Queue[dict[str, Any]] = ctx.Queue(maxsize=1)
+    payload: dict[str, Any] = {
+        "path": request.path,
+        "source_hash": request.source_hash,
+        "sheet": request.sheet,
+        "min_row": request.min_row,
+        "min_col": request.min_col,
+        "max_row": request.max_row,
+        "max_col": request.max_col,
+        "password": request.password,
+        "reveal_formulas": request.reveal_formulas,
+    }
+    process = ctx.Process(
+        target=_preview_worker_entry, args=(payload, result_queue), daemon=True
+    )
     process.start()
     raw: dict[str, Any] | None = None
     try:
@@ -207,13 +425,17 @@ def run_setup_scan_worker(
                 process.join()
         result_queue.close()
     if raw is None:
-        return SetupScanOutcome(disclosure="setup scan worker timed out")
+        return PreviewWindowOutcome(disclosure="preview worker timed out")
     if not raw.get("ok"):
-        missing = raw.get("missing_credential_roles")
-        if missing:
-            return SetupScanOutcome(missing_credential_roles=tuple(missing))
-        return SetupScanOutcome(disclosure=str(raw.get("disclosure") or "setup scan failed"))
-    payload_result = raw.get("result_payload")
-    return SetupScanOutcome(
-        result_payload=payload_result if isinstance(payload_result, dict) else None
+        if raw.get("missing_credential"):
+            return PreviewWindowOutcome(missing_credential=True)
+        return PreviewWindowOutcome(disclosure=str(raw.get("disclosure") or "preview failed"))
+    return PreviewWindowOutcome(
+        rows=list(raw.get("rows") or []),
+        formula_cells=list(raw.get("formula_cells") or []),
+        formula_text=dict(raw.get("formula_text") or {}),
+        resolved_min_row=int(raw.get("resolved_min_row", 1)),
+        resolved_min_col=int(raw.get("resolved_min_col", 1)),
+        resolved_max_row=int(raw.get("resolved_max_row", 0)),
+        resolved_max_col=int(raw.get("resolved_max_col", 0)),
     )
