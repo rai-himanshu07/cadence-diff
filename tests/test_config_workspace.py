@@ -116,6 +116,59 @@ def _stage_disjoint_key_session(work_dir: Path) -> str:
     return session_key
 
 
+def _stage_moved_identity_key_session(work_dir: Path) -> str:
+    """A baseline/current pair where the identity values current column A
+    actually shares are sitting in baseline column C, not baseline column
+    A -- proves a baseline-letter override on an identity column actually
+    RECOMPUTES the key-overlap ratio (not just the initial computation
+    from setting identity_columns) rather than leaving a stale ratio from
+    before the override was entered.
+    """
+    files = {
+        "baseline_excel": work_dir / "uploads" / "baseline_excel" / "baseline.xlsx",
+        "current_excel": work_dir / "uploads" / "current_excel" / "current.xlsx",
+    }
+    files["baseline_excel"].parent.mkdir(parents=True, exist_ok=True)
+    files["current_excel"].parent.mkdir(parents=True, exist_ok=True)
+
+    baseline_wb = Workbook()
+    baseline_sheet = baseline_wb.active
+    assert baseline_sheet is not None
+    baseline_sheet.title = "Data"
+    baseline_sheet.append(["ID", "Value", "ID"])
+    for index, identity in enumerate(("A0", "A1", "A2")):
+        baseline_sheet.append([identity, index * 10, f"B{index}"])
+    baseline_wb.save(files["baseline_excel"])
+
+    current_wb = Workbook()
+    current_sheet = current_wb.active
+    assert current_sheet is not None
+    current_sheet.title = "Data"
+    current_sheet.append(["ID", "Value"])
+    for index, identity in enumerate(("B0", "B1", "B2")):
+        current_sheet.append([identity, index * 10])
+    current_wb.save(files["current_excel"])
+
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    choices = build_session_choices(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="default",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode="decision",
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+    )
+    session_key = session_key_for(file_hashes)
+    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
+        session_key, profile_name="default", choices=choices
+    )
+    return session_key
+
+
 def _write_simple_deck(path: Path, titles: list[str]) -> None:
     from pptx import Presentation
 
@@ -228,8 +281,10 @@ async def test_confirming_disjoint_identity_columns_surfaces_a_low_overlap_warni
     """Step 12 Fix 5: setting a keyed region's identity column to one that
     shares NO values between baseline and current triggers a real
     (subprocess-backed) key-overlap query and surfaces a dedicated,
-    separately-acknowledged caution warning -- not silence, and not a run
-    blocker.
+    separately-acknowledged BLOCKING warning: 'Run once' stays disabled
+    until the analyst explicitly checks the acknowledgement, then becomes
+    enabled again (mirrors ``allow_large_workbooks``'s "acknowledge and
+    continue" precedent -- disclosed, not silently ignorable).
     """
     work_dir = tmp_path / "work"
     session_key = _stage_disjoint_key_session(work_dir)
@@ -260,8 +315,21 @@ async def test_confirming_disjoint_identity_columns_surfaces_a_low_overlap_warni
     # threshold, so the warning still correctly fires.
     await user.should_see("only overlap 14%", retries=_SUBPROCESS_RETRIES)
 
-    # The warning is a caution, not a blocker: it does not appear in the
-    # unresolved-blockers list gating the run buttons.
+    run_once_button = user.find(kind=ui.button, content="Run once").elements.pop()
+    assert isinstance(run_once_button, ui.button)
+    assert not run_once_button.enabled
+
+    checkbox = next(
+        element
+        for element in user.find(kind=ui.checkbox).elements
+        if "only overlap 14%" in (element.text or "")
+    )
+    checkbox.value = True
+
+    run_once_button = user.find(kind=ui.button, content="Run once").elements.pop()
+    assert isinstance(run_once_button, ui.button)
+    assert run_once_button.enabled
+
     store = ConfigSessionStore(work_dir / "history.sqlite3")
     record = store.get(session_key)
     assert record is not None
@@ -270,6 +338,69 @@ async def test_confirming_disjoint_identity_columns_surfaces_a_low_overlap_warni
     [decision] = region_decisions.values()
     assert decision["mode"] == "keyed"
     assert decision["identity_columns"] == ["A"]
+
+
+@pytest.mark.asyncio
+async def test_changing_an_identity_columns_baseline_letter_recomputes_the_overlap(
+    user: User, tmp_path: Path
+) -> None:
+    """Regression test for a real bug found via independent review (Step
+    12, this session): the key-overlap ratio is computed from ``region.
+    baseline_letter_for(letter)`` for each identity column, but the
+    baseline-letter-override change handler never re-triggered the query
+    -- entering an override after the initial (stale, low) computation
+    left the low-overlap warning showing even once the override made the
+    real overlap high. Proves the fix: after setting the baseline
+    override, the warning disappears and 'Run once' becomes enabled
+    without ever checking an acknowledgement box.
+    """
+    work_dir = tmp_path / "work"
+    session_key = _stage_moved_identity_key_session(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+
+    mode_select = next(
+        element
+        for element in user.find(kind=ui.select).elements
+        if isinstance(element.options, dict) and "keyed" in element.options
+    )
+    mode_select.value = "keyed"
+
+    identity_select = next(
+        element
+        for element in user.find(kind=ui.select).elements
+        if element.props.get("label") == "Identity columns"
+    )
+    identity_select.value = ["A"]
+
+    # Baseline column A vs current column A are disjoint -- the initial,
+    # stale computation surfaces the same low-overlap warning as the
+    # disjoint-key test above.
+    await user.should_see("only overlap 14%", retries=_SUBPROCESS_RETRIES)
+    run_once_button = user.find(kind=ui.button, content="Run once").elements.pop()
+    assert isinstance(run_once_button, ui.button)
+    assert not run_once_button.enabled
+
+    user.find("Column letter differs from baseline?").click()
+    await user.should_see("A in baseline", retries=_SUBPROCESS_RETRIES)
+    baseline_letter_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "A in baseline"
+    )
+    baseline_letter_input.value = "C"
+
+    # The real overlap (baseline column C vs current column A) is a full
+    # match -- the warning must disappear and the run must become
+    # available WITHOUT ever checking an acknowledgement box, proving a
+    # fresh query ran against the corrected baseline letter rather than
+    # replaying the stale ratio from the pre-override computation.
+    await user.should_not_see("only overlap", retries=_SUBPROCESS_RETRIES)
+    run_once_button = user.find(kind=ui.button, content="Run once").elements.pop()
+    assert isinstance(run_once_button, ui.button)
+    assert run_once_button.enabled
 
 
 @pytest.mark.asyncio
@@ -626,6 +757,50 @@ async def test_save_profile_succeeds_when_nothing_changed_underneath(
     user.find(kind=ui.button, content="Save profile").click()
 
     await user.should_see("Profile 'acme' saved")
+
+
+@pytest.mark.asyncio
+async def test_save_profile_from_default_requires_typing_a_new_name_first(
+    user: User, tmp_path: Path
+) -> None:
+    """Regression test for a real bug found via live browser verification
+    (plan-20260913 Step 12, this session): starting from the immutable
+    'default' profile, 'Save profile'/'Save profile and run' had NO UI
+    mechanism to type a new profile name at all -- both handlers hardcoded
+    ``as_new_name=None``, so ``_finalize()``'s ``target_name`` always
+    resolved to an empty string and every save attempt failed with "Choose
+    a profile name before saving". Every PRE-EXISTING save-profile test
+    (see the test immediately above) pre-seeded the session with an
+    already-named non-default profile via a direct ``ConfigSessionStore``
+    call, so this exact bug was never exercised by any automated test.
+    Proves the fix: a "Save as profile name" input lets an analyst type a
+    new name and successfully save from the real starting state.
+    """
+    work_dir = tmp_path / "work"
+    session_key = _stage_session(work_dir)  # profile_name="default"
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Confirm all detected regions", retries=_SUBPROCESS_RETRIES)
+    user.find("Confirm all detected regions").click()
+
+    # Without typing a name, saving from "default" must fail exactly as it
+    # did before this fix -- proves the bug is real, not already unreachable.
+    user.find(kind=ui.button, content="Save profile").click()
+    await user.should_see("Choose a profile name before saving")
+
+    name_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "Save as profile name"
+    )
+    name_input.value = "verify-save-as"
+
+    user.find(kind=ui.button, content="Save profile").click()
+    await user.should_see("Profile 'verify-save-as' saved")
+
+    assert (work_dir / "profiles" / "verify-save-as.yaml").exists()
 
 
 class _RecordingQueueManager:

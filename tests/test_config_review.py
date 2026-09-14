@@ -1571,7 +1571,7 @@ def test_compute_key_overlap_warnings_flags_a_low_ratio_keyed_region() -> None:
     assert len(warnings) == 1
     warning = warnings[0]
     assert warning.code == low_key_overlap_warning_code("primary", "Data", region_id)
-    assert warning.severity == "caution"
+    assert warning.severity == "block"
     assert "50%" in warning.message
 
 

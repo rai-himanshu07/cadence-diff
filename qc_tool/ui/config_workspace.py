@@ -816,6 +816,15 @@ def render_config_workspace(
         #: (Step 12 Fix 5's key-overlap recompute) so the event loop cannot
         #: garbage-collect one mid-flight; each removes itself on completion.
         background_tasks: set[asyncio.Task[None]] = set()
+        #: The analyst-typed target profile name for "Save profile"/"Save
+        #: profile and run" (Step 12 fix: these two actions previously had
+        #: NO way to reach a real, non-empty target name whenever the
+        #: currently-selected profile was the immutable "default" -- every
+        #: click silently failed with "Choose a profile name before saving".
+        #: Persists across `refresh()` re-renders (a plain re-seeded
+        #: `ui.input(value=...)` would otherwise discard an in-progress
+        #: keystroke on any unrelated state change).
+        save_as_state: dict[str, str] = {"name": ""}
 
         def _persist_choices() -> None:
             state = workspace_state["value"]
@@ -1766,6 +1775,7 @@ def render_config_workspace(
                                 sheet_name=sheet_name,
                                 region_id=region.region_id,
                                 letter=letter,
+                                is_identity_letter=letter in region.identity_columns,
                             ) -> None:
                                 _apply_region_transform(
                                     member_id,
@@ -1775,6 +1785,23 @@ def render_config_workspace(
                                         r, letter, str(event.value or "")
                                     ),
                                 )
+                                if is_identity_letter:
+                                    # A baseline-letter override on an
+                                    # identity column changes which
+                                    # physical baseline column the key
+                                    # -overlap query reads -- the
+                                    # previously-computed ratio would
+                                    # otherwise go stale (Step 12 Fix 5
+                                    # follow-up).
+                                    overlap_task = asyncio.create_task(
+                                        _recompute_key_overlap(
+                                            member_id, sheet_name, region_id
+                                        )
+                                    )
+                                    background_tasks.add(overlap_task)
+                                    overlap_task.add_done_callback(
+                                        background_tasks.discard
+                                    )
 
                             current_override = next(
                                 (
@@ -2032,7 +2059,12 @@ def render_config_workspace(
                 key_overlap_state["ratios"][region_id] = outcome.ratio
             else:
                 key_overlap_state["ratios"].pop(region_id, None)
-            render_warnings_section()
+            # Full refresh (not just the warnings section): a newly-
+            # discovered low-overlap warning is now `severity="block"`, so
+            # the run-action buttons' enabled state (computed inside
+            # `refresh()`'s own actions_box rebuild) must be recomputed
+            # too, not just the warning text.
+            refresh()
 
         async def _load_preview() -> None:
             active_member_id = preview_state["member_id"]
@@ -2126,10 +2158,12 @@ def render_config_workspace(
             await _finalize(save=False, run=True, as_new_name=None)
 
         async def do_save_profile() -> None:
-            await _finalize(save=True, run=False, as_new_name=None)
+            await _finalize(save=True, run=False, as_new_name=save_as_state["name"].strip() or None)
 
         async def do_save_profile_and_run() -> None:
-            await _finalize(save=True, run=True, as_new_name=None)
+            await _finalize(
+                save=True, run=True, as_new_name=save_as_state["name"].strip() or None
+            )
 
         async def do_export_configuration() -> None:
             profile = selected_profile["value"] or load_profile_by_name(
@@ -2421,8 +2455,20 @@ def render_config_workspace(
             render_advanced_section()
             actions_box.clear()
             with actions_box:
-                blockers = unresolved_blockers(workspace_state["value"], current_warnings())
+                state = workspace_state["value"]
+                blockers = unresolved_blockers(state, current_warnings())
                 enabled = job.overall_status == "done" and not blockers
+
+                def _on_save_as_change(event: events.ValueChangeEventArguments) -> None:
+                    save_as_state["name"] = str(event.value or "")
+
+                if job.overall_status == "done":
+                    ui.input(
+                        "Save as profile name",
+                        value=save_as_state["name"]
+                        or (state.profile_name if state.profile_name != "default" else ""),
+                        on_change=_on_save_as_change,
+                    ).props("outlined dense").classes("w-64")
                 ui.button("Run once", on_click=do_run_once).classes("runbtn").props(
                     "no-caps"
                 ).set_enabled(enabled)

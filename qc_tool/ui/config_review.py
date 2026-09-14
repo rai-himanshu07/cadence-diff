@@ -680,14 +680,20 @@ def low_key_overlap_warning_code(member_id: str, sheet_name: str, region_id: str
 def compute_key_overlap_warnings(
     state: ConfigWorkspaceState, key_overlap_ratios: Mapping[str, float]
 ) -> tuple[WarningItem, ...]:
-    """One caution-level warning per keyed region whose last-computed,
-    analyst-CONFIRMED identity-column overlap ratio measured below
+    """One blocking warning per keyed region whose last-computed, analyst-
+    CONFIRMED identity-column overlap ratio measured below
     ``LOW_KEY_OVERLAP_THRESHOLD`` (Step 12 Fix 5).
 
-    Deliberately never a run blocker: a low overlap on the analyst's own
-    confirmed columns is a disclosed degradation the analyst may accept
-    and proceed with (mirrors ``allow_large_workbooks``'s "acknowledge and
-    continue" precedent), not proof of a wrong configuration by itself.
+    ``severity="block"`` (matching ``compute_warnings``/``compute_sheet_
+    pairing_warnings``/``compute_slide_pairing_warnings`` above): a low
+    overlap on the analyst's own confirmed columns is a real, disclosed
+    degradation that must be explicitly ACKNOWLEDGED (checked in the
+    workspace's Warnings section) before any final action may proceed --
+    the analyst may still accept it and continue (mirrors
+    ``allow_large_workbooks``'s "acknowledge and continue" precedent), but
+    silently ignoring it is not an option. The acknowledgement itself
+    stays run-only: ``state.warnings_acknowledged`` lives only on the
+    session, never persisted into a saved ``DeliverableProfile``.
     ``key_overlap_ratios`` is keyed by ``region_id`` -- a region absent
     from it was never queried and gets no warning (never a false "clean"
     claim from silence).
@@ -713,6 +719,7 @@ def compute_key_overlap_warnings(
                             "matching may be unreliable for a large share of "
                             "this region."
                         ),
+                        severity="block",
                     )
                 )
     return tuple(warnings)
