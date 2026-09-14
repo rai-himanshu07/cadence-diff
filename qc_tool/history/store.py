@@ -159,7 +159,8 @@ CREATE TABLE IF NOT EXISTS run_signoffs (
     profile_sha256 TEXT NOT NULL,
     attestation_path TEXT NOT NULL,
     attestation_sha256 TEXT NOT NULL,
-    report_paths TEXT NOT NULL DEFAULT '{}'
+    report_paths TEXT NOT NULL DEFAULT '{}',
+    profile_drifted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS counterfactual_bases (
     run_id INTEGER NOT NULL,
@@ -664,6 +665,14 @@ class RunHistory:
                 if column not in existing:
                     conn.execute(statement)
             _migrate_annotation_lineage_v2(conn)
+            run_signoffs_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(run_signoffs)")
+            }
+            if "profile_drifted" not in run_signoffs_columns:
+                conn.execute(
+                    "ALTER TABLE run_signoffs ADD COLUMN profile_drifted "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             private_file(db_path)
 
     @property
@@ -1569,6 +1578,7 @@ class RunHistory:
             attestation_path=row["attestation_path"],
             attestation_sha256=row["attestation_sha256"],
             report_paths=json.loads(row["report_paths"]),
+            profile_drifted=bool(row["profile_drifted"]),
         )
 
     def get_signoff(self, run_id: int) -> RunSignoff | None:
@@ -1592,8 +1602,8 @@ class RunHistory:
                     INSERT INTO run_signoffs (
                         run_id, finalized_at, acknowledgements,
                         review_state_digest, profile_sha256, attestation_path,
-                        attestation_sha256, report_paths
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        attestation_sha256, report_paths, profile_drifted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signoff.run_id,
@@ -1604,6 +1614,7 @@ class RunHistory:
                         signoff.attestation_path,
                         signoff.attestation_sha256,
                         json.dumps(signoff.report_paths),
+                        int(signoff.profile_drifted),
                     ),
                 )
             except sqlite3.IntegrityError as exc:

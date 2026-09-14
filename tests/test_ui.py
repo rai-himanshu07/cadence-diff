@@ -1400,14 +1400,14 @@ async def test_stale_row_suggestions_refresh_with_restored_request_context(
 
 
 @pytest.mark.asyncio
-async def test_review_setup_button_is_blocked_with_no_files_selected(
+async def test_run_qc_button_is_blocked_with_no_files_selected(
     user: User, tmp_path: Path
 ) -> None:
     work_dir = tmp_path / "work"
     create_pages(work_dir)
 
     await user.open("/")
-    user.find("Review setup before running").click()
+    user.find(marker="run-qc-button").click()
 
     await user.should_see("Upload a current Excel workbook")
     # No configuration session was created for a blocked click.
@@ -1416,7 +1416,7 @@ async def test_review_setup_button_is_blocked_with_no_files_selected(
 
 
 @pytest.mark.asyncio
-async def test_review_setup_button_creates_a_configuration_session(
+async def test_run_qc_button_creates_a_configuration_session(
     user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     work_dir = tmp_path / "work"
@@ -1462,7 +1462,7 @@ async def test_review_setup_button_creates_a_configuration_session(
     user.find("Refresh row suggestions").click()
     await user.should_see("Run started")
 
-    user.find("Review setup before running").click()
+    user.find(marker="run-qc-button").click()
 
     file_hashes = {role: sha256_file(path) for role, path in files.items()}
     expected_key = session_key_for(file_hashes)

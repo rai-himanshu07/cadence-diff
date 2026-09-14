@@ -225,6 +225,83 @@ def test_legacy_run_without_profile_snapshot_cannot_be_finalized(
         finalize_run(work_dir, run_id, set())
 
 
+def test_finalization_succeeds_and_discloses_drift_when_the_named_profile_changed(
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """plan-20260913 Step 12 fix: a run finalizes from its own frozen
+    profile_snapshot -- later editing the named profile on disk is
+    disclosed on the signoff, never a reason to block finalization or
+    invalidate this run's historical evidence.
+    """
+    from qc_tool.config.profile import profile_path, save_profile
+
+    work_dir = tmp_path / "work"
+    profiles_dir = work_dir / "profiles"
+    original = DeliverableProfile(name="acme")
+    save_profile(original, profile_path(profiles_dir, "acme"))
+    files = {"current_excel": fixture_dir / "current.xlsx"}
+    artifacts = perform_run(
+        work_dir,
+        files,
+        {},
+        original,
+        mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+    )
+    history = RunHistory(work_dir / "history.sqlite3")
+    record = history.get_run(artifacts.run_id)
+    updates = [
+        (
+            finding.finding_id,
+            finding.severity.value if finding.severity is not None else None,
+            "reviewed for sign-off",
+        )
+        for finding in record.findings
+        if finding.severity is not None
+        and finding.severity.value in {"critical", "warning"}
+    ]
+    history.set_annotations_bulk(artifacts.run_id, updates)
+
+    # The profile changes AFTER the run but BEFORE finalization.
+    changed = original.model_copy(
+        update={"tolerance": original.tolerance.model_copy(update={"absolute": 5.0})}
+    )
+    save_profile(changed, profile_path(profiles_dir, "acme"))
+
+    record = history.get_run(artifacts.run_id)
+    signoff = finalize_run(
+        work_dir, artifacts.run_id, set(required_acknowledgements(record))
+    )
+
+    assert signoff.profile_drifted is True
+    # The signed attestation still binds the run's OWN frozen profile hash,
+    # never the drifted current one.
+    assert signoff.profile_sha256 == record.profile_sha256
+    with zipfile.ZipFile(signoff.attestation_path) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["profile_sha256"] == record.profile_sha256
+    assert manifest["signoff"]["profile_drifted"] is True
+    _, key = load_or_create_attestation_key(work_dir)
+    assert verify_attestation(Path(signoff.attestation_path), key=key).valid
+
+    # Reopening the finalized run reads the disclosure back correctly.
+    stored = history.get_signoff(artifacts.run_id)
+    assert stored is not None
+    assert stored.profile_drifted is True
+
+
+def test_finalization_reports_no_drift_when_the_profile_is_unchanged(
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    run_id, signoff = _finalize_ready(fixture_dir, tmp_path / "work")
+    assert signoff.profile_drifted is False
+    history = RunHistory((tmp_path / "work") / "history.sqlite3")
+    stored = history.get_signoff(run_id)
+    assert stored is not None
+    assert stored.profile_drifted is False
+
+
 @pytest.mark.parametrize("failure", ["attestation", "replace", "database"])
 def test_finalization_failures_leave_original_reports_and_run_mutable(
     failure: str,

@@ -69,6 +69,11 @@ class RunSignoff(BaseModel):
     attestation_path: str
     attestation_sha256: str
     report_paths: dict[str, str] = Field(default_factory=dict)
+    #: True when the named profile currently on disk no longer matches
+    #: `profile_sha256` (plan-20260913 Step 12 fix) -- a disclosed fact,
+    #: never a reason finalization was blocked. `False` for any signoff
+    #: recorded before this column existed.
+    profile_drifted: bool = False
 
 
 class CarryForwardCandidate(BaseModel):

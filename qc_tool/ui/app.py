@@ -3223,6 +3223,12 @@ def _render_result_view(
                 ui.label(
                     f"Finalized {signoff.finalized_at}"
                 ).classes("reviewed")
+                if signoff.profile_drifted:
+                    ui.label(
+                        "The named profile has changed since this run was "
+                        "finalized — evidence is unaffected, since sign-off "
+                        "always used the exact profile frozen at run time."
+                    ).classes("note")
                 if Path(signoff.attestation_path).is_file():
                     ui.button(
                         "Download attestation",
@@ -7483,29 +7489,23 @@ def create_pages(
                     spinner = ui.spinner(size="1.6rem")
                     spinner.visible = False
                     run_button = (
-                        # late-bound: start_run is defined below; NiceGUI
-                        # schedules the returned coroutine
-                        ui.button("Run QC", on_click=lambda: start_run())
-                        .classes("runbtn")
-                        .props("no-caps")
-                    )
-                    run_button.tooltip(
-                        "Runs execute one at a time; extra submissions queue and "
-                        "survive a browser refresh"
-                    )
-                    configure_button = (
                         # late-bound: open_configuration_workspace is defined
-                        # below, mirroring start_run's own forward reference
+                        # below; every fresh submission enters the
+                        # dedicated configuration workspace first (plan-
+                        # 20260913's "wizard-first" acceptance criterion) --
+                        # this button no longer calls start_run() directly.
                         ui.button(
-                            "Review setup before running",
+                            "Run QC",
                             on_click=lambda: open_configuration_workspace(),
                         )
-                        .classes("ghostbtn")
-                        .props("no-caps flat")
+                        .classes("runbtn")
+                        .props("no-caps")
+                        .mark("run-qc-button")
                     )
-                    configure_button.tooltip(
-                        "Opens the full setup review: structure, saved-profile "
-                        "diff, and a bounded data preview before QC runs"
+                    run_button.tooltip(
+                        "Opens the setup review (structure, saved-profile diff, "
+                        "bounded data preview) before QC runs; runs execute one "
+                        "at a time and survive a browser refresh"
                     )
                 queue_row = ui.row().classes("readyqueue")
                 queue_row.visible = False
@@ -7566,12 +7566,13 @@ def create_pages(
                         add="caution" if cautions and not blockers else "",
                         remove="" if cautions and not blockers else "caution",
                     )
-                    run_button.set_enabled(not blockers and not _run_ui_busy())
-                    # Reviewing setup is a navigation, not a submission, so it
-                    # is not gated on the single-flight submission lock.
-                    configure_button.set_enabled(not blockers)
+                    # Both buttons only navigate to the configuration
+                    # workspace now (plan-20260913 wizard-first); neither
+                    # submits directly, so neither needs the single-flight
+                    # submission lock -- only the blockers gate applies.
+                    run_button.set_enabled(not blockers)
                     for button in extra_run_buttons:
-                        button.set_enabled(not blockers and not _run_ui_busy())
+                        button.set_enabled(not blockers)
 
                 queue_signature: dict[str, tuple[tuple[str, str], ...]] = {"value": ()}
                 own_requests: set[str] = set()
@@ -8126,7 +8127,10 @@ def create_pages(
             if rerun_banner_actions is not None:
                 with rerun_banner_actions:
                     extra_run_buttons.append(
-                        ui.button("Run QC now", on_click=start_run)
+                        ui.button(
+                            "Run QC now",
+                            on_click=lambda: open_configuration_workspace(),
+                        )
                         .classes("runbtn")
                         .props("no-caps dense")
                     )

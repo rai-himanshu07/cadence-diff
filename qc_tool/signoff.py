@@ -173,11 +173,17 @@ def finalize_run(
         raise SignoffNotReadyError(
             "this legacy run has no exact profile snapshot; submit a Re-QC run"
         )
-    current_profile = _current_profile(work_dir, record)
-    if profile_sha256(current_profile) != record.profile_sha256:
-        raise SignoffNotReadyError(
-            "the profile changed after this run; submit a Re-QC run before sign-off"
-        )
+    # A run always finalizes from its OWN frozen profile_snapshot (never
+    # the current mutable named profile) -- later profile drift is
+    # disclosed on the signoff record, not a reason to block finalization
+    # or invalidate this run's historical evidence (plan-20260913). Any
+    # failure to even load the current profile (deleted, invalid) counts
+    # as drift too, since it cannot be confirmed unchanged.
+    try:
+        current_profile = _current_profile(work_dir, record)
+        profile_drifted = profile_sha256(current_profile) != record.profile_sha256
+    except Exception:
+        profile_drifted = True
     if set(record.file_paths) != set(record.file_hashes):
         raise SignoffNotReadyError("the run does not retain every source path")
     input_files = {role: Path(path) for role, path in record.file_paths.items()}
@@ -199,6 +205,7 @@ def finalize_run(
         acknowledgements=accepted,
         review_state_digest=digest,
         annotation_lineage=lineages,
+        profile_drifted=profile_drifted,
     )
     result = _result_from_record(record)
     signoff_dir = private_directory(work_dir / "runs" / f"signoff-{run_id}")
@@ -249,6 +256,7 @@ def finalize_run(
             attestation_path=str(attestation_path),
             attestation_sha256=sha256_file(attestation_path),
             report_paths={kind: str(path) for kind, path in final_paths.items()},
+            profile_drifted=profile_drifted,
         )
         history.record_signoff(signoff)
         # a finalized review is over; the recorded time must stop with it

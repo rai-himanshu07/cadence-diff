@@ -16,7 +16,11 @@ from openpyxl import Workbook
 
 from qc_tool.coverage import QCRunMode
 from qc_tool.history.config_session import ConfigSessionStore, session_key_for
+from qc_tool.history.run_state import RunStateStore
 from qc_tool.history.store import sha256_file
+from qc_tool.projection import VolumeProjection
+from qc_tool.ui import app as app_module
+from qc_tool.ui import config_workspace as config_workspace_module
 from qc_tool.ui.app import create_pages
 from qc_tool.ui.config_workspace import build_session_choices, get_setup_job_registry
 
@@ -469,3 +473,90 @@ async def test_save_profile_succeeds_when_nothing_changed_underneath(
     user.find(kind=ui.button, content="Save profile").click()
 
     await user.should_see("Profile 'acme' saved")
+
+
+class _RecordingQueueManager:
+    """UI-test queue boundary that records requests without starting a
+    worker -- mirrors ``tests/test_ui.py``'s own stub of the same name.
+    """
+
+    def __init__(self, store: RunStateStore) -> None:
+        self.store = store
+        self.shutdown_hook_installed = False
+        self.submitted: list[tuple[object, dict[str, str]]] = []
+
+    def submit(self, request: object, credentials: dict[str, str] | None = None) -> None:
+        self.submitted.append((request, dict(credentials or {})))
+
+    def shutdown(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_run_once_submits_the_run_and_navigates_home(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary case: a small comparison with no projected-volume
+    warning submits immediately through the workspace's own 'Run once'
+    action (plan-20260913 Step 12's wizard-first fix -- this exact
+    submission path had no end-to-end test before this).
+    """
+    work_dir = tmp_path / "work"
+    session_key = _stage_session(work_dir)
+    manager = _RecordingQueueManager(RunStateStore(work_dir / "history.sqlite3"))
+    monkeypatch.setattr(app_module, "get_manager", lambda _work_dir: manager)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Confirm all detected regions", retries=_SUBPROCESS_RETRIES)
+    user.find("Confirm all detected regions").click()
+
+    user.find(kind=ui.button, content="Run once").click()
+
+    await user.should_see("Run started")
+    assert len(manager.submitted) == 1
+    request, credentials = manager.submitted[0]
+    assert credentials == {}
+    assert request.resolved_input_configuration is not None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_run_once_warns_before_a_very_large_comparison(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Porting the main page's own pre-wizard volume-projection courtesy
+    warning into the workspace (Step 12 fix) -- without this, the warning
+    would have silently disappeared the moment 'Run QC' always routes
+    through here first.
+    """
+    work_dir = tmp_path / "work"
+    session_key = _stage_session(work_dir)
+    manager = _RecordingQueueManager(RunStateStore(work_dir / "history.sqlite3"))
+    monkeypatch.setattr(app_module, "get_manager", lambda _work_dir: manager)
+    huge_projection = VolumeProjection(
+        changed_sheets=("Data",),
+        added_sheets=(),
+        removed_sheets=(),
+        identical_sheets=(),
+        projected_max_findings=999_999,
+    )
+    monkeypatch.setattr(
+        config_workspace_module, "project_cycle_volume", lambda *_args: huge_projection
+    )
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Confirm all detected regions", retries=_SUBPROCESS_RETRIES)
+    user.find("Confirm all detected regions").click()
+
+    user.find(kind=ui.button, content="Run once").click()
+
+    await user.should_see("This looks like a very large comparison")
+    assert manager.submitted == []
+
+    user.find(kind=ui.button, content="Run anyway").click()
+
+    await user.should_see("Run started")
+    assert len(manager.submitted) == 1

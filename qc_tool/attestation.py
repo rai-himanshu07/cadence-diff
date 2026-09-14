@@ -48,6 +48,13 @@ class AttestationSignoff(BaseModel):
     acknowledgements: tuple[str, ...] = ()
     review_state_digest: str
     annotation_lineage: list[dict[str, object]] = Field(default_factory=list)
+    #: True when the named profile currently on disk no longer matches the
+    #: exact bytes this run's evidence was produced with (plan-20260913
+    #: Step 12 fix). A disclosed fact only -- finalization always signs the
+    #: run's own frozen `profile_snapshot`, never the current mutable
+    #: profile, so later profile drift never invalidates this evidence.
+    #: `False` for any bundle signed before this field existed.
+    profile_drifted: bool = False
 
 
 class PopulationManifestEntry(BaseModel):

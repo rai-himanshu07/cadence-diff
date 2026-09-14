@@ -42,6 +42,8 @@ from qc_tool.coverage import QCRunMode
 from qc_tool.history.config_session import ConfigSessionStore
 from qc_tool.history.store import sha256_file
 from qc_tool.package import PackageManifest
+from qc_tool.projection import project_cycle_volume
+from qc_tool.run_service import REPORT_DEFER_FINDINGS
 from qc_tool.runqueue import QueueBusyError, RunQueueManager, run_exclusive
 from qc_tool.setup.models import MemberSetupProfile, SetupAnalysisResult
 from qc_tool.setup.preview_worker import (
@@ -2003,64 +2005,136 @@ def render_config_workspace(
                 ui.notify(f"Profile {target_name!r} saved")
             if not run:
                 return
-            resolved = build_resolved_configuration(
-                workspace_state["value"],
-                profile=profile,
-                profile_sha256=profile_sha256(profile),
-                warnings_acknowledged=tuple(sorted(workspace_state["value"].warnings_acknowledged)),
-                file_hashes=file_hashes,
-            )
-            try:
-                manifest = PackageManifest.from_role_files(
-                    {role: str(path) for role, path in files.items()}
-                )
-            except ValueError as exc:
-                ui.notify(str(exc), type="negative")
-                return
-            from qc_tool.ui.app import SessionState, build_run_request
 
-            live_state = workspace_state["value"]
-            deck = live_state.deck_review
-            available_slides = (
-                [(s.slide_index, s.title) for s in deck.current_slides]
-                if deck is not None
-                else []
+            async def _submit_run() -> None:
+                resolved = build_resolved_configuration(
+                    workspace_state["value"],
+                    profile=profile,
+                    profile_sha256=profile_sha256(profile),
+                    warnings_acknowledged=tuple(
+                        sorted(workspace_state["value"].warnings_acknowledged)
+                    ),
+                    file_hashes=file_hashes,
+                )
+                try:
+                    manifest = PackageManifest.from_role_files(
+                        {role: str(path) for role, path in files.items()}
+                    )
+                except ValueError as exc:
+                    ui.notify(str(exc), type="negative")
+                    return
+                from qc_tool.ui.app import SessionState, build_run_request
+
+                live_state = workspace_state["value"]
+                deck = live_state.deck_review
+                available_slides = (
+                    [(s.slide_index, s.title) for s in deck.current_slides]
+                    if deck is not None
+                    else []
+                )
+                selected_slides = (
+                    {s.slide_index for s in deck.current_slides if s.included}
+                    if deck is not None
+                    else set()
+                )
+                run_state = SessionState(
+                    files=files,
+                    file_hashes=file_hashes,
+                    profile_name=profile.name,
+                    mode=mode,
+                    output_mode=_output_mode_from_choices(choices),
+                    allow_large_workbooks=live_state.allow_large_workbooks,
+                    allow_dependency_indexing=live_state.allow_dependency_indexing,
+                    acceptance_absolute=_coerce_float(
+                        choices.get("acceptance_absolute"), 0.0
+                    ),
+                    acceptance_percent=_coerce_float(
+                        choices.get("acceptance_percent"), 0.0
+                    ),
+                    rerun_of=_coerce_optional_int(choices.get("rerun_of")),
+                    available_slides=available_slides,
+                    selected_slides=selected_slides,
+                )
+                request = build_run_request(
+                    work_dir=work_dir,
+                    state=run_state,
+                    files=files,
+                    profile=profile,
+                    manifest=manifest,
+                    resolved_input_configuration=resolved.model_dump(mode="json"),
+                    resolved_input_digest=resolved.canonical_sha256(),
+                )
+                try:
+                    queue_manager.submit(request, {})
+                except QueueBusyError as exc:
+                    ui.notify(str(exc), type="warning")
+                    return
+                ui.notify("Run started")
+                ui.navigate.to("/")
+
+            # Volume-projection courtesy warning (mirrors the main page's
+            # own pre-wizard check, ported here so it is not silently lost
+            # now that every fresh submission enters this workspace first).
+            # Scoped to the same single-workbook cycle case the original
+            # check covered; a package/preflight/final-package submission
+            # skips straight to _submit_run().
+            acknowledged_large_volume = (
+                "large_comparison_confirmed"
+                in workspace_state["value"].warnings_acknowledged
             )
-            selected_slides = (
-                {s.slide_index for s in deck.current_slides if s.included}
-                if deck is not None
-                else set()
-            )
-            run_state = SessionState(
-                files=files,
-                file_hashes=file_hashes,
-                profile_name=profile.name,
-                mode=mode,
-                output_mode=_output_mode_from_choices(choices),
-                allow_large_workbooks=live_state.allow_large_workbooks,
-                allow_dependency_indexing=live_state.allow_dependency_indexing,
-                acceptance_absolute=_coerce_float(choices.get("acceptance_absolute"), 0.0),
-                acceptance_percent=_coerce_float(choices.get("acceptance_percent"), 0.0),
-                rerun_of=_coerce_optional_int(choices.get("rerun_of")),
-                available_slides=available_slides,
-                selected_slides=selected_slides,
-            )
-            request = build_run_request(
-                work_dir=work_dir,
-                state=run_state,
-                files=files,
-                profile=profile,
-                manifest=manifest,
-                resolved_input_configuration=resolved.model_dump(mode="json"),
-                resolved_input_digest=resolved.canonical_sha256(),
-            )
-            try:
-                queue_manager.submit(request, {})
-            except QueueBusyError as exc:
-                ui.notify(str(exc), type="warning")
-                return
-            ui.notify("Run started")
-            ui.navigate.to("/")
+            if (
+                mode is QCRunMode.CYCLE_COMPARISON
+                and "baseline_excel" in files
+                and "current_excel" in files
+                and not acknowledged_large_volume
+            ):
+                projection = await asyncio.to_thread(
+                    project_cycle_volume,
+                    files["baseline_excel"],
+                    files["current_excel"],
+                )
+                if (
+                    projection is not None
+                    and projection.projected_max_findings > REPORT_DEFER_FINDINGS
+                ):
+
+                    async def _run_anyway() -> None:
+                        workspace_state["value"] = dataclasses.replace(
+                            workspace_state["value"],
+                            warnings_acknowledged=frozenset(
+                                workspace_state["value"].warnings_acknowledged
+                            )
+                            | {"large_comparison_confirmed"},
+                        )
+                        volume_dialog.close()
+                        await _submit_run()
+
+                    with (
+                        ui.dialog().props("persistent") as volume_dialog,
+                        ui.card().classes("w-[36rem] max-w-full"),
+                    ):
+                        ui.label(
+                            "This looks like a very large comparison"
+                        ).classes("runhead")
+                        ui.label(
+                            f"Up to ~{projection.projected_max_findings:,} "
+                            f"findings across {len(projection.changed_sheets)} "
+                            "changed sheet"
+                            f"{'s' if len(projection.changed_sheets) != 1 else ''}. "
+                            "Narrow the region/sheet choices above to reduce "
+                            "this, or continue -- a full run remains the "
+                            "sign-off artifact."
+                        ).classes("notecard")
+                        with ui.row().classes("items-center gap-2"):
+                            ui.button(
+                                "Run anyway", on_click=_run_anyway
+                            ).classes("runbtn").props("no-caps")
+                            ui.button(
+                                "Cancel", on_click=volume_dialog.close
+                            ).props("flat no-caps")
+                    volume_dialog.open()
+                    return
+            await _submit_run()
 
         def _set_allow_large_workbooks(value: bool) -> None:
             workspace_state["value"] = dataclasses.replace(
