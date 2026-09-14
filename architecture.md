@@ -147,17 +147,22 @@ The worker also monitors parent liveness. If its owner disappears, it cancels
 itself and does not emit a result that no manager is waiting to receive.
 
 Browser runs also have a dedicated full-page configuration workspace at
-`/configure` ([`qc_tool/ui/config_workspace.py`](qc_tool/ui/config_workspace.py)),
-reached from the main page's additive "Review setup before running" button.
-It runs one bounded, cancellable setup-analysis job over the selected files
-(sharing the same single heavy-work slot as a QC run -- never concurrent with
-one), then lets the analyst review input roles, per-sheet regions, logical
-columns, and selector prerequisites before choosing `Run once`, `Save
-profile`, `Save profile and run`, `Update profile and run`, or `Export
-configuration`. See "Input Contract And Resolved Configuration" below for
-the two versioned contracts it produces, and "Deliberate Boundaries And Known
-Limitations" for the disclosed gap between this workspace and the main
-page's direct "Run QC" button.
+`/configure` ([`qc_tool/ui/config_workspace.py`](qc_tool/ui/config_workspace.py)).
+Every fresh submission -- the main page's "Run QC" button and the Re-QC
+"Run QC now" banner button alike -- enters this workspace first; neither
+submits directly. It runs one bounded, cancellable setup-analysis job over
+the selected files (sharing the same single heavy-work slot as a QC run --
+never concurrent with one), then lets the analyst review input roles,
+per-sheet regions, logical columns, and selector prerequisites before
+choosing `Run once`, `Save profile`, `Save profile and run`, `Update
+profile and run`, or `Export configuration`. A volume-projection courtesy
+warning (ported from the legacy direct-submit path) still fires here for
+an unusually large projected comparison. Retry flows for an already-
+submitted attempt (workload-override retry, row-identity-confirmation
+retry) remain direct, since they resubmit an existing configuration
+rather than starting a new one. See "Input Contract And Resolved
+Configuration" below for the two versioned contracts this workspace
+produces.
 
 ### 3.3 CLI Execution Path
 
@@ -1062,32 +1067,6 @@ deploy.
 - The native helper is an automatic, separately versioned dependency. Its
   universal fallback wheel keeps the main package operational with conservative
   Python/platform fallbacks when no native wheel matches.
-- The main page's direct "Run QC" button (and its volume-projection,
-  workload-override-retry, and row-identity-confirmation-retry dialogs) still
-  submits a run with no `resolved_input_configuration` at all, bypassing the
-  `/configure` workspace entirely; only the additive "Review setup before
-  running" button reaches it. This is a known, carried-forward gap against
-  plan-20260913's own "wizard-first" acceptance criterion, not a new defect --
-  migrating those dialogs into the workspace (or an equivalent redirect) is an
-  explicit open decision, not yet scheduled to a step.
-- `finalize_run()` ([`qc_tool/signoff.py`](qc_tool/signoff.py)) still refuses
-  to finalize a run when the profile currently on disk no longer matches the
-  run's own recorded `profile_sha256`, even though the run's frozen profile
-  snapshot and resolved configuration are what evidence sign-off actually
-  needs. This contradicts plan-20260913's "later profile drift is disclosed,
-  not a reason to invalidate historical evidence" criterion. Left unchanged
-  deliberately: the current behavior fails closed (too strict, not
-  permissive), the check has no existing test coverage, and a correct fix
-  needs `AttestationSignoff` to gain a disclosed-drift field rather than a
-  quick patch to a sign-off-path gate.
-- Logical columns and selectors resolve to the *same* letter/cell on both
-  baseline and current sides. `ResolvedColumn`/`ResolvedSelector` support
-  independent per-side values, but neither the `/configure` workspace's
-  `RegionDecision`/`SelectorDecision` state nor its UI controls currently let
-  an analyst enter a genuinely different baseline-side letter or cell --
-  `_resolved_column()`/`_resolved_region()` in
-  [`qc_tool/ui/config_review.py`](qc_tool/ui/config_review.py) always mirror
-  the current-side value to the baseline side.
 - Explicitly mapped sheet movement/rename produces a `SHEET_RENAMED` finding
   (`qc_tool/findings.py`), but there is no equivalent region- or
   column-movement finding class yet; a mapped region/column move is absorbed

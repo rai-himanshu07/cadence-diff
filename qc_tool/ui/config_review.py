@@ -136,6 +136,12 @@ class RegionDecision:
     #: Columns whose cached-value changes stay visible Expected rather than
     #: hidden (Step 8's "expected_refresh remains visible Expected" rule).
     expected_refresh_columns: tuple[str, ...] = ()
+    #: Baseline-side letter override per column (Step 12 fix): pairs of
+    #: (current_letter, baseline_letter) for any identity/ordinal/ignore/
+    #: expected_refresh column whose position differs between baseline and
+    #: current -- absent means "same letter both sides" (today's default,
+    #: unchanged for every column with no entry here).
+    column_baseline_letters: tuple[tuple[str, str], ...] = ()
     #: Outer-whitespace trim for identity-column equality (Step 8's "exact
     #: typed equality plus optional outer-whitespace trim only" rule).
     #: Applies to every identity column in this region -- a deliberate
@@ -160,6 +166,15 @@ class RegionDecision:
     def requires_exclusion_detail(self) -> bool:
         return self.mode == "excluded"
 
+    def baseline_letter_for(self, letter: str) -> str:
+        """The baseline-side letter for a current-side column ``letter`` --
+        the analyst-entered override if one exists, else the same letter.
+        """
+        for current, baseline in self.column_baseline_letters:
+            if current == letter:
+                return baseline
+        return letter
+
     @property
     def is_valid(self) -> bool:
         if self.mode == "excluded":
@@ -183,14 +198,17 @@ class RegionDecision:
 class SelectorDecision:
     """One analyst-declared selector/scenario prerequisite cell (Step 8's
     "explicit selector prerequisites for dropdown/filter/scenario/parameter
-    cells" criterion). Never carries a value -- only a label and a
-    current-side cell location; the run-time engine check compares the two
-    files' actual saved values without ever persisting either one.
+    cells" criterion). Never carries a value -- only a label and cell
+    location(s); the run-time engine check compares the two files' actual
+    saved values without ever persisting either one.
     """
 
     selector_id: str
     label: str
     cell: str  # current-side A1 cell
+    #: Baseline-side cell override (Step 12 fix) -- "" means "same cell as
+    #: current" (today's default, unchanged for every existing selector).
+    baseline_cell: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +459,55 @@ def set_expected_refresh_columns(
     region: RegionDecision, columns: tuple[str, ...]
 ) -> RegionDecision:
     return _set_column_role(region, "expected_refresh", columns)
+
+
+def set_column_baseline_letter(
+    region: RegionDecision, letter: str, baseline_letter: str
+) -> RegionDecision:
+    """Set (or clear, when ``baseline_letter`` is blank) an analyst-entered
+    baseline-side letter override for one current-side column ``letter``
+    (Step 12 fix -- "logical columns resolve separately on each side").
+    """
+    remaining = tuple(
+        (current, baseline)
+        for current, baseline in region.column_baseline_letters
+        if current != letter
+    )
+    baseline_letter = baseline_letter.strip().upper()
+    if not baseline_letter or baseline_letter == letter:
+        return replace(region, column_baseline_letters=remaining)
+    return replace(
+        region, column_baseline_letters=(*remaining, (letter, baseline_letter))
+    )
+
+
+def set_selector_baseline_cell(
+    member: MemberReview, sheet_name: str, selector_id: str, baseline_cell: str
+) -> MemberReview:
+    """Set (or clear, when ``baseline_cell`` is blank) an analyst-entered
+    baseline-side cell override for one selector (Step 12 fix). Raises
+    ``ValueError`` for an unparseable non-blank cell.
+    """
+    cleaned = baseline_cell.strip().upper()
+    if cleaned:
+        parse_a1_cell(cleaned)  # validates; raises ValueError with a plain message
+    new_sheets = []
+    for sheet in member.current_sheets:
+        if sheet.sheet_name != sheet_name:
+            new_sheets.append(sheet)
+            continue
+        new_sheets.append(
+            replace(
+                sheet,
+                selectors=tuple(
+                    replace(selector, baseline_cell=cleaned)
+                    if selector.selector_id == selector_id
+                    else selector
+                    for selector in sheet.selectors
+                ),
+            )
+        )
+    return replace(member, current_sheets=tuple(new_sheets))
 
 
 def regions_overlap(a: RegionDecision, b: RegionDecision) -> bool:
@@ -1383,7 +1450,7 @@ def _resolved_column(region: RegionDecision, letter: str) -> ResolvedColumn:
         policy = "expected_refresh"
     return ResolvedColumn(
         column_id=slugify(f"{region.region_id}_{letter}", prefix="col"),
-        baseline_letter=letter,
+        baseline_letter=region.baseline_letter_for(letter),
         current_letter=letter,
         alignment_role=role,
         comparison_policy=policy,
@@ -1507,7 +1574,9 @@ def build_resolved_configuration(
             selectors = tuple(
                 ResolvedSelector(
                     selector_id=selector.selector_id,
-                    baseline_cell=selector.cell if baseline_name else None,
+                    baseline_cell=(selector.baseline_cell or selector.cell)
+                    if baseline_name
+                    else None,
                     current_cell=selector.cell,
                 )
                 for selector in sheet.selectors

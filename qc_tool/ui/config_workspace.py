@@ -76,10 +76,12 @@ from qc_tool.ui.config_review import (
     parse_a1_cell,
     remove_selector,
     resolve_slide_anchors,
+    set_column_baseline_letter,
     set_expected_refresh_columns,
     set_identity_columns,
     set_ignore_columns,
     set_ordinal_columns,
+    set_selector_baseline_cell,
     set_sheet_rename,
     set_slide_included,
     set_slide_rename,
@@ -451,6 +453,16 @@ def _coerce_str_tuple(value: object) -> tuple[str, ...]:
     return tuple(str(item) for item in value)
 
 
+def _coerce_letter_pairs(value: object) -> tuple[tuple[str, str], ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    pairs: list[tuple[str, str]] = []
+    for item in value:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            pairs.append((str(item[0]), str(item[1])))
+    return tuple(pairs)
+
+
 def _coerce_float(value: object, default: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
@@ -502,6 +514,7 @@ def _serialize_region(region) -> dict[str, object]:
         "ordinal_columns": list(region.ordinal_columns),
         "ignore_columns": list(region.ignore_columns),
         "expected_refresh_columns": list(region.expected_refresh_columns),
+        "column_baseline_letters": [list(pair) for pair in region.column_baseline_letters],
         "trim_identity_whitespace": region.trim_identity_whitespace,
         "blank_key_policy": region.blank_key_policy,
         "duplicate_key_policy": region.duplicate_key_policy,
@@ -554,6 +567,9 @@ def _apply_saved_region_choices(
                     expected_refresh_columns=_coerce_str_tuple(
                         saved_region.get("expected_refresh_columns", ())
                     ),
+                    column_baseline_letters=_coerce_letter_pairs(
+                        saved_region.get("column_baseline_letters", ())
+                    ),
                     trim_identity_whitespace=bool(
                         saved_region.get(
                             "trim_identity_whitespace", region.trim_identity_whitespace
@@ -584,6 +600,7 @@ def _serialize_selectors(member: MemberReview) -> list[dict[str, object]]:
                     "selector_id": selector.selector_id,
                     "label": selector.label,
                     "cell": selector.cell,
+                    "baseline_cell": selector.baseline_cell,
                 }
             )
     return entries
@@ -606,6 +623,7 @@ def _apply_saved_selectors(member: MemberReview, saved: list[dict[str, object]])
                 selector_id=str(entry.get("selector_id", "")),
                 label=str(entry.get("label", "")),
                 cell=str(entry.get("cell", "")),
+                baseline_cell=str(entry.get("baseline_cell", "")),
             )
         )
     if not by_sheet:
@@ -1081,6 +1099,24 @@ def render_config_workspace(
             _persist_choices()
             refresh()
 
+        def _set_selector_baseline_cell(
+            member_id: str, sheet_name: str, selector_id: str, baseline_cell: str
+        ) -> None:
+            state = workspace_state["value"]
+            member = state.member_review(member_id)
+            if member is None:
+                return
+            try:
+                updated_member = set_selector_baseline_cell(
+                    member, sheet_name, selector_id, baseline_cell
+                )
+            except ValueError as exc:
+                ui.notify(str(exc), type="warning")
+                return
+            workspace_state["value"] = state.with_member_review(updated_member)
+            _persist_choices()
+            refresh()
+
         def _render_add_selector_control(member: MemberReview) -> None:
             """A compact, always-available control (Step 8's "explicit
             selector prerequisites for dropdown/filter/scenario/parameter
@@ -1116,6 +1152,22 @@ def render_config_workspace(
         def _render_selector_row(member_id: str, sheet_name: str, selector) -> None:
             with ui.row().classes("items-center gap-2"):
                 ui.label(f"{selector.label} ({selector.cell})").classes("note")
+
+                def _on_baseline_cell_change(
+                    event: events.ValueChangeEventArguments,
+                    member_id=member_id,
+                    sheet_name=sheet_name,
+                    selector_id=selector.selector_id,
+                ) -> None:
+                    _set_selector_baseline_cell(
+                        member_id, sheet_name, selector_id, str(event.value or "")
+                    )
+
+                ui.input(
+                    "Cell in baseline (if moved)",
+                    value=selector.baseline_cell,
+                    on_change=_on_baseline_cell_change,
+                ).props("outlined dense").classes("w-40")
 
                 def _on_remove(
                     member_id=member_id, sheet_name=sheet_name, selector_id=selector.selector_id
@@ -1660,6 +1712,64 @@ def render_config_workspace(
                         label="Expected-refresh columns",
                         on_change=_on_expected_refresh_change,
                     ).props("outlined dense use-chips").classes("w-56")
+
+              with (
+                  ui.expansion("Column letter differs from baseline?").classes("w-full"),
+                  ui.row().classes("items-center gap-2 flex-wrap w-full"),
+              ):
+                    lettered_columns = tuple(
+                        dict.fromkeys(
+                            (
+                                *region.identity_columns,
+                                *region.ordinal_columns,
+                                *region.ignore_columns,
+                                *region.expected_refresh_columns,
+                            )
+                        )
+                    )
+                    if not lettered_columns:
+                        ui.label(
+                            "Assign a column role above first -- a column's "
+                            "baseline-side letter only matters once it is "
+                            "identity/ordinal/ignore/expected-refresh."
+                        ).classes("note")
+                    else:
+                        ui.label(
+                            "Only set this when a column's position moved "
+                            "between baseline and current; blank means the "
+                            "same letter both sides."
+                        ).classes("note")
+                        for letter in lettered_columns:
+
+                            def _on_baseline_letter_change(
+                                event: events.ValueChangeEventArguments,
+                                member_id=member_id,
+                                sheet_name=sheet_name,
+                                region_id=region.region_id,
+                                letter=letter,
+                            ) -> None:
+                                _apply_region_transform(
+                                    member_id,
+                                    sheet_name,
+                                    region_id,
+                                    lambda r: set_column_baseline_letter(
+                                        r, letter, str(event.value or "")
+                                    ),
+                                )
+
+                            current_override = next(
+                                (
+                                    baseline
+                                    for current, baseline in region.column_baseline_letters
+                                    if current == letter
+                                ),
+                                "",
+                            )
+                            ui.input(
+                                f"{letter} in baseline",
+                                value=current_override,
+                                on_change=_on_baseline_letter_change,
+                            ).props("outlined dense").classes("w-32")
 
         def render_preview_section() -> None:
             """Current-first preview with an explicit baseline toggle (Step

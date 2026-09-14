@@ -230,6 +230,64 @@ async def test_selector_prerequisite_is_added_and_survives_a_session_reload(
 
 
 @pytest.mark.asyncio
+async def test_selector_baseline_cell_override_survives_a_session_reload(
+    user: User, tmp_path: Path
+) -> None:
+    """plan-20260913 Step 12 fix: a selector's baseline-side cell can
+    differ from its current-side cell, and the override round-trips
+    through the session store like every other region/selector choice.
+    """
+    work_dir = tmp_path / "work"
+    session_key = _stage_session(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Add selector prerequisite:", retries=_SUBPROCESS_RETRIES)
+
+    cell_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "Cell (A1)"
+    )
+    label_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "Label"
+    )
+    cell_input.value = "B5"
+    label_input.value = "Scenario"
+    user.find(kind=ui.button, content="Add").click()
+    await user.should_see("Scenario (B5)")
+
+    baseline_cell_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "Cell in baseline (if moved)"
+    )
+    baseline_cell_input.value = "B9"
+
+    store = ConfigSessionStore(work_dir / "history.sqlite3")
+    record = store.get(session_key)
+    assert record is not None
+    selectors = record.choices.get("selectors")
+    assert isinstance(selectors, dict)
+    saved_entries = selectors.get("primary")
+    assert isinstance(saved_entries, list) and len(saved_entries) == 1
+    assert saved_entries[0]["baseline_cell"] == "B9"
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    await user.should_see("Scenario (B5)")
+    restored_baseline_cell_input = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "Cell in baseline (if moved)"
+    )
+    assert restored_baseline_cell_input.value == "B9"
+
+
+@pytest.mark.asyncio
 async def test_ppt_slide_review_shows_inventory_and_added_removed_warning(
     user: User, tmp_path: Path
 ) -> None:

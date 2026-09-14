@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
 from qc_tool.config.profile import (
     DeliverableProfile,
@@ -33,6 +35,7 @@ from qc_tool.setup.models import (
 )
 from qc_tool.ui.config_review import (
     ConfigWorkspaceState,
+    add_selector,
     apply_anchor_click,
     apply_manual_range,
     apply_region_transform,
@@ -56,10 +59,12 @@ from qc_tool.ui.config_review import (
     parse_a1_range,
     regions_overlap,
     resolve_slide_anchors,
+    set_column_baseline_letter,
     set_expected_refresh_columns,
     set_identity_columns,
     set_ignore_columns,
     set_ordinal_columns,
+    set_selector_baseline_cell,
     set_sheet_rename,
     set_slide_included,
     set_slide_rename,
@@ -499,6 +504,76 @@ def test_build_resolved_configuration_carries_keyed_identity_columns() -> None:
     assert region.mode == "keyed"
     identity_letters = [c.current_letter for c in region.columns if c.alignment_role == "identity"]
     assert identity_letters == ["A"]
+
+
+def test_set_column_baseline_letter_stores_and_clears_an_override() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = review.current_sheets[0].regions[0]
+
+    moved = set_column_baseline_letter(region, "A", "c")
+    assert moved.baseline_letter_for("A") == "C"  # normalized upper
+    assert moved.baseline_letter_for("B") == "B"  # untouched column unaffected
+
+    cleared = set_column_baseline_letter(moved, "A", "")
+    assert cleared.baseline_letter_for("A") == "A"
+    assert cleared.column_baseline_letters == ()
+
+    same_letter = set_column_baseline_letter(region, "A", "A")
+    assert same_letter.column_baseline_letters == ()  # no-op override is not stored
+
+
+def test_build_resolved_configuration_carries_a_baseline_letter_override() -> None:
+    """plan-20260913 Step 12 fix: identity columns resolve separately on
+    each side instead of always mirroring the current-side letter.
+    """
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review, "Data", region_id, mode="keyed", identity_columns=("A",), confirmed=True
+    )
+    updated = apply_region_transform(
+        updated,
+        "Data",
+        region_id,
+        lambda r: set_column_baseline_letter(r, "A", "C"),
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    resolved = build_resolved_configuration(
+        state, profile=DeliverableProfile(name="default"), profile_sha256="deadbeef"
+    )
+    region = resolved.members[0].sheets[0].regions[0]
+    identity_column = next(c for c in region.columns if c.alignment_role == "identity")
+    assert identity_column.current_letter == "A"
+    assert identity_column.baseline_letter == "C"
+
+
+def test_set_selector_baseline_cell_stores_and_clears_an_override() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    review = add_selector(review, "Data", label="Scenario", cell="B1")
+    selector_id = review.current_sheets[0].selectors[0].selector_id
+
+    moved = set_selector_baseline_cell(review, "Data", selector_id, "b2")
+    assert moved.current_sheets[0].selectors[0].baseline_cell == "B2"  # normalized upper
+
+    cleared = set_selector_baseline_cell(moved, "Data", selector_id, "")
+    assert cleared.current_sheets[0].selectors[0].baseline_cell == ""
+
+    with pytest.raises(ValueError):
+        set_selector_baseline_cell(review, "Data", selector_id, "not-a-cell")
+
+
+def test_build_resolved_configuration_carries_a_baseline_cell_override_for_a_selector() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    review = add_selector(review, "Data", label="Scenario", cell="B1")
+    selector_id = review.current_sheets[0].selectors[0].selector_id
+    review = set_selector_baseline_cell(review, "Data", selector_id, "B5")
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(review,))
+    resolved = build_resolved_configuration(
+        state, profile=DeliverableProfile(name="default"), profile_sha256="deadbeef"
+    )
+    selector = resolved.members[0].sheets[0].selectors[0]
+    assert selector.current_cell == "B1"
+    assert selector.baseline_cell == "B5"
 
 
 def test_build_resolved_configuration_leaves_untouched_regions_automatic() -> None:
