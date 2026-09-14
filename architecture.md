@@ -1075,33 +1075,41 @@ deploy.
 - The native helper is an automatic, separately versioned dependency. Its
   universal fallback wheel keeps the main package operational with conservative
   Python/platform fallbacks when no native wheel matches.
-- Explicitly mapped sheet movement/rename produces a `SHEET_RENAMED` finding
-  (`qc_tool/findings.py`), but there is no equivalent region- or
-  column-movement finding class yet; the alignment engine also has no
-  concept of a confirmed region/column mapping at all (unlike its existing
-  `execution_bindings.confirmed_sheet_renames()` for sheets) -- a region or
-  column that moved is neither explicitly mapped nor guaranteed noise-free
-  today.
+- Explicitly mapped sheet movement/rename produces a `SHEET_RENAMED` finding;
+  explicitly mapped column movement produces a `COLUMN_MOVED` finding
+  (`qc_tool/findings.py`, plan-20260913 Step 12 Fix 4). Both are driven by
+  `ExecutionBindings` hooks consumed directly by the alignment engine
+  (`confirmed_sheet_renames()`/`confirmed_column_mappings()` in
+  `qc_tool/config/execution.py`, threaded into `qc_tool/excel/align.py`'s
+  `_align_block`) -- a confirmed rename/move changes what is actually
+  compared, not merely what is reported. There is no equivalent
+  region-movement finding class (a region's baseline/current ranges are
+  independently analyst-specified, not detected via movement, so no
+  comparable engine gap exists there).
 - Column/selector baseline-side overrides
   (`ResolvedColumn.baseline_letter`/`ResolvedSelector.baseline_cell`, an
-  analyst-entered `/configure` workspace choice) persist in the resolved
-  configuration and reports, but are not yet consumed by the alignment
-  engine: `qc_tool/excel/align.py`'s `_align_block` still pairs a region's
-  columns by POSITION within the region on each side, never by letter, so
-  entering a baseline-letter override does not yet change which physical
-  current cell a given baseline cell is actually compared against. Closing
-  this needs a `confirmed_column_mappings`-style hook on `ExecutionBindings`
-  threaded into column-axis alignment, mirroring the existing sheet-rename
-  and row-identity hooks -- a real engine change, not attempted yet.
-- Low key-overlap/uniqueness for a keyed region has no dedicated,
-  separately-acknowledged run-only warning in the `/configure` workspace.
-  `unique_ratio`/`key_overlap` evidence exists only in the older, separate
-  ranked-table dialog (`qc_tool/ui/ranked_table_dialog.py`) and in setup
-  analysis's own key-candidate ranking, not as a workspace acknowledgement
-  gate. Building a general version for an arbitrary analyst-chosen key
-  needs new bounded value-level overlap computation; today's detector
-  only computes overlap for its own candidate, and only when it clears a
-  90% threshold (so it never reports genuinely LOW overlap by construction).
+  analyst-entered `/configure` workspace choice) are fully consumed: a
+  confirmed column mapping drives `_align_block`'s column axis directly
+  (via `ExecutionBindings.confirmed_column_mappings()`), and
+  `check_resolved_selectors()` (`qc_tool/excel/prerequisites.py`) already
+  reads `selector.baseline_cell` directly regardless of position.
+- Low key-overlap for a keyed region's CONFIRMED identity columns has a
+  dedicated, separately-acknowledged, run-only warning in the
+  `/configure` workspace (plan-20260913 Step 12 Fix 5): a bounded
+  on-demand worker (`qc_tool/setup/key_overlap_worker.py`, mirroring
+  `preview_worker.py`'s pattern) computes the overlap ratio for the
+  analyst's own confirmed columns -- distinct from the auto-detector's
+  own candidate ranking (`qc_tool/excel/ranked_identity.py`, which
+  structurally can never report a low-overlap result since it rejects a
+  candidate before constructing one below its own threshold). A low
+  measured ratio surfaces as a caution-severity warning
+  (`compute_key_overlap_warnings()`); acknowledging it (never persisted
+  to a saved profile, matching `allow_large_workbooks`'s own precedent)
+  sets the region's resolved coverage state to `degraded_acknowledged`.
+  The query deliberately includes each side's whole resolved range
+  (including any header row) rather than the engine's exact data-row
+  boundary -- a disclosed, bounded simplification for a diagnostic ratio,
+  immaterial for any real-sized table.
 
 ## 19. Repository Map
 
@@ -1123,7 +1131,7 @@ deploy.
 | [`qc_tool/ui/`](qc_tool/ui) | NiceGUI pages, theme, guide, profile and ranked-table dialogs |
 | [`qc_tool/ui/config_workspace.py`](qc_tool/ui/config_workspace.py), [`qc_tool/ui/config_review.py`](qc_tool/ui/config_review.py) | `/configure` mode-aware configuration wizard (page + pure view model) |
 | [`qc_tool/config/input_contract.py`](qc_tool/config/input_contract.py), [`qc_tool/config/resolved_input.py`](qc_tool/config/resolved_input.py) | Saved logical input contract and per-run resolved configuration |
-| [`qc_tool/setup/`](qc_tool/setup) | Bounded setup-analysis scan, preview worker/store, models |
+| [`qc_tool/setup/`](qc_tool/setup) | Bounded setup-analysis scan, preview worker/store, on-demand key-overlap worker, models |
 | [`qc_tool/focus/`](qc_tool/focus) | Optional secure desktop Office navigation |
 | [`native/cadence_diff_native/`](native/cadence_diff_native) | Rust BIFF12 and formula-delta accelerator |
 | [`scripts/`](scripts) | Audits and bounded diagnostic/acceptance tools |

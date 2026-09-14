@@ -34,6 +34,7 @@ from qc_tool.setup.models import (
     XlsbRiskProfile,
 )
 from qc_tool.ui.config_review import (
+    LOW_KEY_OVERLAP_THRESHOLD,
     ConfigWorkspaceState,
     add_selector,
     apply_anchor_click,
@@ -41,6 +42,7 @@ from qc_tool.ui.config_review import (
     apply_region_transform,
     build_input_contract,
     build_resolved_configuration,
+    compute_key_overlap_warnings,
     compute_required_slide_warnings,
     compute_sheet_pairing_warnings,
     compute_slide_pairing_warnings,
@@ -54,9 +56,11 @@ from qc_tool.ui.config_review import (
     format_a1_range,
     input_contract_from_resolved_configuration,
     is_clean_profile_diff,
+    low_key_overlap_warning_code,
     member_review_from_scan,
     parse_a1_cell,
     parse_a1_range,
+    region_key_overlap_query_bounds,
     regions_overlap,
     resolve_slide_anchors,
     set_column_baseline_letter,
@@ -1516,3 +1520,122 @@ def test_summarize_contract_promotion_flags_added_removed_and_changed_sheets() -
     assert "1 sheet(s) gain saved configuration" in joined
     assert "1 sheet(s) lose their saved configuration" in joined
     assert "1 sheet(s) have different saved configuration" in joined
+
+
+# --- plan-20260913 Step 12 Fix 5: low-key-overlap acknowledgement ----------
+
+
+def _keyed_state(region_id: str | None = None) -> tuple[ConfigWorkspaceState, str]:
+    review = member_review_from_scan("primary", _member_profile())
+    rid = region_id or review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review, "Data", rid, mode="keyed", identity_columns=("A",), confirmed=True
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    return state, rid
+
+
+def test_region_key_overlap_query_bounds_uses_current_range_and_explicit_baseline_range() -> (
+    None
+):
+    review = member_review_from_scan("primary", _member_profile())
+    region = review.current_sheets[0].regions[0]
+    region = replace(region, current_range="A2:C10", baseline_range="A1:C9")
+
+    bounds = region_key_overlap_query_bounds(region, None)
+
+    assert bounds == (1, 9, 2, 10)
+
+
+def test_region_key_overlap_query_bounds_falls_back_to_matched_baseline_region() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = replace(review.current_sheets[0].regions[0], current_range="A2:C10")
+    baseline_region = replace(region, current_range="A1:C9")
+
+    bounds = region_key_overlap_query_bounds(region, baseline_region)
+
+    assert bounds == (1, 9, 2, 10)
+
+
+def test_region_key_overlap_query_bounds_is_none_without_a_resolvable_baseline_range() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = review.current_sheets[0].regions[0]
+
+    assert region_key_overlap_query_bounds(region, None) is None
+
+
+def test_compute_key_overlap_warnings_flags_a_low_ratio_keyed_region() -> None:
+    state, region_id = _keyed_state()
+    warnings = compute_key_overlap_warnings(state, {region_id: 0.5})
+
+    assert len(warnings) == 1
+    warning = warnings[0]
+    assert warning.code == low_key_overlap_warning_code("primary", "Data", region_id)
+    assert warning.severity == "caution"
+    assert "50%" in warning.message
+
+
+def test_compute_key_overlap_warnings_silent_above_threshold() -> None:
+    state, region_id = _keyed_state()
+    assert compute_key_overlap_warnings(state, {region_id: LOW_KEY_OVERLAP_THRESHOLD}) == ()
+    assert compute_key_overlap_warnings(state, {region_id: 0.99}) == ()
+
+
+def test_compute_key_overlap_warnings_silent_when_never_queried() -> None:
+    state, _region_id = _keyed_state()
+    assert compute_key_overlap_warnings(state, {}) == ()
+
+
+def test_compute_key_overlap_warnings_ignores_non_keyed_regions() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(review,))
+    # mode stays "automatic" -- a low ratio recorded against it (should
+    # never happen in practice) still never produces a warning.
+    assert compute_key_overlap_warnings(state, {region_id: 0.1}) == ()
+
+
+def test_build_resolved_configuration_reports_degraded_acknowledged_for_low_overlap() -> None:
+    state, region_id = _keyed_state()
+    code = low_key_overlap_warning_code("primary", "Data", region_id)
+
+    resolved = build_resolved_configuration(
+        state,
+        profile=DeliverableProfile(name="default"),
+        profile_sha256="deadbeef",
+        warnings_acknowledged=(code,),
+        key_overlap_ratios={region_id: 0.5},
+    )
+
+    region = resolved.members[0].sheets[0].regions[0]
+    assert region.coverage == "degraded_acknowledged"
+
+
+def test_build_resolved_configuration_keeps_confirmed_coverage_when_not_acknowledged() -> None:
+    state, region_id = _keyed_state()
+
+    resolved = build_resolved_configuration(
+        state,
+        profile=DeliverableProfile(name="default"),
+        profile_sha256="deadbeef",
+        key_overlap_ratios={region_id: 0.5},
+    )
+
+    region = resolved.members[0].sheets[0].regions[0]
+    assert region.coverage == "confirmed"
+
+
+def test_build_resolved_configuration_keeps_confirmed_coverage_when_ratio_is_high() -> None:
+    state, region_id = _keyed_state()
+    code = low_key_overlap_warning_code("primary", "Data", region_id)
+
+    resolved = build_resolved_configuration(
+        state,
+        profile=DeliverableProfile(name="default"),
+        profile_sha256="deadbeef",
+        warnings_acknowledged=(code,),
+        key_overlap_ratios={region_id: 0.99},
+    )
+
+    region = resolved.members[0].sheets[0].regions[0]
+    assert region.coverage == "confirmed"

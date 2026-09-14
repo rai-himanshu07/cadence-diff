@@ -45,6 +45,7 @@ from qc_tool.package import PackageManifest
 from qc_tool.projection import project_cycle_volume
 from qc_tool.run_service import REPORT_DEFER_FINDINGS
 from qc_tool.runqueue import QueueBusyError, RunQueueManager, run_exclusive
+from qc_tool.setup.key_overlap_worker import KeyOverlapRequest, run_key_overlap_worker
 from qc_tool.setup.models import MemberSetupProfile, SetupAnalysisResult
 from qc_tool.setup.preview_worker import (
     PreviewWindowRequest,
@@ -63,6 +64,7 @@ from qc_tool.ui.config_review import (
     apply_region_transform,
     build_input_contract,
     build_resolved_configuration,
+    compute_key_overlap_warnings,
     compute_required_slide_warnings,
     compute_sheet_pairing_warnings,
     compute_slide_pairing_warnings,
@@ -70,10 +72,12 @@ from qc_tool.ui.config_review import (
     confirm_all_regions,
     deck_review_from_titles,
     diff_profile_against_scan,
+    effective_sheet_pairing,
     effective_slide_pairing,
     is_clean_profile_diff,
     member_review_from_scan,
     parse_a1_cell,
+    region_key_overlap_query_bounds,
     remove_selector,
     resolve_slide_anchors,
     set_column_baseline_letter,
@@ -802,6 +806,16 @@ def render_config_workspace(
             #: the next preview-grid cell click as its new anchor, or None.
             "anchor_target": None,
         }
+        #: Last-computed confirmed-identity key-overlap ratio per
+        #: region_id (Step 12 Fix 5) -- an ephemeral, on-demand query
+        #: result, never a persisted draft choice; a region absent here was
+        #: never queried (mirrors ``preview_state``'s own "regenerates on
+        #: demand" convention).
+        key_overlap_state: dict[str, dict[str, float]] = {"ratios": {}}
+        #: Strong references to in-flight fire-and-forget background tasks
+        #: (Step 12 Fix 5's key-overlap recompute) so the event loop cannot
+        #: garbage-collect one mid-flight; each removes itself on completion.
+        background_tasks: set[asyncio.Task[None]] = set()
 
         def _persist_choices() -> None:
             state = workspace_state["value"]
@@ -1425,6 +1439,11 @@ def render_config_workspace(
                                 set_identity_columns(r, cols), confirmed=True
                             ),
                         )
+                        overlap_task = asyncio.create_task(
+                            _recompute_key_overlap(member_id, sheet_name, region_id)
+                        )
+                        background_tasks.add(overlap_task)
+                        overlap_task.add_done_callback(background_tasks.discard)
 
                     ui.select(
                         list(region.available_columns),
@@ -1931,6 +1950,90 @@ def render_config_workspace(
 
                 _render_preview_grid(outcome, on_cell_click=_on_cell_click)
 
+        async def _recompute_key_overlap(
+            member_id: str, sheet_name: str, region_id: str
+        ) -> None:
+            """Bounded on-demand query (Step 12 Fix 5): re-open both
+            sources and measure the analyst's CONFIRMED identity columns'
+            overlap ratio for one region. Silent on any failure (missing
+            credential, timed-out query, moved source) -- this is a
+            best-effort diagnostic, never a run requirement; a failed or
+            never-attempted query simply means no low-overlap warning is
+            shown, not a false "clean" claim.
+            """
+            state = workspace_state["value"]
+            member = state.member_review(member_id)
+            if member is None:
+                return
+            sheet = next(
+                (s for s in member.current_sheets if s.sheet_name == sheet_name), None
+            )
+            if sheet is None:
+                return
+            region = next((r for r in sheet.regions if r.region_id == region_id), None)
+            if region is None or region.mode != "keyed" or not region.identity_columns:
+                key_overlap_state["ratios"].pop(region_id, None)
+                render_warnings_section()
+                return
+            pairs, _added, _removed = effective_sheet_pairing(member)
+            baseline_by_current = {curr: base for base, curr in pairs}
+            baseline_sheet_name = baseline_by_current.get(sheet_name)
+            if baseline_sheet_name is None:
+                return
+            index = next(
+                (i for i, r in enumerate(sheet.regions) if r.region_id == region_id), None
+            )
+            baseline_sheet = next(
+                (s for s in member.baseline_sheets if s.sheet_name == baseline_sheet_name),
+                None,
+            )
+            baseline_region = None
+            if (
+                baseline_sheet is not None
+                and index is not None
+                and index < len(baseline_sheet.regions)
+            ):
+                baseline_region = baseline_sheet.regions[index]
+            bounds = region_key_overlap_query_bounds(region, baseline_region)
+            if bounds is None:
+                return
+            base_first_row, base_last_row, curr_first_row, curr_last_row = bounds
+            baseline_path, current_path = members.get(member_id, (None, None))
+            if not baseline_path or not current_path:
+                return
+            baseline_letters = tuple(
+                region.baseline_letter_for(letter) for letter in region.identity_columns
+            )
+            request = KeyOverlapRequest(
+                baseline_path=baseline_path,
+                current_path=current_path,
+                baseline_hash=await asyncio.to_thread(sha256_file, Path(baseline_path)),
+                current_hash=await asyncio.to_thread(sha256_file, Path(current_path)),
+                baseline_sheet=baseline_sheet_name,
+                current_sheet=sheet_name,
+                baseline_first_row=base_first_row,
+                baseline_last_row=base_last_row,
+                current_first_row=curr_first_row,
+                current_last_row=curr_last_row,
+                identity_columns=region.identity_columns,
+                baseline_identity_columns=baseline_letters,
+                trim_identity_whitespace=region.trim_identity_whitespace,
+            )
+            try:
+                outcome = await asyncio.to_thread(
+                    run_exclusive,
+                    work_dir,
+                    f"key-overlap:{member_id}:{region_id}",
+                    lambda: run_key_overlap_worker(request),
+                )
+            except QueueBusyError:
+                return
+            if outcome.ok and outcome.ratio is not None:
+                key_overlap_state["ratios"][region_id] = outcome.ratio
+            else:
+                key_overlap_state["ratios"].pop(region_id, None)
+            render_warnings_section()
+
         async def _load_preview() -> None:
             active_member_id = preview_state["member_id"]
             active_sheet_name = preview_state["sheet_name"]
@@ -2004,6 +2107,7 @@ def render_config_workspace(
                 return ()
             state = workspace_state["value"]
             warnings = compute_warnings(job.result) + compute_sheet_pairing_warnings(state)
+            warnings += compute_key_overlap_warnings(state, key_overlap_state["ratios"])
             deck = state.deck_review
             warnings += compute_slide_pairing_warnings(deck)
             profile = selected_profile["value"]
@@ -2037,6 +2141,7 @@ def render_config_workspace(
                 profile_sha256=profile_sha256(profile),
                 warnings_acknowledged=tuple(sorted(workspace_state["value"].warnings_acknowledged)),
                 file_hashes=file_hashes,
+                key_overlap_ratios=key_overlap_state["ratios"],
             )
             import json
             import tempfile
@@ -2125,6 +2230,7 @@ def render_config_workspace(
                         sorted(workspace_state["value"].warnings_acknowledged)
                     ),
                     file_hashes=file_hashes,
+                    key_overlap_ratios=key_overlap_state["ratios"],
                 )
                 try:
                     manifest = PackageManifest.from_role_files(

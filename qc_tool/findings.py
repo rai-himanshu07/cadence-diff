@@ -48,6 +48,11 @@ class FindingClass(StrEnum):
     #: One analyst-confirmed logical rename, replacing what would otherwise
     #: be a SHEET_REMOVED+SHEET_ADDED pair (plan-20260913, Step 3).
     SHEET_RENAMED = "sheet_renamed"
+    #: One analyst-confirmed logical column move (a mapped column's
+    #: baseline-side letter genuinely differs from its current-side
+    #: letter), replacing what would otherwise be spurious cell-level
+    #: VALUE_CHANGED noise from positional pairing (plan-20260913, Step 12).
+    COLUMN_MOVED = "column_moved"
     WORKBOOK_ADDED = "workbook_added"
     WORKBOOK_REMOVED = "workbook_removed"
     HIDDEN_CHANGED = "hidden_changed"

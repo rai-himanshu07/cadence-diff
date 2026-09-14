@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Literal
@@ -656,6 +656,95 @@ def compute_sheet_pairing_warnings(state: ConfigWorkspaceState) -> tuple[Warning
                 )
             )
     return tuple(warnings)
+
+
+#: Same numeric bar ``qc_tool.excel.ranked_identity.MIN_KEY_OVERLAP`` uses
+#: for the auto-detector -- kept as an independent constant (not imported)
+#: since this module never depends on that detection layer, but the two
+#: thresholds are DELIBERATELY kept in sync so "low overlap" means the same
+#: real-world degree of mismatch whether it comes from automatic detection
+#: or a confirmed manual selection.
+LOW_KEY_OVERLAP_THRESHOLD = 0.90
+
+
+def low_key_overlap_warning_code(member_id: str, sheet_name: str, region_id: str) -> str:
+    """The stable warning code for one region's low-confirmed-identity-
+    overlap acknowledgement (Step 12 Fix 5) -- shared between the UI
+    warnings list and ``build_resolved_configuration``'s coverage-state
+    lookup so the two always agree on which region an acknowledgement
+    covers.
+    """
+    return f"low_key_overlap:{member_id}:{sheet_name}:{region_id}"
+
+
+def compute_key_overlap_warnings(
+    state: ConfigWorkspaceState, key_overlap_ratios: Mapping[str, float]
+) -> tuple[WarningItem, ...]:
+    """One caution-level warning per keyed region whose last-computed,
+    analyst-CONFIRMED identity-column overlap ratio measured below
+    ``LOW_KEY_OVERLAP_THRESHOLD`` (Step 12 Fix 5).
+
+    Deliberately never a run blocker: a low overlap on the analyst's own
+    confirmed columns is a disclosed degradation the analyst may accept
+    and proceed with (mirrors ``allow_large_workbooks``'s "acknowledge and
+    continue" precedent), not proof of a wrong configuration by itself.
+    ``key_overlap_ratios`` is keyed by ``region_id`` -- a region absent
+    from it was never queried and gets no warning (never a false "clean"
+    claim from silence).
+    """
+    warnings: list[WarningItem] = []
+    for member in state.member_reviews:
+        for sheet in member.current_sheets:
+            for region in sheet.regions:
+                if region.mode != "keyed":
+                    continue
+                ratio = key_overlap_ratios.get(region.region_id)
+                if ratio is None or ratio >= LOW_KEY_OVERLAP_THRESHOLD:
+                    continue
+                warnings.append(
+                    WarningItem(
+                        code=low_key_overlap_warning_code(
+                            member.member_id, sheet.sheet_name, region.region_id
+                        ),
+                        message=(
+                            f"{sheet.sheet_name!r} {region.current_range}: the "
+                            "confirmed identity columns only overlap "
+                            f"{ratio:.0%} between baseline and current -- row "
+                            "matching may be unreliable for a large share of "
+                            "this region."
+                        ),
+                    )
+                )
+    return tuple(warnings)
+
+
+def region_key_overlap_query_bounds(
+    region: RegionDecision, baseline_region: RegionDecision | None
+) -> tuple[int, int, int, int] | None:
+    """``(baseline_first_row, baseline_last_row, current_first_row,
+    current_last_row)`` for a bounded key-overlap query over this region's
+    resolved ranges, or ``None`` when either side's range cannot be parsed.
+
+    Deliberately simpler than ``_resolved_region``'s own preamble/footer
+    composition: it queries the WHOLE resolved range on each side,
+    including any header/preamble row. This is a disclosed, bounded
+    approximation for a diagnostic ratio (never authoritative evidence,
+    matching this module's own "setup analysis never becomes evidence"
+    boundary) -- a header row counted on both sides shifts the measured
+    ratio by at most one row out of the whole region, immaterial to a 0-1
+    overlap fraction over any real table.
+    """
+    baseline_range = region.baseline_range or (
+        baseline_region.current_range if baseline_region is not None else None
+    )
+    if not baseline_range or not region.current_range:
+        return None
+    try:
+        base_min_row, _, base_max_row, _ = parse_a1_range(baseline_range)
+        curr_min_row, _, curr_max_row, _ = parse_a1_range(region.current_range)
+    except ValueError:
+        return None
+    return (base_min_row, base_max_row, curr_min_row, curr_max_row)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1483,7 +1572,11 @@ def _matching_baseline_region(
 
 
 def _resolved_region(
-    region: RegionDecision, baseline_region: RegionDecision | None
+    region: RegionDecision,
+    baseline_region: RegionDecision | None,
+    *,
+    key_overlap_ratio: float | None = None,
+    low_overlap_acknowledged: bool = False,
 ) -> ResolvedRegion:
     columns = tuple(
         _resolved_column(region, letter)
@@ -1504,6 +1597,17 @@ def _resolved_region(
         coverage = "excluded"
     elif region.mode == "positional":
         coverage = "positional"
+    elif (
+        region.mode == "keyed"
+        and key_overlap_ratio is not None
+        and key_overlap_ratio < LOW_KEY_OVERLAP_THRESHOLD
+        and low_overlap_acknowledged
+    ):
+        # The canonical "forced capability limitation the analyst accepted"
+        # case (Step 12 Fix 5): the analyst's own confirmed identity columns
+        # measure a low overlap between the two files, and the analyst
+        # explicitly acknowledged running with that degradation anyway.
+        coverage = "degraded_acknowledged"
     baseline_outer_range = region.baseline_range or (
         baseline_region.current_range if baseline_region is not None else None
     )
@@ -1542,6 +1646,7 @@ def build_resolved_configuration(
     profile_sha256: str,
     warnings_acknowledged: tuple[str, ...] = (),
     file_hashes: dict[str, str] | None = None,
+    key_overlap_ratios: Mapping[str, float] | None = None,
 ) -> ResolvedInputConfigurationV1:
     """Build a real ``ResolvedInputConfigurationV1`` from the workspace's
     current decisions. Every region defaulting to ``automatic`` (untouched
@@ -1558,8 +1663,17 @@ def build_resolved_configuration(
     unconditionally rejects the resulting configuration as stale the
     moment a run actually tries to use it -- this parameter is required
     for any resolved configuration that will reach ``perform_run()``.
+
+    ``key_overlap_ratios`` (Step 12 Fix 5) is the workspace's last-computed
+    confirmed-identity overlap ratio per region, keyed by ``region_id`` --
+    an ephemeral, on-demand query result never persisted as a draft choice
+    (mirrors ``file_hashes``'s own "extra fact supplied at build time"
+    shape). Absent for any region never queried; only downgrades coverage
+    to ``degraded_acknowledged`` when the matching low-overlap warning code
+    is also present in ``warnings_acknowledged``.
     """
     hashes = file_hashes or {}
+    ratios = key_overlap_ratios or {}
     members: list[ResolvedMember] = []
     for member in state.member_reviews:
         sheets: list[ResolvedSheet] = []
@@ -1568,7 +1682,17 @@ def build_resolved_configuration(
         for sheet in member.current_sheets:
             baseline_name = baseline_by_current.get(sheet.sheet_name)
             regions = tuple(
-                _resolved_region(region, _matching_baseline_region(member, sheet, index))
+                _resolved_region(
+                    region,
+                    _matching_baseline_region(member, sheet, index),
+                    key_overlap_ratio=ratios.get(region.region_id),
+                    low_overlap_acknowledged=(
+                        low_key_overlap_warning_code(
+                            member.member_id, sheet.sheet_name, region.region_id
+                        )
+                        in warnings_acknowledged
+                    ),
+                )
                 for index, region in enumerate(sheet.regions)
             )
             selectors = tuple(

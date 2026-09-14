@@ -23,11 +23,11 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-from openpyxl.utils import column_index_from_string
+from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
 from pydantic import BaseModel, Field
 
-from qc_tool.config.execution import ExecutionBindings
+from qc_tool.config.execution import ConfirmedColumnMapping, ExecutionBindings
 from qc_tool.config.profile import DeliverableProfile, RowIdentityRule, SheetProfile
 from qc_tool.excel.periods import Period, is_period_after, is_period_label, parse_period
 from qc_tool.excel.regions import TableRegion, detect_regions
@@ -75,6 +75,13 @@ class AxisAlignment:
     #: separate post-alignment check (`qc_tool.excel.prerequisites.
     #: check_blank_identity_keys`), never inside this function.
     blank_key_rows: int = 0
+    #: (baseline_index, current_index) pairs paired by a CONFIRMED column
+    #: mapping whose baseline/current letters genuinely differ (Step 12 Fix
+    #: 4). "Unused" (empty) for every axis alignment except a column axis
+    #: produced by ``_align_columns_by_confirmed_mapping`` -- a row axis
+    #: never populates this; a confirmed row/sheet move already has its own
+    #: disclosure path (keyed row identity; ``SHEET_RENAMED``).
+    moved_pairs: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(slots=True)
@@ -674,6 +681,78 @@ def _matching_row_identity_rule(
     return None
 
 
+def _matching_column_mapping(
+    region: TableRegion,
+    extra_mappings: Sequence[ConfirmedColumnMapping] = (),
+) -> dict[str, str] | None:
+    """The first confirmed column mapping whose anchor cell falls inside
+    ``region`` -- mirrors ``_matching_row_identity_rule``'s anchor-cell
+    matching exactly, so a confirmed column move keeps applying across
+    ordinary region growth (plan-20260913, Step 12 Fix 4).
+    """
+    for mapping in extra_mappings:
+        try:
+            anchor_row, anchor_col = coordinate_to_tuple(mapping.anchor_cell)
+        except ValueError:
+            continue
+        if (
+            region.min_row <= anchor_row <= region.max_row
+            and region.min_col <= anchor_col <= region.max_col
+        ):
+            return mapping.mapping
+    return None
+
+
+def _align_columns_by_confirmed_mapping(
+    base_region: TableRegion,
+    curr_region: TableRegion,
+    column_mapping: dict[str, str],
+) -> AxisAlignment:
+    """Column-axis alignment for a region with one or more confirmed
+    baseline-letter overrides (plan-20260913, Step 12 Fix 4).
+
+    Every current column named in ``column_mapping`` pairs with its named
+    baseline column regardless of position; a mapped target outside this
+    region's own bounds is ignored (falls back to positional for that
+    column) rather than silently reaching across regions. Every other
+    column pairs positionally among the remaining unmapped columns on each
+    side -- identical to ``_align_block``'s pre-existing default for a
+    region with no confirmed mapping at all.
+    """
+    alignment = AxisAlignment(method="keys")
+    base_indices = list(range(base_region.min_col, base_region.max_col + 1))
+    curr_indices = list(range(curr_region.min_col, curr_region.max_col + 1))
+    base_index_by_letter = {get_column_letter(index): index for index in base_indices}
+
+    matched_base: set[int] = set()
+    matched_curr: set[int] = set()
+    moved_pairs: list[tuple[int, int]] = []
+    for curr_index in curr_indices:
+        base_letter = column_mapping.get(get_column_letter(curr_index))
+        if base_letter is None:
+            continue
+        base_index = base_index_by_letter.get(base_letter)
+        if base_index is None:
+            continue
+        moved_pairs.append((base_index, curr_index))
+        matched_base.add(base_index)
+        matched_curr.add(curr_index)
+
+    moved_pairs.sort()
+    alignment.pairs.extend(moved_pairs)
+    alignment.moved_pairs = tuple(moved_pairs)
+
+    remaining_base = [index for index in base_indices if index not in matched_base]
+    remaining_curr = [index for index in curr_indices if index not in matched_curr]
+    shared = min(len(remaining_base), len(remaining_curr))
+    for offset in range(shared):
+        alignment.pairs.append((remaining_base[offset], remaining_curr[offset]))
+    alignment.deleted.extend(remaining_base[shared:])
+    alignment.inserted.extend(remaining_curr[shared:])
+    alignment.pairs.sort()
+    return alignment
+
+
 def _identity_key_component(
     value: object, *, exact_typed_equality: bool = False, trim_identity_whitespace: bool = False
 ) -> object:
@@ -915,6 +994,7 @@ def _align_block(
     curr_region: TableRegion,
     sheet_profile: SheetProfile | None = None,
     extra_row_identity_rules: Sequence[RowIdentityRule] = (),
+    extra_column_mappings: Sequence[ConfirmedColumnMapping] = (),
 ) -> RegionAlignment:
     rule = _matching_row_identity_rule(sheet_profile, curr_region, extra_row_identity_rules)
     label_base = [base_region.key_col or base_region.min_col]
@@ -943,11 +1023,15 @@ def _align_block(
             _positional_entries(range(curr_region.min_row, curr_region.max_row + 1)),
             method="positional",
         )
-    columns = _align_axis(
-        _positional_entries(range(base_region.min_col, base_region.max_col + 1)),
-        _positional_entries(range(curr_region.min_col, curr_region.max_col + 1)),
-        method="positional",
-    )
+    column_mapping = _matching_column_mapping(curr_region, extra_column_mappings)
+    if column_mapping is not None:
+        columns = _align_columns_by_confirmed_mapping(base_region, curr_region, column_mapping)
+    else:
+        columns = _align_axis(
+            _positional_entries(range(base_region.min_col, base_region.max_col + 1)),
+            _positional_entries(range(curr_region.min_col, curr_region.max_col + 1)),
+            method="positional",
+        )
     return RegionAlignment(base_region, curr_region, rows, columns)
 
 
@@ -958,6 +1042,7 @@ def align_regions(
     curr_region: TableRegion,
     sheet_profile: SheetProfile | None = None,
     extra_row_identity_rules: Sequence[RowIdentityRule] = (),
+    extra_column_mappings: Sequence[ConfirmedColumnMapping] = (),
 ) -> RegionAlignment:
     orientation = curr_region.orientation
     if orientation == "long":
@@ -971,6 +1056,7 @@ def align_regions(
         curr_region,
         sheet_profile,
         extra_row_identity_rules,
+        extra_column_mappings,
     )
 
 
@@ -1115,6 +1201,11 @@ def align_workbooks(
             if execution_bindings is not None
             else ()
         )
+        extra_column_mappings = (
+            execution_bindings.confirmed_column_mappings(member_id, sheet_name)
+            if execution_bindings is not None
+            else ()
+        )
         region_alignments = [
             align_regions(
                 base_sheet,
@@ -1123,6 +1214,7 @@ def align_workbooks(
                 curr_region,
                 sheet_profile,
                 extra_row_identity_rules,
+                extra_column_mappings,
             )
             for base_region, curr_region in pairs
         ]

@@ -328,6 +328,43 @@ def test_confirmed_rename_emits_one_sheet_renamed_finding_no_cascade() -> None:
     assert renamed.sheet == "Sheet2026"
     assert renamed.baseline_location == "Sheet2025"
     assert _by_class(findings, FindingClass.SHEET_ADDED) == []
+
+
+# --- plan-20260913 Step 12 Fix 4: confirmed column move structural finding -
+
+
+def test_confirmed_column_mapping_emits_one_column_moved_finding_no_cascade() -> None:
+    from qc_tool.excel.align import AxisAlignment, RegionAlignment
+    from qc_tool.excel.diff_values import _axis_findings
+    from qc_tool.excel.regions import TableRegion
+
+    base_region = TableRegion("Data", 1, 1, 3, 3, "block", None, 1, "none")
+    curr_region = TableRegion("Data", 1, 1, 3, 3, "block", None, 1, "none")
+    rows = AxisAlignment(pairs=[(1, 1), (2, 2), (3, 3)], method="positional")
+    columns = AxisAlignment(
+        pairs=[(1, 1), (2, 3), (3, 2)],
+        method="keys",
+        moved_pairs=((2, 3), (3, 2)),
+    )
+    region = RegionAlignment(base_region, curr_region, rows, columns)
+
+    from qc_tool.io.model import SheetSnapshot
+
+    base_sheet = SheetSnapshot(name="Data", visibility="visible", max_row=3, max_column=3)
+    curr_sheet = SheetSnapshot(name="Data", visibility="visible", max_row=3, max_column=3)
+
+    findings = _axis_findings(
+        base_sheet, curr_sheet, region, columns, is_rows=False, region_id="r1"
+    )
+
+    assert [f.finding_class for f in findings] == [
+        FindingClass.COLUMN_MOVED,
+        FindingClass.COLUMN_MOVED,
+    ]
+    by_location = {f.location: f for f in findings}
+    assert by_location["column C"].baseline_location == "column B"
+    assert by_location["column B"].baseline_location == "column C"
+    assert not any(f.baseline_value or f.current_value for f in findings)
     assert _by_class(findings, FindingClass.SHEET_REMOVED) == []
 
 

@@ -574,7 +574,7 @@ def _axis_findings(
 ) -> list[Finding]:
     findings: list[Finding] = []
     sheet_name = curr_sheet.name
-    if not (axis.deleted or axis.inserted or axis.growth):
+    if not (axis.deleted or axis.inserted or axis.growth or axis.moved_pairs):
         return findings
     deleted_events, inserted_events, growth_event, key_changes = _axis_events(axis)
     event_key = f"excel:{region_id}:{'rows' if is_rows else 'columns'}"
@@ -699,6 +699,26 @@ def _axis_findings(
                         if growth_event is FindingSubtype.AXIS_ROLLING_TURNOVER
                         else "appended"
                     )
+                ),
+            )
+        )
+    for base_index, curr_index in axis.moved_pairs:
+        # A confirmed column mapping (plan-20260913, Step 12 Fix 4) --
+        # never populated for the row axis, so this is column-only in
+        # practice. One structural disclosure replaces what positional
+        # pairing would otherwise report as spurious cell-level VALUE_
+        # CHANGED noise on both the source and destination columns.
+        findings.append(
+            Finding(
+                artifact="excel",
+                finding_class=FindingClass.COLUMN_MOVED,
+                event_key=event_key,
+                sheet=sheet_name,
+                location=span(curr_index),
+                baseline_location=span(base_index),
+                message=(
+                    f"{sheet_name} ({region_id}): {span(base_index)} moved to "
+                    f"{span(curr_index)} (confirmed mapping)"
                 ),
             )
         )

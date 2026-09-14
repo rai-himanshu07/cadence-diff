@@ -72,6 +72,50 @@ def _stage_session(work_dir: Path) -> str:
     return session_key
 
 
+def _write_workbook_with_ids(path: Path, ids: list[str]) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.title = "Data"
+    sheet.append(["ID", "Value"])
+    for index, identity in enumerate(ids):
+        sheet.append([identity, index * 10])
+    workbook.save(path)
+
+
+def _stage_disjoint_key_session(work_dir: Path) -> str:
+    """A baseline/current pair whose 'ID' column shares NO values at all --
+    a confirmed identity on column A would measure a 0% overlap ratio
+    (Step 12 Fix 5's low-key-overlap acknowledgement scenario).
+    """
+    files = {
+        "baseline_excel": work_dir / "uploads" / "baseline_excel" / "baseline.xlsx",
+        "current_excel": work_dir / "uploads" / "current_excel" / "current.xlsx",
+    }
+    files["baseline_excel"].parent.mkdir(parents=True, exist_ok=True)
+    files["current_excel"].parent.mkdir(parents=True, exist_ok=True)
+    _write_workbook_with_ids(files["baseline_excel"], ["A0", "A1", "A2"])
+    _write_workbook_with_ids(files["current_excel"], ["B0", "B1", "B2"])
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    choices = build_session_choices(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="default",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode="decision",
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+    )
+    session_key = session_key_for(file_hashes)
+    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
+        session_key, profile_name="default", choices=choices
+    )
+    return session_key
+
+
 def _write_simple_deck(path: Path, titles: list[str]) -> None:
     from pptx import Presentation
 
@@ -175,6 +219,57 @@ async def test_confirm_all_regions_persists_confirmed_true_for_a_valid_region(
     assert isinstance(region_decisions, dict)
     assert region_decisions
     assert all(decision["confirmed"] is True for decision in region_decisions.values())
+
+
+@pytest.mark.asyncio
+async def test_confirming_disjoint_identity_columns_surfaces_a_low_overlap_warning(
+    user: User, tmp_path: Path
+) -> None:
+    """Step 12 Fix 5: setting a keyed region's identity column to one that
+    shares NO values between baseline and current triggers a real
+    (subprocess-backed) key-overlap query and surfaces a dedicated,
+    separately-acknowledged caution warning -- not silence, and not a run
+    blocker.
+    """
+    work_dir = tmp_path / "work"
+    session_key = _stage_disjoint_key_session(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+
+    mode_select = next(
+        element
+        for element in user.find(kind=ui.select).elements
+        if isinstance(element.options, dict) and "keyed" in element.options
+    )
+    mode_select.value = "keyed"
+
+    identity_select = next(
+        element
+        for element in user.find(kind=ui.select).elements
+        if element.props.get("label") == "Identity columns"
+    )
+    identity_select.value = ["A"]
+
+    # The header row's own "ID" label is one extra shared key on both
+    # sides (this diagnostic query includes the whole resolved range --
+    # see ``region_key_overlap_query_bounds``'s own disclosed, bounded
+    # simplification), so a 3-row fixture with fully disjoint data keys
+    # measures ~14% overlap, not exactly 0% -- still well below the 90%
+    # threshold, so the warning still correctly fires.
+    await user.should_see("only overlap 14%", retries=_SUBPROCESS_RETRIES)
+
+    # The warning is a caution, not a blocker: it does not appear in the
+    # unresolved-blockers list gating the run buttons.
+    store = ConfigSessionStore(work_dir / "history.sqlite3")
+    record = store.get(session_key)
+    assert record is not None
+    region_decisions = record.choices.get("region_decisions")
+    assert isinstance(region_decisions, dict)
+    [decision] = region_decisions.values()
+    assert decision["mode"] == "keyed"
+    assert decision["identity_columns"] == ["A"]
 
 
 @pytest.mark.asyncio

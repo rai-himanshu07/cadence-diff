@@ -263,3 +263,95 @@ def test_logical_sheet_id_lookup() -> None:
     bindings = ExecutionBindings(resolved)
     assert bindings.logical_sheet_id("primary", "Data") == "data"
     assert bindings.logical_sheet_id("primary", "Other") is None
+
+
+# --- confirmed_column_mappings (Step 12 Fix 4) ------------------------------
+
+
+def _moved_column_region(**overrides: object) -> ResolvedRegion:
+    defaults: dict[str, object] = {
+        "region_id": "r1",
+        "current_data_range": "A1:C10",
+        "columns": (
+            ResolvedColumn(column_id="amount", baseline_letter="B", current_letter="C"),
+            ResolvedColumn(column_id="notes", baseline_letter="C", current_letter="B"),
+        ),
+    }
+    defaults.update(overrides)
+    return ResolvedRegion(**defaults)  # type: ignore[arg-type]
+
+
+def test_confirmed_column_mappings_reports_every_genuinely_moved_column() -> None:
+    resolved = ResolvedInputConfigurationV1(
+        members=(
+            _member(
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        current_sheet_name="Data",
+                        regions=(_moved_column_region(),),
+                    ),
+                )
+            ),
+        )
+    )
+    bindings = ExecutionBindings(resolved)
+    mappings = bindings.confirmed_column_mappings("primary", "Data")
+    assert len(mappings) == 1
+    assert mappings[0].anchor_cell == "A1"
+    assert mappings[0].mapping == {"C": "B", "B": "C"}
+    assert bindings.confirmed_column_mappings("primary", "Other") == ()
+    assert bindings.confirmed_column_mappings("ops", "Data") == ()
+
+
+def test_a_column_sharing_one_letter_both_sides_is_never_a_mapping_entry() -> None:
+    region = ResolvedRegion(
+        region_id="r1",
+        current_data_range="A1:C10",
+        columns=(
+            ResolvedColumn(column_id="id", baseline_letter="A", current_letter="A"),
+            ResolvedColumn(column_id="amount", baseline_letter="B", current_letter="C"),
+        ),
+    )
+    resolved = ResolvedInputConfigurationV1(
+        members=(
+            _member(
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        current_sheet_name="Data",
+                        regions=(region,),
+                    ),
+                )
+            ),
+        )
+    )
+    bindings = ExecutionBindings(resolved)
+    mappings = bindings.confirmed_column_mappings("primary", "Data")
+    assert len(mappings) == 1
+    assert mappings[0].mapping == {"C": "B"}  # only the genuine move, not "A"
+
+
+def test_no_moved_columns_reports_no_mapping_at_all() -> None:
+    region = ResolvedRegion(
+        region_id="r1",
+        current_data_range="A1:C10",
+        columns=(
+            ResolvedColumn(column_id="id", baseline_letter="A", current_letter="A"),
+        ),
+    )
+    resolved = ResolvedInputConfigurationV1(
+        members=(
+            _member(
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        current_sheet_name="Data",
+                        regions=(region,),
+                    ),
+                )
+            ),
+        )
+    )
+    bindings = ExecutionBindings(resolved)
+    assert bindings.confirmed_column_mappings("primary", "Data") == ()

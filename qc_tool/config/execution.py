@@ -18,6 +18,12 @@ preamble/footer/first-data-row facts directly, producing genuinely
 independent ``baseline_header_row``/``baseline_footer_row`` overrides
 (``qc_tool.excel.align``'s bottom/top-aligned positional comparison) instead
 of assuming one shared boundary for both sides.
+
+Step 12 (Fix 4) extends the adapter with ``confirmed_column_mappings``: a
+region's per-column ``ResolvedColumn.baseline_letter`` override (Step 12
+Fix 3) now drives the alignment engine's column axis directly, not merely
+storage/reporting -- mirroring ``confirmed_sheet_renames`` exactly, one
+level down.
 """
 
 from __future__ import annotations
@@ -215,6 +221,52 @@ def region_column_policies(region: ResolvedRegion) -> RegionColumnPolicies | Non
     )
 
 
+class ConfirmedColumnMapping:
+    """One region's confirmed baseline-letter overrides, keyed by its
+    stable anchor cell (plan-20260913, Step 12 Fix 4) -- consumed by
+    ``qc_tool.excel.align``'s column axis the same way a confirmed
+    ``RowIdentityRule`` is matched by anchor for the row axis.
+    """
+
+    __slots__ = ("anchor_cell", "mapping")
+
+    def __init__(self, anchor_cell: str, mapping: dict[str, str]) -> None:
+        self.anchor_cell = anchor_cell
+        #: ``{current_letter: baseline_letter}`` -- every entry is a
+        #: genuine move (the two letters differ); a column with no
+        #: baseline-letter override never appears here.
+        self.mapping = mapping
+
+
+def region_confirmed_column_mapping(region: ResolvedRegion) -> ConfirmedColumnMapping | None:
+    """Adapt one region's per-column baseline-letter overrides into a
+    ``ConfirmedColumnMapping``, or ``None`` when every column in this
+    region shares the same letter on both sides (today's default).
+    """
+    mapping = {
+        column.current_letter: column.baseline_letter
+        for column in region.columns
+        if (
+            column.current_letter
+            and column.baseline_letter
+            and column.current_letter != column.baseline_letter
+        )
+    }
+    if not mapping:
+        return None
+    anchor_source = region.current_data_range or region.current_outer_range
+    if not anchor_source:
+        return None
+    anchor = _top_left(anchor_source)
+    if anchor is None:
+        return None
+    anchor_row, anchor_col = anchor
+    return ConfirmedColumnMapping(
+        anchor_cell=f"{get_column_letter(anchor_col)}{anchor_row}",
+        mapping=mapping,
+    )
+
+
 class ExecutionBindings:
     """Read-only lookup over one run's resolved logical member/sheet/region
     bindings, organized for direct consumption by ``qc_tool.excel.align``,
@@ -266,6 +318,30 @@ class ExecutionBindings:
                 if policy is not None:
                     policies.append(policy)
         return tuple(policies)
+
+    def confirmed_column_mappings(
+        self, member_id: str, current_sheet_name: str
+    ) -> tuple[ConfirmedColumnMapping, ...]:
+        """Confirmed baseline-letter overrides for every region on
+        ``current_sheet_name`` that declares at least one (Step 12 Fix 4).
+
+        Mirrors ``row_identity_rules``'s lookup shape exactly; consumed by
+        ``qc_tool.excel.align``'s column axis so a confirmed column move
+        actually changes which physical baseline cell a current cell is
+        compared against, not merely what is stored/reported.
+        """
+        member = self._members.get(member_id)
+        if member is None:
+            return ()
+        mappings: list[ConfirmedColumnMapping] = []
+        for sheet in member.sheets:
+            if sheet.current_sheet_name != current_sheet_name:
+                continue
+            for region in sheet.regions:
+                mapping = region_confirmed_column_mapping(region)
+                if mapping is not None:
+                    mappings.append(mapping)
+        return tuple(mappings)
 
     def row_identity_rules(
         self, member_id: str, current_sheet_name: str

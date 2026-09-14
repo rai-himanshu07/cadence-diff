@@ -121,6 +121,8 @@ DEFAULT_SEVERITIES: dict[FindingClass, Severity] = {
     FindingClass.SHEET_ADDED: Severity.INFO,
     #: A confirmed, analyst-recognized logical rename -- not a surprise.
     FindingClass.SHEET_RENAMED: Severity.INFO,
+    #: A confirmed, analyst-recognized logical column move -- not a surprise.
+    FindingClass.COLUMN_MOVED: Severity.INFO,
     FindingClass.WORKBOOK_ADDED: Severity.INFO,
     FindingClass.SLIDE_ADDED: Severity.INFO,
     FindingClass.SLIDE_REORDERED: Severity.INFO,

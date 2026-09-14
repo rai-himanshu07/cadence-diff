@@ -478,3 +478,203 @@ def test_without_execution_bindings_a_renamed_sheet_is_add_plus_remove(
     assert alignment.removed_sheets == ["Sheet2025"]
     assert alignment.renamed_sheets == {}
     assert alignment.regions == {}
+
+
+# --- plan-20260913 Step 12 Fix 4: confirmed column mappings drive the ------
+# --- alignment engine's column axis, not just resolved-config reporting ---
+
+
+def _write_column_moved_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """Baseline has Amount in column B and Notes in column C; current has
+    them swapped (Notes in B, Amount in C). One genuine value change
+    (R2's amount) rides along at the mapped location.
+    """
+    baseline_path = tmp_path / "colmoved_baseline.xlsx"
+    current_path = tmp_path / "colmoved_current.xlsx"
+
+    base_wb = Workbook()
+    base_ws = base_wb.active
+    assert base_ws is not None
+    base_ws.title = "Data"
+    base_ws.append(["ID", "Amount", "Notes"])
+    base_ws.append(["R1", 100, "x"])
+    base_ws.append(["R2", 200, "y"])
+    base_wb.save(baseline_path)
+
+    curr_wb = Workbook()
+    curr_ws = curr_wb.active
+    assert curr_ws is not None
+    curr_ws.title = "Data"
+    curr_ws.append(["ID", "Notes", "Amount"])
+    curr_ws.append(["R1", "x", 100])
+    curr_ws.append(["R2", "y", 999])  # genuine change: R2's amount 200 -> 999
+    curr_wb.save(current_path)
+    return baseline_path, current_path
+
+
+def _column_moved_execution_bindings() -> ExecutionBindings:
+    resolved = ResolvedInputConfigurationV1(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        baseline_sheet_name="Data",
+                        current_sheet_name="Data",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="r1",
+                                current_data_range="A1:C3",
+                                columns=(
+                                    ResolvedColumn(
+                                        column_id="amount",
+                                        baseline_letter="B",
+                                        current_letter="C",
+                                    ),
+                                    ResolvedColumn(
+                                        column_id="notes",
+                                        baseline_letter="C",
+                                        current_letter="B",
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    return ExecutionBindings(resolved)
+
+
+def test_confirmed_column_mapping_pairs_columns_by_letter_not_position(
+    tmp_path: Path,
+) -> None:
+    baseline_path, current_path = _write_column_moved_pair(tmp_path)
+    base_snapshot = load_workbook_snapshot(baseline_path)
+    curr_snapshot = load_workbook_snapshot(current_path)
+
+    alignment = align_workbooks(
+        base_snapshot,
+        curr_snapshot,
+        execution_bindings=_column_moved_execution_bindings(),
+    )
+
+    region = _single_region(alignment, "Data")
+    columns = region.columns
+    assert columns.method == "keys"
+    pair_map = dict(columns.pairs)
+    # Column A (ID) never moved: positional pairing among the unmapped
+    # remainder still applies.
+    assert pair_map[1] == 1
+    # Baseline B (Amount) <-> current C; baseline C (Notes) <-> current B --
+    # the OPPOSITE of what plain positional pairing would produce.
+    assert pair_map[2] == 3
+    assert pair_map[3] == 2
+    assert sorted(columns.moved_pairs) == [(2, 3), (3, 2)]
+    assert columns.deleted == []
+    assert columns.inserted == []
+
+
+def test_without_confirmed_column_mapping_a_moved_column_is_positional(
+    tmp_path: Path,
+) -> None:
+    """Legacy behavior guard: with no execution bindings, a moved column is
+    still ordinary positional pairing -- byte-identical to before this hook
+    existed.
+    """
+    baseline_path, current_path = _write_column_moved_pair(tmp_path)
+    base_snapshot = load_workbook_snapshot(baseline_path)
+    curr_snapshot = load_workbook_snapshot(current_path)
+
+    alignment = align_workbooks(base_snapshot, curr_snapshot)
+
+    region = _single_region(alignment, "Data")
+    assert dict(region.columns.pairs) == {1: 1, 2: 2, 3: 3}
+    assert region.columns.moved_pairs == ()
+
+
+def test_confirmed_column_mapping_changes_what_run_qc_actually_compares(
+    tmp_path: Path,
+) -> None:
+    """The end-to-end proof: the SAME two files produce entirely different
+    VALUE_CHANGED evidence depending only on whether a confirmed column
+    mapping is threaded through -- proving the override changes what is
+    actually COMPARED at run time, not merely what is stored/reported.
+    """
+    baseline_path, current_path = _write_column_moved_pair(tmp_path)
+
+    unmapped = run_qc(baseline_excel=baseline_path, current_excel=current_path)
+    unmapped_value_changes = {
+        (finding.location, finding.baseline_value, finding.current_value)
+        for finding in unmapped.findings
+        if finding.finding_class is FindingClass.VALUE_CHANGED
+    }
+    # Without the mapping, every swapped cell looks like a spurious change:
+    # baseline Amount(header/100/200) vs current Notes(header/"x"/"y") in
+    # column B, and baseline Notes(header/"x"/"y") vs current
+    # Amount(header/100/999) in column C -- 3 rows x 2 columns = 6.
+    assert len(unmapped_value_changes) == 6
+
+    mapped = run_qc(
+        baseline_excel=baseline_path,
+        current_excel=current_path,
+        resolved_input_configuration=ResolvedInputConfigurationV1(
+            members=(
+                ResolvedMember(
+                    member_id="primary",
+                    sheets=(
+                        ResolvedSheet(
+                            sheet_id="data",
+                            baseline_sheet_name="Data",
+                            current_sheet_name="Data",
+                            regions=(
+                                ResolvedRegion(
+                                    region_id="r1",
+                                    current_data_range="A1:C3",
+                                    columns=(
+                                        ResolvedColumn(
+                                            column_id="amount",
+                                            baseline_letter="B",
+                                            current_letter="C",
+                                        ),
+                                        ResolvedColumn(
+                                            column_id="notes",
+                                            baseline_letter="C",
+                                            current_letter="B",
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    mapped_value_changes = [
+        finding
+        for finding in mapped.findings
+        if finding.finding_class is FindingClass.VALUE_CHANGED
+    ]
+    # With the mapping, only the ONE genuine content change survives: R2's
+    # amount, correctly compared at its mapped physical location (baseline
+    # B3=200 vs current C3=999).
+    assert len(mapped_value_changes) == 1
+    [only] = mapped_value_changes
+    assert only.location == "C3"
+    assert only.baseline_value == "200"
+    assert only.current_value == "999"
+
+    # The two moved columns each surface exactly one structural disclosure
+    # instead of contributing to the cell-level VALUE_CHANGED noise above.
+    moved = [
+        finding
+        for finding in mapped.findings
+        if finding.finding_class is FindingClass.COLUMN_MOVED
+    ]
+    assert {(f.baseline_location, f.location) for f in moved} == {
+        ("column B", "column C"),
+        ("column C", "column B"),
+    }
