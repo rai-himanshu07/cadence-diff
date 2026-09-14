@@ -40,10 +40,13 @@ from qc_tool.run_action import (
     RunActionRequired,
 )
 from qc_tool.runqueue import (
+    ExclusiveWorkSlot,
     QueueBusyError,
     RunQueueManager,
     RunRequest,
+    get_exclusive_slot,
     new_request_id,
+    run_exclusive,
 )
 from qc_tool.worker import (
     ENVELOPE_VERSION,
@@ -1067,3 +1070,146 @@ def test_real_qc_runs_in_an_owned_spawned_worker(
     assert stored.findings
     assert all(Path(path).exists() for path in stored.report_paths.values())
     assert record.phases, "phase telemetry is captured inside the worker process"
+
+
+# --- Step 5: shared resource coordinator (plan-20260913) --------------------
+
+
+def test_exclusive_work_slot_allows_one_holder_at_a_time() -> None:
+    slot = ExclusiveWorkSlot()
+    assert slot.try_acquire("job-a")
+    assert slot.holder == "job-a"
+    # The same holder re-acquiring is a no-op success (idempotent).
+    assert slot.try_acquire("job-a")
+    # A different holder is refused while job-a still holds it.
+    assert not slot.try_acquire("job-b")
+    slot.release("job-a")
+    assert slot.holder is None
+    assert slot.try_acquire("job-b")
+
+
+def test_release_by_a_non_holder_is_a_no_op() -> None:
+    slot = ExclusiveWorkSlot()
+    slot.try_acquire("job-a")
+    slot.release("job-b")  # not the holder -- must not clear job-a's hold
+    assert slot.holder == "job-a"
+
+
+def test_get_exclusive_slot_is_a_per_work_dir_singleton(tmp_path: Path) -> None:
+    work_dir = tmp_path / "shared"
+    work_dir.mkdir()
+    assert get_exclusive_slot(work_dir) is get_exclusive_slot(work_dir)
+    other = tmp_path / "other"
+    other.mkdir()
+    assert get_exclusive_slot(work_dir) is not get_exclusive_slot(other)
+
+
+def test_run_exclusive_runs_the_body_and_releases_the_slot(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    result = run_exclusive(work_dir, "holder-1", lambda: 42)
+    assert result == 42
+    assert get_exclusive_slot(work_dir).holder is None
+
+
+def test_run_exclusive_refuses_when_the_slot_is_already_held(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    slot = get_exclusive_slot(work_dir)
+    assert slot.try_acquire("qc-run-in-progress")
+    with pytest.raises(QueueBusyError):
+        run_exclusive(work_dir, "profile-validation-1", lambda: None)
+    # The failed attempt must not have disturbed the real holder.
+    assert slot.holder == "qc-run-in-progress"
+
+
+def test_run_exclusive_releases_even_when_the_body_raises(tmp_path: Path) -> None:
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+
+    def _boom() -> None:
+        raise ValueError("synthetic failure")
+
+    with pytest.raises(ValueError, match="synthetic failure"):
+        run_exclusive(work_dir, "holder-1", _boom)
+    assert get_exclusive_slot(work_dir).holder is None
+
+
+def test_a_qc_job_holds_the_shared_slot_for_its_whole_active_lifetime(
+    make_manager: ManagerFactory,
+) -> None:
+    """plan-20260913 Step 5: a non-QC exclusive job (profile validation,
+    population excerpt, a future setup scan) must never run concurrently
+    with an active QC run -- both compete for the same shared slot.
+    """
+    manager = make_manager(_cooperative_worker)
+    request = _request(manager)
+    manager.submit(request)
+
+    def _is_running() -> bool:
+        record = manager.store.get(request.request_id)
+        return record is not None and record.status is RunStatus.RUNNING
+
+    _wait_until(_is_running)
+
+    with pytest.raises(QueueBusyError):
+        run_exclusive(manager.work_dir, "profile-validation-1", lambda: None)
+
+    manager.cancel(request.request_id)
+    record = manager.wait(request.request_id)
+    assert record.status is RunStatus.CANCELLED
+
+    # The slot is free again once the QC job is fully finished.
+    assert run_exclusive(manager.work_dir, "profile-validation-2", lambda: "ok") == "ok"
+
+
+def test_a_qc_job_never_starts_while_the_shared_slot_is_held_elsewhere(
+    make_manager: ManagerFactory,
+) -> None:
+    manager = make_manager(_sequenced_worker)
+    slot = get_exclusive_slot(manager.work_dir)
+    assert slot.try_acquire("setup-scan-1")
+    request = _request(manager)
+    manager.submit(request)
+
+    # Give the supervisor several ticks; the job must stay queued, never
+    # transition to starting/running, while the slot is held elsewhere.
+    time.sleep(0.3)
+    queued = manager.store.get(request.request_id)
+    assert queued is not None
+    assert queued.status is RunStatus.QUEUED
+
+    slot.release("setup-scan-1")
+    record = manager.wait(request.request_id)
+    assert record.status is RunStatus.SUCCEEDED
+
+
+def test_job_kind_defaults_to_qc_run_and_round_trips_through_run_state(
+    make_manager: ManagerFactory,
+) -> None:
+    manager = make_manager(_sequenced_worker)
+    request = _request(manager)
+    assert request.job_kind == "qc_run"
+    record = manager.submit(request)
+    assert record.job_kind == "qc_run"
+    manager.wait(request.request_id)
+
+
+def test_finalize_waiting_for_credentials_is_terminal_and_assigns_no_run_id(
+    tmp_path: Path,
+) -> None:
+    store = RunStateStore(tmp_path / "history.sqlite3")
+    record = store.enqueue(
+        "req-1", mode="cycle_comparison", profile="fixture", files={}, queue_position=0
+    )
+    assert record.status is RunStatus.QUEUED
+    store.finalize_waiting_for_credentials("req-1", ("baseline_excel", "current_excel"))
+
+    updated = store.get("req-1")
+    assert updated is not None
+    assert updated.status is RunStatus.WAITING_FOR_CREDENTIALS
+    assert not updated.is_active
+    assert updated.run_id is None
+    assert updated.action_required == {
+        "roles": ["baseline_excel", "current_excel"]
+    }

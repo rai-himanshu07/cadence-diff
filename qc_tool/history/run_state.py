@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS run_state (
     profile_snapshot TEXT NOT NULL DEFAULT 'null',
     requested_output_mode TEXT NOT NULL DEFAULT 'profile',
     resolved_input_configuration TEXT NOT NULL DEFAULT 'null',
-    resolved_input_digest TEXT NOT NULL DEFAULT ''
+    resolved_input_digest TEXT NOT NULL DEFAULT '',
+    job_kind TEXT NOT NULL DEFAULT 'qc_run'
 );
 """
 
@@ -56,6 +57,13 @@ class RunStatus(StrEnum):
     #: Terminal: the run cannot proceed until the analyst takes an action
     #: outside this tool (see `qc_tool.run_action`). Never assigned a run id.
     BLOCKED = "blocked"
+    #: Terminal (plan-20260913, Step 5): this request needs a password for at
+    #: least one file and none was supplied, or the shared worker slot was
+    #: unavailable to collect one durably. Never assigned a run id; never
+    #: resumed automatically -- resubmit with credentials once ready.
+    #: Credentials are never persisted, so this status is never restored
+    #: across a server restart ("never wait durably").
+    WAITING_FOR_CREDENTIALS = "waiting_for_credentials"
 
 
 #: Statuses that still occupy or await the single worker slot.
@@ -98,6 +106,14 @@ _MIGRATIONS = {
         "ALTER TABLE run_state ADD COLUMN resolved_input_digest TEXT "
         "NOT NULL DEFAULT ''"
     ),
+    #: Which kind of exclusive work this request represents (plan-20260913,
+    #: Step 5): "qc_run" for every request queued before this column
+    #: existed -- exactly what every prior row already was. Other kinds
+    #: ("profile_validation", "population_excerpt", the future setup scan)
+    #: share the same single worker slot but never create a `runs` row.
+    "job_kind": (
+        "ALTER TABLE run_state ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'qc_run'"
+    ),
 }
 
 
@@ -136,6 +152,9 @@ class RunStateRecord:
     #: a legacy request queued before this column existed.
     resolved_input_configuration: dict[str, object] | None = None
     resolved_input_digest: str = ""
+    #: Which kind of exclusive work this request represents (plan-20260913,
+    #: Step 5); "qc_run" for any row from before this field existed.
+    job_kind: str = "qc_run"
 
     @property
     def is_active(self) -> bool:
@@ -205,6 +224,7 @@ def _record(row: sqlite3.Row) -> RunStateRecord:
             else None
         ),
         resolved_input_digest=resolved_input_digest,
+        job_kind=row["job_kind"],
     )
 
 
@@ -241,6 +261,7 @@ class RunStateStore:
         requested_output_mode: str = "profile",
         resolved_input_configuration: dict[str, object] | None = None,
         resolved_input_digest: str = "",
+        job_kind: str = "qc_run",
     ) -> RunStateRecord:
         with self._connect() as conn:
             conn.execute(
@@ -248,8 +269,8 @@ class RunStateStore:
                 INSERT INTO run_state (
                     request_id, created_at, status, queue_position, mode, profile, files,
                     profile_snapshot, requested_output_mode,
-                    resolved_input_configuration, resolved_input_digest
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    resolved_input_configuration, resolved_input_digest, job_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -263,6 +284,7 @@ class RunStateStore:
                     requested_output_mode,
                     json.dumps(resolved_input_configuration),
                     resolved_input_digest,
+                    job_kind,
                 ),
             )
         record = self.get(request_id)
@@ -424,6 +446,37 @@ class RunStateStore:
                     RunStatus.BLOCKED.value,
                     _now(),
                     json.dumps(action_required),
+                    json.dumps(phases or []),
+                    request_id,
+                ),
+            )
+
+    def finalize_waiting_for_credentials(
+        self,
+        request_id: str,
+        roles: tuple[str, ...],
+        *,
+        phases: list[dict[str, object]] | None = None,
+    ) -> None:
+        """Terminal state (plan-20260913, Step 5): a request needs a password
+        for one or more roles and none was supplied. Never assigns a run id;
+        stores only the bounded role list (never a path/filename) in the
+        existing `action_required` column, mirroring `finalize_blocked`.
+        The caller must resubmit with credentials -- this status is never
+        resumed automatically.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE run_state
+                SET status = ?, finished_at = ?, queue_position = 0,
+                    action_required = ?, phases = ?
+                WHERE request_id = ?
+                """,
+                (
+                    RunStatus.WAITING_FOR_CREDENTIALS.value,
+                    _now(),
+                    json.dumps({"roles": list(roles)}),
                     json.dumps(phases or []),
                     request_id,
                 ),

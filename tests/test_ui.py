@@ -56,7 +56,7 @@ from qc_tool.review import (
     build_review_groups,
 )
 from qc_tool.review_series import SeriesReviewLens, build_series_review_lens
-from qc_tool.runqueue import RunRequest
+from qc_tool.runqueue import RunRequest, get_exclusive_slot
 from qc_tool.security import secure_managed_tree
 from qc_tool.server_config import NetworkMode, ServerConfig
 from qc_tool.signoff import finalize_run, required_acknowledgements
@@ -2317,6 +2317,52 @@ async def test_population_load_sample_excerpts_renders_grids(
     await user.should_see("baseline", retries=50)
     await user.should_see("current", retries=50)
     await user.should_see("B2", retries=50)
+
+
+@pytest.mark.asyncio
+async def test_population_load_sample_excerpts_declines_while_the_slot_is_busy(
+    user: User, tmp_path: Path
+) -> None:
+    """plan-20260913 Step 5: reopening sources for an excerpt shares the
+    shared exclusive slot a QC run (or another such load) holds -- it must
+    decline with a friendly notice, never crash, while the slot is busy.
+    """
+    from qc_tool.config.profile import PopulationPolicy, ReviewPolicy
+
+    work_dir = tmp_path / "work"
+    baseline, current = _build_population_fixture(tmp_path)
+    profile = DeliverableProfile(
+        name="population-excerpts-busy",
+        review_policy=ReviewPolicy(
+            populations=PopulationPolicy(enabled=True, threshold=10)
+        ),
+    )
+    artifacts = perform_run(
+        work_dir,
+        {"baseline_excel": baseline, "current_excel": current},
+        {},
+        profile,
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    group_table = next(
+        element
+        for element in user.find(kind=ui.table).elements
+        if "review-groups-table" in element.classes
+    )
+    population_row = next(
+        row for row in group_table.rows if row.get("class") == "formula_logic_changed"
+    )
+    _emit(group_table, "select", {"id": str(population_row["id"])})
+    await user.should_see("Population membership")
+
+    slot = get_exclusive_slot(work_dir)
+    assert slot.try_acquire("a-qc-run-in-progress")
+    try:
+        user.find("Load sample excerpts").click()
+        await user.should_see("try again once it finishes")
+    finally:
+        slot.release("a-qc-run-in-progress")
 
 
 @pytest.mark.asyncio

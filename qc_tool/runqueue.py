@@ -6,6 +6,15 @@ in flight instead of starting duplicate work. The manager owns the worker
 process and its channel: it cancels cooperatively first, then escalates
 through terminate and kill, and always joins and closes both before the slot
 is released.
+
+plan-20260913, Step 5: a QC run is one of SEVERAL kinds of exclusive work
+that must never run concurrently with each other -- a setup scan, a
+selected-file profile validation, and a population excerpt load all touch
+the same uploaded sources and the same bounded memory budget. `ExclusiveWorkSlot`
+(below) is the shared, per-work-dir primitive every kind of exclusive work
+acquires before proceeding; `RunQueueManager` acquires it for the duration of
+an active QC job, and `run_exclusive()` lets short-lived, non-QC work share
+it without adopting the QC worker's own message protocol.
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from qc_tool.history.run_state import (
     ACTIVE_STATUSES,
@@ -39,6 +48,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 #: Cooperative cancellation grace before the terminate/kill ladder starts.
 CANCEL_GRACE_SECONDS = 10.0
 #: Join interval allowed after `terminate()` and again after `kill()`.
@@ -49,7 +60,83 @@ _EXIT_SETTLE_SECONDS = 0.5
 
 
 class QueueBusyError(RuntimeError):
-    """A password-protected run cannot wait in the persisted queue."""
+    """The shared exclusive slot cannot serve this request right now.
+
+    Raised both for a password-protected run that cannot wait in the
+    persisted queue, and for any other kind of exclusive work (setup scan,
+    profile validation, population excerpt load) that finds the slot held by
+    something else. Never queued in either case -- the caller retries once
+    the slot is free.
+    """
+
+
+class ExclusiveWorkSlot:
+    """Per-work-dir mutual exclusion shared by every kind of exclusive work
+    (plan-20260913, Step 5): a QC run (via `RunQueueManager`), a setup scan,
+    selected-file profile validation, or a population excerpt load. Exactly
+    one holder at a time. This primitive never queues or waits on its own --
+    a caller that cannot acquire it decides for itself whether to retry.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._holder: str | None = None
+
+    def try_acquire(self, holder: str) -> bool:
+        with self._lock:
+            if self._holder is not None and self._holder != holder:
+                return False
+            self._holder = holder
+            return True
+
+    def release(self, holder: str) -> None:
+        with self._lock:
+            if self._holder == holder:
+                self._holder = None
+
+    @property
+    def holder(self) -> str | None:
+        with self._lock:
+            return self._holder
+
+
+_EXCLUSIVE_SLOTS: dict[Path, ExclusiveWorkSlot] = {}
+_EXCLUSIVE_SLOTS_LOCK = threading.Lock()
+
+
+def get_exclusive_slot(work_dir: Path) -> ExclusiveWorkSlot:
+    """Return the process-global exclusive slot for one managed data directory."""
+    key = work_dir.resolve()
+    with _EXCLUSIVE_SLOTS_LOCK:
+        slot = _EXCLUSIVE_SLOTS.get(key)
+        if slot is None:
+            slot = ExclusiveWorkSlot()
+            _EXCLUSIVE_SLOTS[key] = slot
+        return slot
+
+
+def run_exclusive(work_dir: Path, holder: str, body: Callable[[], T]) -> T:
+    """Run `body()` while holding the shared exclusive slot for `work_dir`.
+
+    For short-lived, non-QC exclusive work (selected-file profile
+    validation, population excerpt loads) so it never runs concurrently with
+    a QC run or with another such job -- the same single-slot invariant
+    `RunQueueManager` enforces for QC runs. Raises `QueueBusyError`
+    immediately if the slot is already held; never waits, matching this
+    project's existing "never queued, retry once free" password-job
+    precedent. Never touches `run_state`/`runs` -- callers that want the
+    attempt observable there use their own request id and status updates.
+    """
+    slot = get_exclusive_slot(work_dir)
+    if not slot.try_acquire(holder):
+        raise QueueBusyError(
+            "A run or another setup action is already in progress. "
+            "Try again once it finishes."
+        )
+    try:
+        return body()
+    finally:
+        slot.release(holder)
 
 
 def new_request_id() -> str:
@@ -88,6 +175,9 @@ class RunRequest:
     #: request with no saved input contract.
     resolved_input_configuration: dict[str, Any] = field(default_factory=dict)
     resolved_input_digest: str = ""
+    #: Always "qc_run" for a real QC submission (plan-20260913, Step 5);
+    #: distinguishes this request in `run_state` from a non-QC exclusive job.
+    job_kind: str = "qc_run"
 
 
 @dataclass(slots=True)
@@ -119,6 +209,7 @@ class RunQueueManager:
         worker: Callable[..., None] = worker_main,
         cancel_grace_seconds: float = CANCEL_GRACE_SECONDS,
         terminate_join_seconds: float = TERMINATE_JOIN_SECONDS,
+        exclusive_slot: ExclusiveWorkSlot | None = None,
     ) -> None:
         self.work_dir = work_dir
         self.store = store or RunStateStore(work_dir / "history.sqlite3")
@@ -126,6 +217,10 @@ class RunQueueManager:
         self._worker = worker
         self._cancel_grace = cancel_grace_seconds
         self._terminate_join = terminate_join_seconds
+        #: Shared, per-work-dir slot (plan-20260913, Step 5) also acquired by
+        #: non-QC exclusive work via `run_exclusive()`; a QC job holds it for
+        #: its whole active lifetime, never just while spawning.
+        self._exclusive_slot = exclusive_slot or get_exclusive_slot(work_dir)
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._stopping = threading.Event()
@@ -178,6 +273,7 @@ class RunQueueManager:
                     else None
                 ),
                 resolved_input_digest=request.resolved_input_digest,
+                job_kind=request.job_kind,
             )
             self._pending.append((request, held))
             self._ensure_supervisor()
@@ -244,6 +340,7 @@ class RunQueueManager:
             return
         self._stop_process(job)
         self._release(job)
+        self._exclusive_slot.release(job.request.request_id)
         self.store.finish(
             job.request.request_id,
             RunStatus.ORPHANED,
@@ -278,6 +375,13 @@ class RunQueueManager:
         with self._lock:
             if self._slot_taken() or not self._pending or self._stopping.is_set():
                 return
+            next_request_id = self._pending[0][0].request_id
+            if not self._exclusive_slot.try_acquire(next_request_id):
+                # Some other kind of exclusive work (a setup scan, profile
+                # validation, population excerpt load) holds the shared
+                # slot; retry on the next supervisor tick rather than
+                # starting a QC job that would run concurrently with it.
+                return
             request, held = self._pending.popleft()
             self._starting_id = request.request_id
             self._renumber()
@@ -300,6 +404,7 @@ class RunQueueManager:
             with self._lock:
                 self._starting_id = None
                 self._cancel_requested.discard(request.request_id)
+            self._exclusive_slot.release(request.request_id)
             self.store.finish(
                 request.request_id, RunStatus.FAILED, error=sanitize_error(exc)
             )
@@ -458,6 +563,7 @@ class RunQueueManager:
             # The slot is released even if the terminal write fails.
             with self._lock:
                 self._active = None
+            self._exclusive_slot.release(job.request.request_id)
             self._wake.set()
 
 

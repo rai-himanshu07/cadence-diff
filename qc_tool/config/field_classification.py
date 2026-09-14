@@ -361,6 +361,9 @@ RUN_REQUEST_FIELD_CLASSIFICATION: dict[str, FieldCategory] = {
     #: registry; the digest is a pure derived value.
     "resolved_input_configuration": "operational_only",
     "resolved_input_digest": "operational_only",
+    #: Job routing only (plan-20260913, Step 5); always "qc_run" for a real
+    #: QC submission.
+    "job_kind": "operational_only",
 }
 
 

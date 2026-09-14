@@ -159,6 +159,7 @@ from qc_tool.runqueue import (
     RunRequest,
     get_manager,
     new_request_id,
+    run_exclusive,
 )
 from qc_tool.security import private_directory, private_file, secure_managed_tree
 from qc_tool.server_config import (
@@ -4934,6 +4935,7 @@ def _render_result_view(
             return
         active_history = history
         active_run_id = run_id
+        active_profiles_dir = profiles_dir
         path = _profile_path(profiles_dir, result.profile_name)
         profile = load_profile(path)
         opened_hash = profile_sha256(profile)
@@ -5004,8 +5006,14 @@ def _render_result_view(
                             "profile changed while this dialog was open; reopen it"
                         )
                     record = active_history.get_run(active_run_id)
+                    #: plan-20260913 Step 5: this reopens the current source
+                    #: files, so it shares the same exclusive slot a QC run
+                    #: holds -- never runs concurrently with one.
                     issues = await asyncio.to_thread(
-                        _lint_profile_for_record, draft, record
+                        run_exclusive,
+                        active_profiles_dir.parent,
+                        f"profile-validation-{active_run_id}",
+                        lambda: _lint_profile_for_record(draft, record),
                     )
                     errors = [issue for issue in issues if issue.level == "error"]
                     if errors:
@@ -5065,9 +5073,23 @@ def _render_result_view(
             ui.notify("Reopening the run's recorded source files...")
             try:
                 record = await asyncio.to_thread(active_history.get_run, active_run_id)
+                #: plan-20260913 Step 5: reopening sources shares the same
+                #: exclusive slot a QC run holds -- never runs concurrently
+                #: with one, or with another such excerpt/validation load.
                 loaded = await asyncio.to_thread(
-                    _load_population_sample_excerpts, finding, record
+                    run_exclusive,
+                    active_history.work_dir,
+                    f"population-excerpt-{active_run_id}-{finding.finding_id}",
+                    lambda: _load_population_sample_excerpts(finding, record),
                 )
+            except QueueBusyError:
+                ui.notify(
+                    "A run or another setup action is in progress; try again "
+                    "once it finishes.",
+                    type="negative",
+                )
+                button.set_enabled(True)
+                return
             except Exception:
                 logger.exception("population excerpt load failed")
                 ui.notify(

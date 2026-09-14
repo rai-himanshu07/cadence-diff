@@ -666,6 +666,14 @@ class RunHistory:
             _migrate_annotation_lineage_v2(conn)
             private_file(db_path)
 
+    @property
+    def work_dir(self) -> Path:
+        """The managed data directory this history is stored under
+        (plan-20260913, Step 5) -- the same directory `RunQueueManager`/
+        `get_exclusive_slot` key on for this session's shared exclusive slot.
+        """
+        return self._db_path.parent
+
     def _connect(self) -> sqlite3.Connection:
         # The worker process, the queue manager, and the UI share this file.
         conn = sqlite3.connect(self._db_path, timeout=30.0)
