@@ -5,9 +5,15 @@ mode-aware configuration workspace shell (plan-20260913, Step 7).
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
-from qc_tool.config.profile import DeliverableProfile, ExcelMemberProfile, ExcelProfile
+from qc_tool.config.profile import (
+    DeliverableProfile,
+    ExcelMemberProfile,
+    ExcelProfile,
+    profile_sha256,
+)
 from qc_tool.config.resolved_input import (
     ResolvedColumn,
     ResolvedInputConfigurationV1,
@@ -420,6 +426,62 @@ def test_unresolved_blockers_clears_once_identity_columns_are_set() -> None:
     assert unresolved_blockers(state, ()) == ()
 
 
+def test_unresolved_blockers_flags_an_expired_region_exclusion() -> None:
+    """``input_contract.py``'s own docstring promises "an expired exclusion
+    blocks setup until it is renewed or removed" -- this is that promise's
+    only enforcement point.
+    """
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="excluded",
+        exclusion_reason="known bad legacy tab",
+        exclusion_expires_on="2000-01-01",
+        confirmed=True,
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    blockers = unresolved_blockers(state, ())
+    assert blockers
+    assert "expired on 2000-01-01" in blockers[0]
+
+
+def test_unresolved_blockers_allows_an_unexpired_region_exclusion() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="excluded",
+        exclusion_reason="known bad legacy tab",
+        exclusion_expires_on="2099-01-01",
+        confirmed=True,
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    assert unresolved_blockers(state, ()) == ()
+
+
+def test_unresolved_blockers_flags_an_expired_ignore_columns_exclusion() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        ignore_columns=("B",),
+        ignore_columns_reason="volatile helper column",
+        ignore_columns_expires_on="2000-01-01",
+        confirmed=True,
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    blockers = unresolved_blockers(state, ())
+    assert blockers
+    assert "ignored-column exclusion expired on 2000-01-01" in blockers[0]
+
+
 def test_build_resolved_configuration_carries_keyed_identity_columns() -> None:
     review = member_review_from_scan("primary", _member_profile())
     region_id = review.current_sheets[0].regions[0].region_id
@@ -448,6 +510,139 @@ def test_build_resolved_configuration_leaves_untouched_regions_automatic() -> No
     region = resolved.members[0].sheets[0].regions[0]
     assert region.mode == "automatic"
     assert region.columns == ()
+
+
+def test_build_resolved_configuration_reports_excluded_coverage_for_an_excluded_region() -> None:
+    """An intentional content exclusion is its own distinct coverage state
+    -- never collapsed into "degraded_acknowledged", which names a
+    different concept (a forced capability limitation the analyst
+    accepted, not a deliberate scope choice).
+    """
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    updated = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="excluded",
+        exclusion_reason="notes sheet, not comparable",
+        exclusion_expires_on="2099-01-01",
+        confirmed=True,
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
+    resolved = build_resolved_configuration(
+        state, profile=DeliverableProfile(name="default"), profile_sha256="deadbeef"
+    )
+    region = resolved.members[0].sheets[0].regions[0]
+    assert region.mode == "excluded"
+    assert region.coverage == "excluded"
+
+
+def test_build_resolved_configuration_without_file_hashes_leaves_source_hashes_none() -> None:
+    """Documents the DEFAULT (no ``file_hashes`` argument) behavior -- this
+    is exactly the shape that, before the fix, silently made every wizard-
+    submitted run fail `validate_freshness()` as "stale" the instant that
+    check was actually wired into `perform_run()` (plan-20260913 Step 10).
+    A caller building a resolved configuration that will reach
+    `perform_run()` MUST pass `file_hashes`; this test exists to make that
+    contract explicit, not to bless the omission.
+    """
+    review = member_review_from_scan("primary", _member_profile())
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(review,))
+    resolved = build_resolved_configuration(
+        state, profile=DeliverableProfile(name="default"), profile_sha256="deadbeef"
+    )
+    assert resolved.members[0].baseline_source_sha256 is None
+    assert resolved.members[0].current_source_sha256 is None
+
+
+def test_build_resolved_configuration_populates_source_hashes_from_file_hashes() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(review,))
+    resolved = build_resolved_configuration(
+        state,
+        profile=DeliverableProfile(name="default"),
+        profile_sha256="deadbeef",
+        file_hashes={"baseline_excel": "a" * 64, "current_excel": "b" * 64},
+    )
+    assert resolved.members[0].baseline_source_sha256 == "a" * 64
+    assert resolved.members[0].current_source_sha256 == "b" * 64
+
+
+def test_build_resolved_configuration_populates_member_scoped_source_hashes() -> None:
+    review = member_review_from_scan("secondary", _member_profile())
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(review,))
+    resolved = build_resolved_configuration(
+        state,
+        profile=DeliverableProfile(name="default"),
+        profile_sha256="deadbeef",
+        file_hashes={
+            "baseline_excel:secondary": "c" * 64,
+            "current_excel:secondary": "d" * 64,
+        },
+    )
+    assert resolved.members[0].baseline_source_sha256 == "c" * 64
+    assert resolved.members[0].current_source_sha256 == "d" * 64
+
+
+def test_build_resolved_configuration_output_survives_perform_run_freshness_check(
+    tmp_path: Path,
+) -> None:
+    """Integration proof for a REAL regression: a resolved configuration
+    built the exact way the workspace's own ``_finalize`` builds it (via
+    ``build_resolved_configuration``, not hand-constructed with already-
+    correct hashes) must actually survive `perform_run()`'s
+    `validate_freshness()` call -- this is the precise gap an independent
+    review caught: every wizard-submitted run was silently rejected as
+    stale because `file_hashes` was never threaded through.
+    """
+    from openpyxl import Workbook
+
+    from qc_tool.history.store import sha256_file
+    from qc_tool.run_service import perform_run
+
+    baseline_path = tmp_path / "baseline.xlsx"
+    current_path = tmp_path / "current.xlsx"
+    for path, value in ((baseline_path, 1), (current_path, 2)):
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Data"
+        sheet["A1"] = value
+        workbook.save(path)
+
+    review = member_review_from_scan(
+        "primary",
+        MemberSetupProfile(
+            member_id="primary",
+            baseline_hash="a" * 64,
+            current_hash="b" * 64,
+            current_sheets=(SheetSetupProfile(sheet_name="Data", regions=()),),
+            baseline_sheets=(SheetSetupProfile(sheet_name="Data", regions=()),),
+        ),
+    )
+    state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(review,))
+    profile = DeliverableProfile(name="default")
+    file_hashes = {
+        "baseline_excel": sha256_file(baseline_path),
+        "current_excel": sha256_file(current_path),
+    }
+    resolved = build_resolved_configuration(
+        state,
+        profile=profile,
+        profile_sha256=profile_sha256(profile),
+        file_hashes=file_hashes,
+    )
+
+    artifacts = perform_run(
+        tmp_path / "work",
+        {"baseline_excel": baseline_path, "current_excel": current_path},
+        {},
+        profile,
+        mode=QCRunMode.CYCLE_COMPARISON,
+        resolved_input_configuration=resolved,
+    )
+    assert artifacts.result is not None
 
 
 def test_build_input_contract_only_saves_touched_regions() -> None:
@@ -782,6 +977,29 @@ def test_is_valid_requires_reason_and_expiry_for_ignored_columns() -> None:
         ignore_columns_expires_on="2027-01-01",
     )
     assert fixed.current_sheets[0].regions[0].is_valid is True
+
+
+def test_is_valid_is_false_once_an_exclusion_expiry_date_has_passed() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    still_current = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="excluded",
+        exclusion_reason="known bad legacy tab",
+        exclusion_expires_on="2099-01-01",
+    )
+    assert still_current.current_sheets[0].regions[0].is_valid is True
+    expired = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="excluded",
+        exclusion_reason="known bad legacy tab",
+        exclusion_expires_on="2000-01-01",
+    )
+    assert expired.current_sheets[0].regions[0].is_valid is False
 
 
 def test_regions_overlap_detects_overlapping_and_non_overlapping_ranges() -> None:

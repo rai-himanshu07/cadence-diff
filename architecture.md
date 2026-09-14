@@ -146,6 +146,19 @@ Cancellation escalates in three steps:
 The worker also monitors parent liveness. If its owner disappears, it cancels
 itself and does not emit a result that no manager is waiting to receive.
 
+Browser runs also have a dedicated full-page configuration workspace at
+`/configure` ([`qc_tool/ui/config_workspace.py`](qc_tool/ui/config_workspace.py)),
+reached from the main page's additive "Review setup before running" button.
+It runs one bounded, cancellable setup-analysis job over the selected files
+(sharing the same single heavy-work slot as a QC run -- never concurrent with
+one), then lets the analyst review input roles, per-sheet regions, logical
+columns, and selector prerequisites before choosing `Run once`, `Save
+profile`, `Save profile and run`, `Update profile and run`, or `Export
+configuration`. See "Input Contract And Resolved Configuration" below for
+the two versioned contracts it produces, and "Deliberate Boundaries And Known
+Limitations" for the disclosed gap between this workspace and the main
+page's direct "Run QC" button.
+
 ### 3.3 CLI Execution Path
 
 The headless `run` command calls [`perform_run()`](qc_tool/run_service.py)
@@ -343,6 +356,40 @@ axes are:
 profile, requested/resolved output policy, files, engine provenance, findings,
 coverage, mappings, scope, alignment trust, package manifest, disclosures, and
 cached severity counts.
+
+### 5.8 Input Contract And Resolved Configuration
+
+Two versioned, frozen contracts layer logical (name-stable) input identity on
+top of the physical, name-keyed profile fields in 5.3:
+
+- [`InputContractV1`](qc_tool/config/input_contract.py) is the optional saved
+  half, embedded in a `DeliverableProfile`. It gives each member/sheet/region/
+  column/selector a stable logical ID plus an alias, so a physical rename does
+  not orphan a saved rule. Regions carry an explicit `header_intent`
+  (`automatic` / `no_header` / `first_data_row`), one of four modes
+  (`automatic` / `keyed` / `positional` / `excluded`), and an optional
+  `StructuralExclusionContract(reason, expires_on)` that an excluded region or
+  ignored column must carry. A profile with no `input_contract` resolves
+  through `resolve_legacy_configuration()` to byte-identical legacy behavior.
+- [`ResolvedInputConfigurationV1`](qc_tool/config/resolved_input.py) is the
+  mandatory, engine-native execution contract for one specific run: separate
+  baseline/current sheet names, ranges, first-data rows, and column letters
+  per logical ID, plus each side's source sha256. `validate_freshness()`
+  rejects a resolved configuration whose declared source hash no longer
+  matches the files actually being run
+  ([`qc_tool/run_service.py`](qc_tool/run_service.py) `perform_run()`), so a
+  stale resolved configuration cannot silently drive a run against different
+  bytes. It has its own canonical digest, independent of `profile_sha256`, and
+  persists with the run (see Persistence Model below) for later Re-QC/carry-
+  forward scope-compatibility checks and report/attestation binding.
+
+[`qc_tool/ui/config_review.py`](qc_tool/ui/config_review.py) is the pure (no
+NiceGUI import) view-model layer the `/configure` workspace is built
+on: `MemberReview`/`SheetReview`/`RegionDecision`/`SelectorDecision` hold the
+analyst's in-progress, unsaved decisions; `build_resolved_configuration()`
+turns them into a `ResolvedInputConfigurationV1` for one run;
+`input_contract_from_resolved_configuration()` is the inverse, used when a
+completed run is promoted into a saved profile.
 
 ## 6. Input Normalization
 
@@ -731,6 +778,18 @@ immutable. Carry-forward is explicit and evidence-digest-gated.
 delta when output representations are incompatible, including requested-mode
 changes, effective-policy changes, and observed population/atomic changes.
 
+### 10.4 Configuration Sessions
+
+[`ConfigSessionStore`](qc_tool/history/config_session.py) persists the
+`/configure` workspace's own private, run-only draft state (see "Input
+Contract And Resolved Configuration" above): selected
+files/roles, mode, profile choice, and every region/column/selector decision,
+keyed by a hash of the selected files so a refresh or restart restores the
+same in-progress review after re-validating file identity. It never stores a
+preview cell value, formula text, or a bounded preview window -- only the
+analyst's structural choices. A completed run's resolved configuration itself
+persists in the `runs` table (see 10.2 above), not in this session store.
+
 ## 11. Reports, Schemas, Sign-Off, And Attestation
 
 ### 11.1 Report Generation
@@ -1003,6 +1062,43 @@ deploy.
 - The native helper is an automatic, separately versioned dependency. Its
   universal fallback wheel keeps the main package operational with conservative
   Python/platform fallbacks when no native wheel matches.
+- The main page's direct "Run QC" button (and its volume-projection,
+  workload-override-retry, and row-identity-confirmation-retry dialogs) still
+  submits a run with no `resolved_input_configuration` at all, bypassing the
+  `/configure` workspace entirely; only the additive "Review setup before
+  running" button reaches it. This is a known, carried-forward gap against
+  plan-20260913's own "wizard-first" acceptance criterion, not a new defect --
+  migrating those dialogs into the workspace (or an equivalent redirect) is an
+  explicit open decision, not yet scheduled to a step.
+- `finalize_run()` ([`qc_tool/signoff.py`](qc_tool/signoff.py)) still refuses
+  to finalize a run when the profile currently on disk no longer matches the
+  run's own recorded `profile_sha256`, even though the run's frozen profile
+  snapshot and resolved configuration are what evidence sign-off actually
+  needs. This contradicts plan-20260913's "later profile drift is disclosed,
+  not a reason to invalidate historical evidence" criterion. Left unchanged
+  deliberately: the current behavior fails closed (too strict, not
+  permissive), the check has no existing test coverage, and a correct fix
+  needs `AttestationSignoff` to gain a disclosed-drift field rather than a
+  quick patch to a sign-off-path gate.
+- Logical columns and selectors resolve to the *same* letter/cell on both
+  baseline and current sides. `ResolvedColumn`/`ResolvedSelector` support
+  independent per-side values, but neither the `/configure` workspace's
+  `RegionDecision`/`SelectorDecision` state nor its UI controls currently let
+  an analyst enter a genuinely different baseline-side letter or cell --
+  `_resolved_column()`/`_resolved_region()` in
+  [`qc_tool/ui/config_review.py`](qc_tool/ui/config_review.py) always mirror
+  the current-side value to the baseline side.
+- Explicitly mapped sheet movement/rename produces a `SHEET_RENAMED` finding
+  (`qc_tool/findings.py`), but there is no equivalent region- or
+  column-movement finding class yet; a mapped region/column move is absorbed
+  silently (no cell-cascade noise) rather than surfaced as its own structural
+  finding.
+- Low key-overlap/uniqueness for a keyed region has no dedicated,
+  separately-acknowledged run-only warning in the `/configure` workspace.
+  `unique_ratio`/`key_overlap` evidence exists only in the older, separate
+  ranked-table dialog (`qc_tool/ui/ranked_table_dialog.py`) and in setup
+  analysis's own key-candidate ranking, not as a workspace acknowledgement
+  gate.
 
 ## 19. Repository Map
 
@@ -1022,6 +1118,9 @@ deploy.
 | [`qc_tool/report/`](qc_tool/report) | Excel, HTML, JSON, public schemas |
 | [`qc_tool/attestation.py`](qc_tool/attestation.py), [`qc_tool/signoff.py`](qc_tool/signoff.py) | Signed evidence and immutable finalization |
 | [`qc_tool/ui/`](qc_tool/ui) | NiceGUI pages, theme, guide, profile and ranked-table dialogs |
+| [`qc_tool/ui/config_workspace.py`](qc_tool/ui/config_workspace.py), [`qc_tool/ui/config_review.py`](qc_tool/ui/config_review.py) | `/configure` mode-aware configuration wizard (page + pure view model) |
+| [`qc_tool/config/input_contract.py`](qc_tool/config/input_contract.py), [`qc_tool/config/resolved_input.py`](qc_tool/config/resolved_input.py) | Saved logical input contract and per-run resolved configuration |
+| [`qc_tool/setup/`](qc_tool/setup) | Bounded setup-analysis scan, preview worker/store, models |
 | [`qc_tool/focus/`](qc_tool/focus) | Optional secure desktop Office navigation |
 | [`native/cadence_diff_native/`](native/cadence_diff_native) | Rust BIFF12 and formula-delta accelerator |
 | [`scripts/`](scripts) | Audits and bounded diagnostic/acceptance tools |

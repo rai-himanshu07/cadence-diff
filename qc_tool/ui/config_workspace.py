@@ -1924,6 +1924,7 @@ def render_config_workspace(
                 profile=profile,
                 profile_sha256=profile_sha256(profile),
                 warnings_acknowledged=tuple(sorted(workspace_state["value"].warnings_acknowledged)),
+                file_hashes=file_hashes,
             )
             import json
             import tempfile
@@ -2007,6 +2008,7 @@ def render_config_workspace(
                 profile=profile,
                 profile_sha256=profile_sha256(profile),
                 warnings_acknowledged=tuple(sorted(workspace_state["value"].warnings_acknowledged)),
+                file_hashes=file_hashes,
             )
             try:
                 manifest = PackageManifest.from_role_files(

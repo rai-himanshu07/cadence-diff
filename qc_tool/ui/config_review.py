@@ -18,6 +18,7 @@ bindings together.
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -71,6 +72,25 @@ def _unique_id(base: str, taken: set[str]) -> str:
         suffix += 1
     taken.add(candidate)
     return candidate
+
+
+def _is_expired(iso_date: str) -> bool:
+    """True when ``iso_date`` (an already-set ``exclusion_expires_on`` /
+    ``ignore_columns_expires_on`` value) names a day strictly before today.
+
+    An unset (empty) value is never "expired" here -- ``RegionDecision.
+    is_valid`` already separately requires the field to be non-empty before
+    reaching this check at all. An unparseable value is treated as expired
+    (fail closed): a corrupted date is not a reason to silently keep
+    excluding content.
+    """
+    if not iso_date:
+        return False
+    try:
+        parsed = dt.date.fromisoformat(iso_date)
+    except ValueError:
+        return True
+    return parsed < dt.date.today()
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,16 +162,21 @@ class RegionDecision:
 
     @property
     def is_valid(self) -> bool:
-        if self.mode == "excluded" and (not self.exclusion_reason or not self.exclusion_expires_on):
-            return False
+        if self.mode == "excluded":
+            if not self.exclusion_reason or not self.exclusion_expires_on:
+                return False
+            if _is_expired(self.exclusion_expires_on):
+                return False
         if self.mode == "keyed" and not self.identity_columns:
             return False
         if self.header_intent == "first_data_row" and self.first_data_row is None:
             return False
-        return not (
-            self.ignore_columns
-            and (not self.ignore_columns_reason or not self.ignore_columns_expires_on)
-        )
+        if self.ignore_columns:
+            if not self.ignore_columns_reason or not self.ignore_columns_expires_on:
+                return False
+            if _is_expired(self.ignore_columns_expires_on):
+                return False
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1319,7 +1344,25 @@ def unresolved_blockers(
     for member in state.member_reviews:
         for sheet in member.current_sheets:
             for region in sheet.regions:
-                if region.mode != "automatic" and not region.is_valid:
+                if region.mode == "excluded" and region.exclusion_reason and _is_expired(
+                    region.exclusion_expires_on
+                ):
+                    blockers.append(
+                        f"{sheet.sheet_name!r} {region.current_range}: this "
+                        "exclusion expired on "
+                        f"{region.exclusion_expires_on}; renew or remove it "
+                        "before continuing"
+                    )
+                elif region.ignore_columns and region.ignore_columns_reason and _is_expired(
+                    region.ignore_columns_expires_on
+                ):
+                    blockers.append(
+                        f"{sheet.sheet_name!r} {region.current_range}: the "
+                        "ignored-column exclusion expired on "
+                        f"{region.ignore_columns_expires_on}; renew or remove "
+                        "it before continuing"
+                    )
+                elif region.mode != "automatic" and not region.is_valid:
                     blockers.append(
                         f"{sheet.sheet_name!r} {region.current_range}: "
                         "finish configuring this region before continuing"
@@ -1386,7 +1429,12 @@ def _resolved_region(
     )
     coverage = "confirmed" if region.confirmed else "automatic_confirmed"
     if region.mode == "excluded":
-        coverage = "degraded_acknowledged" if region.confirmed else "automatic_confirmed"
+        # A deliberate content exclusion is its OWN distinct coverage state
+        # -- never "degraded_acknowledged", which is reserved for a
+        # DIFFERENT concept (a forced capability limitation the analyst
+        # accepted, e.g. low-overlap key alignment), not an intentional
+        # scope choice.
+        coverage = "excluded"
     elif region.mode == "positional":
         coverage = "positional"
     baseline_outer_range = region.baseline_range or (
@@ -1426,13 +1474,25 @@ def build_resolved_configuration(
     profile: DeliverableProfile,
     profile_sha256: str,
     warnings_acknowledged: tuple[str, ...] = (),
+    file_hashes: dict[str, str] | None = None,
 ) -> ResolvedInputConfigurationV1:
     """Build a real ``ResolvedInputConfigurationV1`` from the workspace's
     current decisions. Every region defaulting to ``automatic`` (untouched
     by the analyst) still resolves -- it simply carries no identity/ordinal
     columns and its physical range as-scanned, so an untouched sheet keeps
     running exactly as automatic detection would today.
+
+    ``file_hashes`` is the run's own role-keyed source hashes (the exact
+    shape ``qc_tool.run_preflight.hash_run_files`` produces, e.g.
+    ``"baseline_excel"``/``"current_excel"`` for the primary member,
+    ``"baseline_excel:member_id"`` otherwise -- ``PackageManifest.role_key``'s
+    own convention). Without it, every member's ``baseline_source_sha256``/
+    ``current_source_sha256`` stay ``None`` and ``validate_freshness()``
+    unconditionally rejects the resulting configuration as stale the
+    moment a run actually tries to use it -- this parameter is required
+    for any resolved configuration that will reach ``perform_run()``.
     """
+    hashes = file_hashes or {}
     members: list[ResolvedMember] = []
     for member in state.member_reviews:
         sheets: list[ResolvedSheet] = []
@@ -1462,9 +1522,12 @@ def build_resolved_configuration(
                     coverage="automatic_confirmed" if regions else "confirmed",
                 )
             )
+        suffix = "" if member.member_id == "primary" else f":{member.member_id}"
         members.append(
             ResolvedMember(
                 member_id=member.member_id,
+                baseline_source_sha256=hashes.get(f"baseline_excel{suffix}"),
+                current_source_sha256=hashes.get(f"current_excel{suffix}"),
                 sheets=tuple(sheets),
             )
         )
