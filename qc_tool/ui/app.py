@@ -185,6 +185,7 @@ from qc_tool.triage.preview import (
     PreviewReviewFloor,
     preview_policy,
 )
+from qc_tool.ui.config_review import diff_resolved_configurations
 from qc_tool.ui.guide import render_guide
 from qc_tool.ui.profile_editor import ProfileEditorController, open_profile_editor
 from qc_tool.ui.ranked_table_dialog import (
@@ -2643,7 +2644,7 @@ def _rerun_delta(
         )
     if previous.profile_snapshot is None or record.profile_snapshot is None:
         return compare_findings(previous.findings, record.findings), ""
-    delta, scope_excluded = compatible_compare_findings(
+    delta, exclusion_summary = compatible_compare_findings(
         previous.findings,
         record.findings,
         previous_profile=previous.profile_snapshot,
@@ -2651,11 +2652,13 @@ def _rerun_delta(
     )
     note = (
         (
-            f"change summary vs run #{record.rerun_of} excludes scopes whose "
-            "comparison policy changed since that run — the review queue "
-            "below reflects this run in full"
+            f"change summary vs run #{record.rerun_of} excludes "
+            f"{exclusion_summary.previous_excluded} prior and "
+            f"{exclusion_summary.current_excluded} current finding(s) whose "
+            "scope's comparison policy changed since that run — the review "
+            "queue below reflects this run in full"
         )
-        if scope_excluded
+        if exclusion_summary.any_excluded
         else ""
     )
     return delta, note
@@ -2807,6 +2810,33 @@ def _render_budget_run_view(
             icon="chevron_right", on_click=lambda: turn(1)
         ).props("flat dense")
     refresh()
+
+
+def _render_predecessor_config_diff(
+    history: "RunHistory", rerun_of: int, result: QCRunResult
+) -> None:
+    """"Configuration changes vs run #N" (plan-20260913 Step 10's "History
+    surfaces config diff versus predecessor using persisted resolved
+    snapshots, not heuristics" criterion) -- silent when nothing in the
+    run-specific resolution actually changed, matching the plan's own
+    "concise" requirement and Step 7's established compact-summary
+    philosophy (no news is no section, not an empty placeholder).
+    """
+    try:
+        predecessor = history.get_run(rerun_of)
+    except KeyError:
+        return
+    config_diff = diff_resolved_configurations(
+        predecessor.resolved_input_configuration,
+        result.resolved_input_configuration,
+    )
+    if not config_diff:
+        return
+    with ui.expansion(
+        f"Configuration changes vs run #{rerun_of} ({len(config_diff)})"
+    ).props("dense"):
+        for entry in config_diff:
+            ui.label(f"{entry.scope}: {entry.description}").classes("notecard")
 
 
 def _render_result_view(
@@ -3005,6 +3035,8 @@ def _render_result_view(
                     f'<span class="bad">{delta.new} new</span> · '
                     f"{delta.persisting} persisting"
                 )
+        if rerun_of is not None and history is not None:
+            _render_predecessor_config_diff(history, rerun_of, result)
         for disclosure in result.disclosures:
             ui.label(disclosure).classes("notecard")
         if stories:

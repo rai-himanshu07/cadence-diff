@@ -83,22 +83,48 @@ class _GroupView:
     members: tuple[_SingletonMember, ...]
 
 
+def _sheet_rename_alias_lookup(result: QCRunResult) -> dict[str, str]:
+    """``sheet_id`` -> a human-readable "current (renamed from baseline)"
+    label, built only from the run's OWN resolved configuration (never a
+    fresh, possibly-drifted profile lookup) -- so a rendered alias always
+    matches what this run actually compared. Empty when the run has no
+    resolved configuration or no sheet was renamed.
+    """
+    resolved = result.resolved_input_configuration
+    if resolved is None:
+        return {}
+    lookup: dict[str, str] = {}
+    for member in resolved.members:
+        for sheet in member.sheets:
+            baseline = sheet.baseline_sheet_name
+            current = sheet.current_sheet_name
+            if baseline and current and baseline != current:
+                lookup[sheet.sheet_id] = f"{current} (renamed from {baseline})"
+    return lookup
+
+
 def _group_views(
     result: QCRunResult, summaries: list[GroupSummary]
 ) -> list[_GroupView]:
+    alias_lookup = _sheet_rename_alias_lookup(result)
     views: list[_GroupView] = []
     for summary in summaries:
+        first = finding_by_id(result.findings, summary.member_finding_ids[0])
         members: tuple[_SingletonMember, ...] = ()
         if summary.member_count == 1:
-            first = finding_by_id(result.findings, summary.member_finding_ids[0])
             members = (_SingletonMember(first.message if first else ""),)
+        sheet = summary.sheet
+        if first is not None and first.logical_address is not None:
+            alias = alias_lookup.get(first.logical_address.sheet_id)
+            if alias:
+                sheet = alias
         views.append(
             _GroupView(
                 group_id=summary.group_id,
                 severity=summary.severity,
                 finding_class=summary.finding_class,
                 artifact_member=summary.artifact_member,
-                sheet=summary.sheet,
+                sheet=sheet,
                 slide=summary.slide,
                 ranges=summary.ranges,
                 bounding_range=summary.bounding_range,

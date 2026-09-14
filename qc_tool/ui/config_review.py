@@ -868,6 +868,238 @@ def is_clean_profile_diff(diff: tuple[DiffEntry, ...]) -> bool:
     return all(entry.kind == "matches" for entry in diff)
 
 
+def _resolved_column_signature(
+    columns: tuple[ResolvedColumn, ...],
+) -> dict[str, tuple[str, str]]:
+    return {c.column_id: (c.alignment_role, c.comparison_policy) for c in columns}
+
+
+def _diff_resolved_columns(
+    prev_columns: tuple[ResolvedColumn, ...], curr_columns: tuple[ResolvedColumn, ...]
+) -> str:
+    """One concise clause naming how many columns' role/policy changed, or
+    "" when nothing did. Never names a column id (content-free, matching
+    ``LogicalFindingAddress``'s own bounded-identifier discipline).
+    """
+    prev_roles = _resolved_column_signature(prev_columns)
+    curr_roles = _resolved_column_signature(curr_columns)
+    changed = [
+        column_id
+        for column_id in sorted(set(prev_roles) | set(curr_roles))
+        if prev_roles.get(column_id) != curr_roles.get(column_id)
+    ]
+    if not changed:
+        return ""
+    return f"column role/policy changed for {len(changed)} column(s)"
+
+
+def _diff_resolved_selectors(
+    scope: str,
+    prev_selectors: tuple[ResolvedSelector, ...],
+    curr_selectors: tuple[ResolvedSelector, ...],
+) -> list[DiffEntry]:
+    entries: list[DiffEntry] = []
+    prev_ids = {s.selector_id for s in prev_selectors}
+    curr_ids = {s.selector_id for s in curr_selectors}
+    for selector_id in sorted(curr_ids - prev_ids):
+        entries.append(
+            DiffEntry(
+                scope=f"{scope}/{selector_id}",
+                kind="new_in_scan",
+                description="a selector prerequisite is new since the predecessor run",
+            )
+        )
+    for selector_id in sorted(prev_ids - curr_ids):
+        entries.append(
+            DiffEntry(
+                scope=f"{scope}/{selector_id}",
+                kind="missing_from_profile",
+                description="a selector prerequisite is no longer present",
+            )
+        )
+    return entries
+
+
+def _diff_resolved_regions(
+    scope: str,
+    prev_regions: tuple[ResolvedRegion, ...],
+    curr_regions: tuple[ResolvedRegion, ...],
+) -> list[DiffEntry]:
+    entries: list[DiffEntry] = []
+    prev_by_id = {r.region_id: r for r in prev_regions}
+    curr_by_id = {r.region_id: r for r in curr_regions}
+    for region_id in sorted(set(prev_by_id) | set(curr_by_id)):
+        prev_region = prev_by_id.get(region_id)
+        curr_region = curr_by_id.get(region_id)
+        region_scope = f"{scope}/{region_id}"
+        if prev_region is None:
+            entries.append(
+                DiffEntry(
+                    scope=region_scope,
+                    kind="new_in_scan",
+                    description="region is new since the predecessor run",
+                )
+            )
+            continue
+        if curr_region is None:
+            entries.append(
+                DiffEntry(
+                    scope=region_scope,
+                    kind="missing_from_profile",
+                    description="region is no longer present",
+                )
+            )
+            continue
+        clauses: list[str] = []
+        if prev_region.mode != curr_region.mode:
+            clauses.append(f"mode {prev_region.mode!r} -> {curr_region.mode!r}")
+        if prev_region.header_intent != curr_region.header_intent:
+            clauses.append(
+                f"header intent {prev_region.header_intent!r} -> "
+                f"{curr_region.header_intent!r}"
+            )
+        if prev_region.duplicate_key_policy != curr_region.duplicate_key_policy:
+            clauses.append(
+                "duplicate-key policy "
+                f"{prev_region.duplicate_key_policy!r} -> "
+                f"{curr_region.duplicate_key_policy!r}"
+            )
+        if prev_region.blank_key_policy != curr_region.blank_key_policy:
+            clauses.append(
+                f"blank-key policy {prev_region.blank_key_policy!r} -> "
+                f"{curr_region.blank_key_policy!r}"
+            )
+        column_clause = _diff_resolved_columns(prev_region.columns, curr_region.columns)
+        if column_clause:
+            clauses.append(column_clause)
+        if clauses:
+            entries.append(
+                DiffEntry(
+                    scope=region_scope,
+                    kind="conflict",
+                    description="; ".join(clauses),
+                )
+            )
+    return entries
+
+
+def _diff_resolved_member(
+    member_id: str, prev_member: ResolvedMember, curr_member: ResolvedMember
+) -> list[DiffEntry]:
+    entries: list[DiffEntry] = []
+    prev_sheets = {s.sheet_id: s for s in prev_member.sheets}
+    curr_sheets = {s.sheet_id: s for s in curr_member.sheets}
+    for sheet_id in sorted(set(prev_sheets) | set(curr_sheets)):
+        prev_sheet = prev_sheets.get(sheet_id)
+        curr_sheet = curr_sheets.get(sheet_id)
+        scope = f"{member_id}/{sheet_id}"
+        if prev_sheet is None:
+            entries.append(
+                DiffEntry(
+                    scope=scope,
+                    kind="new_in_scan",
+                    description="sheet is new since the predecessor run",
+                )
+            )
+            continue
+        if curr_sheet is None:
+            entries.append(
+                DiffEntry(
+                    scope=scope,
+                    kind="missing_from_profile",
+                    description="sheet is no longer present",
+                )
+            )
+            continue
+        if (
+            prev_sheet.baseline_sheet_name != curr_sheet.baseline_sheet_name
+            or prev_sheet.current_sheet_name != curr_sheet.current_sheet_name
+        ):
+            entries.append(
+                DiffEntry(
+                    scope=scope,
+                    kind="conflict",
+                    description="sheet pairing changed since the predecessor run",
+                )
+            )
+        entries.extend(
+            _diff_resolved_regions(scope, prev_sheet.regions, curr_sheet.regions)
+        )
+        entries.extend(
+            _diff_resolved_selectors(scope, prev_sheet.selectors, curr_sheet.selectors)
+        )
+    return entries
+
+
+def diff_resolved_configurations(
+    previous: ResolvedInputConfigurationV1 | None,
+    current: ResolvedInputConfigurationV1 | None,
+) -> tuple[DiffEntry, ...]:
+    """Concise, run-specific diff between a run's resolved configuration and
+    its predecessor's (plan-20260913 Step 10's "History surfaces config diff
+    versus predecessor using persisted resolved snapshots, not heuristics"
+    criterion).
+
+    Compares the exact per-run RESOLUTION -- member/sheet pairing, region
+    mode/header-intent/key-policy, column role/policy composition, and
+    selector prerequisite declarations -- never just ``profile_sha256``, so
+    a policy-only edit that changed a run's actual resolution is disclosed
+    even when someone only glances at the profile hash. Deliberately
+    excludes pure numeric range/first-data-row drift, which is the ROUTINE,
+    expected difference between almost any two runs over growing data and
+    would make this "concise" summary noisy rather than useful. Never
+    touches cell content or selector values -- only stable logical
+    ids/enums already present on ``ResolvedInputConfigurationV1``.
+
+    ``None`` on one side only (a legacy run recorded before the input
+    contract existed, compared against one that has it) is disclosed as a
+    single explanatory entry rather than silently producing an empty diff
+    that would misleadingly read as "nothing changed". ``None`` on both
+    sides (neither run used the input contract) yields an empty diff.
+    """
+    if previous is None and current is None:
+        return ()
+    if previous is None or current is None:
+        return (
+            DiffEntry(
+                scope="configuration",
+                kind="conflict",
+                description=(
+                    "one of these two runs has no saved resolved configuration "
+                    "to compare against (a legacy run recorded before the input "
+                    "contract existed) -- no run-specific configuration diff is "
+                    "available"
+                ),
+            ),
+        )
+    entries: list[DiffEntry] = []
+    previous_members = {m.member_id: m for m in previous.members}
+    current_members = {m.member_id: m for m in current.members}
+    for member_id in sorted(set(previous_members) | set(current_members)):
+        prev_member = previous_members.get(member_id)
+        curr_member = current_members.get(member_id)
+        if prev_member is None:
+            entries.append(
+                DiffEntry(
+                    scope=member_id,
+                    kind="new_in_scan",
+                    description="member is new since the predecessor run",
+                )
+            )
+            continue
+        if curr_member is None:
+            entries.append(
+                DiffEntry(
+                    scope=member_id,
+                    kind="missing_from_profile",
+                    description="member is no longer present",
+                )
+            )
+            continue
+        entries.extend(_diff_resolved_member(member_id, prev_member, curr_member))
+    return tuple(entries)
+
+
 @dataclass(frozen=True, slots=True)
 class ConfigWorkspaceState:
     """The workspace's own in-memory decisions for one browser session --

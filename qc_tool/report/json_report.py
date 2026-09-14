@@ -172,6 +172,16 @@ def _payload_scaffold(
             mode="json",
             exclude_none=True,
         ),
+        # Canonical digest of the exact per-run resolved logical
+        # configuration (plan-20260913 Step 10): purely informational
+        # disclosure, present at every schema version, never a validation
+        # gate. `None`/"" for any run with no saved input_contract.
+        "resolved_input_configuration": (
+            result.resolved_input_configuration.model_dump(mode="json")
+            if result.resolved_input_configuration is not None
+            else None
+        ),
+        "resolved_input_digest": result.resolved_input_digest,
         "files": result.files,
         "counts": {sev.value: count for sev, count in result.counts.items()},
         "disclosures": result.disclosures,

@@ -8,7 +8,7 @@ import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 import yaml
@@ -2913,6 +2913,83 @@ async def test_reqc_page_discloses_output_mode_change_instead_of_a_delta_banner(
     await user.should_see("output mode changed")
     await user.should_not_see("resolved")
     await user.should_not_see("new ·")
+
+
+@pytest.mark.asyncio
+async def test_run_page_renders_a_predecessor_configuration_diff(
+    user: User, tmp_path: Path
+) -> None:
+    """plan-20260913 Step 10: "History surfaces config diff versus
+    predecessor using persisted resolved snapshots, not heuristics" -- a
+    region whose resolved mode changed between the predecessor and this
+    run is disclosed by name, using only the two runs' own persisted
+    resolved configurations.
+    """
+    from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
+    from qc_tool.config.resolved_input import (
+        ResolvedInputConfigurationV1,
+        ResolvedMember,
+        ResolvedRegion,
+        ResolvedSheet,
+    )
+
+    work_dir = tmp_path / "work"
+    history = RunHistory(work_dir / "history.sqlite3")
+    finding = Finding(
+        finding_id="F1",
+        artifact="excel",
+        finding_class=FindingClass.VALUE_CHANGED,
+        severity=Severity.CRITICAL,
+        sheet="Data",
+        location="B2",
+        baseline_value="1",
+        current_value="2",
+        message="changed",
+    )
+
+    def _resolved(
+        mode: Literal["automatic", "keyed", "positional", "excluded"],
+    ) -> ResolvedInputConfigurationV1:
+        return ResolvedInputConfigurationV1(
+            inspection_contract_version=INPUT_CONTRACT_VERSION,
+            members=(
+                ResolvedMember(
+                    member_id="primary",
+                    sheets=(
+                        ResolvedSheet(
+                            sheet_id="sheet-data",
+                            baseline_sheet_name="Data",
+                            current_sheet_name="Data",
+                            regions=(ResolvedRegion(region_id="r1", mode=mode),),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    previous = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding],
+            resolved_input_configuration=_resolved("automatic"),
+        ),
+        file_hashes={},
+        report_paths={},
+    )
+    current = history.record_run(
+        QCRunResult(
+            profile_name="fixture",
+            findings=[finding.model_copy(update={"finding_id": "N1"})],
+            resolved_input_configuration=_resolved("keyed"),
+        ),
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous,
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{current}")
+
+    await user.should_see(f"Configuration changes vs run #{previous}")
 
 
 @pytest.mark.asyncio

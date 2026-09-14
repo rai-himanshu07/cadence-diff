@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from qc_tool.config.profile import DeliverableProfile, NumericTolerance
-from qc_tool.config.resolved_input import ResolvedInputConfigurationV1
+from qc_tool.config.resolved_input import ResolvedInputConfigurationV1, validate_freshness
 from qc_tool.coverage import FindingOutputMode, QCRunMode
 from qc_tool.engine import (
     FindingsDelta,
@@ -53,6 +53,26 @@ logger = logging.getLogger(__name__)
 #: whose report files ARE the output) write eagerly. This constant remains
 #: the budget for run-completion extras such as the re-QC delta.
 REPORT_DEFER_FINDINGS = 50_000
+
+
+def _resolved_config_source_hashes(
+    resolved: ResolvedInputConfigurationV1, file_hashes: dict[str, str]
+) -> dict[str, tuple[str | None, str | None]]:
+    """Per-member ``(baseline_sha256, current_sha256)`` freshly computed
+    from this run's actual ``file_hashes`` (role-keyed, `role_key()`'s own
+    ``primary``-vs-``role:member_id`` convention) -- the shape
+    ``validate_freshness`` compares against the resolved configuration's
+    own recorded hashes.
+    """
+    result: dict[str, tuple[str | None, str | None]] = {}
+    for member in resolved.members:
+        member_id = member.member_id
+        suffix = "" if member_id == "primary" else f":{member_id}"
+        result[member_id] = (
+            file_hashes.get(f"baseline_excel{suffix}"),
+            file_hashes.get(f"current_excel{suffix}"),
+        )
+    return result
 
 
 @dataclass(slots=True)
@@ -181,6 +201,13 @@ def perform_run(
     if _perform_run_telemetry is not None:
         _perform_run_telemetry.initial_hash_seconds += time.perf_counter() - _hash_start
     reject_duplicate_bytes(mode, files, file_hashes)
+    if resolved_input_configuration is not None:
+        validate_freshness(
+            resolved_input_configuration,
+            current_source_sha256=_resolved_config_source_hashes(
+                resolved_input_configuration, file_hashes
+            ),
+        )
 
     formula_cache = (
         FormulaExtractionCache(work_dir / "formula-cache")
@@ -300,17 +327,20 @@ def perform_run(
                 ):
                     previous_profile = previous.profile_snapshot
                     if previous_profile is not None:
-                        delta, scope_excluded = compatible_compare_findings(
+                        delta, exclusion_summary = compatible_compare_findings(
                             previous.findings,
                             result.findings,
                             previous_profile=previous_profile,
                             current_profile=profile,
                         )
-                        if scope_excluded:
+                        if exclusion_summary.any_excluded:
                             result.disclosures.append(
-                                f"change summary vs run #{rerun_of} excludes scopes "
-                                "whose comparison policy changed since that run -- "
-                                "the review queue below reflects this run in full"
+                                f"change summary vs run #{rerun_of} excludes "
+                                f"{exclusion_summary.previous_excluded} prior and "
+                                f"{exclusion_summary.current_excluded} current "
+                                "finding(s) whose scope's comparison policy "
+                                "changed since that run -- the review queue "
+                                "below reflects this run in full"
                             )
                     else:
                         delta = compare_findings(previous.findings, result.findings)

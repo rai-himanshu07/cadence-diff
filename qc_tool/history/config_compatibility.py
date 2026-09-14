@@ -321,13 +321,31 @@ def configuration_compatible(
     )
 
 
+@dataclass(frozen=True)
+class ScopeExclusionSummary:
+    """How many findings on each side of a Re-QC delta were excluded because
+    their logical scope's comparison policy differs between the two runs'
+    profile snapshots -- never counted resolved/new, never evaluated at
+    all for this comparison (plan-20260913 Step 10's "comparable/not-
+    evaluated summaries" criterion). Zero on both sides is the common,
+    unchanged-profile case.
+    """
+
+    previous_excluded: int = 0
+    current_excluded: int = 0
+
+    @property
+    def any_excluded(self) -> bool:
+        return self.previous_excluded > 0 or self.current_excluded > 0
+
+
 def compatible_compare_findings(
     previous_findings: Sequence[Finding],
     current_findings: Sequence[Finding],
     *,
     previous_profile: DeliverableProfile,
     current_profile: DeliverableProfile,
-) -> tuple[FindingsDelta, bool]:
+) -> tuple[FindingsDelta, ScopeExclusionSummary]:
     """Drop-in, scope-aware replacement for
     ``qc_tool.engine.compare_findings``.
 
@@ -335,9 +353,9 @@ def compatible_compare_findings(
     configuration differs between the two profile snapshots before
     delegating to ``compare_findings`` -- so a suppressed or rescoped
     finding is never silently counted "resolved", and a newly-visible one
-    is never silently counted "new". Returns ``(delta, any_scope_excluded)``;
-    callers disclose ``any_scope_excluded`` the same way they already
-    disclose an output-representation change.
+    is never silently counted "new". Returns ``(delta, exclusion_summary)``;
+    callers disclose ``exclusion_summary.any_excluded`` the same way they
+    already disclose an output-representation change.
 
     Same caller contract as ``compare_findings``: both finding sequences
     must already have passed ``output_representations_compatible`` --
@@ -346,7 +364,8 @@ def compatible_compare_findings(
     compatibility = configuration_compatible(previous_profile, current_profile)
     filtered_previous = [f for f in previous_findings if compatibility.comparable(f)]
     filtered_current = [f for f in current_findings if compatibility.comparable(f)]
-    any_excluded = len(filtered_previous) != len(previous_findings) or len(
-        filtered_current
-    ) != len(current_findings)
-    return compare_findings(filtered_previous, filtered_current), any_excluded
+    exclusion_summary = ScopeExclusionSummary(
+        previous_excluded=len(previous_findings) - len(filtered_previous),
+        current_excluded=len(current_findings) - len(filtered_current),
+    )
+    return compare_findings(filtered_previous, filtered_current), exclusion_summary

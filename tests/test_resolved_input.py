@@ -6,7 +6,10 @@ Plan: docs/plans/plan-20260913-mode-aware-configuration-wizard.md, Step 1.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+from openpyxl import Workbook
 from pydantic import ValidationError
 
 from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
@@ -245,3 +248,91 @@ def test_resolved_column_is_frozen() -> None:
 def test_resolved_configuration_version_is_frozen_at_one() -> None:
     assert RESOLVED_INPUT_CONFIGURATION_VERSION == 1
     assert ResolvedInputConfigurationV1().version == 1
+
+
+# --- perform_run() actually calls validate_freshness() (plan Step 10) -----
+
+
+def _write_pair(tmp_path: Path) -> tuple[Path, Path]:
+    baseline_path = tmp_path / "baseline.xlsx"
+    current_path = tmp_path / "current.xlsx"
+    for path, value in ((baseline_path, 1), (current_path, 2)):
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Data"
+        sheet["A1"] = value
+        workbook.save(path)
+    return baseline_path, current_path
+
+
+def test_perform_run_rejects_a_resolved_configuration_with_a_stale_source_hash(
+    tmp_path: Path,
+) -> None:
+    """Step 10's "source-hash-bound request rejection" criterion: a saved
+    resolved configuration whose declared source hash no longer matches the
+    file actually being loaded (e.g. the file changed since the workspace
+    resolved it) must be refused before any QC work happens -- not silently
+    applied against different data. `validate_freshness()` existed since
+    Step 1 but was never actually called by any production caller until now.
+    """
+    from qc_tool.history.store import sha256_file
+    from qc_tool.run_service import perform_run
+
+    baseline_path, current_path = _write_pair(tmp_path)
+    real_current_hash = sha256_file(current_path)
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                baseline_source_sha256=sha256_file(baseline_path),
+                # Deliberately wrong -- simulates the current file having
+                # changed since this configuration was resolved.
+                current_source_sha256="0" * 64,
+            ),
+        ),
+    )
+    assert resolved.members[0].current_source_sha256 != real_current_hash
+
+    with pytest.raises(StaleResolvedConfigurationError):
+        perform_run(
+            tmp_path / "work",
+            {"baseline_excel": baseline_path, "current_excel": current_path},
+            {},
+            DeliverableProfile(name="default"),
+            mode=QCRunMode.CYCLE_COMPARISON,
+            resolved_input_configuration=resolved,
+        )
+
+
+def test_perform_run_accepts_a_resolved_configuration_with_matching_hashes(
+    tmp_path: Path,
+) -> None:
+    """The inverse control: a resolved configuration whose declared hashes
+    DO match the real files must not be rejected by the freshness check.
+    """
+    from qc_tool.history.store import sha256_file
+    from qc_tool.run_service import perform_run
+
+    baseline_path, current_path = _write_pair(tmp_path)
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                baseline_source_sha256=sha256_file(baseline_path),
+                current_source_sha256=sha256_file(current_path),
+            ),
+        ),
+    )
+
+    artifacts = perform_run(
+        tmp_path / "work",
+        {"baseline_excel": baseline_path, "current_excel": current_path},
+        {},
+        DeliverableProfile(name="default"),
+        mode=QCRunMode.CYCLE_COMPARISON,
+        resolved_input_configuration=resolved,
+    )
+    assert artifacts.result is not None

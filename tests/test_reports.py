@@ -197,6 +197,112 @@ def test_excel_report_population_column(tmp_path: Path) -> None:
     assert summary_values["Warning represented changes"] == "19"
 
 
+def test_excel_report_renders_a_renamed_sheet_alias_beside_the_physical_name(
+    tmp_path: Path,
+) -> None:
+    """plan-20260913 Step 10: "aliases plus physical coordinates render in
+    human reports" -- a finding whose logical address resolves to a sheet
+    renamed since baseline shows both names, sourced only from the run's
+    own resolved configuration.
+    """
+    from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
+    from qc_tool.config.resolved_input import (
+        ResolvedInputConfigurationV1,
+        ResolvedMember,
+        ResolvedSheet,
+    )
+    from qc_tool.findings import LogicalFindingAddress
+
+    result = QCRunResult(profile_name="test")
+    result.resolved_input_configuration = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="sheet-revenue",
+                        baseline_sheet_name="Revenue FY25",
+                        current_sheet_name="Revenue FY26",
+                    ),
+                ),
+            ),
+        ),
+    )
+    result.findings = [
+        Finding(
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            severity=Severity.CRITICAL,
+            sheet="Revenue FY26",
+            location="C1",
+            baseline_value="1",
+            current_value="2",
+            message="value changed",
+            logical_address=LogicalFindingAddress(
+                member_id="primary", sheet_id="sheet-revenue"
+            ),
+        )
+    ]
+    path = tmp_path / "renamed-sheet.xlsx"
+
+    write_excel_report(result, path)
+
+    workbook = load_workbook(path)
+    findings = workbook["Findings"]
+    header_row = [cell.value for cell in findings[1]]
+    sheet_column = header_row.index("Sheet / Slide") + 1
+    assert findings.cell(row=2, column=sheet_column).value == (
+        "Revenue FY26 (renamed from Revenue FY25)"
+    )
+
+
+def test_html_report_renders_a_renamed_sheet_alias_beside_the_physical_name() -> None:
+    from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
+    from qc_tool.config.resolved_input import (
+        ResolvedInputConfigurationV1,
+        ResolvedMember,
+        ResolvedSheet,
+    )
+    from qc_tool.findings import LogicalFindingAddress
+
+    result = QCRunResult(profile_name="test")
+    result.resolved_input_configuration = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="sheet-revenue",
+                        baseline_sheet_name="Revenue FY25",
+                        current_sheet_name="Revenue FY26",
+                    ),
+                ),
+            ),
+        ),
+    )
+    result.findings = [
+        Finding(
+            artifact="excel",
+            finding_class=FindingClass.VALUE_CHANGED,
+            severity=Severity.CRITICAL,
+            sheet="Revenue FY26",
+            location="C1",
+            baseline_value="1",
+            current_value="2",
+            message="value changed",
+            logical_address=LogicalFindingAddress(
+                member_id="primary", sheet_id="sheet-revenue"
+            ),
+        )
+    ]
+
+    html = render_html_report(result)
+
+    assert "Revenue FY26 (renamed from Revenue FY25)" in html
+
+
 def test_html_report_population_column(tmp_path: Path) -> None:
     from qc_tool.findings import MembershipCodec, PopulationEvidence
 
@@ -513,6 +619,47 @@ def test_json_payload_carries_output_mode_and_matches_schema_for_every_version()
     assert decision_payload["values_engines"] == decision_result.values_engines
     assert set(decision_payload) <= set(v2_schema["properties"])
     assert set(v2_schema["required"]) <= set(decision_payload)
+
+
+def test_json_payload_carries_resolved_input_configuration_and_matches_schema() -> None:
+    """plan-20260913 Step 10: the exact per-run resolved logical
+    configuration plus its canonical digest are always present in the JSON
+    payload (``None``/"" with no saved input_contract) and stay within
+    every shipped schema's declared properties.
+    """
+    from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
+    from qc_tool.config.resolved_input import ResolvedInputConfigurationV1, ResolvedMember
+
+    v1_result = QCRunResult(profile_name="fixture")
+    v1_payload = result_payload(v1_result)
+    v1_schema = json.loads(
+        (Path(__file__).parents[1] / "qc_tool/report/findings.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert v1_payload["resolved_input_configuration"] is None
+    assert v1_payload["resolved_input_digest"] == ""
+    assert set(v1_payload) <= set(v1_schema["properties"])
+
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                baseline_source_sha256="a" * 64,
+                current_source_sha256="b" * 64,
+            ),
+        ),
+    )
+    bound_result = QCRunResult(profile_name="fixture")
+    bound_result.resolved_input_configuration = resolved
+    bound_result.resolved_input_digest = resolved.canonical_sha256()
+    bound_payload = result_payload(bound_result)
+    assert bound_payload["resolved_input_configuration"] == resolved.model_dump(
+        mode="json"
+    )
+    assert bound_payload["resolved_input_digest"] == resolved.canonical_sha256()
+    assert set(bound_payload) <= set(v1_schema["properties"])
 
 
 def test_multi_member_excel_report_has_package_and_member_columns(

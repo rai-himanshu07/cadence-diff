@@ -24,7 +24,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from qc_tool.coverage import capability_limited
 from qc_tool.engine import QCRunResult
-from qc_tool.findings import Severity
+from qc_tool.findings import Finding, Severity
 from qc_tool.findings_store import finding_by_id, finding_ordinal
 from qc_tool.review import format_ranges, population_summary_text
 from qc_tool.review_stream import (
@@ -97,6 +97,39 @@ def _dynamic_cell(
     if isinstance(value, str):
         cell.data_type = "s"
     return cell
+
+
+def _sheet_rename_alias_lookup(result: QCRunResult) -> dict[str, str]:
+    """``sheet_id`` -> a human-readable "current (renamed from baseline)"
+    label, built only from the run's OWN resolved configuration (never a
+    fresh, possibly-drifted profile lookup) -- so a rendered alias always
+    matches what this run actually compared. Empty when the run has no
+    resolved configuration or no sheet was renamed.
+    """
+    resolved = result.resolved_input_configuration
+    if resolved is None:
+        return {}
+    lookup: dict[str, str] = {}
+    for member in resolved.members:
+        for sheet in member.sheets:
+            baseline = sheet.baseline_sheet_name
+            current = sheet.current_sheet_name
+            if baseline and current and baseline != current:
+                lookup[sheet.sheet_id] = f"{current} (renamed from {baseline})"
+    return lookup
+
+
+def _sheet_or_slide_label(finding: Finding, alias_lookup: dict[str, str]) -> str:
+    """The finding's physical sheet/slide label, or -- when its logical
+    address resolves to a renamed sheet -- a label naming both the current
+    physical name and the baseline name it continues.
+    """
+    label = finding.sheet or finding.slide or ""
+    if finding.logical_address is not None:
+        alias = alias_lookup.get(finding.logical_address.sheet_id)
+        if alias:
+            return alias
+    return label
 
 
 @dataclass(slots=True)
@@ -603,6 +636,7 @@ def _write_findings_sheets(
     finding_columns = [*_COLUMNS]
     if multi_member:
         finding_columns.insert(3, ("Member", 14))
+    alias_lookup = _sheet_rename_alias_lookup(result)
     total = len(result.findings)
     sheet = None
     sheet_index = 0
@@ -629,7 +663,7 @@ def _write_findings_sheets(
                 else []
             ),
             finding.finding_class.value,
-            finding.sheet or finding.slide or "",
+            _sheet_or_slide_label(finding, alias_lookup),
             finding.location or finding.baseline_location or "",
             finding.element or "",
             finding.provenance.value if finding.provenance is not None else "",

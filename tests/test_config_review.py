@@ -6,7 +6,16 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from qc_tool.config.input_contract import INPUT_CONTRACT_VERSION
 from qc_tool.config.profile import DeliverableProfile, ExcelMemberProfile, ExcelProfile
+from qc_tool.config.resolved_input import (
+    ResolvedColumn,
+    ResolvedInputConfigurationV1,
+    ResolvedMember,
+    ResolvedRegion,
+    ResolvedSelector,
+    ResolvedSheet,
+)
 from qc_tool.coverage import QCRunMode
 from qc_tool.excel.regions import TableRegion
 from qc_tool.setup.models import (
@@ -30,6 +39,7 @@ from qc_tool.ui.config_review import (
     confirm_all_regions,
     deck_review_from_titles,
     diff_profile_against_scan,
+    diff_resolved_configurations,
     effective_sheet_pairing,
     effective_slide_pairing,
     format_a1_range,
@@ -184,6 +194,208 @@ def test_is_clean_profile_diff_true_only_when_everything_matches() -> None:
             matching_profile, empty_result, mode=QCRunMode.CYCLE_COMPARISON
         )
     )
+
+
+def _resolved_region(region_id: str = "r1", **overrides: object) -> ResolvedRegion:
+    defaults: dict[str, object] = {"region_id": region_id}
+    defaults.update(overrides)
+    return ResolvedRegion(**defaults)  # type: ignore[arg-type]
+
+
+def _resolved_sheet(sheet_id: str = "s1", **overrides: object) -> ResolvedSheet:
+    defaults: dict[str, object] = {
+        "sheet_id": sheet_id,
+        "baseline_sheet_name": "Data",
+        "current_sheet_name": "Data",
+        "regions": (_resolved_region(),),
+    }
+    defaults.update(overrides)
+    return ResolvedSheet(**defaults)  # type: ignore[arg-type]
+
+
+def _resolved_config(**overrides: object) -> ResolvedInputConfigurationV1:
+    defaults: dict[str, object] = {
+        "inspection_contract_version": INPUT_CONTRACT_VERSION,
+        "members": (
+            ResolvedMember(member_id="primary", sheets=(_resolved_sheet(),)),
+        ),
+    }
+    defaults.update(overrides)
+    return ResolvedInputConfigurationV1(**defaults)  # type: ignore[arg-type]
+
+
+def test_diff_resolved_configurations_is_empty_when_both_sides_are_none() -> None:
+    assert diff_resolved_configurations(None, None) == ()
+
+
+def test_diff_resolved_configurations_is_empty_for_an_identical_snapshot() -> None:
+    config = _resolved_config()
+    assert diff_resolved_configurations(config, config) == ()
+
+
+def test_diff_resolved_configurations_discloses_a_legacy_predecessor_mismatch() -> None:
+    diff = diff_resolved_configurations(None, _resolved_config())
+    assert len(diff) == 1
+    assert diff[0].scope == "configuration"
+    assert diff[0].kind == "conflict"
+
+
+def test_diff_resolved_configurations_ignores_pure_range_drift() -> None:
+    """Concise by design: a routine range/first-data-row shift between two
+    runs over growing data is NOT disclosed -- only a real resolution
+    (mode/policy/pairing/column-role) change is.
+    """
+    previous = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    _resolved_sheet(
+                        regions=(
+                            _resolved_region(current_data_range="A2:B10", current_first_data_row=2),
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+    current = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    _resolved_sheet(
+                        regions=(
+                            _resolved_region(current_data_range="A2:B40", current_first_data_row=2),
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+    assert diff_resolved_configurations(previous, current) == ()
+
+
+def test_diff_resolved_configurations_flags_a_region_mode_change() -> None:
+    previous = _resolved_config()
+    current = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(_resolved_sheet(regions=(_resolved_region(mode="keyed"),)),),
+            ),
+        )
+    )
+    diff = diff_resolved_configurations(previous, current)
+    assert len(diff) == 1
+    assert diff[0].scope == "primary/s1/r1"
+    assert diff[0].kind == "conflict"
+    assert "mode" in diff[0].description
+
+
+def test_diff_resolved_configurations_flags_an_added_and_a_removed_sheet() -> None:
+    previous = _resolved_config()
+    current = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(_resolved_sheet(sheet_id="s2"),),
+            ),
+        )
+    )
+    diff = diff_resolved_configurations(previous, current)
+    kinds = {entry.scope: entry.kind for entry in diff}
+    assert kinds["primary/s1"] == "missing_from_profile"
+    assert kinds["primary/s2"] == "new_in_scan"
+
+
+def test_diff_resolved_configurations_flags_a_sheet_pairing_change() -> None:
+    previous = _resolved_config()
+    current = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(_resolved_sheet(baseline_sheet_name="Data (FY25)"),),
+            ),
+        )
+    )
+    diff = diff_resolved_configurations(previous, current)
+    assert any(
+        entry.scope == "primary/s1" and entry.kind == "conflict" for entry in diff
+    )
+
+
+def test_diff_resolved_configurations_flags_a_column_role_change() -> None:
+    previous = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    _resolved_sheet(
+                        regions=(
+                            _resolved_region(
+                                columns=(ResolvedColumn(column_id="c1"),)
+                            ),
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+    current = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    _resolved_sheet(
+                        regions=(
+                            _resolved_region(
+                                columns=(
+                                    ResolvedColumn(
+                                        column_id="c1", alignment_role="identity"
+                                    ),
+                                )
+                            ),
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+    diff = diff_resolved_configurations(previous, current)
+    assert len(diff) == 1
+    assert "column role/policy changed for 1 column(s)" in diff[0].description
+
+
+def test_diff_resolved_configurations_flags_an_added_and_a_removed_selector() -> None:
+    previous = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    _resolved_sheet(
+                        selectors=(ResolvedSelector(selector_id="scenario"),)
+                    ),
+                ),
+            ),
+        )
+    )
+    current = _resolved_config(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    _resolved_sheet(
+                        selectors=(ResolvedSelector(selector_id="fx_rate"),)
+                    ),
+                ),
+            ),
+        )
+    )
+    diff = diff_resolved_configurations(previous, current)
+    kinds = {entry.scope: entry.kind for entry in diff}
+    assert kinds["primary/s1/scenario"] == "missing_from_profile"
+    assert kinds["primary/s1/fx_rate"] == "new_in_scan"
 
 
 def test_unresolved_blockers_flags_an_invalid_keyed_region_without_identity_columns() -> None:

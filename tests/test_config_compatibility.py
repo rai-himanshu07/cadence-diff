@@ -315,13 +315,15 @@ def test_compatible_compare_findings_excludes_only_the_changed_scope() -> None:
         _excel_finding(sheet="Other"),
     ]
     current_findings = [_excel_finding(sheet="Data")]
-    delta, any_excluded = compatible_compare_findings(
+    delta, exclusion_summary = compatible_compare_findings(
         previous_findings,
         current_findings,
         previous_profile=previous_profile,
         current_profile=current_profile,
     )
-    assert any_excluded
+    assert exclusion_summary.any_excluded
+    assert exclusion_summary.previous_excluded == 1  # "Data" (previous side)
+    assert exclusion_summary.current_excluded == 1  # "Data" (current side)
     assert delta.resolved == 1  # "Other" resolved
     assert delta.new == 0
     assert delta.persisting == 0
@@ -331,13 +333,15 @@ def test_compatible_compare_findings_is_a_true_delta_when_nothing_scope_related_
     profile = DeliverableProfile(name="monthly")
     previous_findings = [_excel_finding(sheet="Data")]
     current_findings = [_excel_finding(sheet="Data"), _excel_finding(sheet="Other")]
-    delta, any_excluded = compatible_compare_findings(
+    delta, exclusion_summary = compatible_compare_findings(
         previous_findings,
         current_findings,
         previous_profile=profile,
         current_profile=profile.model_copy(deep=True),
     )
-    assert not any_excluded
+    assert not exclusion_summary.any_excluded
+    assert exclusion_summary.previous_excluded == 0
+    assert exclusion_summary.current_excluded == 0
     assert delta.persisting == 1
     assert delta.new == 1
     assert delta.resolved == 0

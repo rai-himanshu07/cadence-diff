@@ -54,6 +54,8 @@
     "formula_engines": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
     "values_engines": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
     "comparison_scope": {"type": "object"},
+    "resolved_input_configuration": {"type": ["object", "null"]},
+    "resolved_input_digest": {"type": "string"},
     "files": {"type": "object", "additionalProperties": {"type": "string"}},
     "counts": {"type": "object", "additionalProperties": {"type": "integer"}},
     "disclosures": {"type": "array", "items": {"type": "string"}},
