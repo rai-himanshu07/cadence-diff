@@ -555,7 +555,11 @@ class WarningItem:
     severity: Literal["caution", "block"] = "caution"
 
 
-def compute_warnings(result: SetupAnalysisResult) -> tuple[WarningItem, ...]:
+def compute_warnings(
+    result: SetupAnalysisResult,
+    *,
+    state: ConfigWorkspaceState | None = None,
+) -> tuple[WarningItem, ...]:
     """Bounded, content-free warnings computed from an already-completed
     scan -- never a raw cell value or a filename.
     """
@@ -595,7 +599,31 @@ def compute_warnings(result: SetupAnalysisResult) -> tuple[WarningItem, ...]:
                         )
                     )
                 for detected in sheet.regions:
-                    if detected.ranked_candidate is not None:
+                    ranked_is_pending = True
+                    if state is not None:
+                        review = state.member_review(member_id)
+                        reviewed_sheet = next(
+                            (
+                                item
+                                for item in review.current_sheets
+                                if item.sheet_name == sheet.sheet_name
+                            ),
+                            None,
+                        ) if review is not None else None
+                        reviewed_region = next(
+                            (
+                                item
+                                for item in reviewed_sheet.regions
+                                if item.current_range == detected.region.cell_range
+                            ),
+                            None,
+                        ) if reviewed_sheet is not None else None
+                        ranked_is_pending = bool(
+                            reviewed_region is not None
+                            and reviewed_region.ranked_candidate_pending
+                            and reviewed_region.mode == "automatic"
+                        )
+                    if detected.ranked_candidate is not None and ranked_is_pending:
                         warnings.append(
                             WarningItem(
                                 code=(
@@ -1393,6 +1421,78 @@ def format_a1_range(min_row: int, min_col: int, max_row: int, max_col: int) -> s
     return f"{top_left}:{get_column_letter(max_col)}{max_row}"
 
 
+def set_region_data_start(
+    region: RegionDecision, first_data_row: int | None
+) -> RegionDecision:
+    """Set the one canonical current-side data-start boundary.
+
+    ``None`` restores automatic detection. The outer range's first row means
+    there is no header; a later row means every preceding row is preamble.
+    Legacy ``preamble_rows`` is cleared so two controls can never disagree.
+    """
+    min_row, _min_col, max_row, _max_col = parse_a1_range(region.current_range)
+    if first_data_row is None:
+        return replace(
+            region,
+            header_intent="automatic",
+            first_data_row=None,
+            preamble_rows=0,
+        )
+    last_data_row = max_row - region.footer_rows
+    if first_data_row < min_row or first_data_row > last_data_row:
+        raise ValueError(
+            f"data start must be between rows {min_row} and {last_data_row}"
+        )
+    return replace(
+        region,
+        header_intent=("no_header" if first_data_row == min_row else "first_data_row"),
+        first_data_row=(None if first_data_row == min_row else first_data_row),
+        preamble_rows=0,
+    )
+
+
+def set_region_footer_rows(region: RegionDecision, footer_rows: int) -> RegionDecision:
+    """Set a footer count without allowing it to consume the data band."""
+    min_row, _min_col, max_row, _max_col = parse_a1_range(region.current_range)
+    if footer_rows < 0:
+        raise ValueError("footer rows cannot be negative")
+    data_start = (
+        region.first_data_row
+        if region.header_intent == "first_data_row"
+        and region.first_data_row is not None
+        else min_row
+        if region.header_intent == "no_header"
+        else min_row + region.preamble_rows
+    )
+    if footer_rows > max_row - data_start:
+        raise ValueError("footer rows must leave at least one data row")
+    return replace(region, footer_rows=footer_rows)
+
+
+def effective_region_data_range(
+    region: RegionDecision, *, outer_range: str | None = None
+) -> str | None:
+    """Project the region's relative data boundaries onto one side's range."""
+    current_min_row, _current_min_col, _current_max_row, _current_max_col = (
+        parse_a1_range(region.current_range)
+    )
+    min_row, min_col, max_row, max_col = parse_a1_range(
+        outer_range or region.current_range
+    )
+    if region.header_intent == "first_data_row" and region.first_data_row is not None:
+        data_min_row = min_row + (region.first_data_row - current_min_row)
+    elif region.header_intent == "no_header":
+        data_min_row = min_row
+    elif region.preamble_rows > 0:
+        data_min_row = min_row + region.preamble_rows
+    else:
+        return None
+    data_max_row = max_row - region.footer_rows
+    if data_min_row > data_max_row:
+        return None
+    return format_a1_range(data_min_row, min_col, data_max_row, max_col)
+
+
 def region_with_bounds(
     region: RegionDecision, *, min_row: int, min_col: int, max_row: int, max_col: int
 ) -> RegionDecision:
@@ -1403,11 +1503,33 @@ def region_with_bounds(
     dropped (it no longer names a real column); mode, header intent,
     exclusion detail, and confirmed all survive unchanged.
     """
+    old_min_row, _old_min_col, _old_max_row, _old_max_col = parse_a1_range(
+        region.current_range
+    )
+    first_data_row = (
+        region.first_data_row + (min_row - old_min_row)
+        if region.header_intent == "first_data_row"
+        and region.first_data_row is not None
+        else None
+    )
+    preamble_rows = (
+        region.preamble_rows
+        if region.header_intent not in {"no_header", "first_data_row"}
+        else 0
+    )
+    data_start = first_data_row or min_row + preamble_rows
+    if data_start > max_row - region.footer_rows:
+        raise ValueError(
+            "the resized range must leave at least one data row after "
+            "header and footer boundaries"
+        )
     columns = _region_columns(min_col, max_col)
     return replace(
         region,
         anchor_cell=f"{get_column_letter(min_col)}{min_row}",
         current_range=format_a1_range(min_row, min_col, max_row, max_col),
+        first_data_row=first_data_row,
+        preamble_rows=preamble_rows,
         available_columns=columns,
         identity_columns=tuple(c for c in region.identity_columns if c in columns),
         ordinal_columns=tuple(c for c in region.ordinal_columns if c in columns),
@@ -1507,7 +1629,13 @@ def unresolved_blockers(
     for member in state.member_reviews:
         for sheet in member.current_sheets:
             for region in sheet.regions:
-                if region.mode == "excluded" and region.exclusion_reason and _is_expired(
+                if region.ranked_candidate_pending and region.mode == "automatic":
+                    blockers.append(
+                        f"{sheet.sheet_name!r} {region.current_range}: choose "
+                        "Match rows by key, Compare by position, or Exclude "
+                        "before running"
+                    )
+                elif region.mode == "excluded" and region.exclusion_reason and _is_expired(
                     region.exclusion_expires_on
                 ):
                     blockers.append(
@@ -1531,6 +1659,36 @@ def unresolved_blockers(
                         "finish configuring this region before continuing"
                     )
     return tuple(blockers)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceReadiness:
+    """One immutable decision used by both final-action rendering and handlers."""
+
+    ready: bool
+    blockers: tuple[str, ...]
+
+
+def compute_workspace_readiness(
+    state: ConfigWorkspaceState,
+    warnings: tuple[WarningItem, ...],
+    *,
+    setup_complete: bool,
+    expected_excel_member_ids: frozenset[str],
+    ppt_required: bool,
+) -> WorkspaceReadiness:
+    """Require terminal setup plus an exact, fully hydrated artifact review."""
+    blockers = list(unresolved_blockers(state, warnings))
+    if not setup_complete:
+        blockers.append("Setup analysis is not complete")
+    actual_member_ids = {member.member_id for member in state.member_reviews}
+    for member_id in sorted(expected_excel_member_ids - actual_member_ids):
+        blockers.append(f"missing required Excel member review: {member_id}")
+    for member_id in sorted(actual_member_ids - expected_excel_member_ids):
+        blockers.append(f"stale Excel member review: {member_id}")
+    if ppt_required and state.deck_review is None:
+        blockers.append("PowerPoint review is not ready")
+    return WorkspaceReadiness(ready=not blockers, blockers=tuple(blockers))
 
 
 def _resolved_column(region: RegionDecision, letter: str) -> ResolvedColumn:
@@ -1618,6 +1776,26 @@ def _resolved_region(
     baseline_outer_range = region.baseline_range or (
         baseline_region.current_range if baseline_region is not None else None
     )
+    current_first_data_row = (
+        region.first_data_row if region.header_intent == "first_data_row" else None
+    )
+    current_preamble_rows = (
+        region.preamble_rows
+        if region.header_intent not in {"no_header", "first_data_row"}
+        else 0
+    )
+    current_outer_top = parse_a1_range(region.current_range)[0]
+    baseline_outer_top = (
+        parse_a1_range(baseline_outer_range)[0]
+        if baseline_outer_range is not None
+        else None
+    )
+    baseline_first_data_row = (
+        baseline_outer_top + (current_first_data_row - current_outer_top)
+        if baseline_outer_top is not None
+        and current_first_data_row is not None
+        else None
+    )
     return ResolvedRegion(
         region_id=region.region_id,
         mode=region.mode,
@@ -1626,17 +1804,11 @@ def _resolved_region(
         current_outer_range=region.current_range,
         baseline_data_range=baseline_outer_range,
         current_data_range=region.current_range,
-        baseline_first_data_row=(
-            baseline_region.first_data_row if baseline_region is not None else None
-        ),
-        current_first_data_row=region.first_data_row,
-        baseline_preamble_rows=(
-            baseline_region.preamble_rows if baseline_region is not None else region.preamble_rows
-        ),
-        current_preamble_rows=region.preamble_rows,
-        baseline_footer_rows=(
-            baseline_region.footer_rows if baseline_region is not None else region.footer_rows
-        ),
+        baseline_first_data_row=baseline_first_data_row,
+        current_first_data_row=current_first_data_row,
+        baseline_preamble_rows=current_preamble_rows,
+        current_preamble_rows=current_preamble_rows,
+        baseline_footer_rows=region.footer_rows,
         current_footer_rows=region.footer_rows,
         columns=columns,
         duplicate_key_policy=region.duplicate_key_policy,

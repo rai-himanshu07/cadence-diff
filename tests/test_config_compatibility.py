@@ -7,6 +7,7 @@ Plan: docs/plans/plan-20260913-mode-aware-configuration-wizard.md, Step 4.
 from __future__ import annotations
 
 import datetime as dt
+from typing import Literal
 
 from qc_tool.config.input_contract import (
     LogicalMemberContract,
@@ -21,6 +22,14 @@ from qc_tool.config.profile import (
     FindingWaiver,
     NumericTolerance,
     SheetProfile,
+)
+from qc_tool.config.resolved_input import (
+    ResolvedColumn,
+    ResolvedInputConfigurationV1,
+    ResolvedMember,
+    ResolvedRegion,
+    ResolvedSelector,
+    ResolvedSheet,
 )
 from qc_tool.findings import Finding, FindingClass, LogicalFindingAddress, Severity
 from qc_tool.history.config_compatibility import (
@@ -64,6 +73,61 @@ def _crosscheck_finding() -> Finding:
         finding_class=FindingClass.CROSSCHECK_MISMATCH,
         severity=Severity.CRITICAL,
         message="changed",
+    )
+
+
+def _resolved(
+    *,
+    mode: Literal["automatic", "keyed", "positional", "excluded"] = "keyed",
+    baseline_sheet: str = "Data 2025",
+    current_sheet: str = "Data 2026",
+    baseline_letter: str = "A",
+    current_letter: str = "A",
+    selector_formula_backed: bool = False,
+    baseline_hash: str = "a" * 64,
+    current_hash: str = "b" * 64,
+) -> ResolvedInputConfigurationV1:
+    return ResolvedInputConfigurationV1(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                baseline_source_sha256=baseline_hash,
+                current_source_sha256=current_hash,
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="ledger",
+                        baseline_sheet_name=baseline_sheet,
+                        current_sheet_name=current_sheet,
+                        regions=(
+                            ResolvedRegion(
+                                region_id="r1",
+                                mode=mode,
+                                baseline_outer_range="A1:B10",
+                                current_outer_range="A1:B10",
+                                columns=(
+                                    ResolvedColumn(
+                                        column_id="account",
+                                        baseline_letter=baseline_letter,
+                                        current_letter=current_letter,
+                                        alignment_role="identity",
+                                    ),
+                                ),
+                            ),
+                        ),
+                        selectors=(
+                            ResolvedSelector(
+                                selector_id="scenario",
+                                baseline_cell="B2",
+                                current_cell="B2",
+                                equal=True,
+                                baseline_formula_backed=selector_formula_backed,
+                                current_formula_backed=selector_formula_backed,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
     )
 
 
@@ -345,3 +409,76 @@ def test_compatible_compare_findings_is_a_true_delta_when_nothing_scope_related_
     assert delta.persisting == 1
     assert delta.new == 1
     assert delta.resolved == 0
+
+
+def test_run_only_region_mode_change_makes_logical_scope_not_comparable() -> None:
+    profile = DeliverableProfile(name="monthly")
+    finding = _excel_finding(
+        logical_address=LogicalFindingAddress(
+            member_id="primary", sheet_id="ledger", region_id="r1"
+        )
+    )
+    compatibility = configuration_compatible(
+        profile,
+        profile,
+        previous_resolved=_resolved(mode="keyed"),
+        current_resolved=_resolved(mode="positional"),
+    )
+
+    assert not compatibility.comparable(finding)
+
+
+def test_source_hash_and_physical_movement_do_not_break_logical_comparability() -> None:
+    profile = DeliverableProfile(name="monthly")
+    finding = _excel_finding(
+        logical_address=LogicalFindingAddress(
+            member_id="primary",
+            sheet_id="ledger",
+            region_id="r1",
+            column_id="account",
+        )
+    )
+    compatibility = configuration_compatible(
+        profile,
+        profile,
+        previous_resolved=_resolved(),
+        current_resolved=_resolved(
+            baseline_sheet="Renamed baseline",
+            current_sheet="Renamed current",
+            baseline_letter="C",
+            current_letter="D",
+            baseline_hash="c" * 64,
+            current_hash="d" * 64,
+        ),
+    )
+
+    assert compatibility.comparable(finding)
+
+
+def test_selector_fact_change_makes_its_sheet_not_comparable() -> None:
+    profile = DeliverableProfile(name="monthly")
+    finding = _excel_finding(
+        logical_address=LogicalFindingAddress(
+            member_id="primary", sheet_id="ledger"
+        )
+    )
+    compatibility = configuration_compatible(
+        profile,
+        profile,
+        previous_resolved=_resolved(selector_formula_backed=False),
+        current_resolved=_resolved(selector_formula_backed=True),
+    )
+
+    assert not compatibility.comparable(finding)
+
+
+def test_mixed_legacy_and_resolved_runs_are_not_comparable() -> None:
+    profile = DeliverableProfile(name="monthly")
+    compatibility = configuration_compatible(
+        profile,
+        profile,
+        previous_resolved=None,
+        current_resolved=_resolved(),
+    )
+
+    assert not compatibility.comparable(_excel_finding())

@@ -20,6 +20,7 @@ from qc_tool.report.json_report import result_payload
 from qc_tool.review import build_pattern_groups
 from qc_tool.scope import ComparisonScope
 from qc_tool.triage.rules import triage
+from tests.fixtures.xlsb_writer import write_xlsb
 
 
 def _write_pair(tmp_path: Path) -> tuple[Path, Path]:
@@ -100,6 +101,24 @@ def test_peek_sheet_visibility_reports_hidden_and_very_hidden(tmp_path: Path) ->
     very_hidden_sheet.sheet_state = "veryHidden"
     path = tmp_path / "visibility.xlsx"
     workbook.save(path)
+
+    assert peek_sheet_visibility(path) == {
+        "Visible": "visible",
+        "Hidden": "hidden",
+        "VeryHidden": "veryHidden",
+    }
+
+
+def test_peek_sheet_visibility_reports_xlsb_states(tmp_path: Path) -> None:
+    path = tmp_path / "visibility.xlsb"
+    write_xlsb(
+        path,
+        {"Visible": [[1]], "Hidden": [[2]], "VeryHidden": [[3]]},
+        sheet_visibility={
+            "Hidden": "hidden",
+            "VeryHidden": "veryHidden",
+        },
+    )
 
     assert peek_sheet_visibility(path) == {
         "Visible": "visible",

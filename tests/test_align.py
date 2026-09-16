@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
+import qc_tool.excel.align as align_module
 from qc_tool.config.execution import ExecutionBindings
 from qc_tool.config.profile import DeliverableProfile
 from qc_tool.config.resolved_input import (
@@ -593,6 +594,56 @@ def test_without_confirmed_column_mapping_a_moved_column_is_positional(
     region = _single_region(alignment, "Data")
     assert dict(region.columns.pairs) == {1: 1, 2: 2, 3: 3}
     assert region.columns.moved_pairs == ()
+
+
+def test_excluded_region_cannot_reappear_as_unpaired_structure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline_path, current_path = _write_column_moved_pair(tmp_path)
+    base_snapshot = load_workbook_snapshot(baseline_path)
+    curr_snapshot = load_workbook_snapshot(current_path)
+    resolved = ResolvedInputConfigurationV1(
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        baseline_sheet_name="Data",
+                        current_sheet_name="Data",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="excluded",
+                                mode="excluded",
+                                baseline_outer_range="A1:C3",
+                                current_outer_range="A1:C3",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+
+    monkeypatch.setattr(
+        align_module,
+        "_pair_regions",
+        lambda _base, _curr, base_regions, curr_regions: (
+            [],
+            base_regions,
+            curr_regions,
+        ),
+    )
+    alignment = align_workbooks(
+        base_snapshot,
+        curr_snapshot,
+        execution_bindings=ExecutionBindings(resolved),
+    )
+
+    assert alignment.regions["Data"] == []
+    assert alignment.unpaired_baseline_regions == []
+    assert alignment.unpaired_current_regions == []
+    assert len(alignment.excluded_current_regions) == 1
 
 
 def test_confirmed_column_mapping_changes_what_run_qc_actually_compares(

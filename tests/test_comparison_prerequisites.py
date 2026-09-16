@@ -22,6 +22,8 @@ from qc_tool.config.profile import (
 )
 from qc_tool.coverage import QCRunMode
 from qc_tool.engine import run_qc
+from qc_tool.excel.prerequisites import evaluate_resolved_selectors
+from qc_tool.io.model import CellRecord, SheetSnapshot, WorkbookSnapshot
 from qc_tool.package import PackageArtifact, PackageManifest, PackageMember, PackageSide
 from qc_tool.run_action import RunActionReason, RunBlockedError
 
@@ -229,7 +231,9 @@ def test_perform_run_writes_no_history_or_reports_when_blocked(tmp_path: Path) -
     assert not runs_dir.exists() or not any(runs_dir.iterdir())
 
 
-def _resolved_configuration_with_selector():
+def _resolved_configuration_with_selector(
+    member_id: str = "primary",
+):
     from qc_tool.config.resolved_input import (
         ResolvedInputConfigurationV1,
         ResolvedMember,
@@ -241,7 +245,7 @@ def _resolved_configuration_with_selector():
         mode=QCRunMode.CYCLE_COMPARISON,
         members=(
             ResolvedMember(
-                member_id="primary",
+                member_id=member_id,
                 sheets=(
                     ResolvedSheet(
                         sheet_id="config",
@@ -279,7 +283,55 @@ def test_matching_resolved_selector_does_not_block(tmp_path: Path) -> None:
         resolved_input_configuration=_resolved_configuration_with_selector(),
     )
 
-    assert result is not None
+    assert result.resolved_input_configuration is not None
+    [member] = result.resolved_input_configuration.members
+    [sheet] = member.sheets
+    [selector] = sheet.selectors
+    assert selector.equal is True
+    assert selector.baseline_formula_backed is False
+    assert selector.current_formula_backed is False
+    assert result.resolved_input_digest == (
+        result.resolved_input_configuration.canonical_sha256()
+    )
+
+
+def test_selector_outcome_records_formula_presence_without_values() -> None:
+    def workbook(value: str, *, formula: bool) -> WorkbookSnapshot:
+        cell = CellRecord(
+            row=2,
+            column=2,
+            value=value,
+            formula="=A1" if formula else None,
+            is_formula=formula,
+        )
+        return WorkbookSnapshot(
+            source_name="synthetic",
+            file_format="xlsx",
+            formulas_available=True,
+            styles_available=True,
+            sheets=[
+                SheetSnapshot(
+                    name="Config",
+                    visibility="visible",
+                    max_row=2,
+                    max_column=2,
+                    cells={(2, 2): cell},
+                )
+            ],
+        )
+
+    outcomes, mismatches = evaluate_resolved_selectors(
+        workbook("Base Case", formula=True),
+        workbook("Base Case", formula=False),
+        _resolved_configuration_with_selector(),
+    )
+
+    assert mismatches == []
+    [outcome] = outcomes
+    assert outcome.equal is True
+    assert outcome.baseline_formula_backed is True
+    assert outcome.current_formula_backed is False
+    assert "Base Case" not in repr(outcome)
 
 
 def test_mismatched_resolved_selector_blocks_before_analysis(tmp_path: Path) -> None:
@@ -303,3 +355,39 @@ def test_mismatched_resolved_selector_blocks_before_analysis(tmp_path: Path) -> 
     serialized = action.model_dump_json()
     assert "Base Case" not in serialized
     assert "Upside Case" not in serialized
+
+
+def test_multi_member_resolved_selector_is_enforced_for_its_owner(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "baseline.xlsx"
+    current = tmp_path / "current.xlsx"
+    _book(baseline, "Base Case")
+    _book(current, "Upside Case")
+    manifest = PackageManifest(
+        members=(
+            _package_member("ops", PackageSide.BASELINE, "baseline.xlsx"),
+            _package_member("ops", PackageSide.CURRENT, "current.xlsx"),
+        )
+    )
+
+    with pytest.raises(RunBlockedError) as excinfo:
+        run_qc(
+            package_manifest=manifest,
+            package_files={
+                "baseline_excel:ops": baseline,
+                "current_excel:ops": current,
+            },
+            profile=DeliverableProfile(
+                name="package",
+                excel=ExcelProfile(members={"ops": ExcelMemberProfile()}),
+            ),
+            mode=QCRunMode.CYCLE_COMPARISON,
+            resolved_input_configuration=_resolved_configuration_with_selector("ops"),
+        )
+
+    assert (
+        excinfo.value.action_required.reason
+        is RunActionReason.COMPARISON_PREREQUISITE_MISMATCH
+    )
+    assert excinfo.value.action_required.items[0].member_id == "ops"

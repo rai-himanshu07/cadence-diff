@@ -955,6 +955,42 @@ def test_latest_terminal_survives_refresh_and_ignores_active_requests(
     assert latest.status is RunStatus.BLOCKED
 
 
+def test_delete_terminal_attempt_refuses_active_and_completed_requests(
+    tmp_path: Path,
+) -> None:
+    store = RunStateStore(tmp_path / "history.sqlite3")
+    blocked = store.enqueue(
+        "blocked-request",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        files={},
+        queue_position=0,
+    )
+    store.finalize_blocked(blocked.request_id, {"reason": "needs_review"})
+    active = store.enqueue(
+        "active-request",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        files={},
+        queue_position=1,
+    )
+    completed = store.enqueue(
+        "completed-request",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        files={},
+        queue_position=2,
+    )
+    store.finish(completed.request_id, RunStatus.SUCCEEDED, run_id=7)
+
+    assert store.delete_terminal_attempt(blocked.request_id)
+    assert store.get(blocked.request_id) is None
+    assert not store.delete_terminal_attempt(active.request_id)
+    assert store.get(active.request_id) is not None
+    assert not store.delete_terminal_attempt(completed.request_id)
+    assert store.get(completed.request_id) is not None
+
+
 def test_run_state_migrates_a_legacy_table_missing_action_required(
     tmp_path: Path,
 ) -> None:

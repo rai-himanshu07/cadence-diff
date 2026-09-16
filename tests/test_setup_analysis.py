@@ -9,8 +9,10 @@ from __future__ import annotations
 import random
 from unittest.mock import patch
 
+import qc_tool.excel.complexity as complexity_module
+from qc_tool.excel.regions import TableRegion
 from qc_tool.io.model import CellRecord, CellValue, SheetSnapshot, WorkbookSnapshot
-from qc_tool.setup.analysis import analyze_member
+from qc_tool.setup.analysis import StreamingMemberAnalyzer, analyze_member
 
 _LARGE_N = 6000
 
@@ -146,6 +148,26 @@ def test_analyze_member_ranked_candidate_not_evaluated_when_region_counts_differ
     assert current_region.ranked_candidate is None
 
 
+def test_analyze_member_does_not_screen_non_block_regions() -> None:
+    sheet = _sheet("Data", [["Period", "Value"], ["2026-01", 1]])
+    wide_region = TableRegion("Data", 1, 1, 2, 2, "wide", 1, 1, "columns")
+
+    with (
+        patch("qc_tool.setup.analysis.detect_regions", return_value=[wide_region]),
+        patch("qc_tool.setup.analysis.detect_ranked_table_candidate") as detector,
+    ):
+        profile = analyze_member(
+            member_id="primary",
+            baseline=_workbook(sheet),
+            current=_workbook(sheet),
+            baseline_hash="a" * 64,
+            current_hash="b" * 64,
+        )
+
+    assert profile.current_sheets[0].regions[0].ranked_candidate is None
+    detector.assert_not_called()
+
+
 def test_analyze_member_isolates_a_single_sheet_detector_failure() -> None:
     good_sheet = _sheet("Good", [["x"], ["y"]])
     bad_sheet = _sheet("Bad", [["x"]])
@@ -184,6 +206,34 @@ def test_analyze_member_computes_a_workload_forecast_for_both_sides() -> None:
     assert profile.baseline_complexity.formula_count == 1
     assert profile.current_complexity is not None
     assert profile.current_complexity.formula_count == 1
+
+
+def test_streaming_complexity_recomputes_warnings_across_sheets() -> None:
+    analyzer = StreamingMemberAnalyzer(
+        member_id="primary",
+        baseline_hash="a" * 64,
+        current_hash="b" * 64,
+    )
+    with patch.object(
+        complexity_module,
+        "_COMPLEXITY_LIMITS",
+        (("formula_count", 3, 10, "formula cells"),),
+    ):
+        for index in range(2):
+            analyzer.add_baseline(
+                _sheet(
+                    f"Data{index}",
+                    [[1], [2]],
+                    formulas={(1, 1): "=A1", (2, 1): "=A1"},
+                )
+            )
+        profile = analyzer.result()
+
+    assert profile.baseline_complexity is not None
+    assert profile.baseline_complexity.formula_count == 4
+    assert profile.baseline_complexity.warning_reasons == (
+        "formula cells 4 >= warning limit 3",
+    )
 
 
 def test_analyze_member_workload_forecast_failure_disables_only_the_forecast() -> None:

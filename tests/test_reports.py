@@ -303,6 +303,69 @@ def test_html_report_renders_a_renamed_sheet_alias_beside_the_physical_name() ->
     assert "Revenue FY26 (renamed from Revenue FY25)" in html
 
 
+def test_human_reports_include_resolved_digest_and_value_free_summary(
+    tmp_path: Path,
+) -> None:
+    from openpyxl import load_workbook
+
+    from qc_tool.config.resolved_input import (
+        ResolvedInputConfigurationV1,
+        ResolvedMember,
+        ResolvedRegion,
+        ResolvedSelector,
+        ResolvedSheet,
+    )
+
+    resolved = ResolvedInputConfigurationV1(
+        warnings_acknowledged=("low-overlap",),
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="r1",
+                                mode="excluded",
+                                coverage="excluded",
+                            ),
+                        ),
+                        selectors=(
+                            ResolvedSelector(selector_id="scenario", equal=True),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    result = QCRunResult(
+        profile_name="test",
+        resolved_input_configuration=resolved,
+        resolved_input_digest=resolved.canonical_sha256(),
+    )
+    excel_path = tmp_path / "report.xlsx"
+
+    write_excel_report(result, excel_path)
+    html = render_html_report(result)
+
+    workbook = load_workbook(excel_path, read_only=True)
+    summary = {
+        row[0].value: row[1].value
+        for row in workbook["Summary"].iter_rows(min_col=1, max_col=2)
+    }
+    assert summary["Resolved input digest"] == resolved.canonical_sha256()
+    assert summary["Configured members"] == "1"
+    assert summary["Configured sheets"] == "1"
+    assert summary["Configured regions"] == "1"
+    assert summary["Configured selectors"] == "1"
+    assert summary["Excluded regions"] == "1"
+    assert "Resolved configuration" in html
+    assert resolved.canonical_sha256() in html
+    assert "members: 1" in html
+    assert "selectors: 1" in html
+
+
 def test_html_report_population_column(tmp_path: Path) -> None:
     from qc_tool.findings import MembershipCodec, PopulationEvidence
 

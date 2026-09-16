@@ -35,7 +35,7 @@ def peek_sheet_names(path: Path) -> list[str]:
 
             with zipfile.ZipFile(path) as archive:
                 data = archive.read("xl/workbook.bin")
-            return [name for name, _ in _workbook_sheets(data)]
+            return [name for name, _relationship_id, _visibility in _workbook_sheets(data)]
     except Exception as exc:
         logger.info("sheet peek unavailable for %s: %s", path.name, exc)
     return []
@@ -43,14 +43,21 @@ def peek_sheet_names(path: Path) -> list[str]:
 
 def peek_sheet_visibility(path: Path) -> dict[str, str]:
     """Worksheet name -> ``"visible"``/``"hidden"``/``"veryHidden"`` for an
-    xlsx/xlsm workbook, or {} when unreadable or unsupported (xlsb: the
-    full structural scan already reports visibility via
-    ``SheetSnapshot.visibility`` regardless of this lightweight peek path).
+    xlsx/xlsm/xlsb workbook, or {} when unreadable or unsupported.
     """
     suffix = path.suffix.lower()
-    if suffix not in (".xlsx", ".xlsm"):
-        return {}
     try:
+        if suffix == ".xlsb":
+            from qc_tool.io.xlsb_formula import _workbook_sheets
+
+            with zipfile.ZipFile(path) as archive:
+                data = archive.read("xl/workbook.bin")
+            return {
+                name: visibility
+                for name, _relationship_id, visibility in _workbook_sheets(data)
+            }
+        if suffix not in (".xlsx", ".xlsm"):
+            return {}
         with zipfile.ZipFile(path) as archive:
             root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
         return {

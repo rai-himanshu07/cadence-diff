@@ -12,6 +12,7 @@ import random
 
 import pytest
 
+import qc_tool.excel.ranked_identity as ranked_identity_module
 from qc_tool.excel.ranked_identity import (
     MIN_DATA_ROWS,
     MIN_MISMATCH_REDUCTION,
@@ -89,6 +90,31 @@ def test_unshuffled_identical_order_is_not_suggested() -> None:
 
     # Positional alignment is already correct; nothing displaced to fix.
     assert detect_ranked_table_candidate(sheet, sheet, region, region) is None
+
+
+def test_candidate_combinations_reuse_normalized_column_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = 30
+    columns = 12
+    values: list[list[CellValue]] = [
+        [f"key-{column}-{row}" for column in range(columns)]
+        for row in range(rows)
+    ]
+    sheet = _sheet(values)
+    region = _region(rows, columns)
+    original = ranked_identity_module._key_component
+    calls = 0
+
+    def counted(value: CellValue) -> object:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(ranked_identity_module, "_key_component", counted)
+
+    assert detect_ranked_table_candidate(sheet, sheet, region, region) is None
+    assert calls == rows * columns * 2
 
 
 def test_below_minimum_row_count_never_suggests() -> None:
@@ -318,6 +344,34 @@ def test_duplicate_single_column_needs_a_composite_key() -> None:
     # Column order reflects a screening heuristic, not semantics -- both
     # columns are required together, in either order.
     assert set(candidate.columns) == {1, 2}
+
+
+def test_position_stable_unique_column_does_not_hide_a_displaced_composite() -> None:
+    n = _LARGE_N
+    half = n // 2
+    base_rows = [
+        [
+            f"Position{i}",
+            f"Team {'A' if i < half else 'B'}",
+            f"Member{i % half}",
+            100.0 + i,
+            200.0 + i * 2,
+            300.0 - i,
+        ]
+        for i in range(n)
+    ]
+    curr_rows = [list(row) for row in base_rows]
+    random.Random(7).shuffle(curr_rows)
+    for position, row in enumerate(curr_rows):
+        row[0] = f"Position{position}"
+    base_sheet = _sheet(base_rows)
+    curr_sheet = _sheet(curr_rows)
+    region = _region(n, 6)
+
+    candidate = detect_ranked_table_candidate(base_sheet, curr_sheet, region, region)
+
+    assert candidate is not None
+    assert set(candidate.columns) == {2, 3}
 
 
 def test_large_absolute_noise_reduction_survives_genuine_changes() -> None:

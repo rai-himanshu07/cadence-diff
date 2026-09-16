@@ -16,6 +16,7 @@ from typing import Literal
 import pytest
 from openpyxl import Workbook
 
+import qc_tool.engine as engine_module
 from qc_tool.config.resolved_input import (
     ResolvedColumn,
     ResolvedInputConfigurationV1,
@@ -224,6 +225,120 @@ def test_run_qc_without_resolved_configuration_stays_legacy(tmp_path: Path) -> N
     assert FindingClass.SHEET_RENAMED not in classes
     assert classes.count(FindingClass.SHEET_ADDED) == 1
     assert classes.count(FindingClass.SHEET_REMOVED) == 1
+
+
+def _resolved_region_mode(mode: Literal["positional", "excluded"]):
+    return ResolvedInputConfigurationV1(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        baseline_sheet_name="Data",
+                        current_sheet_name="Data",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="data_a1_c5",
+                                mode=mode,
+                                baseline_outer_range="A1:C5",
+                                current_outer_range="A1:C5",
+                                baseline_data_range="A1:C5",
+                                current_data_range="A1:C5",
+                                coverage=(
+                                    "positional"
+                                    if mode == "positional"
+                                    else "excluded"
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _write_region_mode_pair(tmp_path: Path) -> tuple[Path, Path]:
+    baseline_path = tmp_path / "baseline.xlsx"
+    current_path = tmp_path / "current.xlsx"
+    baseline = Workbook()
+    baseline_sheet = baseline.active
+    assert baseline_sheet is not None
+    baseline_sheet.title = "Data"
+    baseline_sheet.append(["ID", "Value", "Formula"])
+    for index in range(4):
+        baseline_sheet.append([f"K{index}", index, f"=B{index + 2}*2"])
+    baseline.save(baseline_path)
+    current = Workbook()
+    current_sheet = current.active
+    assert current_sheet is not None
+    current_sheet.title = "Data"
+    current_sheet.append(["ID", "Value", "Formula"])
+    for index in reversed(range(4)):
+        current_sheet.append(
+            [
+                f"K{index}",
+                index + (10 if index == 2 else 0),
+                "#REF!" if index == 1 else f"=B{5 - index}*3",
+            ]
+        )
+    current.save(current_path)
+    return baseline_path, current_path
+
+
+def test_explicit_positional_region_skips_ranked_screening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline_path, current_path = _write_region_mode_pair(tmp_path)
+
+    def ranked_screen_must_not_run(*_args, **_kwargs):
+        raise AssertionError("explicit positional regions must not be screened")
+
+    monkeypatch.setattr(
+        engine_module,
+        "detect_ranked_table_candidate",
+        ranked_screen_must_not_run,
+    )
+
+    result = run_qc(
+        baseline_excel=baseline_path,
+        current_excel=current_path,
+        mode=QCRunMode.CYCLE_COMPARISON,
+        resolved_input_configuration=_resolved_region_mode("positional"),
+    )
+
+    assert result.alignment_trust is not None
+    assert any(
+        region.row.method == "positional"
+        for region in result.alignment_trust.regions
+    )
+
+
+def test_excluded_region_produces_no_region_findings_and_discloses_scope(
+    tmp_path: Path,
+) -> None:
+    baseline_path, current_path = _write_region_mode_pair(tmp_path)
+
+    result = run_qc(
+        baseline_excel=baseline_path,
+        current_excel=current_path,
+        mode=QCRunMode.CYCLE_COMPARISON,
+        resolved_input_configuration=_resolved_region_mode("excluded"),
+    )
+
+    assert not any(
+        finding.sheet == "Data" and finding.location
+        for finding in result.findings
+    )
+    exclusion = next(
+        item
+        for item in result.coverage
+        if item.check_id == "excel-configured-region-exclusions"
+    )
+    assert exclusion.state.value == "not_included"
+    assert exclusion.findings == 1
 
 
 def test_resolved_ignore_and_expected_refresh_columns_reach_the_value_diff(

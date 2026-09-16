@@ -9,6 +9,7 @@ localhost; sources are read-only. The visual language lives in
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import datetime as dt
 import html
@@ -28,6 +29,7 @@ from fastapi import HTTPException
 from nicegui import app, events, ui
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
+from starlette.responses import RedirectResponse
 
 from qc_tool.config.editor import source_sha256
 from qc_tool.config.lint import lint_profile
@@ -50,6 +52,7 @@ from qc_tool.config.promotion import (
     available_promotions,
     promote_finding,
 )
+from qc_tool.config.resolved_input import ResolvedInputConfigurationV1
 from qc_tool.coverage import (
     CoverageItem,
     CoverageState,
@@ -90,7 +93,7 @@ from qc_tool.history.carry_forward import (
     preview_carry_forward,
 )
 from qc_tool.history.config_compatibility import compatible_compare_findings
-from qc_tool.history.config_session import ConfigSessionStore, session_key_for
+from qc_tool.history.config_session import ConfigSessionConflictError, ConfigSessionStore
 from qc_tool.history.review_state import AnnotationLineageOutcome
 from qc_tool.history.run_state import RunStateRecord, RunStatus
 from qc_tool.history.store import RunHistory, RunRecord, export_runs_archive, sha256_file
@@ -170,6 +173,8 @@ from qc_tool.server_config import (
     local_config,
     save_server_config,
 )
+from qc_tool.setup.coordinator import SetupCoordinatorStore, get_setup_coordinator
+from qc_tool.setup.preview_store import SetupScanStore
 from qc_tool.shortcut import (
     ShortcutState,
     install_shortcut,
@@ -190,6 +195,7 @@ from qc_tool.ui.config_review import (
     input_contract_from_resolved_configuration,
     summarize_contract_promotion,
 )
+from qc_tool.ui.credential_vault import CredentialVault
 from qc_tool.ui.guide import render_guide
 from qc_tool.ui.profile_editor import ProfileEditorController, open_profile_editor
 from qc_tool.ui.ranked_table_dialog import (
@@ -380,6 +386,8 @@ class SessionState:
     available_slides: list[tuple[int, str]] = field(default_factory=list)
     rerun_of: int | None = None
     rerun_required: frozenset[str] = frozenset()  # roles the previous run used
+    config_session_id: str | None = None
+    config_session_revision: int | None = None
     # Package/manifest aware session state
     package_manifest: PackageManifest | None = None
     selected_member_sheets: dict[str, set[str]] = field(default_factory=dict)
@@ -420,10 +428,13 @@ def _rerun_profile_choice(
     return options, "default", None
 
 
-_TEMPORARY_PROFILE_SUFFIX = " (temporary)"
+_TEMPORARY_PROFILE_SUFFIX = " - temporary"
+_LEGACY_TEMPORARY_PROFILE_SUFFIX = " (temporary)"
 
 
 def _temporary_profile_name(name: str) -> str:
+    if name.endswith(_LEGACY_TEMPORARY_PROFILE_SUFFIX):
+        name = name.removesuffix(_LEGACY_TEMPORARY_PROFILE_SUFFIX)
     return name if name.endswith(_TEMPORARY_PROFILE_SUFFIX) else (
         name + _TEMPORARY_PROFILE_SUFFIX
     )
@@ -438,8 +449,12 @@ def _temporary_row_matching_base(
     if snapshot is not None:
         return snapshot.model_copy(deep=True)
     candidates = [source_profile]
-    if source_profile.endswith(_TEMPORARY_PROFILE_SUFFIX):
-        candidates.append(source_profile.removesuffix(_TEMPORARY_PROFILE_SUFFIX))
+    for suffix in (
+        _TEMPORARY_PROFILE_SUFFIX,
+        _LEGACY_TEMPORARY_PROFILE_SUFFIX,
+    ):
+        if source_profile.endswith(suffix):
+            candidates.append(source_profile.removesuffix(suffix))
     for name in candidates:
         if name == "default":
             return default_profile()
@@ -451,6 +466,27 @@ def _temporary_row_matching_base(
         "The profile used by this blocked attempt is no longer available. "
         "Choose Save to profile and select or create a destination."
     )
+
+
+def _row_matching_choice_updates(
+    view_model: DialogViewModel,
+) -> dict[str, object]:
+    """Primitive pending decisions for Configure & Run to review visibly."""
+    return {
+        "pending_row_matching": [
+            {
+                "member_id": region.member_id,
+                "sheet": region.sheet,
+                "anchor_cell": region.anchor_cell,
+                "current_range": region.current_range,
+                "header_row": region.header_row,
+                "identity_columns": list(region.identity_columns),
+                "ordinal_columns": list(region.ordinal_columns),
+                "duplicate_policy": region.duplicate_policy,
+            }
+            for region in view_model.regions
+        ]
+    }
 
 
 def _set_desktop_focus_preference(
@@ -2653,6 +2689,8 @@ def _rerun_delta(
         record.findings,
         previous_profile=previous.profile_snapshot,
         current_profile=record.profile_snapshot,
+        previous_resolved=previous.resolved_input_configuration,
+        current_resolved=record.resolved_input_configuration,
     )
     note = (
         (
@@ -6265,6 +6303,19 @@ def create_pages(
     profiles_dir = work_dir / "profiles"
     private_directory(uploads_dir)
     private_directory(profiles_dir)
+    credential_vault = CredentialVault()
+    stale_cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=7)
+    ConfigSessionStore(work_dir / "history.sqlite3").delete_stale(stale_cutoff)
+    SetupScanStore(work_dir / "setup-inspection.sqlite3").delete_stale(
+        stale_cutoff
+    )
+    SetupCoordinatorStore(work_dir / "history.sqlite3").delete_stale(
+        stale_cutoff
+    )
+    setup_coordinator = get_setup_coordinator(work_dir)
+    if not setup_coordinator.shutdown_hook_installed:
+        setup_coordinator.shutdown_hook_installed = True
+        app.on_shutdown(setup_coordinator.shutdown)
     # Windows-only, loopback-only, explicit opt-in; off unless all three hold.
     focus_service = FocusService(
         work_dir, enabled=desktop_focus, network_mode=network_mode
@@ -6533,7 +6584,10 @@ def create_pages(
         dialog.open()
 
     @ui.page("/")
-    def main_page(rerun: int | None = None) -> None:  # pyright: ignore[reportUnusedFunction]
+    def main_page(  # pyright: ignore[reportUnusedFunction]
+        rerun: int | None = None,
+        config_session: str = "",
+    ) -> None:
         state = SessionState(
             mode=_initial_mode(app.storage.general.get("qc_mode")),
         )
@@ -6541,6 +6595,84 @@ def create_pages(
         dynamic_member_boxes: dict[str, ui.element] = {}
         add_member_buttons: dict[str, ui.button] = {}
         maybe_prompt_storage_cleanup(offer_history_nav=True)
+
+        resumed_config = (
+            ConfigSessionStore(work_dir / "history.sqlite3").get(config_session)
+            if config_session
+            else None
+        )
+        if resumed_config is not None:
+            resumed_choices = resumed_config.choices
+            raw_files = resumed_choices.get("files")
+            raw_hashes = resumed_choices.get("file_hashes")
+            if isinstance(raw_files, dict) and isinstance(raw_hashes, dict):
+                managed_root = uploads_dir.resolve()
+                for role, raw_path in raw_files.items():
+                    if not isinstance(role, str) or not isinstance(raw_path, str):
+                        continue
+                    expected_hash = raw_hashes.get(role)
+                    if not isinstance(expected_hash, str):
+                        continue
+                    try:
+                        path = Path(raw_path).resolve(strict=True)
+                        path.relative_to(managed_root)
+                    except (OSError, ValueError):
+                        continue
+                    if path.is_file() and sha256_file(path) == expected_hash:
+                        state.files[role] = path
+                        state.file_hashes[role] = expected_hash
+                        state.file_sizes[role] = path.stat().st_size
+            with contextlib.suppress(ValueError):
+                state.mode = QCRunMode(str(resumed_choices.get("mode", state.mode.value)))
+            with contextlib.suppress(ValueError):
+                state.output_mode = FindingOutputMode(
+                    str(resumed_choices.get("output_mode", state.output_mode.value))
+                )
+            state.profile_name = str(
+                resumed_choices.get("profile_name", state.profile_name)
+            )
+            raw_profile_snapshot = resumed_choices.get("profile_snapshot")
+            if isinstance(raw_profile_snapshot, dict):
+                try:
+                    state.profile_override = DeliverableProfile.model_validate(
+                        raw_profile_snapshot
+                    )
+                except ValueError:
+                    state.profile_override = None
+            state.allow_large_workbooks = bool(
+                resumed_choices.get("allow_large_workbooks", False)
+            )
+            state.allow_dependency_indexing = bool(
+                resumed_choices.get("allow_dependency_indexing", False)
+            )
+            raw_acceptance_absolute = resumed_choices.get(
+                "acceptance_absolute", 0.0
+            )
+            if isinstance(raw_acceptance_absolute, int | float) and not isinstance(
+                raw_acceptance_absolute, bool
+            ):
+                state.acceptance_absolute = float(raw_acceptance_absolute)
+            raw_acceptance_percent = resumed_choices.get(
+                "acceptance_percent", 0.0
+            )
+            if isinstance(raw_acceptance_percent, int | float) and not isinstance(
+                raw_acceptance_percent, bool
+            ):
+                state.acceptance_percent = float(raw_acceptance_percent)
+            raw_rerun = resumed_choices.get("rerun_of")
+            state.rerun_of = (
+                raw_rerun
+                if isinstance(raw_rerun, int) and not isinstance(raw_rerun, bool)
+                else None
+            )
+            state.config_session_id = resumed_config.session_id
+            state.config_session_revision = resumed_config.revision
+            for role in state.files:
+                prefix, separator, member_id = role.partition(":")
+                if separator and prefix in {"baseline_excel", "current_excel"}:
+                    side = prefix.removesuffix("_excel")
+                    if member_id not in state.member_order[side]:
+                        state.member_order[side].append(member_id)
 
         rerun_record = None
         if rerun is not None:
@@ -6967,7 +7099,18 @@ def create_pages(
                         render_dynamic_members(group)
             update_mode_surface()
 
-            if rerun_record is not None:
+            if resumed_config is not None:
+                for side in ("baseline", "current"):
+                    render_dynamic_members(side)
+                for role, path in state.files.items():
+                    if role not in file_states:
+                        continue
+                    size = state.file_sizes.get(role, 0)
+                    file_states[role].text = (
+                        f"{path.name} · {max(1, size // 1024):,} KB · restored"
+                    )
+                    file_states[role].classes(add="ok", remove="err")
+            elif rerun_record is not None:
                 for role in rerun_record.file_paths:
                     prefix, separator, member_id = role.partition(":")
                     if not separator or prefix not in {
@@ -7013,10 +7156,21 @@ def create_pages(
             ui.link("Profiles and controls guide →", "/guide#profiles").classes(
                 "guide-jump"
             )
-            profile_options, initial_profile, state.profile_override = (
-                _rerun_profile_choice(rerun_record, list_profiles(profiles_dir))
-            )
-            state.profile_name = initial_profile
+            if resumed_config is not None:
+                profile_options = list_profiles(profiles_dir)
+                if (
+                    state.profile_override is not None
+                    and state.profile_override.name not in profile_options
+                ):
+                    profile_options.append(state.profile_override.name)
+                if state.profile_name not in profile_options:
+                    state.profile_name = "default"
+                initial_profile = state.profile_name
+            else:
+                profile_options, initial_profile, state.profile_override = (
+                    _rerun_profile_choice(rerun_record, list_profiles(profiles_dir))
+                )
+                state.profile_name = initial_profile
 
             def manage_profiles() -> None:
                 """Profile authoring lives here so routine setup stays a selector."""
@@ -7509,11 +7663,12 @@ def create_pages(
                     )
                 queue_row = ui.row().classes("readyqueue")
                 queue_row.visible = False
+                initial_pending = queue_manager.store.pending()
                 latest_terminal = queue_manager.store.latest_terminal()
                 terminal_message: dict[str, str] = {
                     "value": (
                         _terminal_request_summary(latest_terminal)
-                        if latest_terminal is not None
+                        if latest_terminal is not None and not initial_pending
                         else ""
                     )
                 }
@@ -7629,19 +7784,13 @@ def create_pages(
                             action.get("reason")
                             == "row_identity_confirmation_required"
                             and not _ranked_action_needs_refresh(action)
-                            and _open_row_identity_setup(
-                                action,
-                                record.profile,
-                                (
-                                    DeliverableProfile.model_validate(
-                                        record.profile_snapshot
-                                    )
-                                    if record.profile_snapshot is not None
-                                    else None
-                                ),
-                                source_record=record,
-                            )
                         ):
+                            ui.notify(
+                                "QC paused for row matching. Open Configure setup "
+                                "to review the affected regions before running again.",
+                                type="warning",
+                                multi_line=True,
+                            )
                             refresh_readiness()
                             return
                         if (
@@ -7698,9 +7847,15 @@ def create_pages(
                     refresh_readiness()
 
                 def refresh_queue() -> None:
+                    setup_coordinator.evict_terminal(max_age_seconds=60.0)
                     pending = queue_manager.store.pending()
                     lines = [_queue_status_line(record) for record in pending]
                     progress_label.set_text(" || ".join(lines))
+                    if pending:
+                        terminal_outcome.visible = False
+                        terminal_actions.clear()
+                    else:
+                        terminal_outcome.visible = bool(terminal_message["value"])
                     queue_row.visible = (
                         bool(lines)
                         or bool(completed_links.default_slot.children)
@@ -7962,7 +8117,13 @@ def create_pages(
                     )
                     refresh_queue()
 
-                def open_configuration_workspace() -> None:
+                def open_configuration_workspace(
+                    *,
+                    profile_override: DeliverableProfile | None = None,
+                    resolved_override: ResolvedInputConfigurationV1 | None = None,
+                    choice_updates: dict[str, object] | None = None,
+                    reuse_source_session: bool = False,
+                ) -> None:
                     """Create a private configuration session for the
                     currently selected files/profile and hand off to the
                     full-page mode-aware setup review (plan-20260913, Step
@@ -7990,11 +8151,27 @@ def create_pages(
                         for role in files
                         if role in state.file_hashes
                     }
-                    from qc_tool.ui.config_workspace import build_session_choices
+                    from qc_tool.ui.config_workspace import (
+                        build_session_choices,
+                        session_choice_overrides_from_resolved,
+                    )
 
-                    choices = build_session_choices(
+                    effective_profile = (
+                        profile_override or state.profile_override
+                    )
+                    effective_profile_name = (
+                        effective_profile.name
+                        if effective_profile is not None
+                        else state.profile_name
+                    )
+                    recovered_choices = (
+                        session_choice_overrides_from_resolved(resolved_override)
+                        if resolved_override is not None
+                        else {}
+                    )
+                    base_choices = build_session_choices(
                         mode=state.mode,
-                        profile_name=state.profile_name,
+                        profile_name=effective_profile_name,
                         files={role: str(path) for role, path in files.items()},
                         file_hashes=file_hashes,
                         output_mode=state.output_mode.value,
@@ -8003,16 +8180,96 @@ def create_pages(
                         acceptance_absolute=state.acceptance_absolute,
                         acceptance_percent=state.acceptance_percent,
                         rerun_of=state.rerun_of,
+                        profile_snapshot=(
+                            effective_profile.model_dump(mode="json")
+                            if effective_profile is not None
+                            else None
+                        ),
+                        resolved_input_configuration=(
+                            resolved_override.model_dump(mode="json")
+                            if resolved_override is not None
+                            else None
+                        ),
                     )
-                    config_session_key = session_key_for(file_hashes)
-                    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
-                        config_session_key,
-                        profile_name=state.profile_name,
-                        choices=choices,
+                    choice_updates = choice_updates or {}
+                    choices = {
+                        **recovered_choices,
+                        **base_choices,
+                        **choice_updates,
+                    }
+                    config_store = ConfigSessionStore(work_dir / "history.sqlite3")
+                    existing = (
+                        config_store.get(state.config_session_id)
+                        if state.config_session_id is not None
+                        else config_store.latest_for_source_set(file_hashes)
+                        if reuse_source_session
+                        else None
                     )
-                    ui.navigate.to(f"/configure?session={config_session_key}")
+                    if existing is not None:
+                        merged_choices = {
+                            **recovered_choices,
+                            **existing.choices,
+                            **base_choices,
+                            **choice_updates,
+                        }
+                        try:
+                            config_session = config_store.save_choices(
+                                existing.session_id,
+                                profile_name=effective_profile_name,
+                                choices=merged_choices,
+                                expected_revision=(
+                                    state.config_session_revision
+                                    if state.config_session_id
+                                    == existing.session_id
+                                    else existing.revision
+                                ),
+                            )
+                        except ConfigSessionConflictError:
+                            ui.notify(
+                                "This configuration changed in another tab. "
+                                "Reload before continuing.",
+                                type="warning",
+                            )
+                            return
+                    else:
+                        config_session = config_store.create_session(
+                            file_hashes=file_hashes,
+                            profile_name=effective_profile_name,
+                            choices=choices,
+                        )
+                    state.config_session_id = config_session.session_id
+                    state.config_session_revision = config_session.revision
+                    credential_vault.store_bundle(
+                        config_session.session_id,
+                        input_generation=config_session.input_generation,
+                        source_hashes=file_hashes,
+                        credentials={
+                            role: password
+                            for role, password in state.passwords.items()
+                            if role in files and password
+                        },
+                    )
+                    ui.navigate.to(
+                        f"/configure?session={config_session.session_id}"
+                    )
 
                 def _open_complexity_override(record: RunStateRecord) -> None:
+                    current_record = queue_manager.store.get(record.request_id)
+                    if (
+                        queue_manager.store.pending()
+                        or current_record is None
+                        or current_record.status is not RunStatus.FAILED
+                        or not current_record.error.startswith(
+                            "WorkbookComplexityError:"
+                        )
+                    ):
+                        ui.notify(
+                            "This recovery action is no longer available.",
+                            type="warning",
+                        )
+                        refresh_queue()
+                        return
+                    record = current_record
                     with ui.dialog().props("persistent") as dialog, ui.card().classes(
                         "w-[36rem] max-w-[94vw]"
                     ):
@@ -8035,8 +8292,20 @@ def create_pages(
                             allow_large_checkbox.set_value(True)
                             dialog.close()
                             terminal_actions.clear()
-                            ui.notify("Workload override confirmed; retrying QC")
-                            await start_run(profile_override=profile)
+                            ui.notify(
+                                "Workload override confirmed; review setup before running"
+                            )
+                            open_configuration_workspace(
+                                profile_override=profile,
+                                reuse_source_session=True,
+                                resolved_override=(
+                                    ResolvedInputConfigurationV1.model_validate(
+                                        record.resolved_input_configuration
+                                    )
+                                    if record.resolved_input_configuration is not None
+                                    else None
+                                ),
+                            )
 
                         with ui.row().classes("items-center gap-2"):
                             ui.button(
@@ -8053,6 +8322,79 @@ def create_pages(
                     terminal_actions.clear()
                     if record is None:
                         return
+
+                    def current_terminal_record() -> RunStateRecord | None:
+                        current = queue_manager.store.get(record.request_id)
+                        if (
+                            queue_manager.store.pending()
+                            or current is None
+                            or current.is_active
+                        ):
+                            ui.notify(
+                                "This action is no longer available while a run is active.",
+                                type="warning",
+                            )
+                            refresh_queue()
+                            return None
+                        return current
+
+                    def discard_attempt() -> None:
+                        current = current_terminal_record()
+                        if current is None:
+                            return
+                        if not queue_manager.store.delete_terminal_attempt(
+                            current.request_id
+                        ):
+                            ui.notify(
+                                "This attempt is active or belongs to completed "
+                                "run history and cannot be discarded here.",
+                                type="warning",
+                            )
+                            return
+                        watched_requests.discard(record.request_id)
+                        own_requests.discard(record.request_id)
+                        terminal_message["value"] = ""
+                        terminal_outcome.set_text("")
+                        terminal_outcome.visible = False
+                        terminal_actions.clear()
+                        queue_row.visible = bool(
+                            queue_manager.store.pending()
+                            or completed_links.default_slot.children
+                        )
+                        ui.notify("Previous attempt discarded")
+
+                    def add_discard_button() -> None:
+                        ui.button(
+                            "Discard attempt",
+                            icon="delete_outline",
+                            on_click=discard_attempt,
+                        ).props("flat no-caps dense color=negative")
+
+                    async def configure_blocked_attempt() -> None:
+                        current = current_terminal_record()
+                        if current is None or current.status is not RunStatus.BLOCKED:
+                            return
+                        profile, error = await _restore_request_context(current)
+                        if error is not None or profile is None:
+                            ui.notify(
+                                error or "Retry context unavailable.",
+                                type="warning",
+                                multi_line=True,
+                            )
+                            return
+                        resolved = (
+                            ResolvedInputConfigurationV1.model_validate(
+                                current.resolved_input_configuration
+                            )
+                            if current.resolved_input_configuration is not None
+                            else None
+                        )
+                        open_configuration_workspace(
+                            profile_override=profile,
+                            resolved_override=resolved,
+                            reuse_source_session=True,
+                        )
+
                     action = record.action_required or {}
                     if (
                         record.status is RunStatus.BLOCKED
@@ -8063,7 +8405,18 @@ def create_pages(
                         if _ranked_action_needs_refresh(action):
 
                             async def refresh_row_suggestions() -> None:
-                                profile, error = await _restore_request_context(record)
+                                current = current_terminal_record()
+                                current_action = (
+                                    current.action_required if current is not None else None
+                                ) or {}
+                                if (
+                                    current is None
+                                    or current.status is not RunStatus.BLOCKED
+                                    or current_action.get("reason")
+                                    != "row_identity_confirmation_required"
+                                ):
+                                    return
+                                profile, error = await _restore_request_context(current)
                                 if error is not None or profile is None:
                                     ui.notify(
                                         error or "Retry context unavailable.",
@@ -8072,23 +8425,47 @@ def create_pages(
                                     )
                                     return
                                 terminal_actions.clear()
-                                ui.notify("Refreshing row-matching suggestions")
-                                await start_run(profile_override=profile)
+                                ui.notify(
+                                    "Review refreshed row-matching setup before running"
+                                )
+                                open_configuration_workspace(
+                                    profile_override=profile,
+                                    reuse_source_session=True,
+                                    resolved_override=(
+                                        ResolvedInputConfigurationV1.model_validate(
+                                            current.resolved_input_configuration
+                                        )
+                                        if current.resolved_input_configuration is not None
+                                        else None
+                                    ),
+                                )
 
                             with terminal_actions:
                                 ui.button(
                                     "Refresh row suggestions",
                                     on_click=refresh_row_suggestions,
                                 ).classes("ghostbtn").props("flat no-caps dense")
+                                add_discard_button()
                             return
 
                         def review_row_matching() -> None:
+                            current = current_terminal_record()
+                            current_action = (
+                                current.action_required if current is not None else None
+                            ) or {}
+                            if (
+                                current is None
+                                or current.status is not RunStatus.BLOCKED
+                                or current_action.get("reason")
+                                != "row_identity_confirmation_required"
+                            ):
+                                return
                             try:
                                 snapshot = (
                                     DeliverableProfile.model_validate(
-                                        record.profile_snapshot
+                                        current.profile_snapshot
                                     )
-                                    if record.profile_snapshot is not None
+                                    if current.profile_snapshot is not None
                                     else None
                                 )
                             except ValueError:
@@ -8099,30 +8476,41 @@ def create_pages(
                                 )
                                 return
                             _open_row_identity_setup(
-                                action,
-                                record.profile,
+                                current_action,
+                                current.profile,
                                 snapshot,
-                                source_record=record,
+                                source_record=current,
                             )
 
                         with terminal_actions:
                             ui.button(
+                                "Configure setup",
+                                on_click=configure_blocked_attempt,
+                            ).classes("runbtn").props("no-caps dense")
+                            ui.button(
                                 "Review row matching",
                                 on_click=review_row_matching,
                             ).classes("ghostbtn").props("flat no-caps dense")
+                            add_discard_button()
                         return
-                    if not (
+                    if (
                         record.status is RunStatus.FAILED
                         and record.error.startswith("WorkbookComplexityError:")
                     ):
+                        with terminal_actions:
+                            ui.button(
+                                "Run with override",
+                                on_click=lambda: _open_complexity_override(record),
+                            ).classes("ghostbtn").props("flat no-caps dense")
+                            add_discard_button()
                         return
-                    with terminal_actions:
-                        ui.button(
-                            "Run with override",
-                            on_click=lambda: _open_complexity_override(record),
-                        ).classes("ghostbtn").props("flat no-caps dense")
+                    if record.run_id is None and not record.is_active:
+                        with terminal_actions:
+                            add_discard_button()
 
-                _refresh_terminal_actions(latest_terminal)
+                _refresh_terminal_actions(
+                    latest_terminal if not initial_pending else None
+                )
 
             if rerun_banner_actions is not None:
                 with rerun_banner_actions:
@@ -8211,9 +8599,9 @@ def create_pages(
                         icon = "check_circle" if region.is_valid else "error"
                         controls["tab"].props(f"icon={icon}")
                     save_button.set_text(
-                        "Save rule and run QC"
+                        "Save rule and review setup"
                         if vm.persist_profile
-                        else "Run QC once"
+                        else "Apply and review setup"
                     )
                     save_button.set_enabled(vm.is_valid)
 
@@ -8545,9 +8933,21 @@ def create_pages(
                             refresh_readiness()
                             ui.notify(
                                 f"Saved row matching to profile {target_name!r}; "
-                                "Re-QC started"
+                                "review setup before running"
                             )
-                            await start_run()
+                            open_configuration_workspace(
+                                choice_updates=_row_matching_choice_updates(vm),
+                                reuse_source_session=True,
+                                resolved_override=(
+                                    ResolvedInputConfigurationV1.model_validate(
+                                        source_record.resolved_input_configuration
+                                    )
+                                    if source_record is not None
+                                    and source_record.resolved_input_configuration
+                                    is not None
+                                    else None
+                                )
+                            )
                         else:
                             state.profile_name = profile.name
                             state.profile_override = profile.model_copy(deep=True)
@@ -8559,14 +8959,27 @@ def create_pages(
                             profile_select.update()
                             refresh_readiness()
                             ui.notify(
-                                "Temporary row matching applied; Re-QC started "
-                                "without saving a profile"
+                                "Temporary row matching applied; review setup "
+                                "before running"
                             )
-                            await start_run(profile_override=profile)
+                            open_configuration_workspace(
+                                profile_override=profile,
+                                choice_updates=_row_matching_choice_updates(vm),
+                                reuse_source_session=True,
+                                resolved_override=(
+                                    ResolvedInputConfigurationV1.model_validate(
+                                        source_record.resolved_input_configuration
+                                    )
+                                    if source_record is not None
+                                    and source_record.resolved_input_configuration
+                                    is not None
+                                    else None
+                                ),
+                            )
 
                     with ui.row().classes("items-center gap-2 rankedtable-actions"):
                         save_button = ui.button(
-                            "Save rule and run QC", on_click=apply_rules
+                            "Save rule and review setup", on_click=apply_rules
                         ).classes("runbtn").props("no-caps")
 
                         def _cancel() -> None:
@@ -8590,18 +9003,27 @@ def create_pages(
             results = ui.column().classes("w-full")
 
     @ui.page("/configure")
-    def configure_page(session: str = "") -> None:  # pyright: ignore[reportUnusedFunction]
+    def configure_page(  # pyright: ignore[reportUnusedFunction]
+        session: str = "",
+    ) -> RedirectResponse | None:
         from qc_tool.ui.config_workspace import render_config_workspace
 
+        record = ConfigSessionStore(work_dir / "history.sqlite3").get(session)
+        if record is not None and record.session_id != session:
+            return RedirectResponse(
+                url=f"/configure?session={record.session_id}", status_code=307
+            )
         render_config_workspace(
             work_dir,
             profiles_dir,
             session,
             queue_manager=queue_manager,
+            credential_vault=credential_vault,
             network_mode=network_mode.value,
             on_settings=open_app_settings,
             on_shutdown=request_shutdown,
         )
+        return None
 
     @ui.page("/guide")
     def guide_page() -> None:  # pyright: ignore[reportUnusedFunction]

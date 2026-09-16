@@ -2,8 +2,8 @@
 identity columns (plan-20260913, Step 12 Fix 5).
 
 Mirrors ``qc_tool.setup.preview_worker``'s ``run_preview_window_worker``
-pattern: a short-lived child process re-opens both already-uploaded
-sources, computes ONLY the overlap ratio for the analyst's CONFIRMED
+pattern: a short-lived child process queries setup sidecar blocks and
+computes ONLY the overlap ratio for the analyst's CONFIRMED
 ``identity_columns`` (never the auto-detector's own candidate --
 ``qc_tool.excel.ranked_identity._evaluate_combination()`` structurally
 cannot report a low-overlap result, since it returns ``None`` the moment
@@ -45,8 +45,10 @@ class KeyOverlapRequest:
     worker never guesses a header boundary.
     """
 
-    baseline_path: str
-    current_path: str
+    sidecar_path: str
+    session_key: str
+    input_generation: int
+    member_id: str
     baseline_hash: str
     current_hash: str
     baseline_sheet: str
@@ -63,8 +65,6 @@ class KeyOverlapRequest:
     #: override -- Step 12 Fix 3).
     baseline_identity_columns: tuple[str, ...] = ()
     trim_identity_whitespace: bool = False
-    baseline_password: str = ""
-    current_password: str = ""
 
 
 @dataclass(slots=True)
@@ -94,7 +94,7 @@ def _is_blank(value: object) -> bool:
 
 
 def _unique_row_keys(
-    sheet: Any,
+    cells: dict[tuple[int, int], Any],
     columns: list[int],
     *,
     first_row: int,
@@ -111,7 +111,7 @@ def _unique_row_keys(
         parts: list[object] = []
         blank = False
         for column in columns:
-            cell = sheet.cells.get((row, column))
+            cell = cells.get((row, column))
             value = None if cell is None else cell.value
             if _is_blank(value):
                 blank = True
@@ -130,64 +130,11 @@ def _worker_entry(payload: dict[str, Any], result_queue: mp.Queue[dict[str, Any]
     try:
         from openpyxl.utils import column_index_from_string
 
-        from qc_tool.history.store import sha256_file
-        from qc_tool.io.decrypt import InvalidPasswordError, PasswordRequiredError
-        from qc_tool.io.loader import (
-            OOXMLWorkloadError,
-            UnsupportedFormatError,
-            XLSBWorkloadError,
-            load_workbook_snapshot,
+        from qc_tool.setup.preview_store import (
+            SetupScanStore,
+            SetupSidecarCorruptError,
+            SetupSidecarStaleError,
         )
-
-        snapshots: dict[str, Any] = {}
-        missing_credentials: list[str] = []
-        for side, path_str, expected_hash, password in (
-            (
-                "baseline",
-                payload["baseline_path"],
-                payload["baseline_hash"],
-                payload["baseline_password"],
-            ),
-            (
-                "current",
-                payload["current_path"],
-                payload["current_hash"],
-                payload["current_password"],
-            ),
-        ):
-            path = Path(str(path_str))
-            if not path.exists():
-                result_queue.put(
-                    {
-                        "ok": False,
-                        "disclosure": f"{side} source is no longer at its recorded location",
-                    }
-                )
-                return
-            if expected_hash and sha256_file(path) != expected_hash:
-                result_queue.put(
-                    {"ok": False, "disclosure": f"{side} source changed since it was uploaded"}
-                )
-                return
-            try:
-                snapshots[side] = load_workbook_snapshot(path, password=password or None)
-            except (PasswordRequiredError, InvalidPasswordError):
-                missing_credentials.append(side)
-            except (OOXMLWorkloadError, XLSBWorkloadError):
-                result_queue.put(
-                    {"ok": False, "disclosure": f"{side} source is too large to query"}
-                )
-                return
-            except UnsupportedFormatError:
-                result_queue.put(
-                    {"ok": False, "disclosure": f"{side} source format is not supported"}
-                )
-                return
-        if missing_credentials:
-            result_queue.put(
-                {"ok": False, "missing_credential_roles": tuple(missing_credentials)}
-            )
-            return
 
         current_letters: list[str] = list(payload["identity_columns"])
         baseline_letters: list[str] = list(payload["baseline_identity_columns"]) or current_letters
@@ -203,23 +150,56 @@ def _worker_entry(payload: dict[str, Any], result_queue: mp.Queue[dict[str, Any]
             result_queue.put({"ok": False, "disclosure": "identity column letters are invalid"})
             return
 
+        store = SetupScanStore(Path(str(payload["sidecar_path"])))
         try:
-            base_sheet = snapshots["baseline"].sheet(str(payload["baseline_sheet"]))
-            curr_sheet = snapshots["current"].sheet(str(payload["current_sheet"]))
+            baseline_cells = store.query_cells(
+                str(payload["session_key"]),
+                str(payload["member_id"]),
+                "baseline",
+                str(payload["baseline_sheet"]),
+                expected_generation=int(payload["input_generation"]),
+                expected_source_hash=str(payload["baseline_hash"]),
+                min_row=int(payload["baseline_first_row"]),
+                max_row=int(payload["baseline_last_row"]),
+                columns=frozenset(baseline_cols),
+            )
+            current_cells = store.query_cells(
+                str(payload["session_key"]),
+                str(payload["member_id"]),
+                "current",
+                str(payload["current_sheet"]),
+                expected_generation=int(payload["input_generation"]),
+                expected_source_hash=str(payload["current_hash"]),
+                min_row=int(payload["current_first_row"]),
+                max_row=int(payload["current_last_row"]),
+                columns=frozenset(current_cols),
+            )
+        except SetupSidecarStaleError:
+            result_queue.put(
+                {"ok": False, "disclosure": "setup key query is stale; rerun analysis"}
+            )
+            return
+        except SetupSidecarCorruptError:
+            result_queue.put(
+                {"ok": False, "disclosure": "setup key sidecar is unreadable"}
+            )
+            return
         except KeyError:
-            result_queue.put({"ok": False, "disclosure": "sheet not found on one or both sides"})
+            result_queue.put(
+                {"ok": False, "disclosure": "sheet not found on one or both sides"}
+            )
             return
 
         trim = bool(payload["trim_identity_whitespace"])
         base_unique = _unique_row_keys(
-            base_sheet,
+            baseline_cells,
             baseline_cols,
             first_row=int(payload["baseline_first_row"]),
             last_row=int(payload["baseline_last_row"]),
             trim_identity_whitespace=trim,
         )
         curr_unique = _unique_row_keys(
-            curr_sheet,
+            current_cells,
             current_cols,
             first_row=int(payload["current_first_row"]),
             last_row=int(payload["current_last_row"]),
@@ -264,8 +244,10 @@ def run_key_overlap_worker(
     ctx = mp.get_context("spawn")
     result_queue: mp.Queue[dict[str, Any]] = ctx.Queue(maxsize=1)
     payload: dict[str, Any] = {
-        "baseline_path": request.baseline_path,
-        "current_path": request.current_path,
+        "sidecar_path": request.sidecar_path,
+        "session_key": request.session_key,
+        "input_generation": request.input_generation,
+        "member_id": request.member_id,
         "baseline_hash": request.baseline_hash,
         "current_hash": request.current_hash,
         "baseline_sheet": request.baseline_sheet,
@@ -277,8 +259,6 @@ def run_key_overlap_worker(
         "identity_columns": list(request.identity_columns),
         "baseline_identity_columns": list(request.baseline_identity_columns),
         "trim_identity_whitespace": request.trim_identity_whitespace,
-        "baseline_password": request.baseline_password,
-        "current_password": request.current_password,
     }
     process = ctx.Process(target=_worker_entry, args=(payload, result_queue), daemon=True)
     process.start()

@@ -38,7 +38,8 @@ class WorkbookComplexity:
     interaction_rule_count: int = 0
     warning_reasons: tuple[str, ...] = ()
     override_used: bool = False
-    #: Populated only when the caller passed ``sample_limit``.
+    #: Number of formula cells used by a future bounded estimator. Zero means
+    #: the dependency-cost fields were calculated exactly.
     sampled_formulas: int = 0
     extras: dict[str, int] = field(default_factory=dict)
 
@@ -97,6 +98,35 @@ def _formula_cost(formula: str) -> _FormulaCost:
     return _FormulaCost(operands, range_cells, projected_edges)
 
 
+def finalize_workbook_complexity(
+    complexity: WorkbookComplexity,
+    *,
+    source_name: str,
+    allow_complex_workbook: bool = False,
+) -> WorkbookComplexity:
+    """Apply workload thresholds to already-accumulated complexity facts."""
+    warnings: list[str] = []
+    refusals: list[str] = []
+    for attribute, warn_limit, refusal_limit, label in _COMPLEXITY_LIMITS:
+        value = int(getattr(complexity, attribute))
+        if value >= refusal_limit:
+            refusals.append(f"{label} {value:,} >= refusal limit {refusal_limit:,}")
+        elif value >= warn_limit:
+            warnings.append(f"{label} {value:,} >= warning limit {warn_limit:,}")
+    if refusals and not allow_complex_workbook:
+        raise WorkbookComplexityError(
+            f"{source_name}: dependency workload refused: "
+            f"{'; '.join(refusals)}. Rerun with the explicit local "
+            "allow_complex_workbook override only when sufficient memory and time "
+            "are available."
+        )
+    complexity.override_used = bool(refusals)
+    if refusals:
+        warnings.extend(f"override accepted: {reason}" for reason in refusals)
+    complexity.warning_reasons = tuple(warnings)
+    return complexity
+
+
 def assess_workbook_complexity(
     workbook: WorkbookSnapshot,
     *,
@@ -119,58 +149,34 @@ def assess_workbook_complexity(
         for index, cell in enumerate(sheet.cells.values(), start=1):
             if index % 10_000 == 0:
                 check_cancelled(cancellation_token)
-            if cell.formula is None:
+            formula = cell.formula
+            if formula is None:
                 continue
             complexity.formula_count += 1
-            lowered = cell.formula.casefold()
+            lowered = formula.casefold()
             if "let(" in lowered or "lambda(" in lowered:
                 complexity.lexical_formula_count += 1
             try:
-                # An adapter-supplied canonical R1C1 (native-complete XLSB)
-                # is already position-independent, so cells sharing one
-                # produce an identical _formula_cost() regardless of which
-                # cell's own text computed it -- reusing it as the cache key
-                # skips formula_pattern_key()'s tokenization on every cache
-                # hit, which representative large-workbook telemetry showed
-                # dominating this
-                # scan's cost (plan-20260908-phase-b-guest-performance-
-                # followup.md). Falls back to the original pattern key
-                # exactly as before when no adapter R1C1 is available.
                 key: FormulaPatternKey | str = (
                     cell.formula_r1c1
                     if cell.formula_r1c1 is not None
-                    else formula_pattern_key(cell.formula)
+                    else formula_pattern_key(formula)
                 )
                 cost = costs.get(key)
                 if cost is None:
-                    cost = _formula_cost(cell.formula)
+                    cost = _formula_cost(formula)
                     costs[key] = cost
-            except Exception:  # malformed formulas cost nothing to index
+            except Exception:
                 continue
             complexity.reference_operands += cost.operands
             complexity.resolved_range_cells += cost.range_cells
             complexity.projected_concrete_edges += cost.projected_edges
 
-    warnings: list[str] = []
-    refusals: list[str] = []
-    for attribute, warn_limit, refusal_limit, label in _COMPLEXITY_LIMITS:
-        value = int(getattr(complexity, attribute))
-        if value >= refusal_limit:
-            refusals.append(f"{label} {value:,} >= refusal limit {refusal_limit:,}")
-        elif value >= warn_limit:
-            warnings.append(f"{label} {value:,} >= warning limit {warn_limit:,}")
-    if refusals and not allow_complex_workbook:
-        raise WorkbookComplexityError(
-            f"{workbook.source_name}: dependency workload refused: "
-            f"{'; '.join(refusals)}. Rerun with the explicit local "
-            "allow_complex_workbook override only when sufficient memory and time "
-            "are available."
-        )
-    if refusals:
-        warnings.extend(f"override accepted: {reason}" for reason in refusals)
-        complexity.override_used = True
-    complexity.warning_reasons = tuple(warnings)
-    return complexity
+    return finalize_workbook_complexity(
+        complexity,
+        source_name=workbook.source_name,
+        allow_complex_workbook=allow_complex_workbook,
+    )
 
 
 #: Above this many formula cells, dependency indexing (the graph build behind

@@ -47,10 +47,12 @@ from qc_tool.ui.config_review import (
     compute_sheet_pairing_warnings,
     compute_slide_pairing_warnings,
     compute_warnings,
+    compute_workspace_readiness,
     confirm_all_regions,
     deck_review_from_titles,
     diff_profile_against_scan,
     diff_resolved_configurations,
+    effective_region_data_range,
     effective_sheet_pairing,
     effective_slide_pairing,
     format_a1_range,
@@ -68,6 +70,8 @@ from qc_tool.ui.config_review import (
     set_identity_columns,
     set_ignore_columns,
     set_ordinal_columns,
+    set_region_data_start,
+    set_region_footer_rows,
     set_selector_baseline_cell,
     set_sheet_rename,
     set_slide_included,
@@ -163,6 +167,60 @@ def test_compute_warnings_flags_a_pending_ranked_candidate() -> None:
     warnings = compute_warnings(result)
     codes = [w.code for w in warnings]
     assert any(code.startswith("ranked_candidate:") for code in codes)
+
+
+def test_compute_warnings_removes_ranked_caution_after_explicit_choice() -> None:
+    result = _scan_result(with_ranked_candidate=True)
+    review = member_review_from_scan("primary", result.members["primary"])
+    region_id = review.current_sheets[0].regions[0].region_id
+    review = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="positional",
+        confirmed=True,
+    )
+    state = ConfigWorkspaceState(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        member_reviews=(review,),
+    )
+
+    assert not any(
+        warning.code.startswith("ranked_candidate:")
+        for warning in compute_warnings(result, state=state)
+    )
+
+
+def test_unresolved_blockers_requires_an_explicit_ranked_region_choice() -> None:
+    review = member_review_from_scan(
+        "primary", _member_profile(with_ranked_candidate=True)
+    )
+    state = ConfigWorkspaceState(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        member_reviews=(review,),
+    )
+
+    blockers = unresolved_blockers(state, compute_warnings(_scan_result(
+        with_ranked_candidate=True
+    )))
+
+    assert any("choose Match rows by key" in blocker for blocker in blockers)
+
+    region_id = review.current_sheets[0].regions[0].region_id
+    positional = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="positional",
+        confirmed=True,
+    )
+    resolved = replace(state, member_reviews=(positional,))
+    assert not any(
+        "choose Match rows by key" in blocker
+        for blocker in unresolved_blockers(
+            resolved, compute_warnings(_scan_result(with_ranked_candidate=True))
+        )
+    )
 
 
 def test_compute_warnings_flags_an_unsafe_xlsb_source() -> None:
@@ -433,6 +491,47 @@ def test_unresolved_blockers_clears_once_identity_columns_are_set() -> None:
     )
     state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
     assert unresolved_blockers(state, ()) == ()
+
+
+def test_workspace_readiness_rejects_done_scan_before_expected_reviews_are_seeded() -> None:
+    readiness = compute_workspace_readiness(
+        ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON),
+        (),
+        setup_complete=True,
+        expected_excel_member_ids=frozenset({"primary"}),
+        ppt_required=False,
+    )
+
+    assert not readiness.ready
+    assert "missing required Excel member review: primary" in readiness.blockers
+
+
+def test_workspace_readiness_requires_exact_members_and_required_deck() -> None:
+    primary = member_review_from_scan("primary", _member_profile())
+    state = ConfigWorkspaceState(
+        mode=QCRunMode.CURRENT_FILE_PREFLIGHT,
+        member_reviews=(primary,),
+    )
+
+    without_deck = compute_workspace_readiness(
+        state,
+        (),
+        setup_complete=True,
+        expected_excel_member_ids=frozenset({"primary"}),
+        ppt_required=True,
+    )
+    with_deck = compute_workspace_readiness(
+        replace(state, deck_review=deck_review_from_titles([], [(1, "Cover")])),
+        (),
+        setup_complete=True,
+        expected_excel_member_ids=frozenset({"primary"}),
+        ppt_required=True,
+    )
+
+    assert not without_deck.ready
+    assert "PowerPoint review is not ready" in without_deck.blockers
+    assert with_deck.ready
+    assert with_deck.blockers == ()
 
 
 def test_unresolved_blockers_flags_an_expired_region_exclusion() -> None:
@@ -821,6 +920,58 @@ def test_format_a1_range_round_trips_with_parse_a1_range() -> None:
     assert format_a1_range(*parse_a1_range("B4")) == "B4"
 
 
+def test_region_data_start_is_canonical_and_clears_stale_boundary_state() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = replace(
+        review.current_sheets[0].regions[0],
+        header_intent="first_data_row",
+        first_data_row=3,
+        preamble_rows=2,
+    )
+
+    automatic = set_region_data_start(region, None)
+    assert automatic.header_intent == "automatic"
+    assert automatic.first_data_row is None
+    assert automatic.preamble_rows == 0
+    assert effective_region_data_range(automatic) is None
+
+    no_header = set_region_data_start(region, 1)
+    assert no_header.header_intent == "no_header"
+    assert no_header.first_data_row is None
+    assert no_header.preamble_rows == 0
+    assert effective_region_data_range(no_header) == "A1:C5"
+
+    explicit = set_region_data_start(region, 3)
+    assert explicit.header_intent == "first_data_row"
+    assert explicit.first_data_row == 3
+    assert explicit.preamble_rows == 0
+    assert effective_region_data_range(explicit) == "A3:C5"
+
+
+def test_region_footer_must_leave_a_data_row() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = set_region_data_start(review.current_sheets[0].regions[0], 3)
+
+    assert effective_region_data_range(set_region_footer_rows(region, 1)) == "A3:C4"
+    with pytest.raises(ValueError, match="leave at least one data row"):
+        set_region_footer_rows(region, 3)
+
+
+def test_effective_data_range_projects_relative_boundaries_to_baseline() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = replace(
+        set_region_footer_rows(
+            set_region_data_start(review.current_sheets[0].regions[0], 3), 1
+        ),
+        baseline_range="D10:F20",
+    )
+
+    assert effective_region_data_range(region) == "A3:C4"
+    assert effective_region_data_range(
+        region, outer_range=region.baseline_range
+    ) == "D12:F19"
+
+
 def test_apply_anchor_click_shifts_the_region_preserving_size() -> None:
     review = member_review_from_scan("primary", _member_profile())
     region = review.current_sheets[0].regions[0]
@@ -829,6 +980,27 @@ def test_apply_anchor_click_shifts_the_region_preserving_size() -> None:
     assert moved.anchor_cell == "B3"
     assert moved.current_range == "B3:D7"  # same 3x5 footprint, shifted
     assert moved.available_columns == ("B", "C", "D")
+
+
+def test_apply_anchor_click_moves_the_explicit_data_start_with_the_region() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = set_region_data_start(review.current_sheets[0].regions[0], 3)
+
+    moved = apply_anchor_click(region, 5, 2)
+
+    assert moved.current_range == "B5:D9"
+    assert moved.first_data_row == 7
+    assert effective_region_data_range(moved) == "B7:D9"
+
+
+def test_apply_manual_range_rejects_a_resize_that_consumes_the_data_band() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region = set_region_footer_rows(
+        set_region_data_start(review.current_sheets[0].regions[0], 3), 1
+    )
+
+    with pytest.raises(ValueError, match="leave at least one data row"):
+        apply_manual_range(region, "A1:C3")
 
 
 def test_apply_anchor_click_prunes_identity_columns_that_fall_out_of_range() -> None:
@@ -1157,6 +1329,7 @@ def test_build_resolved_configuration_carries_preamble_footer_and_first_data_row
         first_data_row=2,
         preamble_rows=1,
         footer_rows=1,
+        baseline_range="A1:C5",
         blank_key_policy="block",
     )
     state = ConfigWorkspaceState(mode=QCRunMode.CYCLE_COMPARISON, member_reviews=(updated,))
@@ -1165,8 +1338,40 @@ def test_build_resolved_configuration_carries_preamble_footer_and_first_data_row
     )
     region = resolved.members[0].sheets[0].regions[0]
     assert region.current_first_data_row == 2
-    assert region.current_preamble_rows == 1
+    assert region.current_preamble_rows == 0
     assert region.current_footer_rows == 1
+    assert region.baseline_first_data_row == 2
+    assert region.baseline_preamble_rows == 0
+    assert region.baseline_footer_rows == 1
+
+
+def test_build_resolved_configuration_ignores_stale_first_data_row_for_no_header() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    review = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="positional",
+        confirmed=True,
+        header_intent="no_header",
+        first_data_row=4,
+        preamble_rows=3,
+    )
+    state = ConfigWorkspaceState(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        member_reviews=(review,),
+    )
+
+    resolved = build_resolved_configuration(
+        state,
+        profile=DeliverableProfile(name="resolved-boundaries"),
+        profile_sha256="a" * 64,
+    )
+
+    region = resolved.members[0].sheets[0].regions[0]
+    assert region.current_first_data_row is None
+    assert region.current_preamble_rows == 0
 
 
 def test_build_input_contract_carries_blank_key_policy_and_first_data_row() -> None:

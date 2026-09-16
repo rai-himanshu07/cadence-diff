@@ -146,23 +146,41 @@ Cancellation escalates in three steps:
 The worker also monitors parent liveness. If its owner disappears, it cancels
 itself and does not emit a result that no manager is waiting to receive.
 
-Browser runs also have a dedicated full-page configuration workspace at
+Browser runs use one full-page configuration workspace at
 `/configure` ([`qc_tool/ui/config_workspace.py`](qc_tool/ui/config_workspace.py)).
-Every fresh submission -- the main page's "Run QC" button and the Re-QC
-"Run QC now" banner button alike -- enters this workspace first; neither
-submits directly. It runs one bounded, cancellable setup-analysis job over
-the selected files (sharing the same single heavy-work slot as a QC run --
-never concurrent with one), then lets the analyst review input roles,
-per-sheet regions, logical columns, and selector prerequisites before
+Every fresh submission, Re-QC, blocked action, and failed/override retry enters
+this workspace before submission. The Files step owns mode, roles, members,
+managed uploads, ephemeral passwords, and profile preference. A progressive
+[`SetupCoordinator`](qc_tool/setup/coordinator.py) runs format-specific,
+one-pass readers in disposable workers, persists structural/cell blocks in the
+private compressed [`SetupScanStore`](qc_tool/setup/preview_store.py), and emits
+inventory and per-sheet events. It shares the single heavy-work slot with QC,
+never runs concurrently with a QC worker, and never invokes the full QC loader
+or an Office formula adapter. The analyst can review completed sheets while
+later sheets scan, navigate away and reconnect, cancel back to files without
+losing choices, or resume/discard explicitly before
 choosing `Run once`, `Save profile`, `Save profile and run`, `Update
 profile and run`, or `Export configuration`. A volume-projection courtesy
 warning (ported from the legacy direct-submit path) still fires here for
-an unusually large projected comparison. Retry flows for an already-
-submitted attempt (workload-override retry, row-identity-confirmation
-retry) remain direct, since they resubmit an existing configuration
-rather than starting a new one. See "Input Contract And Resolved
-Configuration" below for the two versioned contracts this workspace
-produces.
+an unusually large projected comparison. See "Input Contract And Resolved
+Configuration" below for the two versioned contracts this workspace produces.
+
+The active table editor has four persistent tabs: **Rows**, **Data bounds**,
+**Scenario checks**, and **Advanced**. Only one member/sheet/region editor is
+mounted at a time; unresolved counts and **Next needs attention** preserve the
+cross-sheet queue. One canonical data-start row plus footer count projects
+relative boundaries onto each side's physical outer range. The full-width
+preview remains mounted below the editor, coalesces rapid navigation into one
+latest-request-wins sidecar query, renders bounded OOXML formula text on
+request, and discloses XLSB's presence-only formula capability without opening
+Office. The existing complete profile editor opens in-place and requires a
+separate explicit apply action before its saved policy changes the setup.
+
+Queue presentation is state-exclusive: a queued, starting, running, or
+cancelling request hides historical terminal outcomes and recovery controls.
+Those controls return for the latest terminal request only; every callback
+re-reads persisted state before recovering or discarding, so an already-
+dispatched stale click cannot affect history after a new request starts.
 
 ### 3.3 CLI Execution Path
 
@@ -388,13 +406,17 @@ top of the physical, name-keyed profile fields in 5.3:
   persists with the run (see Persistence Model below) for later Re-QC/carry-
   forward scope-compatibility checks and report/attestation binding.
   `ResolvedColumn.baseline_letter`/`current_letter` and `ResolvedSelector.
-  baseline_cell`/`current_cell` can already differ (an analyst-entered
-  override in the `/configure` workspace), but this is disclosure/reporting
-  data only today -- the alignment engine's own column axis
-  (`qc_tool/excel/align.py`'s `_align_block`) still pairs columns by
-  POSITION within a region, not by letter, so a baseline-letter override does
-  not yet change which physical cells are actually compared at run time. See
-  "Deliberate Boundaries And Known Limitations" below.
+  baseline_cell`/`current_cell` can differ. Confirmed column mappings drive
+  the alignment engine's column axis, and authoritative selector checks read
+  each side's resolved cell directly.
+
+  Explicit region modes are execution behavior, not UI labels. `positional`
+  forces positional rows and bypasses ranked-table screening. `excluded`
+  removes matched or unpaired regions on both sides before value, formula,
+  formula-error, and structural producers run, then emits one
+  `excel-configured-region-exclusions` coverage disclosure. Keyed regions keep
+  preamble/header and footer rows positionally comparable around the keyed data
+  body; rank/order columns suppress cached-value changes only.
 
 [`qc_tool/ui/config_review.py`](qc_tool/ui/config_review.py) is the pure (no
 NiceGUI import) view-model layer the `/configure` workspace is built
@@ -797,11 +819,17 @@ changes, effective-policy changes, and observed population/atomic changes.
 `/configure` workspace's own private, run-only draft state (see "Input
 Contract And Resolved Configuration" above): selected
 files/roles, mode, profile choice, and every region/column/selector decision,
-keyed by a hash of the selected files so a refresh or restart restores the
-same in-progress review after re-validating file identity. It never stores a
+under a random canonical session id. A separate source-set digest supports
+resume discovery; revisions provide compare-and-swap protection between tabs,
+and monotonically increasing input generations reject stale worker/query
+results after replacement. Legacy deterministic ids remain aliases that
+redirect to the canonical random id. It never stores a
 preview cell value, formula text, or a bounded preview window -- only the
 analyst's structural choices. A completed run's resolved configuration itself
 persists in the `runs` table (see 10.2 above), not in this session store.
+Passwords live only in the page-scoped
+[`CredentialVault`](qc_tool/ui/credential_vault.py), keyed by session, role,
+and source hash; refresh/restart requires re-entry.
 
 ## 11. Reports, Schemas, Sign-Off, And Attestation
 
@@ -1131,7 +1159,7 @@ deploy.
 | [`qc_tool/ui/`](qc_tool/ui) | NiceGUI pages, theme, guide, profile and ranked-table dialogs |
 | [`qc_tool/ui/config_workspace.py`](qc_tool/ui/config_workspace.py), [`qc_tool/ui/config_review.py`](qc_tool/ui/config_review.py) | `/configure` mode-aware configuration wizard (page + pure view model) |
 | [`qc_tool/config/input_contract.py`](qc_tool/config/input_contract.py), [`qc_tool/config/resolved_input.py`](qc_tool/config/resolved_input.py) | Saved logical input contract and per-run resolved configuration |
-| [`qc_tool/setup/`](qc_tool/setup) | Bounded setup-analysis scan, preview worker/store, on-demand key-overlap worker, models |
+| [`qc_tool/setup/`](qc_tool/setup) | Progressive setup coordinator, format-specific one-pass readers, compressed inspection sidecar, preview and on-demand key-overlap workers, models |
 | [`qc_tool/focus/`](qc_tool/focus) | Optional secure desktop Office navigation |
 | [`native/cadence_diff_native/`](native/cadence_diff_native) | Rust BIFF12 and formula-delta accelerator |
 | [`scripts/`](scripts) | Audits and bounded diagnostic/acceptance tools |

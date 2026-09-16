@@ -137,7 +137,10 @@ def preview_carry_forward(history: RunHistory, run_id: int) -> CarryForwardPrevi
     compatibility: ConfigurationCompatibility | None = None
     if source.profile_snapshot is not None and current.profile_snapshot is not None:
         compatibility = configuration_compatible(
-            source.profile_snapshot, current.profile_snapshot
+            source.profile_snapshot,
+            current.profile_snapshot,
+            previous_resolved=source.resolved_input_configuration,
+            current_resolved=current.resolved_input_configuration,
         )
 
     exact: list[CarryForwardCandidate] = []

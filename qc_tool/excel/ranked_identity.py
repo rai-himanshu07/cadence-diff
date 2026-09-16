@@ -133,7 +133,15 @@ class _ColumnScreen:
     unique_base: float
     unique_curr: float
     formula_ratio: float
-    sequence_like: bool
+    base_sequence_like: bool
+    curr_sequence_like: bool
+    base_components: tuple[int | None, ...]
+    curr_components: tuple[int | None, ...]
+    component_values: tuple[object, ...]
+
+    @property
+    def sequence_like(self) -> bool:
+        return self.base_sequence_like or self.curr_sequence_like
 
     @property
     def safe(self) -> bool:
@@ -166,40 +174,101 @@ def _screen_column(
 ) -> _ColumnScreen:
     base_values = _column_values(base_sheet, base_region, column)
     curr_values = _column_values(curr_sheet, curr_region, column)
-    base_non_blank = [v for v in base_values if not _is_blank(v)]
-    curr_non_blank = [v for v in curr_values if not _is_blank(v)]
-    base_keys = [_key_component(v) for v in base_non_blank]
-    curr_keys = [_key_component(v) for v in curr_non_blank]
+    component_ids: dict[object, int] = {}
+    component_values: list[object] = []
+
+    def encode(values: list[CellValue]) -> tuple[int | None, ...]:
+        encoded: list[int | None] = []
+        for value in values:
+            if _is_blank(value):
+                encoded.append(None)
+                continue
+            component = _key_component(value)
+            try:
+                component_id = component_ids[component]
+            except KeyError:
+                component_id = len(component_ids)
+                component_ids[component] = component_id
+                component_values.append(component)
+            encoded.append(component_id)
+        return tuple(encoded)
+
+    base_components = encode(base_values)
+    curr_components = encode(curr_values)
+    base_keys = [value for value in base_components if value is not None]
+    curr_keys = [value for value in curr_components if value is not None]
     return _ColumnScreen(
         column=column,
-        non_blank_base=len(base_non_blank) / len(base_values) if base_values else 0.0,
-        non_blank_curr=len(curr_non_blank) / len(curr_values) if curr_values else 0.0,
+        non_blank_base=len(base_keys) / len(base_values) if base_values else 0.0,
+        non_blank_curr=len(curr_keys) / len(curr_values) if curr_values else 0.0,
         unique_base=(len(set(base_keys)) / len(base_keys)) if base_keys else 0.0,
         unique_curr=(len(set(curr_keys)) / len(curr_keys)) if curr_keys else 0.0,
         formula_ratio=max(
             _column_formula_ratio(base_sheet, base_region, column),
             _column_formula_ratio(curr_sheet, curr_region, column),
         ),
-        sequence_like=_is_sequence_like(base_values) or _is_sequence_like(curr_values),
+        base_sequence_like=_is_sequence_like(base_values),
+        curr_sequence_like=_is_sequence_like(curr_values),
+        base_components=base_components,
+        curr_components=curr_components,
+        component_values=tuple(component_values),
     )
 
 
-def _row_keys(
-    sheet: SheetSnapshot, region: TableRegion, columns: tuple[int, ...]
-) -> dict[int, tuple[object, ...] | None]:
-    """Row -> composite key, or None if any component is blank."""
-    keys: dict[int, tuple[object, ...] | None] = {}
-    for row in range(region.min_row, region.max_row + 1):
-        parts: list[object] = []
-        blank = False
-        for column in columns:
-            value = _cell_value(sheet, row, column)
-            if _is_blank(value):
-                blank = True
+def _cannot_contribute_displacement(screen: _ColumnScreen) -> bool:
+    base_offsets: dict[object, int] = {}
+    for offset, component in enumerate(screen.base_components):
+        if component is None:
+            continue
+        if component in base_offsets:
+            return False
+        base_offsets[component] = offset
+    curr_offsets: dict[object, int] = {}
+    for offset, component in enumerate(screen.curr_components):
+        if component is None:
+            continue
+        if component in curr_offsets:
+            return False
+        curr_offsets[component] = offset
+    return all(
+        base_offsets[component] == curr_offsets[component]
+        for component in base_offsets.keys() & curr_offsets.keys()
+    )
+
+
+def _combination_key_stats(
+    region: TableRegion,
+    columns: tuple[int, ...],
+    screens: dict[int, _ColumnScreen],
+    *,
+    baseline: bool,
+) -> tuple[
+    int,
+    Counter[tuple[int, ...]],
+    dict[tuple[int, ...], int],
+]:
+    vectors = [
+        screens[column].base_components
+        if baseline
+        else screens[column].curr_components
+        for column in columns
+    ]
+    counts: Counter[tuple[int, ...]] = Counter()
+    row_by_key: dict[tuple[int, ...], int] = {}
+    non_blank = 0
+    for offset, row in enumerate(range(region.min_row, region.max_row + 1)):
+        parts: list[int] = []
+        for vector in vectors:
+            component = vector[offset]
+            if component is None:
                 break
-            parts.append(_key_component(value))
-        keys[row] = None if blank else tuple(parts)
-    return keys
+            parts.append(component)
+        else:
+            key = tuple(parts)
+            non_blank += 1
+            counts[key] += 1
+            row_by_key[key] = row
+    return non_blank, counts, row_by_key
 
 
 def _infer_header_row(
@@ -358,23 +427,30 @@ def _sample_mismatch_reduction(
     base_region: TableRegion,
     curr_region: TableRegion,
     identity_columns: tuple[int, ...],
-    base_row_by_key: dict[tuple[object, ...], int],
-    curr_row_by_key: dict[tuple[object, ...], int],
-    matched_keys: set[tuple[object, ...]],
+    base_row_by_key: dict[tuple[int, ...], int],
+    curr_row_by_key: dict[tuple[int, ...], int],
+    matched_keys: set[tuple[int, ...]],
+    sequence_like_columns: frozenset[int],
+    screens: dict[int, _ColumnScreen],
 ) -> tuple[float, int]:
     """Deterministic bounded sample comparing positional vs. key-based pairing."""
     value_columns = [
         column
         for column in range(curr_region.min_col, curr_region.max_col + 1)
         if column not in identity_columns
-        and not (
-            _is_sequence_like(_column_values(base_sheet, base_region, column))
-            and _is_sequence_like(_column_values(curr_sheet, curr_region, column))
-        )
+        and column not in sequence_like_columns
     ]
     if not value_columns or not matched_keys:
         return 0.0, 0
-    ordered_keys = sorted(matched_keys, key=repr)
+    ordered_keys = sorted(
+        matched_keys,
+        key=lambda key: repr(
+            tuple(
+                screens[column].component_values[component]
+                for column, component in zip(identity_columns, key, strict=True)
+            )
+        ),
+    )
     sample_size = min(len(ordered_keys), _SAMPLE_ROWS)
     if sample_size < len(ordered_keys):
         step = len(ordered_keys) / sample_size
@@ -420,16 +496,29 @@ def _evaluate_combination(
     columns: tuple[int, ...],
     formula_ratio: float,
     *,
+    screens: dict[int, _ColumnScreen],
+    sequence_like_columns: frozenset[int],
     manual_review: bool = False,
 ) -> RankedTableCandidate | None:
-    base_keys = _row_keys(base_sheet, base_region, columns)
-    curr_keys = _row_keys(curr_sheet, curr_region, columns)
-    base_non_blank = {row: key for row, key in base_keys.items() if key is not None}
-    curr_non_blank = {row: key for row, key in curr_keys.items() if key is not None}
-    if not base_keys or not curr_keys:
+    base_non_blank, base_key_counts, base_rows = _combination_key_stats(
+        base_region,
+        columns,
+        screens,
+        baseline=True,
+    )
+    curr_non_blank, curr_key_counts, curr_rows = _combination_key_stats(
+        curr_region,
+        columns,
+        screens,
+        baseline=False,
+    )
+    base_row_count = base_region.max_row - base_region.min_row + 1
+    curr_row_count = curr_region.max_row - curr_region.min_row + 1
+    if base_row_count < 1 or curr_row_count < 1:
         return None
     non_blank_coverage = min(
-        len(base_non_blank) / len(base_keys), len(curr_non_blank) / len(curr_keys)
+        base_non_blank / base_row_count,
+        curr_non_blank / curr_row_count,
     )
     minimum_coverage = (
         MANUAL_MIN_NON_BLANK_COVERAGE
@@ -439,13 +528,11 @@ def _evaluate_combination(
     if non_blank_coverage < minimum_coverage:
         return None
 
-    base_key_counts = Counter(base_non_blank.values())
-    curr_key_counts = Counter(curr_non_blank.values())
-    unique_base = sum(1 for count in base_key_counts.values() if count == 1) / len(
-        base_non_blank
+    unique_base = (
+        sum(1 for count in base_key_counts.values() if count == 1) / base_non_blank
     )
-    unique_curr = sum(1 for count in curr_key_counts.values() if count == 1) / len(
-        curr_non_blank
+    unique_curr = (
+        sum(1 for count in curr_key_counts.values() if count == 1) / curr_non_blank
     )
     unique_ratio = min(unique_base, unique_curr)
     if unique_ratio < MIN_UNIQUE_RATIO:
@@ -459,10 +546,10 @@ def _evaluate_combination(
         return None
 
     base_row_by_key = {
-        key: row for row, key in base_non_blank.items() if base_key_counts[key] == 1
+        key: base_rows[key] for key in base_unique_keys
     }
     curr_row_by_key = {
-        key: row for row, key in curr_non_blank.items() if curr_key_counts[key] == 1
+        key: curr_rows[key] for key in curr_unique_keys
     }
     matched = base_unique_keys & curr_unique_keys
     if not matched:
@@ -486,6 +573,8 @@ def _evaluate_combination(
         base_row_by_key,
         curr_row_by_key,
         matched,
+        sequence_like_columns,
+        screens,
     )
     if projected_mismatches < MIN_PROJECTED_MISMATCHES:
         return None
@@ -538,17 +627,40 @@ def detect_ranked_table_candidate(
         (
             screen
             for screen in screens
-            if screen.safe or (allow_manual_review and screen.manual_safe)
+            if (
+                screen.safe or (allow_manual_review and screen.manual_safe)
+            )
+            and not _cannot_contribute_displacement(screen)
         ),
         key=lambda screen: -screen.score,
     )
     top = safe[:MAX_SINGLE_CANDIDATES]
     if not top:
         return None
+    if all(
+        len(screen.base_components) == len(screen.curr_components)
+        and all(
+            baseline == current
+            for baseline, current in zip(
+                screen.base_components,
+                screen.curr_components,
+                strict=True,
+            )
+        )
+        for screen in top
+    ):
+        return None
     top_columns = [screen.column for screen in top]
     formula_ratio_by_column = {screen.column: screen.formula_ratio for screen in top}
+    screens_by_column = {screen.column: screen for screen in screens}
+    sequence_like_columns = frozenset(
+        screen.column
+        for screen in screens
+        if screen.base_sequence_like and screen.curr_sequence_like
+    )
 
     best: RankedTableCandidate | None = None
+    perfect_candidate = False
     for size in range(1, min(MAX_COMPOSITE_SIZE, len(top_columns)) + 1):
         for combo in combinations(top_columns, size):
             candidate = _evaluate_combination(
@@ -558,19 +670,25 @@ def detect_ranked_table_candidate(
                 curr_region,
                 combo,
                 max(formula_ratio_by_column[column] for column in combo),
+                screens=screens_by_column,
+                sequence_like_columns=sequence_like_columns,
                 manual_review=allow_manual_review,
             )
             if candidate is None:
                 continue
             if best is None or candidate.unique_ratio > best.unique_ratio:
                 best = candidate
+            if best.unique_ratio == 1.0:
+                perfect_candidate = True
+                break
+        if perfect_candidate:
+            break
     if best is None:
         return None
     ordinal_columns = tuple(
         screen.column
         for screen in screens
-        if _is_sequence_like(_column_values(base_sheet, base_region, screen.column))
-        and _is_sequence_like(_column_values(curr_sheet, curr_region, screen.column))
+        if screen.base_sequence_like and screen.curr_sequence_like
     )
     return replace(
         best,

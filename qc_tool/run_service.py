@@ -56,7 +56,7 @@ REPORT_DEFER_FINDINGS = 50_000
 
 
 def _resolved_config_source_hashes(
-    resolved: ResolvedInputConfigurationV1, file_hashes: dict[str, str]
+    file_hashes: dict[str, str],
 ) -> dict[str, tuple[str | None, str | None]]:
     """Per-member ``(baseline_sha256, current_sha256)`` freshly computed
     from this run's actual ``file_hashes`` (role-keyed, `role_key()`'s own
@@ -64,15 +64,18 @@ def _resolved_config_source_hashes(
     ``validate_freshness`` compares against the resolved configuration's
     own recorded hashes.
     """
-    result: dict[str, tuple[str | None, str | None]] = {}
-    for member in resolved.members:
-        member_id = member.member_id
-        suffix = "" if member_id == "primary" else f":{member_id}"
-        result[member_id] = (
-            file_hashes.get(f"baseline_excel{suffix}"),
-            file_hashes.get(f"current_excel{suffix}"),
-        )
-    return result
+    members: dict[str, list[str | None]] = {}
+    for role, source_hash in file_hashes.items():
+        prefix, separator, member_id = role.partition(":")
+        if prefix not in {"baseline_excel", "current_excel"}:
+            continue
+        logical_member_id = member_id if separator else "primary"
+        pair = members.setdefault(logical_member_id, [None, None])
+        pair[0 if prefix == "baseline_excel" else 1] = source_hash
+    return {
+        member_id: (pair[0], pair[1])
+        for member_id, pair in members.items()
+    }
 
 
 @dataclass(slots=True)
@@ -204,9 +207,7 @@ def perform_run(
     if resolved_input_configuration is not None:
         validate_freshness(
             resolved_input_configuration,
-            current_source_sha256=_resolved_config_source_hashes(
-                resolved_input_configuration, file_hashes
-            ),
+            current_source_sha256=_resolved_config_source_hashes(file_hashes),
         )
 
     formula_cache = (
@@ -332,6 +333,10 @@ def perform_run(
                             result.findings,
                             previous_profile=previous_profile,
                             current_profile=profile,
+                            previous_resolved=(
+                                previous.resolved_input_configuration
+                            ),
+                            current_resolved=result.resolved_input_configuration,
                         )
                         if exclusion_summary.any_excluded:
                             result.disclosures.append(

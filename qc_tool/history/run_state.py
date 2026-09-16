@@ -323,6 +323,25 @@ class RunStateStore:
             ).fetchone()
         return None if row is None else _record(row)
 
+    def delete_terminal_attempt(self, request_id: str) -> bool:
+        """Delete one terminal request that never produced a completed run.
+
+        Active requests and rows linked to immutable run history are never
+        deleted through this recovery control.
+        """
+        placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+        statuses = sorted(status.value for status in ACTIVE_STATUSES)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                DELETE FROM run_state
+                WHERE request_id = ? AND run_id IS NULL
+                    AND status NOT IN ({placeholders})
+                """,
+                (request_id, *statuses),
+            )
+            return cursor.rowcount == 1
+
     def set_queue_position(self, request_id: str, position: int) -> None:
         with self._connect() as conn:
             conn.execute(

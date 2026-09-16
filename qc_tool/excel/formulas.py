@@ -925,6 +925,13 @@ def _error_findings(
         )
         saved_error_findings: list[tuple[Finding, int, int, str, CellRecord]] = []
         for (row, col), cell in sorted(sheet.cells.items()):
+            if any(
+                region.sheet == sheet.name
+                and region.min_row <= row <= region.max_row
+                and region.min_col <= col <= region.max_col
+                for region in alignment.excluded_current_regions
+            ):
+                continue
             if _ignored(sheet_profile, row, col):
                 continue
             scanned_cells += 1

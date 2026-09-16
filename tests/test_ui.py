@@ -1,5 +1,6 @@
 """UI smoke tests (criterion 12): pages render; perform_run produces artifacts."""
 
+import asyncio
 import datetime as dt
 import hashlib
 import inspect
@@ -160,6 +161,27 @@ def _write_managed_retry_pair(work_dir: Path) -> dict[str, Path]:
     for role, path in files.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(role.encode("ascii"))
+    return files
+
+
+def _write_valid_managed_retry_pair(work_dir: Path) -> dict[str, Path]:
+    from openpyxl import Workbook
+
+    files = {
+        "baseline_excel": work_dir / "uploads" / "baseline_excel" / "baseline.xlsx",
+        "current_excel": work_dir / "uploads" / "current_excel" / "current.xlsx",
+    }
+    for role, path in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        workbook = Workbook()
+        sheet = workbook.active
+        assert sheet is not None
+        sheet.title = "Data"
+        sheet.append(["ID", "Value"])
+        sheet.append(["A0", 10])
+        sheet.append(["A1", 20])
+        sheet.append(["A2", 31 if role == "current_excel" else 30])
+        workbook.save(path)
     return files
 
 
@@ -1169,6 +1191,63 @@ def test_terminal_request_summary_explains_complexity_failure_without_details() 
     assert "private detail" not in summary
 
 
+@pytest.mark.asyncio
+async def test_active_request_hides_terminal_actions_and_stale_discard_is_refused(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_dir = tmp_path / "work"
+    store = RunStateStore(work_dir / "history.sqlite3")
+    old = store.enqueue(
+        "old-terminal-attempt",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="default",
+        files={},
+        queue_position=0,
+    )
+    store.finish(old.request_id, RunStatus.FAILED, error="safe failure")
+    manager = _RecordingQueueManager(store)
+    monkeypatch.setattr(app_module, "get_manager", lambda _work_dir: manager)
+    create_pages(work_dir)
+
+    await user.open("/")
+    await user.should_see("Discard attempt")
+    stale_discard = next(
+        iter(user.find(kind=ui.button, content="Discard attempt").elements)
+    )
+    stale_listener = next(
+        listener
+        for listener in stale_discard._event_listeners.values()
+        if listener.type == "click" and listener.handler is not None
+    )
+    assert stale_listener.handler is not None
+    stale_handler = stale_listener.handler
+    stale_slot = stale_discard.parent_slot or stale_discard.client.layout.default_slot
+
+    active = store.enqueue(
+        "new-active-attempt",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="default",
+        files={},
+        queue_position=1,
+    )
+    await asyncio.sleep(0.6)
+    await user.should_not_see("Discard attempt")
+
+    with stale_slot:
+        stale_handler(
+            events.GenericEventArguments(
+                sender=stale_discard,
+                client=stale_discard.client,
+                args={},
+            )
+        )
+    assert store.get(old.request_id) is not None
+
+    store.finish(active.request_id, RunStatus.CANCELLED)
+    await user.should_see("Discard attempt", retries=20)
+    await user.should_see("Last attempt #new-acti was cancelled", retries=20)
+
+
 def test_old_typed_ranked_action_requires_a_detector_refresh() -> None:
     evidence = ranked_table_evidence_payload_v2()
     current_action: dict[str, object] = {
@@ -1248,8 +1327,12 @@ def test_migrated_default_temporary_profile_recovers_without_yaml(
     )
 
     assert profile.name == "default"
-    assert _temporary_profile_name(profile.name) == "default (temporary)"
-    assert _temporary_profile_name("default (temporary)") == "default (temporary)"
+    assert _temporary_profile_name(profile.name) == "default - temporary"
+    assert _temporary_profile_name("default (temporary)") == "default - temporary"
+    assert _temporary_profile_name("default - temporary") == "default - temporary"
+    assert _profile_path(tmp_path, _temporary_profile_name(profile.name)).name == (
+        "default - temporary.yaml"
+    )
 
 
 def test_missing_non_default_temporary_profile_has_targeted_error(
@@ -1296,6 +1379,36 @@ async def test_run_page_reconnects_to_queue_state_from_another_tab(
 
 
 @pytest.mark.asyncio
+async def test_main_page_periodically_evicts_unsubscribed_terminal_setup_jobs(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MaintenanceCoordinator:
+        shutdown_hook_installed = False
+
+        def __init__(self) -> None:
+            self.evictions = 0
+
+        def shutdown(self) -> None:
+            pass
+
+        def evict_terminal(self, *, max_age_seconds: float) -> int:
+            assert max_age_seconds == 60.0
+            self.evictions += 1
+            return 0
+
+    coordinator = MaintenanceCoordinator()
+    monkeypatch.setattr(
+        app_module, "get_setup_coordinator", lambda _work_dir: coordinator
+    )
+    create_pages(tmp_path / "work")
+
+    await user.open("/")
+    await asyncio.sleep(0.6)
+
+    assert coordinator.evictions >= 1
+
+
+@pytest.mark.asyncio
 async def test_complexity_failure_offers_an_explicit_override_confirmation(
     user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1335,15 +1448,16 @@ async def test_complexity_failure_offers_an_explicit_override_confirmation(
         if button.text == "Run with override" and "runbtn" in button.classes
     )
     _emit(confirm, "click", {})
-    await user.should_see("Run started")
+    await user.should_see("Configure & run")
 
-    assert len(manager.submitted) == 1
-    request, credentials = manager.submitted[0]
-    assert request.files == {role: str(path.resolve()) for role, path in files.items()}
-    assert request.profile == profile.model_dump(mode="json")
-    assert request.requested_output_mode == FindingOutputMode.DECISION.value
-    assert request.allow_large_workbooks is True
-    assert credentials == {}
+    assert manager.submitted == []
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    config = ConfigSessionStore(work_dir / "history.sqlite3").latest_for_source_set(
+        file_hashes
+    )
+    assert config is not None
+    assert config.choices["allow_large_workbooks"] is True
+    assert config.choices["profile_snapshot"] == profile.model_dump(mode="json")
 
 
 @pytest.mark.asyncio
@@ -1388,15 +1502,16 @@ async def test_stale_row_suggestions_refresh_with_restored_request_context(
     await user.open("/")
     await user.should_see("Refresh row suggestions")
     user.find("Refresh row suggestions").click()
-    await user.should_see("Run started")
+    await user.should_see("Configure & run")
 
-    assert len(manager.submitted) == 1
-    request, credentials = manager.submitted[0]
-    assert request.files == {role: str(path.resolve()) for role, path in files.items()}
-    assert request.profile == profile.model_dump(mode="json")
-    assert request.requested_output_mode == FindingOutputMode.ATOMIC.value
-    assert request.allow_large_workbooks is False
-    assert credentials == {}
+    assert manager.submitted == []
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    config = ConfigSessionStore(work_dir / "history.sqlite3").latest_for_source_set(
+        file_hashes
+    )
+    assert config is not None
+    assert config.choices["output_mode"] == FindingOutputMode.ATOMIC.value
+    assert config.choices["profile_snapshot"] == profile.model_dump(mode="json")
 
 
 @pytest.mark.asyncio
@@ -1460,14 +1575,11 @@ async def test_run_qc_button_creates_a_configuration_session(
     # file's own row-suggestions-refresh test does, without depending on a
     # real browser upload widget (none exists in this test suite).
     user.find("Refresh row suggestions").click()
-    await user.should_see("Run started")
-
-    user.find(marker="run-qc-button").click()
+    await user.should_see("Configure & run")
 
     file_hashes = {role: sha256_file(path) for role, path in files.items()}
-    expected_key = session_key_for(file_hashes)
     config_store = ConfigSessionStore(work_dir / "history.sqlite3")
-    record = config_store.get(expected_key)
+    record = config_store.latest_for_source_set(file_hashes)
     assert record is not None
     assert record.choices["mode"] == QCRunMode.CYCLE_COMPARISON.value
     assert record.choices["files"] == {
@@ -1560,6 +1672,175 @@ async def test_blocked_row_matching_reopens_with_compact_labeled_controls(
         ("A · Order", "B · Code"),
         ("A · Position", "B · Key"),
     }
+
+
+@pytest.mark.asyncio
+async def test_temporary_row_matching_returns_to_setup_and_can_discard_attempt(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from qc_tool.config.resolved_input import (
+        ResolvedInputConfigurationV1,
+        ResolvedMember,
+        ResolvedRegion,
+        ResolvedSelector,
+        ResolvedSheet,
+    )
+    from qc_tool.ui.config_workspace import build_session_choices
+
+    work_dir = tmp_path / "work"
+    files = _write_valid_managed_retry_pair(work_dir)
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    profile = DeliverableProfile(name="default")
+    resolved = ResolvedInputConfigurationV1(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="default",
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                baseline_source_sha256=file_hashes["baseline_excel"],
+                current_source_sha256=file_hashes["current_excel"],
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="primary_data",
+                        baseline_sheet_name="Data",
+                        current_sheet_name="Data",
+                        regions=(
+                            ResolvedRegion(
+                                region_id="data_a1_b4",
+                                baseline_outer_range="A1:B4",
+                                current_outer_range="A1:B4",
+                            ),
+                        ),
+                        selectors=(
+                            ResolvedSelector(
+                                selector_id="scenario",
+                                baseline_cell="B1",
+                                current_cell="B1",
+                                equal=True,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    choices = build_session_choices(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="default",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode=FindingOutputMode.DECISION.value,
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+        profile_snapshot=profile.model_dump(mode="json"),
+        resolved_input_configuration=resolved.model_dump(mode="json"),
+    )
+    choices["selectors"] = {
+        "primary": [
+            {
+                "sheet_name": "Data",
+                "selector_id": "scenario",
+                "label": "Scenario choice",
+                "cell": "B1",
+                "baseline_cell": "B1",
+            }
+        ]
+    }
+    config_store = ConfigSessionStore(work_dir / "history.sqlite3")
+    config_store.create_session(
+        file_hashes=file_hashes,
+        profile_name="default",
+        choices=choices,
+    )
+
+    run_store = RunStateStore(work_dir / "history.sqlite3")
+    record = run_store.enqueue(
+        "blocked-temporary-row-matching",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="default",
+        files={role: path.name for role, path in files.items()},
+        queue_position=0,
+        profile_snapshot=profile.model_dump(mode="json"),
+        requested_output_mode=FindingOutputMode.DECISION.value,
+        resolved_input_configuration=resolved.model_dump(mode="json"),
+        resolved_input_digest=resolved.canonical_sha256(),
+    )
+    evidence = ranked_table_evidence_payload_v2(
+        sheet="Data",
+        current_range="A1:B4",
+        data_row_count=3,
+        available_columns=("A", "B"),
+        column_headers=("ID", "Value"),
+        suggested_identity_columns=("A",),
+        suggested_ordinal_columns=(),
+    )
+    run_store.finalize_blocked(
+        record.request_id,
+        {
+            "version": 2,
+            "reason": "row_identity_confirmation_required",
+            "message": "Review row matching.",
+            "items": [
+                {
+                    "member_id": "primary",
+                    "sheet": "Data",
+                    "cell": "A1",
+                    "ranked_table_evidence": evidence,
+                }
+            ],
+        },
+    )
+    manager = _RecordingQueueManager(run_store)
+    monkeypatch.setattr(app_module, "get_manager", lambda _work_dir: manager)
+    create_pages(work_dir)
+
+    await user.open("/")
+    await user.should_see("Configure setup")
+    await user.should_see("Discard attempt")
+    user.find("Review row matching").click()
+    await user.should_see("Apply and review setup")
+    user.find(kind=ui.button, content="Apply and review setup").click()
+
+    await user.should_see("Configure & run", retries=20)
+    await user.should_see("Analysis complete", retries=50)
+    await user.should_see("Scenario choice (B1)", retries=20)
+    assert manager.submitted == []
+    recovered = config_store.latest_for_source_set(file_hashes)
+    assert recovered is not None
+    assert recovered.choices["profile_name"] == "default - temporary"
+    profile_snapshot = recovered.choices["profile_snapshot"]
+    assert isinstance(profile_snapshot, dict)
+    assert profile_snapshot["name"] == "default - temporary"
+    assert recovered.choices["selectors"] == choices["selectors"]
+    pending = recovered.choices["pending_row_matching"]
+    assert isinstance(pending, list)
+    [proposal] = pending
+    assert isinstance(proposal, dict)
+    assert proposal["identity_columns"] == ["A"]
+
+    mode_toggle = next(iter(user.find(marker="region-mode-toggle").elements))
+    assert isinstance(mode_toggle, ui.toggle)
+    assert mode_toggle.value == "keyed"
+    mode_toggle.value = "positional"
+    revised = config_store.latest_for_source_set(file_hashes)
+    assert revised is not None
+    assert "pending_row_matching" not in revised.choices
+    region_choices = revised.choices["region_decisions"]
+    assert isinstance(region_choices, dict)
+    assert any(
+        isinstance(choice, dict) and choice.get("mode") == "positional"
+        for choice in region_choices.values()
+    )
+
+    await user.open("/")
+    await user.should_see("Discard attempt")
+    user.find(kind=ui.button, content="Discard attempt").click()
+    await user.should_see("Previous attempt discarded")
+    assert run_store.get(record.request_id) is None
+    assert config_store.latest_for_source_set(file_hashes) is not None
 
 
 @pytest.mark.asyncio
@@ -3780,8 +4061,10 @@ def test_ranked_block_opens_the_review_row_matching_dialog() -> None:
     assert "def _open_row_identity_setup(" in source
     assert '"Review row matching"' in flat
     assert '"QC paused"' in flat
-    assert '"Save rule and run QC"' in flat
-    assert '"Run QC once"' in flat
+    assert '"Save rule and review setup"' in flat
+    assert '"Apply and review setup"' in flat
+    assert '"Configure setup"' in flat
+    assert '"Discard attempt"' in flat
     assert '"This run only"' in flat
     assert '"Save for future runs"' in flat
     assert '"Existing profile or new name"' in flat
@@ -3792,20 +4075,22 @@ def test_ranked_block_opens_the_review_row_matching_dialog() -> None:
     assert "region.formula_driven_identity" in source
     assert '"No formula result is used as a column "' in source
     assert "options=region.column_options" in source
-    assert "await start_run(profile_override=profile)" in source
+    assert "open_configuration_workspace(" in source
     assert "profile_override: DeliverableProfile | None = None" in source
+    assert "choice_updates=_row_matching_choice_updates(vm)" in source
+    assert "reuse_source_session=True" in source
     assert '"rankedtable-card"' in flat
     assert '"rankedtable-body w-full gap-2"' in flat
-    assert "await start_run()" in source
+    assert "await start_run(" not in source
     assert "view_model_from_action(" in source
     blocked_branch = source.split("elif record.status is RunStatus.BLOCKED:", 1)[1]
     assert '== "row_identity_confirmation_required"' in blocked_branch
-    assert "record.profile_snapshot" in blocked_branch
+    assert "current.profile_snapshot" in blocked_branch
     assert "DeliverableProfile.model_validate(" in blocked_branch
-    assert "source_record=record" in blocked_branch
+    assert "source_record=current" in blocked_branch
     assert "await _restore_request_context(source_record)" in source
     temporary_branch = source.split(
-        '"Temporary row matching applied; Re-QC started "', 1
+        '"Temporary row matching applied; review setup "', 1
     )[0].rsplit("else:", 1)[1]
     assert "state.profile_override = profile.model_copy(deep=True)" in temporary_branch
     assert "profile_select.value = profile.name" in temporary_branch
@@ -3825,7 +4110,8 @@ def test_complexity_failure_branch_prompts_and_retries_only_after_confirmation()
     assert '"Run with override"' in override_dialog
     assert "await _restore_request_context(record)" in override_dialog
     assert "state.allow_large_workbooks = True" in override_dialog
-    assert "await start_run(profile_override=profile)" in override_dialog
+    assert "open_configuration_workspace(" in override_dialog
+    assert "await start_run(" not in override_dialog
 
 
 def test_stale_ranked_action_refreshes_through_managed_request_context() -> None:
@@ -3836,21 +4122,26 @@ def test_stale_ranked_action_refreshes_through_managed_request_context() -> None
 
     assert "_ranked_action_needs_refresh(action)" in action_branch
     assert '"Refresh row suggestions"' in action_branch
-    assert "await _restore_request_context(record)" in action_branch
-    assert "await start_run(profile_override=profile)" in action_branch
+    assert "await _restore_request_context(current)" in action_branch
+    assert "open_configuration_workspace(" in action_branch
+    assert "await start_run(" not in action_branch
 
 
 def test_guide_describes_manual_prerequisites_and_ranked_setup() -> None:
     from qc_tool.ui import guide
 
     source = inspect.getsource(guide.render_guide)
-    assert "Prerequisite cells are manually pinned for both OOXML and XLSB" in source
+    flat = " ".join(source.split())
+    assert "These cells are manually pinned" in source
+    assert "Scenario checks" in source
     assert "Ranked or sorted tables" in source
-    assert "run once without saving" in source
-    assert "re-runs automatically" in source
+    assert "Apply and review setup" in source
+    assert '"this attempt only and returns to Configure & Run; it never starts "' in flat
+    assert '"Configuration never starts QC automatically;' in flat
+    assert "Discard attempt" in source
     assert "formula result is never presented as a header" in source
     assert "Different selections can change reference columns" in source
-    assert "Comparison prerequisites" in source
+    assert "Rank/order columns" in source
     assert "automatic dropdown suggestions are OOXML-only" not in source
 
 

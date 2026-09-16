@@ -4,6 +4,7 @@ tests (plan-20260913, Step 12 Fix 5).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -14,6 +15,7 @@ from qc_tool.setup.key_overlap_worker import (
     KeyOverlapRequest,
     run_key_overlap_worker,
 )
+from qc_tool.setup.preview_worker import SetupScanRequest, run_setup_scan_worker
 from tests.fixtures.generate import encrypt_file
 
 
@@ -38,11 +40,34 @@ def _request(
     current_password: str = "",
     trim_identity_whitespace: bool = False,
 ) -> KeyOverlapRequest:
+    sidecar_path = baseline_path.parent / "setup-inspection.sqlite3"
+    baseline_hash = sha256_file(baseline_path)
+    current_hash = sha256_file(current_path)
+    scan = run_setup_scan_worker(
+        SetupScanRequest(
+            member_id="primary",
+            baseline_path=str(baseline_path),
+            current_path=str(current_path),
+            baseline_hash=baseline_hash,
+            current_hash=current_hash,
+            sidecar_path=str(sidecar_path),
+            session_key="session-1",
+            input_generation=1,
+            passwords={
+                "baseline": baseline_password,
+                "current": current_password,
+            },
+        )
+    )
+    if baseline_password or current_password:
+        assert scan.result_payload is not None
     return KeyOverlapRequest(
-        baseline_path=str(baseline_path),
-        current_path=str(current_path),
-        baseline_hash=sha256_file(baseline_path),
-        current_hash=sha256_file(current_path),
+        sidecar_path=str(sidecar_path),
+        session_key="session-1",
+        input_generation=1,
+        member_id="primary",
+        baseline_hash=baseline_hash,
+        current_hash=current_hash,
         baseline_sheet="Data",
         current_sheet="Data",
         baseline_first_row=2,  # row 1 is the "ID"/"Amount" header
@@ -51,8 +76,6 @@ def _request(
         current_last_row=6,
         identity_columns=identity_columns,
         baseline_identity_columns=baseline_identity_columns,
-        baseline_password=baseline_password,
-        current_password=current_password,
         trim_identity_whitespace=trim_identity_whitespace,
     )
 
@@ -63,7 +86,10 @@ def test_worker_reports_full_overlap_for_identical_unique_keys(tmp_path: Path) -
     _write_workbook(baseline_path, [("R1", 1), ("R2", 2), ("R3", 3)])
     _write_workbook(current_path, [("R3", 30), ("R1", 10), ("R2", 20)])  # reordered
 
-    outcome = run_key_overlap_worker(_request(baseline_path, current_path))
+    request = _request(baseline_path, current_path)
+    baseline_path.unlink()
+    current_path.unlink()
+    outcome = run_key_overlap_worker(request)
 
     assert outcome.ok
     assert outcome.ratio == 1.0
@@ -168,35 +194,25 @@ def test_worker_discloses_a_hash_mismatch(tmp_path: Path) -> None:
     _write_workbook(baseline_path, [("R1", 1)])
     _write_workbook(current_path, [("R1", 1)])
 
-    request = KeyOverlapRequest(
-        baseline_path=str(baseline_path),
-        current_path=str(current_path),
-        baseline_hash="0" * 64,  # deliberately wrong
-        current_hash=sha256_file(current_path),
-        baseline_sheet="Data",
-        current_sheet="Data",
-        baseline_first_row=1,
-        baseline_last_row=2,
-        current_first_row=1,
-        current_last_row=2,
-        identity_columns=("A",),
-    )
-
-    outcome = run_key_overlap_worker(request)
-
-    assert not outcome.ok
-    assert "changed since it was uploaded" in outcome.disclosure
-
-
-def test_worker_discloses_a_missing_source_file(tmp_path: Path) -> None:
-    current_path = tmp_path / "current.xlsx"
-    _write_workbook(current_path, [("R1", 1)])
-
-    request = KeyOverlapRequest(
-        baseline_path=str(tmp_path / "nonexistent.xlsx"),
-        current_path=str(current_path),
+    request = replace(
+        _request(baseline_path, current_path),
         baseline_hash="0" * 64,
-        current_hash=sha256_file(current_path),
+    )
+
+    outcome = run_key_overlap_worker(request)
+
+    assert not outcome.ok
+    assert "stale" in outcome.disclosure
+
+
+def test_worker_discloses_a_missing_sidecar(tmp_path: Path) -> None:
+    request = KeyOverlapRequest(
+        sidecar_path=str(tmp_path / "missing-sidecar.sqlite3"),
+        session_key="session-1",
+        input_generation=1,
+        member_id="primary",
+        baseline_hash="0" * 64,
+        current_hash="1" * 64,
         baseline_sheet="Data",
         current_sheet="Data",
         baseline_first_row=1,
@@ -209,7 +225,7 @@ def test_worker_discloses_a_missing_source_file(tmp_path: Path) -> None:
     outcome = run_key_overlap_worker(request)
 
     assert not outcome.ok
-    assert "no longer at its recorded location" in outcome.disclosure
+    assert "sheet not found" in outcome.disclosure
 
 
 def test_worker_reports_a_missing_credential_role_without_a_password(
@@ -225,7 +241,8 @@ def test_worker_reports_a_missing_credential_role_without_a_password(
     outcome = run_key_overlap_worker(_request(baseline_path, current_path))
 
     assert not outcome.ok
-    assert outcome.missing_credential_roles == ("baseline",)
+    assert outcome.missing_credential_roles == ()
+    assert "sheet not found" in outcome.disclosure
 
 
 def test_worker_scans_successfully_with_the_right_password(tmp_path: Path) -> None:
@@ -277,18 +294,9 @@ def test_worker_discloses_a_missing_sheet(tmp_path: Path) -> None:
     _write_workbook(baseline_path, [("R1", 1)])
     _write_workbook(current_path, [("R1", 1)])
 
-    request = KeyOverlapRequest(
-        baseline_path=str(baseline_path),
-        current_path=str(current_path),
-        baseline_hash=sha256_file(baseline_path),
-        current_hash=sha256_file(current_path),
-        baseline_sheet="Data",
+    request = replace(
+        _request(baseline_path, current_path),
         current_sheet="NoSuchSheet",
-        baseline_first_row=1,
-        baseline_last_row=2,
-        current_first_row=1,
-        current_last_row=2,
-        identity_columns=("A",),
     )
 
     outcome = run_key_overlap_worker(request)

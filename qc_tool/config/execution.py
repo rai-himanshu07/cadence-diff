@@ -28,6 +28,8 @@ level down.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple, range_boundaries
 
@@ -191,6 +193,54 @@ class RegionColumnPolicies:
         self.expected_refresh_columns = expected_refresh_columns
 
 
+class RegionDisposition:
+    """One explicit non-automatic region decision keyed by anchor cell."""
+
+    __slots__ = ("anchor_cell", "baseline_anchor_cell", "mode")
+    anchor_cell: str
+    baseline_anchor_cell: str | None
+    mode: Literal["positional", "excluded"]
+
+    def __init__(
+        self,
+        anchor_cell: str,
+        mode: Literal["positional", "excluded"],
+        baseline_anchor_cell: str | None = None,
+    ) -> None:
+        self.anchor_cell = anchor_cell
+        self.baseline_anchor_cell = baseline_anchor_cell
+        self.mode = mode
+
+
+def region_disposition(region: ResolvedRegion) -> RegionDisposition | None:
+    if region.mode == "positional":
+        mode: Literal["positional", "excluded"] = "positional"
+    elif region.mode == "excluded":
+        mode = "excluded"
+    else:
+        return None
+    anchor_source = region.current_data_range or region.current_outer_range
+    if not anchor_source:
+        return None
+    anchor = _top_left(anchor_source)
+    if anchor is None:
+        return None
+    anchor_row, anchor_col = anchor
+    baseline_anchor_source = region.baseline_data_range or region.baseline_outer_range
+    baseline_anchor = (
+        _top_left(baseline_anchor_source) if baseline_anchor_source else None
+    )
+    return RegionDisposition(
+        anchor_cell=f"{get_column_letter(anchor_col)}{anchor_row}",
+        mode=mode,
+        baseline_anchor_cell=(
+            f"{get_column_letter(baseline_anchor[1])}{baseline_anchor[0]}"
+            if baseline_anchor is not None
+            else None
+        ),
+    )
+
+
 def region_column_policies(region: ResolvedRegion) -> RegionColumnPolicies | None:
     """Adapt one region's ignore/expected-refresh column columns into
     ``RegionColumnPolicies``, or ``None`` when it declares neither.
@@ -318,6 +368,23 @@ class ExecutionBindings:
                 if policy is not None:
                     policies.append(policy)
         return tuple(policies)
+
+    def region_dispositions(
+        self, member_id: str, current_sheet_name: str
+    ) -> tuple[RegionDisposition, ...]:
+        """Explicit positional/excluded decisions for one physical sheet."""
+        member = self._members.get(member_id)
+        if member is None:
+            return ()
+        dispositions: list[RegionDisposition] = []
+        for sheet in member.sheets:
+            if sheet.current_sheet_name != current_sheet_name:
+                continue
+            for region in sheet.regions:
+                disposition = region_disposition(region)
+                if disposition is not None:
+                    dispositions.append(disposition)
+        return tuple(dispositions)
 
     def confirmed_column_mappings(
         self, member_id: str, current_sheet_name: str

@@ -218,6 +218,22 @@ def test_validate_freshness_rejects_a_missing_member() -> None:
         validate_freshness(resolved, current_source_sha256={})
 
 
+def test_validate_freshness_rejects_an_expected_member_missing_from_resolution() -> None:
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(),
+    )
+
+    with pytest.raises(
+        StaleResolvedConfigurationError,
+        match="resolved configuration is missing member 'primary'",
+    ):
+        validate_freshness(
+            resolved,
+            current_source_sha256={"primary": ("a" * 64, "b" * 64)},
+        )
+
+
 def test_validate_freshness_rejects_a_stale_contract_schema_version() -> None:
     resolved = ResolvedInputConfigurationV1(
         inspection_contract_version=INPUT_CONTRACT_VERSION - 1 if INPUT_CONTRACT_VERSION > 0 else 0,
@@ -296,6 +312,31 @@ def test_perform_run_rejects_a_resolved_configuration_with_a_stale_source_hash(
     assert resolved.members[0].current_source_sha256 != real_current_hash
 
     with pytest.raises(StaleResolvedConfigurationError):
+        perform_run(
+            tmp_path / "work",
+            {"baseline_excel": baseline_path, "current_excel": current_path},
+            {},
+            DeliverableProfile(name="default"),
+            mode=QCRunMode.CYCLE_COMPARISON,
+            resolved_input_configuration=resolved,
+        )
+
+
+def test_perform_run_rejects_empty_resolution_for_supplied_excel_pair(
+    tmp_path: Path,
+) -> None:
+    from qc_tool.run_service import perform_run
+
+    baseline_path, current_path = _write_pair(tmp_path)
+    resolved = ResolvedInputConfigurationV1(
+        inspection_contract_version=INPUT_CONTRACT_VERSION,
+        members=(),
+    )
+
+    with pytest.raises(
+        StaleResolvedConfigurationError,
+        match="resolved configuration is missing member 'primary'",
+    ):
         perform_run(
             tmp_path / "work",
             {"baseline_excel": baseline_path, "current_excel": current_path},

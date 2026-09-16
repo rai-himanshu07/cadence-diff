@@ -355,3 +355,32 @@ def test_no_moved_columns_reports_no_mapping_at_all() -> None:
     )
     bindings = ExecutionBindings(resolved)
     assert bindings.confirmed_column_mappings("primary", "Data") == ()
+
+
+def test_excluded_region_disposition_carries_both_side_anchors() -> None:
+    region = ResolvedRegion(
+        region_id="r1",
+        mode="excluded",
+        baseline_outer_range="D10:F20",
+        current_outer_range="A2:C12",
+    )
+    resolved = ResolvedInputConfigurationV1(
+        members=(
+            _member(
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="data",
+                        current_sheet_name="Data",
+                        regions=(region,),
+                    ),
+                )
+            ),
+        )
+    )
+
+    [disposition] = ExecutionBindings(resolved).region_dispositions(
+        "primary", "Data"
+    )
+    assert disposition.anchor_cell == "A2"
+    assert disposition.baseline_anchor_cell == "D10"
+    assert disposition.mode == "excluded"

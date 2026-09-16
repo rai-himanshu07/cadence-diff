@@ -10,6 +10,7 @@ from nicegui import ui
 GUIDE_SECTIONS = (
     ("launch", "Launch and first run"),
     ("start", "Start here"),
+    ("configure", "Configure and run"),
     ("example", "Worked example"),
     ("modes", "Choose a mode"),
     ("files", "Files and formats"),
@@ -31,6 +32,7 @@ GUIDE_SECTIONS = (
 COMMON_TASKS = (
     ("Launch QC Tool", "launch"),
     ("Run a first preflight", "launch"),
+    ("Configure files and matching", "configure"),
     ("See a worked example", "example"),
     ("Review a reporting cycle", "review"),
     ("Use Desktop Office focus", "focus"),
@@ -404,27 +406,26 @@ cadence-diff --data-dir "/path/to/qc-data"
             with _guide_section("start", "Start here"):
                 _callout(
                     "Check prerequisites before you compare",
-                    "If the profile pins a scenario or selector cell (for example a "
+                    "If the setup pins a scenario or parameter cell (for example a "
                     "dropdown-driven forecast case), baseline and current must show "
                     "the exact same, non-blank value there. A mismatch blocks the run "
                     "before any comparison, report, or history entry is produced: "
                     "select the same scenario in both files, fully recalculate, save, "
-                    "then run again. Configure pins in a named profile's "
-                    "<strong>Comparison prerequisites</strong> (Excel, advanced "
-                    "section) as a sheet and cell for each selector that must match. "
-                    "Prerequisite cells are manually pinned for both OOXML and XLSB "
-                    "workbooks today.",
+                    "then run again. Add each check from the active table's "
+                    "<strong>Scenario checks</strong> tab; save the setup to a named "
+                    "profile when it should recur. These cells are manually pinned "
+                    "for both OOXML and XLSB workbooks today.",
                     warning=True,
                 )
                 _callout(
                     "Ranked or sorted tables",
-                    "When a large positional block looks like the same records in a "
-                    "different order, QC pauses before creating mass cell-to-cell "
-                    "noise. Review row matching: pick the columns that match rows "
-                    "by (and, optionally, columns whose order-only values should "
-                    "be ignored), choose how duplicate identities are handled, and "
-                    "either run once without saving or save the rule to an existing "
-                    "or new named profile. Detected header labels appear beside stable "
+                    "When setup finds a large positional block that looks like the "
+                    "same records in a different order, Run once stays unavailable "
+                    "until you explicitly choose Match rows by key, Compare by "
+                    "position, or Remove from this run for that table. Pick the key "
+                    "columns and, if needed, Rank/order columns whose cached-value "
+                    "changes alone should be skipped, then choose how duplicate identities are "
+                    "handled. Detected header labels appear beside stable "
                     "column letters, including when a table has preamble rows. A "
                     "formula result is never presented as a header; calculated identity "
                     "columns without a proven literal header are labelled as such. QC "
@@ -432,14 +433,24 @@ cadence-diff --data-dir "/path/to/qc-data"
                     "and current use the same dropdown, filter, scenario, and parameter "
                     "selections. Different selections can change reference columns and "
                     "row membership, so QC may intentionally withhold a row-matching "
-                    "suggestion rather than guess across different configurations. Pin "
-                    "recurring selector cells as <strong>Comparison prerequisites</strong>. "
-                    "Confirmed row order and rank ordinals are ignored; formulas, "
+                    "suggestion rather than guess across different configurations. "
+                    "Confirmed row order and rank/order cached values are ignored; formulas, "
                     "styles, structure, and other business values remain checked. "
-                    "If no safe identity can be proved automatically, add a "
-                    "<strong>Row identity rule</strong> under the sheet in Manage "
-                    "profiles or leave positional comparison unchanged.",
+                    "Configuration never starts QC automatically; review the setup, "
+                    "then choose Run once or a save-and-run action.",
                     warning=True,
+                )
+                _callout(
+                    "Recovering a paused attempt",
+                    "An attempt paused by an older or unexpected row-matching check "
+                    "does not create a completed run. Choose Configure setup to return "
+                    "to the full workspace, or Review row matching to prepare a "
+                    "proposed rule first. Apply and review setup keeps the rule for "
+                    "this attempt only and returns to Configure & Run; it never starts "
+                    "QC automatically. Save for future runs writes the rule only after "
+                    "you choose a valid named profile. Discard attempt removes that "
+                    "terminal attempt message without deleting selected files, the "
+                    "configuration session, or completed run history.",
                 )
                 _paragraph(
                     "A defensible run has four parts: select the mode that answers the "
@@ -459,6 +470,34 @@ cadence-diff --data-dir "/path/to/qc-data"
                     "Sources are read-only",
                     "QC Tool copies uploaded files into managed local storage and verifies source "
                     "integrity in tests. It does not repair or overwrite source deliverables.",
+                )
+
+            with _guide_section("configure", "Configure and run"):
+                _paragraph(
+                    "Every browser-started run opens one Configure & Run workspace. "
+                    "Choose the mode, files, workbook members, passwords, profile, "
+                    "and structural matching there before submitting QC."
+                )
+                _list(
+                    [
+                        "Use <strong>Choose</strong>, <strong>Replace</strong>, and <strong>Clear</strong> on each file role. Re-QC restores valid managed copies and marks only roles that need replacement.",
+                        "Setup lists sheets and members first. Completed sheets become editable while later sheets continue scanning; leaving for History or Guide does not discard the setup session.",
+                        "Use <strong>Back to files</strong> at any setup or review stage. <strong>Cancel and go back</strong> stops the current setup generation but preserves selected files and configuration choices.",
+                        "For the active table, use <strong>Rows</strong>, <strong>Data bounds</strong>, <strong>Scenario checks</strong>, and <strong>Advanced</strong>. The preview remains mounted below the tabs and reloads when its side, window, or formula-text setting changes.",
+                        "<strong>Data bounds</strong> uses one data-start row plus footer rows and shows the effective baseline/current ranges. <strong>Advanced</strong> keeps physical outer ranges, anchor picking, moved-column letters, and specialized value policies out of the routine path.",
+                        "Use <strong>Edit profile policy</strong> to create or edit a named profile without leaving the setup. Saving the profile and applying it to this setup are separate explicit actions.",
+                        "After cancellation, <strong>Resume analysis</strong> starts a fresh setup attempt. <strong>Discard setup</strong> removes the setup decisions and sidecar; it does not silently replace source files.",
+                        "Passwords are held only in page memory. After a browser refresh or server restart, re-enter any required password inline; files and non-secret choices remain available.",
+                        "Final run and save-and-run actions remain disabled until every required member, sheet, deck, acknowledgement, and source hash belongs to the current input generation.",
+                    ]
+                )
+                _callout(
+                    "Setup is lighter than QC",
+                    "Setup reads each source once with format-specific readers and stores a "
+                    "private compressed sidecar for previews and key diagnostics. It does not "
+                    "launch Excel or LibreOffice, build dependencies, create reports, or treat "
+                    "setup observations as QC evidence. The submitted run performs its own "
+                    "authoritative load and validation.",
                 )
 
             with _guide_section("example", "Worked example"):

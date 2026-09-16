@@ -1,6 +1,7 @@
 """Explicit evidence-gated annotation carry-forward."""
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -9,6 +10,12 @@ from qc_tool.config.profile import (
     ExcelAvailabilityRule,
     ExcelProfile,
     SheetProfile,
+)
+from qc_tool.config.resolved_input import (
+    ResolvedInputConfigurationV1,
+    ResolvedMember,
+    ResolvedRegion,
+    ResolvedSheet,
 )
 from qc_tool.engine import QCRunResult, compare_findings
 from qc_tool.findings import (
@@ -606,4 +613,60 @@ def test_byte_identical_profiles_carry_forward_exactly_as_before(tmp_path: Path)
 
     assert preview.resolved == ("F1",)
     assert preview.ambiguous == ()
+
+
+def test_run_only_resolved_scope_change_cannot_carry_as_resolved(
+    tmp_path: Path,
+) -> None:
+    def resolved(
+        mode: Literal["automatic", "keyed", "positional", "excluded"],
+    ) -> ResolvedInputConfigurationV1:
+        return ResolvedInputConfigurationV1(
+            members=(
+                ResolvedMember(
+                    member_id="primary",
+                    sheets=(
+                        ResolvedSheet(
+                            sheet_id="data",
+                            baseline_sheet_name="Data",
+                            current_sheet_name="Data",
+                            regions=(ResolvedRegion(region_id="r1", mode=mode),),
+                        ),
+                    ),
+                ),
+            )
+        )
+
+    history = RunHistory(tmp_path / "history.sqlite3")
+    profile = DeliverableProfile(name="fixture")
+    previous_resolved = resolved("keyed")
+    previous = QCRunResult(
+        profile_name="fixture",
+        findings=[_finding("F1", "A1", "1")],
+        resolved_input_configuration=previous_resolved,
+    )
+    previous.resolved_input_digest = previous_resolved.canonical_sha256()
+    previous_id = history.record_run(
+        previous, file_hashes={}, report_paths={}, profile_snapshot=profile
+    )
+    history.set_annotations_bulk(previous_id, [("F1", None, "reviewed")])
+    current_resolved = resolved("positional")
+    current = QCRunResult(
+        profile_name="fixture",
+        findings=[],
+        resolved_input_configuration=current_resolved,
+    )
+    current.resolved_input_digest = current_resolved.canonical_sha256()
+    current_id = history.record_run(
+        current,
+        file_hashes={},
+        report_paths={},
+        rerun_of=previous_id,
+        profile_snapshot=profile,
+    )
+
+    preview = preview_carry_forward(history, current_id)
+
+    assert preview.ambiguous == ("F1",)
+    assert preview.resolved == ()
 

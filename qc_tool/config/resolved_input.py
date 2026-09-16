@@ -272,6 +272,13 @@ def validate_freshness(
             f"version {resolved.inspection_contract_version}, but the "
             f"current version is {INPUT_CONTRACT_VERSION}"
         )
+    resolved_member_ids = {member.member_id for member in resolved.members}
+    missing_member_ids = set(current_source_sha256) - resolved_member_ids
+    if missing_member_ids:
+        member_id = sorted(missing_member_ids)[0]
+        raise StaleResolvedConfigurationError(
+            f"resolved configuration is missing member {member_id!r}"
+        )
     for member in resolved.members:
         fresh = current_source_sha256.get(member.member_id)
         if fresh is None:

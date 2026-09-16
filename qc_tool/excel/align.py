@@ -27,7 +27,11 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
 from pydantic import BaseModel, Field
 
-from qc_tool.config.execution import ConfirmedColumnMapping, ExecutionBindings
+from qc_tool.config.execution import (
+    ConfirmedColumnMapping,
+    ExecutionBindings,
+    RegionDisposition,
+)
 from qc_tool.config.profile import DeliverableProfile, RowIdentityRule, SheetProfile
 from qc_tool.excel.periods import Period, is_period_after, is_period_label, parse_period
 from qc_tool.excel.regions import TableRegion, detect_regions
@@ -90,6 +94,7 @@ class RegionAlignment:
     current: TableRegion
     rows: AxisAlignment
     columns: AxisAlignment
+    configuration_mode: Literal["automatic", "keyed", "positional"] = "automatic"
 
     def cell_pairs(self) -> Iterator[tuple[tuple[int, int], tuple[int, int]]]:
         """Yield ((baseline_row, baseline_col), (current_row, current_col))."""
@@ -121,6 +126,7 @@ class WorkbookAlignment:
     regions: dict[str, list[RegionAlignment]] = field(default_factory=dict)
     unpaired_baseline_regions: list[TableRegion] = field(default_factory=list)
     unpaired_current_regions: list[TableRegion] = field(default_factory=list)
+    excluded_current_regions: list[TableRegion] = field(default_factory=list)
     low_confidence_regions: list[str] = field(default_factory=list)
     #: ``{current_sheet_name: baseline_sheet_name}`` for every sheet paired
     #: by a confirmed logical rename (plan-20260913, Step 3) rather than by
@@ -703,6 +709,32 @@ def _matching_column_mapping(
     return None
 
 
+def _matching_region_disposition(
+    region: TableRegion,
+    dispositions: Sequence[RegionDisposition],
+    *,
+    baseline: bool = False,
+) -> Literal["positional", "excluded"] | None:
+    for disposition in dispositions:
+        anchor_cell = (
+            disposition.baseline_anchor_cell
+            if baseline
+            else disposition.anchor_cell
+        )
+        if anchor_cell is None:
+            continue
+        try:
+            anchor_row, anchor_col = coordinate_to_tuple(anchor_cell)
+        except ValueError:
+            continue
+        if (
+            region.min_row <= anchor_row <= region.max_row
+            and region.min_col <= anchor_col <= region.max_col
+        ):
+            return disposition.mode
+    return None
+
+
 def _align_columns_by_confirmed_mapping(
     base_region: TableRegion,
     curr_region: TableRegion,
@@ -1043,21 +1075,33 @@ def align_regions(
     sheet_profile: SheetProfile | None = None,
     extra_row_identity_rules: Sequence[RowIdentityRule] = (),
     extra_column_mappings: Sequence[ConfirmedColumnMapping] = (),
+    force_positional_rows: bool = False,
 ) -> RegionAlignment:
     orientation = curr_region.orientation
     if orientation == "long":
-        return _align_long(base_sheet, curr_sheet, base_region, curr_region)
-    if orientation == "wide":
-        return _align_wide(base_sheet, curr_sheet, base_region, curr_region)
-    return _align_block(
-        base_sheet,
-        curr_sheet,
-        base_region,
-        curr_region,
-        sheet_profile,
-        extra_row_identity_rules,
-        extra_column_mappings,
-    )
+        alignment = _align_long(base_sheet, curr_sheet, base_region, curr_region)
+    elif orientation == "wide":
+        alignment = _align_wide(base_sheet, curr_sheet, base_region, curr_region)
+    else:
+        alignment = _align_block(
+            base_sheet,
+            curr_sheet,
+            base_region,
+            curr_region,
+            sheet_profile,
+            extra_row_identity_rules,
+            extra_column_mappings,
+        )
+    if force_positional_rows:
+        alignment.rows = _align_axis(
+            _positional_entries(range(base_region.min_row, base_region.max_row + 1)),
+            _positional_entries(range(curr_region.min_row, curr_region.max_row + 1)),
+            method="positional",
+        )
+        alignment.configuration_mode = "positional"
+    elif alignment.rows.duplicate_policy is not None:
+        alignment.configuration_mode = "keyed"
+    return alignment
 
 
 # --- workbook alignment ---------------------------------------------------
@@ -1194,8 +1238,6 @@ def align_workbooks(
         pairs, unpaired_base, unpaired_curr = _pair_regions(
             base_sheet, curr_sheet, base_regions, curr_regions
         )
-        result.unpaired_baseline_regions.extend(unpaired_base)
-        result.unpaired_current_regions.extend(unpaired_curr)
         extra_row_identity_rules = (
             execution_bindings.row_identity_rules(member_id, sheet_name)
             if execution_bindings is not None
@@ -1206,8 +1248,36 @@ def align_workbooks(
             if execution_bindings is not None
             else ()
         )
-        region_alignments = [
-            align_regions(
+        dispositions = (
+            execution_bindings.region_dispositions(member_id, sheet_name)
+            if execution_bindings is not None
+            else ()
+        )
+        excluded_unpaired_current = [
+            region
+            for region in unpaired_curr
+            if _matching_region_disposition(region, dispositions) == "excluded"
+        ]
+        result.excluded_current_regions.extend(excluded_unpaired_current)
+        result.unpaired_current_regions.extend(
+            region for region in unpaired_curr if region not in excluded_unpaired_current
+        )
+        result.unpaired_baseline_regions.extend(
+            region
+            for region in unpaired_base
+            if _matching_region_disposition(
+                region, dispositions, baseline=True
+            )
+            != "excluded"
+        )
+        region_alignments: list[RegionAlignment] = []
+        for base_region, curr_region in pairs:
+            disposition = _matching_region_disposition(curr_region, dispositions)
+            if disposition == "excluded":
+                result.excluded_current_regions.append(curr_region)
+                continue
+            region_alignments.append(
+                align_regions(
                 base_sheet,
                 curr_sheet,
                 base_region,
@@ -1215,9 +1285,9 @@ def align_workbooks(
                 sheet_profile,
                 extra_row_identity_rules,
                 extra_column_mappings,
+                    force_positional_rows=disposition == "positional",
+                )
             )
-            for base_region, curr_region in pairs
-        ]
         result.regions[sheet_name] = region_alignments
         result.low_confidence_regions.extend(
             f"{sheet_name}!{region.current.cell_range}"

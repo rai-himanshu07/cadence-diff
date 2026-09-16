@@ -56,6 +56,11 @@ _MAX_RECORD_BYTES = 64 * 1024 * 1024
 _MAX_STRING_CHARS = 1_000_000
 _MAX_ROW = 1_048_575
 _MAX_COLUMN = 16_383
+_SHEET_VISIBILITY = {
+    0: "visible",
+    1: "hidden",
+    2: "veryHidden",
+}
 #: Bounds a malformed styles.bin count from causing an unbounded allocation.
 _MAX_STYLE_RECORDS = 1_000_000
 
@@ -118,6 +123,7 @@ class XlsbFormulaScan:
     """Formula coordinates and risky package features found in an XLSB."""
 
     formula_cells: dict[str, frozenset[tuple[int, int]]]
+    sheet_visibility: dict[str, str] = field(default_factory=dict)
     risky_features: tuple[str, ...] = ()
     #: Recognized external-workbook-link metadata; safe for the isolated
     #: adapters. Never implies the link is inactive -- that requires complete
@@ -340,14 +346,20 @@ def _workbook_relationships(archive: zipfile.ZipFile) -> dict[str, _Relationship
     return relationships
 
 
-def _workbook_sheets(data: bytes) -> list[tuple[str, str]]:
-    sheets: list[tuple[str, str]] = []
+def _workbook_sheets(data: bytes) -> list[tuple[str, str, str]]:
+    sheets: list[tuple[str, str, str]] = []
     names: set[str] = set()
     for record_id, payload in _records(data):
         if record_id != _SHEET_RECORD:
             continue
         if len(payload) < 12:
             raise XlsbFormulaScanError("truncated BrtBundleSh record")
+        state = int.from_bytes(payload[:4], "little")
+        visibility = _SHEET_VISIBILITY.get(state)
+        if visibility is None:
+            raise XlsbFormulaScanError(
+                f"BrtBundleSh has unsupported visibility state {state}"
+            )
         relationship_id, position = _read_wide_string(payload, 8)
         name, _ = _read_wide_string(payload, position)
         if not name or not relationship_id:
@@ -355,7 +367,7 @@ def _workbook_sheets(data: bytes) -> list[tuple[str, str]]:
         if name in names:
             raise XlsbFormulaScanError(f"duplicate workbook sheet name {name!r}")
         names.add(name)
-        sheets.append((name, relationship_id))
+        sheets.append((name, relationship_id, visibility))
     if not sheets:
         raise XlsbFormulaScanError("workbook contains no BrtBundleSh records")
     return sheets
@@ -546,7 +558,9 @@ def resolve_worksheet_targets(data: bytes) -> dict[str, str]:
                     "missing required XLSB part xl/workbook.bin"
                 ) from exc
             targets: dict[str, str] = {}
-            for sheet_name, relationship_id in _workbook_sheets(workbook_data):
+            for sheet_name, relationship_id, _visibility in _workbook_sheets(
+                workbook_data
+            ):
                 relationship = relationships.get(relationship_id)
                 if relationship is not None and relationship.kind == "worksheet":
                     targets[sheet_name] = relationship.target
@@ -680,7 +694,7 @@ def scan_xlsb_formulas(data: bytes) -> XlsbFormulaScan:
             sheets = _workbook_sheets(workbook_data)
             formula_cells: dict[str, frozenset[tuple[int, int]]] = {}
             worksheet_metrics: dict[str, XlsbWorksheetMetrics] = {}
-            for sheet_name, relationship_id in sheets:
+            for sheet_name, relationship_id, _visibility in sheets:
                 relationship = relationships.get(relationship_id)
                 if relationship is None:
                     raise XlsbFormulaScanError(
@@ -703,6 +717,10 @@ def scan_xlsb_formulas(data: bytes) -> XlsbFormulaScan:
             risk = _risky_features(archive, relationships)
             return XlsbFormulaScan(
                 formula_cells=formula_cells,
+                sheet_visibility={
+                    sheet_name: visibility
+                    for sheet_name, _relationship_id, visibility in sheets
+                },
                 risky_features=risk.aggregate,
                 passive_features=risk.passive,
                 blocking_features=risk.blocking,

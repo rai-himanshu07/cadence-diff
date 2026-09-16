@@ -8,6 +8,14 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A unified **Configure & Run** workspace for every browser-started run,
+  including progressive Office-free setup analysis, reconnectable private
+  sidecar previews, mode-aware file roles, one active member/sheet/table
+  editor, explicit scenario checks, and frozen per-run resolved configuration.
+- A task-first four-tab table editor (**Rows**, **Data bounds**, **Scenario
+  checks**, and **Advanced**) with effective two-sided data-range disclosure,
+  reversible table removal, next-needs-attention navigation, bounded OOXML
+  formula reveal, and explicit XLSB presence-only behavior.
 - Automatic Rust/PyO3 native engine (`native/cadence_diff_native/`) for XLSB
   value/formula decoding and high-volume formula-delta classification. The
   separately built `cadence-diff-native` implementation distribution is an
@@ -60,6 +68,11 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Explicit table modes now drive the comparison engine: positional mode forces
+  positional row alignment and bypasses ranked-table screening, while excluded
+  tables are removed from matched and unpaired value/formula/structure analysis
+  with an auditable coverage disclosure. Active runs also suppress historical
+  recovery controls, whose callbacks revalidate persisted eligibility.
 - Native XLSB formula rendering now fails closed per cell: a render
   failure is absent from the formula surface (and lowers formula-text
   coverage) rather than ever appearing as an empty string or a bare `=`.

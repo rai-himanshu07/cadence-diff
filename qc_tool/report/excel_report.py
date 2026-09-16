@@ -26,6 +26,7 @@ from qc_tool.coverage import capability_limited
 from qc_tool.engine import QCRunResult
 from qc_tool.findings import Finding, Severity
 from qc_tool.findings_store import finding_by_id, finding_ordinal
+from qc_tool.report.configuration_summary import summarize_resolved_configuration
 from qc_tool.review import format_ranges, population_summary_text
 from qc_tool.review_stream import (
     GroupSummary,
@@ -245,11 +246,33 @@ def _write_summary_sheet(
 ) -> None:
     grid = _SheetGrid()
     grid.set(1, 1, "QC Report", font=Font(bold=True, size=16))
+    configuration = summarize_resolved_configuration(
+        result.resolved_input_configuration,
+        digest=result.resolved_input_digest,
+    )
     rows: list[tuple[str, str]] = [
         ("Generated (UTC)", dt.datetime.now(dt.UTC).isoformat(timespec="seconds")),
         ("Profile", result.profile_name),
         ("Mode", result.mode.value),
         ("Output mode", result.requested_output_mode.value),
+    ]
+    if configuration is not None:
+        rows.extend(
+            [
+                ("Resolved input digest", configuration.digest),
+                ("Configured members", str(configuration.member_count)),
+                ("Configured sheets", str(configuration.sheet_count)),
+                ("Configured regions", str(configuration.region_count)),
+                ("Configured selectors", str(configuration.selector_count)),
+                ("Region coverage", configuration.coverage_text),
+                ("Excluded regions", str(configuration.excluded_regions)),
+                ("Accepted degradations", str(configuration.degraded_regions)),
+                ("Acknowledgements", str(configuration.acknowledgement_count)),
+                ("Run overrides", str(configuration.override_count)),
+            ]
+        )
+    rows.extend(
+        [
         *((f"Formula engine: {role}", engine) for role, engine in result.formula_engines.items()),
         *((f"Values engine: {role}", engine) for role, engine in result.values_engines.items()),
         *((f"File: {role}", name) for role, name in result.files.items()),
@@ -273,7 +296,8 @@ def _write_summary_sheet(
             (f"{severity.value.title()} represented changes", str(count))
             for severity, count in (counts.represented_changes or {}).items()
         ),
-    ]
+        ]
+    )
     for offset, (label, value) in enumerate(rows, start=3):
         grid.set(offset, 1, label, font=Font(bold=True))
         grid.set(offset, 2, value)

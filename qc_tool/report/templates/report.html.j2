@@ -54,6 +54,21 @@
   | verified cross-checks: {{ result.verified_crosschecks }}
   {% if capability_limited %} | <strong class="capability-limited">capability-limited</strong>{% endif %}
 </div>
+{% if configuration %}
+<h2>Resolved configuration</h2>
+<div class="meta">
+  Digest: <strong class="mono">{{ configuration.digest }}</strong> |
+  members: {{ configuration.member_count }} |
+  sheets: {{ configuration.sheet_count }} |
+  regions: {{ configuration.region_count }} |
+  selectors: {{ configuration.selector_count }} |
+  excluded regions: {{ configuration.excluded_regions }} |
+  accepted degradations: {{ configuration.degraded_regions }} |
+  acknowledgements: {{ configuration.acknowledgement_count }} |
+  run overrides: {{ configuration.override_count }}
+</div>
+<div class="meta">Region coverage: {{ configuration.coverage_text }}</div>
+{% endif %}
 {% if capability_limited %}
 <div class="note">One or more required checks were unavailable, so a low finding
 count is not a clean result. Review the check coverage table below.</div>

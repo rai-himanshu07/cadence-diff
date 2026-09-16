@@ -10,22 +10,38 @@ nothing until the analyst aligns them.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from openpyxl.utils.cell import coordinate_to_tuple
 
 from qc_tool.config.profile import ComparisonPrerequisite
+from qc_tool.config.resolved_input import ResolvedInputConfigurationV1
 from qc_tool.io.model import WorkbookSnapshot
 from qc_tool.run_action import RunActionItem
 
 if TYPE_CHECKING:
-    from qc_tool.config.resolved_input import ResolvedInputConfigurationV1, ResolvedRegion
+    from qc_tool.config.resolved_input import ResolvedRegion
     from qc_tool.excel.align import WorkbookAlignment
     from qc_tool.excel.regions import TableRegion
 
 
 def _is_blank(value: object) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+@dataclass(frozen=True, slots=True)
+class SelectorCheckOutcome:
+    """Value-free authoritative facts for one resolved selector."""
+
+    member_id: str
+    sheet_id: str
+    selector_id: str
+    equal: bool
+    baseline_formula_backed: bool
+    current_formula_backed: bool
+    missing: bool
+    blank: bool
 
 
 def check_comparison_prerequisites(
@@ -88,16 +104,29 @@ def check_resolved_selectors(
     VALUES are read only to compare them; neither side's value is ever
     returned or persisted.
     """
+    _outcomes, mismatches = evaluate_resolved_selectors(
+        baseline, current, resolved, member_id=member_id
+    )
+    return mismatches
+
+
+def evaluate_resolved_selectors(
+    baseline: WorkbookSnapshot,
+    current: WorkbookSnapshot,
+    resolved: ResolvedInputConfigurationV1 | None,
+    *,
+    member_id: str = "primary",
+) -> tuple[list[SelectorCheckOutcome], list[RunActionItem]]:
+    """Return value-free selector facts and the existing blocking items."""
     if resolved is None:
-        return []
+        return [], []
     member = next((m for m in resolved.members if m.member_id == member_id), None)
     if member is None:
-        return []
+        return [], []
+    outcomes: list[SelectorCheckOutcome] = []
     mismatches: list[RunActionItem] = []
     for sheet in member.sheets:
         for selector in sheet.selectors:
-            if not sheet.current_sheet_name or not selector.current_cell:
-                continue
             base_cell = None
             curr_cell = None
             if sheet.baseline_sheet_name and selector.baseline_cell:
@@ -107,30 +136,92 @@ def check_resolved_selectors(
                     )
                 except (KeyError, ValueError):
                     base_cell = None
-            try:
-                curr_cell = current.sheet(sheet.current_sheet_name).cell(selector.current_cell)
-            except (KeyError, ValueError):
-                curr_cell = None
+            if sheet.current_sheet_name and selector.current_cell:
+                try:
+                    curr_cell = current.sheet(sheet.current_sheet_name).cell(
+                        selector.current_cell
+                    )
+                except (KeyError, ValueError):
+                    curr_cell = None
             base_value = None if base_cell is None else base_cell.value
             curr_value = None if curr_cell is None else curr_cell.value
-            if base_cell is None or curr_cell is None:
+            missing = base_cell is None or curr_cell is None
+            blank = not missing and (
+                _is_blank(base_value) or _is_blank(curr_value)
+            )
+            equal = not missing and not blank and base_value == curr_value
+            outcomes.append(
+                SelectorCheckOutcome(
+                    member_id=member_id,
+                    sheet_id=sheet.sheet_id,
+                    selector_id=selector.selector_id,
+                    equal=equal,
+                    baseline_formula_backed=(
+                        base_cell.has_formula if base_cell is not None else False
+                    ),
+                    current_formula_backed=(
+                        curr_cell.has_formula if curr_cell is not None else False
+                    ),
+                    missing=missing,
+                    blank=blank,
+                )
+            )
+            if missing:
                 reason = "the configured sheet or cell is missing from one or both files"
-            elif _is_blank(base_value) or _is_blank(curr_value):
+            elif blank:
                 reason = "the selector cell is blank in one or both files"
-            elif base_value != curr_value:
+            elif not equal:
                 reason = "baseline and current do not have the same selector value"
             else:
                 continue
             mismatches.append(
                 RunActionItem(
                     member_id=member_id,
-                    sheet=sheet.current_sheet_name,
-                    cell=selector.current_cell,
+                    sheet=sheet.current_sheet_name or sheet.sheet_id,
+                    cell=selector.current_cell or selector.baseline_cell or "",
                     label=selector.selector_id,
                     detail=reason,
                 )
             )
-    return mismatches
+    return outcomes, mismatches
+
+
+def apply_selector_outcomes(
+    resolved: ResolvedInputConfigurationV1,
+    outcomes: list[SelectorCheckOutcome],
+) -> ResolvedInputConfigurationV1:
+    """Return the same resolved contract with authoritative selector facts."""
+    by_key = {
+        (outcome.member_id, outcome.sheet_id, outcome.selector_id): outcome
+        for outcome in outcomes
+    }
+    members = []
+    for member in resolved.members:
+        sheets = []
+        for sheet in member.sheets:
+            selectors = []
+            for selector in sheet.selectors:
+                outcome = by_key.get(
+                    (member.member_id, sheet.sheet_id, selector.selector_id)
+                )
+                selectors.append(
+                    selector
+                    if outcome is None
+                    else selector.model_copy(
+                        update={
+                            "equal": outcome.equal,
+                            "baseline_formula_backed": (
+                                outcome.baseline_formula_backed
+                            ),
+                            "current_formula_backed": (
+                                outcome.current_formula_backed
+                            ),
+                        }
+                    )
+                )
+            sheets.append(sheet.model_copy(update={"selectors": tuple(selectors)}))
+        members.append(member.model_copy(update={"sheets": tuple(sheets)}))
+    return resolved.model_copy(update={"members": tuple(members)})
 
 
 def _region_anchor_containing(

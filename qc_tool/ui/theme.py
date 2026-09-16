@@ -226,6 +226,9 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .q-uploader__title { font-size: 0.8125rem; font-weight: 600; }
 .q-uploader__subtitle { font-family: var(--font-mono); font-size: var(--fs-meta); }
 .q-uploader__list { min-height: 1.4rem; padding: 0.35rem 0.6rem; }
+.config-role-upload { width: 10.5rem !important; min-width: 10.5rem; }
+.config-role-upload .q-uploader__header { min-height: 2.55rem; padding: 0.3rem 0.5rem; }
+.config-role-upload .q-uploader__list { display: none; }
 .q-expansion-item { background: var(--panel); border: 1px solid var(--line);
   border-radius: 6px; }
 .profile-section { margin-bottom: 0.4rem; }
@@ -501,7 +504,7 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
 /* setup-workspace bounded preview grid (Step 7): same visual language as
    .ctxgrid, plus a pointer cursor since cells are clickable anchor targets */
 .previewscroll { max-width: 100%; overflow-x: auto; margin-top: 0.4rem; }
-.previewgrid { border-collapse: collapse; font-family: var(--font-mono);
+.previewgrid { border-collapse: collapse; font-family: var(--font-mono); min-width: 100%;
   font-size: var(--fs-meta); }
 .previewgrid th { background: var(--surface2); color: var(--ink-soft); font-weight: 500;
   padding: 1px 6px; border: 1px solid var(--line-soft); }
@@ -510,6 +513,26 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
   white-space: nowrap; cursor: pointer; }
 .previewcell:hover { background: var(--surface2); }
 .previewcell-formula { font-style: italic; color: var(--ink-soft); }
+.previewrow-outside .previewcell { background: var(--surface1); color: var(--ink-soft); }
+.previewrow-data .previewcell {
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--info) 22%, transparent); }
+.config-files-grid { display: grid; gap: 0.45rem; }
+.config-file-row { display: grid; grid-template-columns: minmax(15rem, 1fr) 10.5rem 2.25rem;
+  align-items: center; gap: 0.65rem; min-height: 2.75rem; }
+.config-workspace-nav { padding: 0.55rem 0; border-bottom: 1px solid var(--line-soft); }
+.config-sheet-select { flex: 1 1 18rem; max-width: 34rem; }
+.config-region-select { flex: 1 1 20rem; max-width: 40rem; }
+.config-active-sheet { display: grid; gap: 0.65rem; padding: 0.8rem 0; }
+.config-region-editor { border-block: 1px solid var(--line); padding: 0.7rem 0; }
+.config-region-heading { min-height: 2.5rem; }
+.config-region-tabs { width: 100%; border-bottom: 1px solid var(--line-soft); }
+.config-region-panels { background: transparent; }
+.config-region-panels .q-tab-panel { padding: 0.8rem 0 0; }
+.config-preview-panel { border-top: 1px solid var(--line); padding: 0.85rem 0 1rem; }
+.config-preview-toolbar { margin-top: 0.35rem; }
+.config-workspace-actions { position: sticky; bottom: 0; z-index: 5; width: 100%;
+  background: var(--surface1); border-top: 1px solid var(--line);
+  padding: 0.7rem 0; margin-top: 0.8rem; }
 /* related-series lens rows */
 .review-groups-table tr.clusterrow > td { background: var(--surface2); font-weight: 500; }
 .review-groups-table tr.clusterrow > td:first-child { white-space: normal; }
@@ -733,6 +756,10 @@ body.body--dark .q-select__dropdown-icon { color: var(--ink-soft); }
     line-height: 1.45; }
   .section .rule { min-width: 1rem; margin-top: 0.45rem; }
   .mode-select { display: grid; grid-template-columns: 1fr; }
+  .config-file-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .config-file-row .statuschip { grid-column: 1 / -1; }
+  .config-role-upload { width: 100% !important; min-width: 0; }
+  .config-region-tabs .q-tab { padding-inline: 0.45rem; }
   .guide-layout { grid-template-columns: 1fr; gap: 1.2rem; }
   .guide-toc { position: static; display: grid; grid-template-columns: repeat(2, 1fr);
     border-left: 0; border-bottom: 1px solid var(--line); padding: 0 0 0.8rem; }

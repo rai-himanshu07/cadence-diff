@@ -108,9 +108,10 @@ from qc_tool.excel.population import (
 )
 from qc_tool.excel.preflight import defined_name_scope_coverage, preflight_workbook
 from qc_tool.excel.prerequisites import (
+    apply_selector_outcomes,
     check_blank_identity_keys,
     check_comparison_prerequisites,
-    check_resolved_selectors,
+    evaluate_resolved_selectors,
 )
 from qc_tool.excel.ranked_identity import detect_ranked_table_candidate
 from qc_tool.excel.regions import internal_period_band_suggestions
@@ -842,6 +843,10 @@ def _memberize_excel_result(
         if finding.artifact != "excel":
             continue
         finding.artifact_member = member_id
+        if finding.logical_address is not None:
+            finding.logical_address = finding.logical_address.model_copy(
+                update={"member_id": member_id}
+            )
         finding.finding_id = ""
         finding.severity_overridden = False
         finding.analyst_comment = ""
@@ -955,6 +960,8 @@ def _ranked_table_suggestions(
         curr_sheet = current.sheet(sheet_name)
         for region in regions:
             if region.current.orientation != "block":
+                continue
+            if region.configuration_mode == "positional":
                 continue
             if region.rows.method != "positional" or region.low_confidence:
                 continue
@@ -1121,6 +1128,7 @@ def _run_multi_package(
     formula_telemetry: FormulaComparisonTelemetry | None = None,
     pair_key_telemetry: PairKeyTelemetry | None = None,
     population_telemetry: PopulationTelemetry | None = None,
+    resolved_input_configuration: ResolvedInputConfigurationV1 | None = None,
 ) -> QCRunResult:
     """Run existing single-artifact pipelines sequentially, then merge once."""
     paths_by_member(files, manifest)
@@ -1178,6 +1186,14 @@ def _run_multi_package(
     ranked_blocks: list[tuple[str, RunActionRequired]] = []
     stream = _FindingStream()
     today = dt.date.today()
+    enriched_resolved_members = {
+        member.member_id: member
+        for member in (
+            resolved_input_configuration.members
+            if resolved_input_configuration is not None
+            else ()
+        )
+    }
 
     def member_passwords(*role_pairs: tuple[str, str]) -> dict[str, str]:
         return {
@@ -1196,6 +1212,32 @@ def _run_multi_package(
         projected.waivers = []
         projected.crosscheck.mappings = []
         return projected
+
+    def projected_resolution(
+        member_id: str,
+    ) -> ResolvedInputConfigurationV1 | None:
+        if resolved_input_configuration is None:
+            return None
+        member = enriched_resolved_members.get(member_id)
+        if member is None:
+            return None
+        return resolved_input_configuration.model_copy(
+            update={
+                "members": (
+                    member.model_copy(update={"member_id": "primary"}),
+                )
+            }
+        )
+
+    def retain_enriched_resolution(
+        member_id: str, subresult: QCRunResult
+    ) -> None:
+        resolved = subresult.resolved_input_configuration
+        if resolved is None or len(resolved.members) != 1:
+            return
+        enriched_resolved_members[member_id] = resolved.members[0].model_copy(
+            update={"member_id": member_id}
+        )
 
     def add_findings(items: Iterable[Finding]) -> None:
         batch = list(items)
@@ -1279,6 +1321,7 @@ def _run_multi_package(
                     _formula_telemetry=formula_telemetry,
                     _pair_key_telemetry=pair_key_telemetry,
                     _population_telemetry=population_telemetry,
+                    resolved_input_configuration=projected_resolution(member_id),
                 )
             except RunBlockedError as blocked:
                 if (
@@ -1295,6 +1338,7 @@ def _run_multi_package(
             member_findings, member_coverage, member_trust = (
                 _memberize_excel_result(subresult, member_id)
             )
+            retain_enriched_resolution(member_id, subresult)
             add_findings(member_findings)
             coverage.extend(member_coverage)
             if member_trust is not None:
@@ -1332,10 +1376,12 @@ def _run_multi_package(
                 _formula_telemetry=formula_telemetry,
                 _pair_key_telemetry=pair_key_telemetry,
                 _population_telemetry=population_telemetry,
+                resolved_input_configuration=projected_resolution(member_id),
             )
             member_findings, member_coverage, _member_trust = (
                 _memberize_excel_result(subresult, member_id)
             )
+            retain_enriched_resolution(member_id, subresult)
             if mode is QCRunMode.FINAL_PACKAGE:
                 if (
                     capture is None
@@ -1564,6 +1610,18 @@ def _run_multi_package(
     )
     if disclosure := result.comparison_scope.disclosure():
         result.disclosures.append(disclosure)
+    if resolved_input_configuration is not None:
+        result.resolved_input_configuration = resolved_input_configuration.model_copy(
+            update={
+                "members": tuple(
+                    enriched_resolved_members.get(member.member_id, member)
+                    for member in resolved_input_configuration.members
+                )
+            }
+        )
+        result.resolved_input_digest = (
+            result.resolved_input_configuration.canonical_sha256()
+        )
     return result
 
 
@@ -1735,6 +1793,7 @@ def run_qc(
                 formula_telemetry=_formula_telemetry,
                 pair_key_telemetry=_pair_key_telemetry,
                 population_telemetry=_population_telemetry,
+                resolved_input_configuration=resolved_input_configuration,
             )
     if mode is QCRunMode.CURRENT_FILE_PREFLIGHT:
         if baseline_excel is not None or baseline_ppt is not None:
@@ -2157,9 +2216,12 @@ def run_qc(
                 curr_wb,
                 profile.excel.comparison_prerequisites,
             )
-            mismatches.extend(
-                check_resolved_selectors(base_wb, curr_wb, resolved_input_configuration)
+            selector_outcomes, selector_mismatches = evaluate_resolved_selectors(
+                base_wb,
+                curr_wb,
+                resolved_input_configuration,
             )
+            mismatches.extend(selector_mismatches)
             if mismatches:
                 raise RunBlockedError(
                     RunActionRequired(
@@ -2170,6 +2232,14 @@ def run_qc(
                             "and Re-QC before comparing."
                         ),
                     )
+                )
+            if resolved_input_configuration is not None:
+                resolved_input_configuration = apply_selector_outcomes(
+                    resolved_input_configuration, selector_outcomes
+                )
+                result.resolved_input_configuration = resolved_input_configuration
+                result.resolved_input_digest = (
+                    resolved_input_configuration.canonical_sha256()
                 )
         result.files["baseline_excel"] = baseline_excel.name
         result.files["current_excel"] = current_excel.name
@@ -2286,6 +2356,21 @@ def run_qc(
                 detail="; ".join(details),
             )
         )
+        if alignment.excluded_current_regions:
+            result.coverage.append(
+                CoverageItem(
+                    check_id="excel-configured-region-exclusions",
+                    label="Configured Excel region exclusions",
+                    artifact="excel",
+                    state=CoverageState.NOT_INCLUDED,
+                    findings=len(alignment.excluded_current_regions),
+                    detail=(
+                        f"{len(alignment.excluded_current_regions)} region(s) "
+                        "were intentionally excluded by this run's resolved "
+                        "configuration"
+                    ),
+                )
+            )
         period_suggestions = []
         for sheet_name, regions in alignment.regions.items():
             period_suggestions.extend(

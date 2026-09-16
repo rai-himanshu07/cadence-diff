@@ -23,6 +23,7 @@ from qc_tool.engine import QCRunResult
 from qc_tool.excel.formulas import formula_token_diff
 from qc_tool.findings import Finding, FindingClass, Severity
 from qc_tool.findings_store import finding_by_id
+from qc_tool.report.configuration_summary import summarize_resolved_configuration
 from qc_tool.review import population_summary_text
 from qc_tool.review_stream import (
     GroupSummary,
@@ -249,6 +250,10 @@ def _render_context(result: QCRunResult) -> dict[str, object]:
         "atomics_threshold": ATOMICS_INLINE_THRESHOLD,
         "counts": counts_from_summaries(summaries),
         "capability_limited": capability_limited(result.coverage),
+        "configuration": summarize_resolved_configuration(
+            result.resolved_input_configuration,
+            digest=result.resolved_input_digest,
+        ),
         "generated_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
     }
 

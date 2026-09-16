@@ -109,13 +109,24 @@ def _xl_string(text: str) -> bytes:
     return struct.pack("<I", len(encoded) // 2) + encoded
 
 
-def _workbook_part(sheet_names: list[str], *, date1904: bool) -> bytes:
+def _workbook_part(
+    sheet_names: list[str],
+    *,
+    date1904: bool,
+    sheet_visibility: Mapping[str, str] | None = None,
+) -> bytes:
     out = bytearray()
     out += _record(biff12.WORKBOOK)
     out += _record(_WBPROP, struct.pack("<I", 1 if date1904 else 0))
     out += _record(biff12.SHEETS)
+    visibility_codes = {"visible": 0, "hidden": 1, "veryHidden": 2}
     for index, name in enumerate(sheet_names, start=1):
-        payload = struct.pack("<II", 0, index) + _xl_string(f"rId{index}") + _xl_string(name)
+        visibility = (sheet_visibility or {}).get(name, "visible")
+        payload = (
+            struct.pack("<II", visibility_codes[visibility], index)
+            + _xl_string(f"rId{index}")
+            + _xl_string(name)
+        )
         out += _record(biff12.SHEET, payload)
     out += _record(biff12.SHEETS_END)
     out += _record(biff12.WORKBOOK_END)
@@ -199,6 +210,7 @@ def write_xlsb(
     date1904: bool = False,
     custom_formats: dict[int, str] | None = None,
     cell_xfs: list[int] | None = None,
+    sheet_visibility: Mapping[str, str] | None = None,
 ) -> None:
     """Write a deterministic, pyxlsb-readable xlsb workbook.
 
@@ -222,7 +234,11 @@ def write_xlsb(
     parts: dict[str, bytes] = {
         "[Content_Types].xml": _CONTENT_TYPES.encode("utf-8"),
         "_rels/.rels": _ROOT_RELS.encode("utf-8"),
-        "xl/workbook.bin": _workbook_part(sheet_names, date1904=date1904),
+        "xl/workbook.bin": _workbook_part(
+            sheet_names,
+            date1904=date1904,
+            sheet_visibility=sheet_visibility,
+        ),
         "xl/_rels/workbook.bin.rels": _workbook_rels(len(sheet_names)),
         "xl/sharedStrings.bin": _shared_strings_part(strings, total_strings),
     }
