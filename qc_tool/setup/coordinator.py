@@ -310,6 +310,7 @@ class SetupCoordinator:
         self._exclusive_runner = exclusive_runner
         self._jobs: dict[tuple[str, int], SetupCoordinatorJob] = {}
         self._lock = threading.RLock()
+        self._persist_lock = threading.Lock()
         self.shutdown_hook_installed = False
 
     def _key(self, session_id: str, input_generation: int) -> tuple[str, int]:
@@ -583,10 +584,11 @@ class SetupCoordinator:
             return self._jobs.get(self._key(job.session_id, job.input_generation)) is job
 
     def _persist(self, job: SetupCoordinatorJob) -> None:
-        if self._is_current(job):
-            self.store.save(
-                job.snapshot(), requires_credentials=job._requires_credentials
-            )
+        with self._persist_lock:
+            if self._is_current(job):
+                self.store.save(
+                    job.snapshot(), requires_credentials=job._requires_credentials
+                )
 
     def _update_progress(
         self,
@@ -709,6 +711,7 @@ class SetupCoordinator:
                 break
             if outcome is None:
                 continue
+            awaiting_credentials = False
             with job._condition:
                 if outcome.missing_credential_roles:
                     job._requires_credentials = True
@@ -725,9 +728,8 @@ class SetupCoordinator:
                     job._started = False
                     job._updated_monotonic = time.monotonic()
                     job._condition.notify_all()
-                    self._persist(job)
-                    return
-                if outcome.result_payload is None:
+                    awaiting_credentials = True
+                elif outcome.result_payload is None:
                     job.member_status[member_id] = "failed"
                     job.member_disclosures[member_id] = (
                         outcome.disclosure or "setup analysis failed"
@@ -738,6 +740,8 @@ class SetupCoordinator:
                 job._updated_monotonic = time.monotonic()
                 job._condition.notify_all()
             self._persist(job)
+            if awaiting_credentials:
+                return
 
         if not self._is_current(job):
             return

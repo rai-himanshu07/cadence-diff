@@ -70,6 +70,50 @@ def test_coordinator_persists_aggregate_progress_and_completion(tmp_path: Path) 
     assert persisted.total == 2
 
 
+def test_newer_setup_state_cannot_be_overwritten_by_a_delayed_snapshot(
+    tmp_path: Path,
+) -> None:
+    class DelayedStore(SetupCoordinatorStore):
+        def __init__(self, db_path: Path) -> None:
+            super().__init__(db_path)
+            self.waiting_save_started = threading.Event()
+            self.release_waiting_save = threading.Event()
+            self._delayed = False
+
+        def save(self, snapshot, *, requires_credentials: bool) -> None:
+            if snapshot.status is SetupStatus.WAITING_FOR_SLOT and not self._delayed:
+                self._delayed = True
+                self.waiting_save_started.set()
+                assert self.release_waiting_save.wait(2.0)
+            super().save(snapshot, requires_credentials=requires_credentials)
+
+    store = DelayedStore(tmp_path / "history.sqlite3")
+    coordinator = SetupCoordinator(tmp_path, store=store)
+    job = coordinator.get_or_create("session-1", 1)
+    with job._condition:
+        job.status = SetupStatus.WAITING_FOR_SLOT
+
+    older = threading.Thread(target=coordinator._persist, args=(job,))
+    older.start()
+    assert store.waiting_save_started.wait(1.0)
+
+    with job._condition:
+        job.status = SetupStatus.COMPLETE
+        job.phase = "complete"
+    newer = threading.Thread(target=coordinator._persist, args=(job,))
+    newer.start()
+
+    store.release_waiting_save.set()
+    older.join(2.0)
+    newer.join(2.0)
+    assert not older.is_alive()
+    assert not newer.is_alive()
+
+    persisted = store.get("session-1", 1)
+    assert persisted is not None
+    assert persisted.status is SetupStatus.COMPLETE
+
+
 def test_completed_sheet_profile_is_available_before_member_completion(
     tmp_path: Path,
 ) -> None:
