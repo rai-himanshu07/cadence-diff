@@ -13,13 +13,14 @@ for the full design; this module is only the thin, defensive import boundary
 
 from __future__ import annotations
 
+import importlib
 import importlib.metadata
 from enum import StrEnum
 from types import ModuleType
 from typing import Any
 
 try:
-    import cadence_diff_native as _native_module  # pyright: ignore[reportMissingModuleSource]
+    _native_module = importlib.import_module("cadence_diff_native")
 except ImportError:  # pragma: no cover - exercised by an unpatched real env
     _native_module = None
 
