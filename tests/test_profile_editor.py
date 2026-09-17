@@ -222,6 +222,23 @@ def test_nested_repeatable_mutations_preserve_unrelated_advanced_fields() -> Non
     assert draft.dirty
 
 
+def test_append_materializes_an_omitted_optional_array() -> None:
+    draft = ProfileDraft.from_profile(DeliverableProfile(name="optional-array"))
+    path = ("excel", "comparison_prerequisites")
+    item_schema = _schema_at("excel", "comparison_prerequisites", "[]")
+
+    assert "comparison_prerequisites" not in draft.payload["excel"]
+    draft.append(path, item_schema)
+    draft.set((*path, 0, "name"), "Forecast scenario")
+    draft.set((*path, 0, "sheet"), "Dashboard")
+    draft.set((*path, 0, "cell"), "B3")
+
+    [prerequisite] = draft.profile().excel.comparison_prerequisites
+    assert prerequisite.name == "Forecast scenario"
+    assert prerequisite.sheet == "Dashboard"
+    assert prerequisite.cell == "B3"
+
+
 def test_default_is_immutable_and_named_profile_can_be_renamed(tmp_path: Path) -> None:
     default = ProfileDraft.from_profile(DeliverableProfile(name="default"))
     with pytest.raises(ValueError, match="default profile is immutable"):

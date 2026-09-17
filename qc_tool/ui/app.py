@@ -2909,10 +2909,16 @@ def _render_result_view(
     profiles_dir: Path | None = None,
     focus_actions: Callable[[Finding], None] | None = None,
     export_root: Path | None = None,
-) -> None:
+) -> Callable[[], None]:
     """Results workbench: a compact run header, then Review queue (default),
     Stories, Coverage, Atomic evidence, and Mapping review. Only the active
     view is mounted, so a high-volume run does not pay for hidden tables."""
+    review_timer: Any | None = None
+
+    def cleanup() -> None:
+        if review_timer is not None:
+            review_timer.cancel()
+
     summary_view: (
         tuple[
             list[GroupSummary],
@@ -2936,7 +2942,7 @@ def _render_result_view(
                 run_id=run_id,
                 export_root=export_root,
             )
-            return
+            return cleanup
     if summary_view is None and (
         len(result.findings) > _ATOMIC_INLINE_THRESHOLD
         and not isinstance(result.findings, list)
@@ -3049,7 +3055,10 @@ def _render_result_view(
                     render_timer()
 
             render_timer()
-            ui.timer(1.0, tick_timer)
+            review_timer = ui.timer(1.0, tick_timer)
+            client = ui.context.client
+            client.on_disconnect(cleanup)
+            client.on_delete(cleanup)
 
         def render_stats() -> None:
             counts = (
@@ -5849,6 +5858,7 @@ def _render_result_view(
 })();
 """,
         )
+    return cleanup
 
 
 def _result_scope_line(result: QCRunResult) -> str:
@@ -6283,11 +6293,15 @@ def _render_completed_run(
         delta, delta_note = _rerun_delta(history, record)
         if delta_note:
             ui.notify(delta_note)
+    container_state = cast(Any, container)
+    previous_cleanup = getattr(container_state, "_qc_result_cleanup", None)
+    if callable(previous_cleanup):
+        previous_cleanup()
     container.clear()
     with container:
         if record.focus_degraded():
             ui.label(_FOCUS_DEGRADED_NOTE).classes("notecard")
-        _render_result_view(
+        container_state._qc_result_cleanup = _render_result_view(
             _result_from_record(record),
             {kind: Path(path) for kind, path in record.report_paths.items()},
             f"Results — run #{run_id}",
@@ -8129,7 +8143,8 @@ def create_pages(
                             _unlock_run()
 
                 queue_refresh_timer = ui.timer(0.5, refresh_queue)
-                ui.context.client.on_disconnect(queue_refresh_timer.deactivate)
+                ui.context.client.on_disconnect(queue_refresh_timer.cancel)
+                ui.context.client.on_delete(queue_refresh_timer.cancel)
 
                 async def start_run(
                     profile_override: DeliverableProfile | None = None,

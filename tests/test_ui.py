@@ -2586,6 +2586,35 @@ async def test_run_detail_page(user: User, fixture_dir: Path, tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_run_detail_review_timer_stops_when_page_is_deleted(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    user.find(kind=ui.button, content="Start").click()
+    caplog.clear()
+
+    await user.open("/")
+    await asyncio.sleep(1.2)
+
+    assert "parent slot of Timer" not in caplog.text
+    assert "has been deleted" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_first_run_hides_specialist_controls_in_advanced_sections(
     user: User, tmp_path: Path
 ) -> None:

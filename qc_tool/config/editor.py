@@ -199,7 +199,11 @@ class ProfileDraft:
         self.dirty = True
 
     def append(self, path: DraftPath, item_schema: Schema) -> None:
-        values = self.get(path)
+        try:
+            values = self.get(path)
+        except KeyError:
+            self.set(path, [])
+            values = self.get(path)
         if not isinstance(values, list):
             raise TypeError("draft path is not a list")
         values.append(default_for_schema(item_schema))

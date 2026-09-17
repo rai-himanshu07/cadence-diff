@@ -983,6 +983,12 @@ async def test_profile_policy_editor_opens_in_place_only_once(
     new_name.value = "embedded-policy"
     user.find(kind=ui.button, content="Create").click()
     await user.should_see("Profile 'embedded-policy' created")
+
+    user.find(kind=ui.tab, content="Advanced Excel/PPT").click()
+    user.find("Comparison Prerequisites (0)").click()
+    user.find(kind=ui.button, content="Add Comparison Prerequisites item").click()
+    await user.should_see("Comparison Prerequisites (1)")
+
     user.find(
         kind=ui.button,
         content="Apply saved profile to this setup",

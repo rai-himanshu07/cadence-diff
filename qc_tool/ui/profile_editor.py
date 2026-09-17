@@ -650,7 +650,10 @@ class ProfileEditorController:
             if not value:
                 ui.notify("Choose or enter a value first", type="warning")
                 return
-            current = self.session.draft.get(path)
+            try:
+                current = self.session.draft.get(path)
+            except KeyError:
+                current = []
             if isinstance(current, list) and value in current:
                 ui.notify(f"{value!r} is already configured", type="warning")
                 return
