@@ -8143,8 +8143,12 @@ def create_pages(
                             _unlock_run()
 
                 queue_refresh_timer = ui.timer(0.5, refresh_queue)
-                ui.context.client.on_disconnect(queue_refresh_timer.cancel)
-                ui.context.client.on_delete(queue_refresh_timer.cancel)
+
+                def cleanup_queue_timer() -> None:
+                    queue_refresh_timer.cancel()
+
+                ui.context.client.on_disconnect(cleanup_queue_timer)
+                ui.context.client.on_delete(cleanup_queue_timer)
 
                 async def start_run(
                     profile_override: DeliverableProfile | None = None,

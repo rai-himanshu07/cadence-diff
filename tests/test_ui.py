@@ -2615,6 +2615,24 @@ async def test_run_detail_review_timer_stops_when_page_is_deleted(
 
 
 @pytest.mark.asyncio
+async def test_main_page_queue_timer_stops_when_page_is_deleted(
+    user: User,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    create_pages(tmp_path / "work")
+    await user.open("/")
+    caplog.clear()
+
+    await user.open("/guide")
+    await asyncio.sleep(0.6)
+
+    assert "Timer.cancel() takes" not in caplog.text
+    assert "parent slot of Timer" not in caplog.text
+    assert "has been deleted" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_first_run_hides_specialist_controls_in_advanced_sections(
     user: User, tmp_path: Path
 ) -> None:
