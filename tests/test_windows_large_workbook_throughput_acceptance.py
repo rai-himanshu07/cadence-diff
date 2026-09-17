@@ -93,8 +93,16 @@ def test_supervised_harness_emits_complete_aggregate_report(tmp_path: Path) -> N
     assert report["population_telemetry"]["construction_seconds"] > 0
     assert report["perform_run_telemetry"]["total_seconds"] > 0
     formula_telemetry = report["formula_comparison_telemetry"]
-    assert formula_telemetry["native_delta_supported_pairs"] == 25
-    assert formula_telemetry["native_delta_fallback_pairs"] == 0
+    if formula_telemetry["native_delta_batches"]:
+        assert formula_telemetry["native_delta_batches"] == 1
+        assert formula_telemetry["native_delta_supported_pairs"] == 25
+        assert formula_telemetry["native_delta_fallback_pairs"] == 0
+        assert formula_telemetry["native_delta_seconds"] > 0.0
+    else:
+        assert formula_telemetry["native_delta_supported_pairs"] == 0
+        assert formula_telemetry["native_delta_fallback_pairs"] == 0
+        assert formula_telemetry["native_delta_seconds"] == 0.0
+        assert formula_telemetry["python_fallback_delta_seconds"] > 0.0
     assert formula_telemetry["native_delta_batch_failures"] == 0
     assert formula_telemetry["native_delta_api_failures"] == 0
     assert formula_telemetry["native_delta_protocol_failures"] == 0
@@ -102,8 +110,6 @@ def test_supervised_harness_emits_complete_aggregate_report(tmp_path: Path) -> N
     assert formula_telemetry["native_delta_declared_unsupported_pairs"] == 0
     assert formula_telemetry["native_delta_invalid_output_pairs"] == 0
     assert formula_telemetry["native_delta_oversized_pairs"] == 0
-    assert formula_telemetry["native_delta_batches"] == 1
-    assert formula_telemetry["native_delta_seconds"] > 0.0
     assert formula_telemetry["formula_delta_classification_seconds"] == pytest.approx(
         formula_telemetry["native_delta_seconds"]
         + formula_telemetry["python_fallback_delta_seconds"]

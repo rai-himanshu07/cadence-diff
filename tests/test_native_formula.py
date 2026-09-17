@@ -27,8 +27,6 @@ from qc_tool.io.native_formula import (
 )
 from qc_tool.io.xlsb_formula import XlsbFormulaScan
 
-FIXTURE = Path(__file__).parent / "fixtures" / "generated" / "current.xlsb"
-
 
 def _available_native_module() -> SimpleNamespace:
     return SimpleNamespace(
@@ -46,8 +44,8 @@ def _available_native_module() -> SimpleNamespace:
     not native_formula_available(),
     reason="native/cadence_diff_native/ not built in this environment (optional accelerator)",
 )
-def test_formula_surface_report_returns_a_typed_surface() -> None:
-    surface = formula_surface_report(FIXTURE.read_bytes())
+def test_formula_surface_report_returns_a_typed_surface(fixture_dir: Path) -> None:
+    surface = formula_surface_report((fixture_dir / "current.xlsb").read_bytes())
     assert isinstance(surface.sheets, tuple)
     assert isinstance(surface.defined_names, tuple)
     # This fixture has 0 formulas (a values-only fixture) but must still
@@ -69,7 +67,7 @@ def test_formula_surface_report_raises_a_clear_error_when_unavailable(
 ) -> None:
     monkeypatch.setattr(native_kernel_module, "_native_module", None)
     with pytest.raises(RuntimeError, match=r"native engine unavailable \(missing\)"):
-        formula_surface_report(FIXTURE.read_bytes())
+        formula_surface_report(b"not-read-when-native-is-unavailable")
 
 
 def _fake_surface() -> WorkbookFormulaSurface:
