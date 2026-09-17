@@ -38,11 +38,10 @@ project uses [Semantic Versioning](https://semver.org/).
 - Ranked/sorted-table detection: a pre-diff heuristic flags an
   unconfigured positional block region that a composite row identity would
   explain more reliably than raw row position. Surfaced through a typed,
-  value-free `RankedTableEvidence` run-action contract (v2) and a rebuilt
-  "Review row matching" dialog: chip-based column selection, one
-  -region-at-a-time navigation, every duplicate-identity policy visible
-  with its exact consequence, profile optimistic concurrency, and
-  package-member qualification.
+  value-free `RankedTableEvidence` run-action contract (v2). A blocked attempt
+  returns bounded, package-member-qualified proposals to the same Configure &
+  Run workspace, where the analyst explicitly chooses keyed, positional, or
+  excluded handling before submission.
 - Findings JSON schema v3, selected automatically whenever a report
   contains a population finding; v1/v2 outputs and readers remain
   compatible for atomic/package runs without one.
@@ -97,11 +96,29 @@ project uses [Semantic Versioning](https://semver.org/).
   finalization streams capped group state to lazy result blocks, reconstructing
   full atomic findings only for groups that must replay.
 - Multi-workbook ranked-table checks collect all currently blocked package
-  members into one bounded action, so one dialog save can resolve every known
-  row-identity rule before Re-QC.
+  members into one bounded action, so one return-to-setup pass can surface
+  every known row-identity decision before Re-QC.
 
 ### Fixed
 
+- Configure & Run now preserves files, scope, profile, selectors, ranges, and
+  table choices across Back, reload, Resume, and blocked-run recovery. Returning
+  to setup consumes the paused no-run attempt, prevents competing recovery
+  controls, and never restarts QC automatically.
+- Spawned workers now validate and forward the exact resolved input
+  configuration and canonical digest consumed by the authoritative engine;
+  warning acknowledgements and run-only safety overrides also survive reload.
+- Ranked-candidate detection is persisted separately from transient
+  confirmation. A detected ranked table left on Automatic cannot pass bulk
+  confirmation or legacy-session restore, while ordinary non-ranked tables may
+  return to Automatic without a false blocker.
+- The profile editor now materializes omitted optional arrays and missing
+  dictionary ancestors transactionally, including population classes, input
+  contract members, and comparison prerequisites, instead of raising
+  `KeyError` from a normal named-profile Add action.
+- Review and queue timers survive transient Socket.IO reconnects. Review-time
+  ownership follows every live run view across multiple tabs and dynamic result
+  replacement; deleting the final view pauses timing and cancels its timer.
 - The native-kernel Python boundary is now total: mismatched formula
   -surface vector lengths, an out-of-range definition id, or any PyO3
   runtime failure become a disclosed, bounded `FormulaEnrichmentError` and
