@@ -621,7 +621,7 @@ def compute_warnings(
                         ranked_is_pending = bool(
                             reviewed_region is not None
                             and reviewed_region.ranked_candidate_pending
-                            and reviewed_region.mode == "automatic"
+                            and not reviewed_region.confirmed
                         )
                     if detected.ranked_candidate is not None and ranked_is_pending:
                         warnings.append(
@@ -1611,7 +1611,13 @@ def confirm_all_regions(member: MemberReview) -> MemberReview:
     new_sheets = []
     for sheet in member.current_sheets:
         new_regions = tuple(
-            replace(region, confirmed=True) if region.is_valid else region
+            replace(
+                region,
+                confirmed=True,
+                ranked_candidate_pending=False,
+            )
+            if region.is_valid
+            else region
             for region in sheet.regions
         )
         new_sheets.append(replace(sheet, regions=new_regions))
@@ -1629,11 +1635,10 @@ def unresolved_blockers(
     for member in state.member_reviews:
         for sheet in member.current_sheets:
             for region in sheet.regions:
-                if region.ranked_candidate_pending and region.mode == "automatic":
+                if region.ranked_candidate_pending and not region.confirmed:
                     blockers.append(
-                        f"{sheet.sheet_name!r} {region.current_range}: choose "
-                        "Match rows by key, Compare by position, or Exclude "
-                        "before running"
+                        f"{sheet.sheet_name!r} {region.current_range}: confirm "
+                        "the row setup before running"
                     )
                 elif region.mode == "excluded" and region.exclusion_reason and _is_expired(
                     region.exclusion_expires_on

@@ -8,6 +8,7 @@ subprocess-based setup scan -- not a mock.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import threading
 from pathlib import Path
@@ -32,7 +33,11 @@ from qc_tool.history.run_state import RunStateStore
 from qc_tool.history.store import sha256_file
 from qc_tool.projection import VolumeProjection
 from qc_tool.setup import coordinator as setup_coordinator_module
-from qc_tool.setup.coordinator import SetupStatus, get_setup_coordinator
+from qc_tool.setup.coordinator import (
+    SetupCoordinatorJob,
+    SetupStatus,
+    get_setup_coordinator,
+)
 from qc_tool.setup.models import DetectedRegion, MemberSetupProfile, SheetSetupProfile
 from qc_tool.setup.preview_worker import PreviewWindowOutcome
 from qc_tool.ui import app as app_module
@@ -209,8 +214,49 @@ def test_pending_row_matching_updates_only_the_target_region() -> None:
     assert proposed.ordinal_columns == ("B",)
     assert proposed.duplicate_key_policy == "occurrence"
     assert proposed.first_data_row == 5
-    assert proposed.confirmed
-    assert not proposed.ranked_candidate_pending
+    assert not proposed.confirmed
+    assert proposed.ranked_candidate_pending
+
+
+def test_pending_row_matching_preserves_an_existing_configured_region() -> None:
+    member = member_review_from_scan("primary", _member_profile_for_pending())
+    first, second = member.current_sheets[0].regions
+    configured = dataclasses.replace(
+        second,
+        mode="keyed",
+        identity_columns=("B",),
+        confirmed=True,
+    )
+    member = dataclasses.replace(
+        member,
+        current_sheets=(
+            dataclasses.replace(
+                member.current_sheets[0],
+                regions=(first, configured),
+            ),
+        ),
+    )
+
+    updated = _apply_pending_row_matching(
+        member,
+        [
+            {
+                "member_id": "primary",
+                "sheet": "Data",
+                "anchor_cell": second.anchor_cell,
+                "current_range": second.current_range,
+                "identity_columns": ["A"],
+                "ordinal_columns": [],
+                "duplicate_policy": "skip",
+            }
+        ],
+    )
+
+    preserved = updated.current_sheets[0].regions[1]
+    assert preserved.mode == "keyed"
+    assert preserved.identity_columns == ("B",)
+    assert preserved.ranked_candidate_pending
+    assert not preserved.confirmed
 
 
 def _stage_session(work_dir: Path) -> str:
@@ -527,15 +573,16 @@ async def test_workspace_can_add_a_new_excel_member_role(
     session_key = _stage_session(work_dir)
     create_pages(work_dir)
     await user.open(f"/configure?session={session_key}")
-    await user.should_see("New Excel member ID")
+    await user.should_see("Additional workbooks (optional)")
+    await user.should_see("same stable ID")
     member_input = next(
         element
         for element in user.find(kind=ui.input).elements
-        if element.props.get("label") == "New Excel member ID"
+        if element.props.get("label") == "Workbook member ID"
     )
     member_input.value = "ops"
 
-    user.find(kind=ui.button, content="Add workbook member").click()
+    user.find(kind=ui.button, content="Add workbook pair").click()
 
     await user.should_see("Baseline workbook · ops")
     await user.should_see("Current workbook · ops")
@@ -545,6 +592,43 @@ async def test_workspace_can_add_a_new_excel_member_role(
         "baseline_excel:ops",
         "current_excel:ops",
     ]
+
+
+@pytest.mark.asyncio
+async def test_profile_policy_editor_scrolls_and_suggests_scanned_sheets(
+    user: User, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    session_key = _stage_multi_region_session(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    user.find(kind=ui.button, content="Edit profile policy").click()
+
+    await user.should_see("Advanced reusable policy")
+    cards = [
+        element
+        for element in user.find(kind=ui.card).elements
+        if "profile-editor-card" in element.classes
+    ]
+    assert len(cards) == 1
+    sheet_controls = [
+        element
+        for element in user.find(kind=ui.select).elements
+        if element.props.get("label") == "New sheet"
+    ]
+    assert len(sheet_controls) == 1
+    assert set(sheet_controls[0].options) == {"Data", "Summary"}
+    ignore_sheet_controls = [
+        element
+        for element in user.find(kind=ui.select).elements
+        if element.props.get("label") == "Add Ignore Sheets"
+    ]
+    assert len(ignore_sheet_controls) == 1
+    assert set(ignore_sheet_controls[0].options) == {"Data", "Summary"}
+    await user.should_see("Whole sheets omitted from Excel QC")
+    await user.should_see("Per-sheet reusable overrides")
 
 
 @pytest.mark.asyncio
@@ -709,7 +793,14 @@ async def test_tabbed_region_editor_preserves_tab_and_toggles_exclusion(
         for element in user.find(kind=ui.tabs).elements
         if "config-region-tabs" in element.classes
     )
-    tabs.value = "bounds"
+    assert tabs.value == "bounds"
+    assert [child.props.get("label") for child in tabs.default_slot.children] == [
+        "Data bounds",
+        "Rows",
+        "Scenario checks",
+        "Advanced",
+    ]
+    tabs.value = "rows"
     user.find(kind=ui.button, content="Remove from this run").click()
 
     updated_tabs = next(
@@ -717,7 +808,7 @@ async def test_tabbed_region_editor_preserves_tab_and_toggles_exclusion(
         for element in user.find(kind=ui.tabs).elements
         if "config-region-tabs" in element.classes
     )
-    assert updated_tabs.value == "bounds"
+    assert updated_tabs.value == "rows"
     await user.should_see("Restore to this run")
 
     record = ConfigSessionStore(work_dir / "history.sqlite3").get(session_key)
@@ -783,6 +874,22 @@ async def test_data_start_commits_on_enter_and_preview_formula_text_reloads(
     assert decision["header_intent"] == "first_data_row"
     assert decision["first_data_row"] == 2
     assert decision["preamble_rows"] == 0
+
+    tabs = next(
+        element
+        for element in user.find(kind=ui.tabs).elements
+        if "config-region-tabs" in element.classes
+    )
+    tabs.value = "rows"
+    mode_toggle = next(iter(user.find(marker="region-mode-toggle").elements))
+    assert isinstance(mode_toggle, ui.toggle)
+    mode_toggle.value = "keyed"
+    identity_columns = next(
+        element
+        for element in user.find(kind=ui.select).elements
+        if element.props.get("label") == "Key columns"
+    )
+    assert identity_columns.options == {"A": "A · cached", "B": "B"}
 
     reveal = next(
         element
@@ -887,6 +994,91 @@ async def test_profile_policy_editor_opens_in_place_only_once(
 
 
 @pytest.mark.asyncio
+async def test_profile_policy_editor_survives_setup_completion_refresh(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_dir = tmp_path / "work"
+    session_key = _stage_session(work_dir)
+    record = ConfigSessionStore(work_dir / "history.sqlite3").get(session_key)
+    assert record is not None
+    job = SetupCoordinatorJob(
+        session_id=record.session_id,
+        input_generation=record.input_generation,
+        status=SetupStatus.PARTIAL_READY,
+        phase="scanning",
+        processed=1,
+        total=2,
+        result_payloads={
+            "primary": dataclasses.asdict(_member_profile_for_pending())
+        },
+    )
+
+    class Coordinator:
+        shutdown_hook_installed = False
+
+        def attach(self, *_args) -> SetupCoordinatorJob:
+            return job
+
+        def start(self, *_args, **_kwargs) -> SetupCoordinatorJob:
+            return job
+
+        def restart(self, *_args) -> SetupCoordinatorJob:
+            return job
+
+        def cancel(self, *_args) -> bool:
+            return True
+
+        def discard(self, *_args):
+            return None
+
+        def detach(self, *_args) -> None:
+            pass
+
+        def evict_terminal(self, *, max_age_seconds: float) -> int:
+            assert max_age_seconds == 60.0
+            return 0
+
+        def shutdown(self) -> None:
+            pass
+
+    coordinator = Coordinator()
+    monkeypatch.setattr(
+        config_workspace_module,
+        "get_setup_coordinator",
+        lambda _work_dir: coordinator,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "get_setup_coordinator",
+        lambda _work_dir: coordinator,
+    )
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Edit profile policy")
+    user.find(kind=ui.button, content="Edit profile policy").click()
+    await user.should_see("Apply saved profile to this setup")
+
+    with job._condition:
+        job.status = SetupStatus.COMPLETE
+        job.phase = "complete"
+        job.processed = job.total
+        job._finished = True
+        job._condition.notify_all()
+    await asyncio.sleep(0.6)
+
+    assert len(user.find(kind=ui.card).elements) > 0
+    await user.should_see("Apply saved profile to this setup")
+    assert (
+        len(
+            user.find(
+                kind=ui.button,
+                content="Apply saved profile to this setup",
+            ).elements
+        )
+        == 1
+    )
+@pytest.mark.asyncio
 async def test_retry_analysis_binds_and_starts_the_replacement_job(
     user: User, tmp_path: Path
 ) -> None:
@@ -933,6 +1125,43 @@ async def test_confirm_all_regions_persists_confirmed_true_for_a_valid_region(
     assert isinstance(region_decisions, dict)
     assert region_decisions
     assert all(decision["confirmed"] is True for decision in region_decisions.values())
+
+
+@pytest.mark.asyncio
+async def test_review_and_run_safety_overrides_survive_workspace_reload(
+    user: User, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    session_key = _stage_session(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    labels = {
+        "Allow large workbooks (override the workload safety gate)",
+        "Force full dependency indexing (override the size gate)",
+    }
+    controls = {
+        checkbox.text: checkbox
+        for checkbox in user.find(kind=ui.checkbox).elements
+        if checkbox.text in labels
+    }
+    assert set(controls) == labels
+    for checkbox in controls.values():
+        checkbox.value = True
+
+    stored = ConfigSessionStore(work_dir / "history.sqlite3").get(session_key)
+    assert stored is not None
+    assert stored.choices["allow_large_workbooks"] is True
+    assert stored.choices["allow_dependency_indexing"] is True
+
+    await user.open(f"/configure?session={stored.session_id}")
+    restored = {
+        checkbox.text: checkbox.value
+        for checkbox in user.find(kind=ui.checkbox).elements
+        if checkbox.text in labels
+    }
+    assert restored == dict.fromkeys(labels, True)
 
 
 @pytest.mark.asyncio
@@ -996,6 +1225,10 @@ async def test_confirming_disjoint_identity_columns_surfaces_a_low_overlap_warni
     [decision] = region_decisions.values()
     assert decision["mode"] == "keyed"
     assert decision["identity_columns"] == ["A"]
+    warning_codes = record.choices.get("warnings_acknowledged")
+    assert isinstance(warning_codes, list)
+    assert len(warning_codes) == 1
+    assert warning_codes[0].startswith("low_key_overlap:")
 
 
 @pytest.mark.asyncio
@@ -1553,6 +1786,48 @@ async def test_run_once_submits_the_run_and_navigates_home(
     assert request.resolved_input_configuration is not None  # type: ignore[attr-defined]
 
 
+@pytest.mark.asyncio
+async def test_run_once_preserves_selected_sheet_scope_without_reprompting(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_dir = tmp_path / "work"
+    session_key = _stage_multi_region_session(work_dir)
+    store = ConfigSessionStore(work_dir / "history.sqlite3")
+    record = store.get(session_key)
+    assert record is not None
+    store.save_choices(
+        session_key,
+        profile_name=record.profile_name,
+        choices={**record.choices, "selected_sheets": ["Data"]},
+        expected_revision=record.revision,
+    )
+    manager = _RecordingQueueManager(RunStateStore(work_dir / "history.sqlite3"))
+    monkeypatch.setattr(app_module, "get_manager", lambda _work_dir: manager)
+    monkeypatch.setattr(
+        config_workspace_module,
+        "project_cycle_volume",
+        lambda *_args: VolumeProjection(
+            changed_sheets=("Data", "Summary"),
+            added_sheets=(),
+            removed_sheets=(),
+            identical_sheets=(),
+            projected_max_findings=999_999,
+        ),
+    )
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    user.find("Confirm all detected regions").click()
+    user.find(kind=ui.button, content="Run once").click()
+
+    await user.should_see("Run started")
+    await user.should_not_see("Confirm full comparison size")
+    assert len(manager.submitted) == 1
+    request, _credentials = manager.submitted[0]
+    assert request.compare_sheets == ("Data",)  # type: ignore[attr-defined]
+
+
 def test_configuration_export_is_built_as_in_memory_bytes() -> None:
     from qc_tool.config.profile import DeliverableProfile
     from qc_tool.config.resolved_input import ResolvedInputConfigurationV1
@@ -1600,7 +1875,8 @@ async def test_run_once_warns_before_a_very_large_comparison(
 
     user.find(kind=ui.button, content="Run once").click()
 
-    await user.should_see("This looks like a very large comparison")
+    await user.should_see("Confirm full comparison size")
+    await user.should_see("not another setup or row-matching review")
     assert manager.submitted == []
 
     user.find(kind=ui.button, content="Run anyway").click()

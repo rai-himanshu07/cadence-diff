@@ -1108,6 +1108,167 @@ def test_real_qc_runs_in_an_owned_spawned_worker(
     assert record.phases, "phase telemetry is captured inside the worker process"
 
 
+def test_ranked_setup_recovery_completes_a_real_spawned_qc_run(
+    make_manager: ManagerFactory,
+) -> None:
+    """Full process: authoritative block -> resolved setup -> successful history.
+
+    This deliberately uses the same 6,000-row shuffled fixture that proves the
+    production ranked detector blocks an unconfirmed run. The second request
+    carries the exact per-run resolved configuration (the Run-once path), not a
+    saved profile shortcut, and must finish through the owned spawned worker.
+    """
+    from openpyxl.utils.cell import range_boundaries
+
+    from qc_tool.config.profile import profile_sha256
+    from qc_tool.config.resolved_input import (
+        ResolvedColumn,
+        ResolvedInputConfigurationV1,
+        ResolvedMember,
+        ResolvedRegion,
+        ResolvedSheet,
+    )
+    from qc_tool.coverage import FindingOutputMode
+    from qc_tool.history.store import sha256_file
+    from tests.test_row_identity import (
+        _LARGE_N,
+        _detector_rows,
+        _shuffled,
+        _write_panel,
+    )
+
+    manager = make_manager(worker_main)
+    inputs = manager.work_dir / "inputs"
+    inputs.mkdir()
+    baseline = inputs / "baseline.xlsx"
+    current = inputs / "current.xlsx"
+    base_rows = _detector_rows(_LARGE_N)
+    current_rows = _shuffled(base_rows, seed=99)
+    headers = ("Rank", "ID", "Value", "Value2", "Value3")
+    _write_panel(baseline, base_rows, headers=headers)
+    _write_panel(current, current_rows, headers=headers)
+    files = {
+        "baseline_excel": str(baseline),
+        "current_excel": str(current),
+    }
+    display_files = {role: Path(path).name for role, path in files.items()}
+    profile = DeliverableProfile(name="ranked-e2e")
+    run_overrides = {
+        "requested_output_mode": FindingOutputMode.DECISION.value,
+        "allow_large_workbooks": True,
+        "allow_dependency_indexing": True,
+        "acceptance_absolute": 2.5,
+        "acceptance_relative": 0.001,
+    }
+
+    unconfirmed = _request(
+        manager,
+        profile_name=profile.name,
+        profile=profile.model_dump(mode="json"),
+        files=files,
+        display_files=display_files,
+        **run_overrides,
+    )
+    manager.submit(unconfirmed)
+    blocked = manager.wait(unconfirmed.request_id, timeout=300.0)
+
+    assert blocked.status is RunStatus.BLOCKED, blocked.error
+    assert blocked.run_id is None
+    action = RunActionRequired.model_validate(blocked.action_required)
+    assert action.reason is RunActionReason.ROW_IDENTITY_CONFIRMATION_REQUIRED
+    [item] = action.items
+    evidence = item.ranked_table_evidence
+    assert evidence is not None
+    assert evidence.suggested_identity_columns == ("B",)
+    assert evidence.suggested_ordinal_columns == ("A",)
+    assert RunHistory(manager.work_dir / "history.sqlite3").list_runs() == []
+
+    min_col, _min_row, max_col, max_row = range_boundaries(evidence.current_range)
+    assert min_col is not None and max_col is not None and max_row is not None
+    first_data_row = (evidence.header_row or 0) + 1
+    data_range = f"A{first_data_row}:E{max_row}"
+    file_hashes = {role: sha256_file(Path(path)) for role, path in files.items()}
+    resolved = ResolvedInputConfigurationV1(
+        source="input_contract",
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name=profile.name,
+        profile_sha256=profile_sha256(profile),
+        members=(
+            ResolvedMember(
+                member_id="primary",
+                baseline_source_sha256=file_hashes["baseline_excel"],
+                current_source_sha256=file_hashes["current_excel"],
+                sheets=(
+                    ResolvedSheet(
+                        sheet_id="primary_panel",
+                        baseline_sheet_name=evidence.sheet,
+                        current_sheet_name=evidence.sheet,
+                        regions=(
+                            ResolvedRegion(
+                                region_id="primary_panel_region",
+                                mode="keyed",
+                                header_intent="first_data_row",
+                                baseline_outer_range=evidence.current_range,
+                                current_outer_range=evidence.current_range,
+                                baseline_data_range=data_range,
+                                current_data_range=data_range,
+                                baseline_first_data_row=first_data_row,
+                                current_first_data_row=first_data_row,
+                                columns=(
+                                    ResolvedColumn(
+                                        column_id="identity_b",
+                                        baseline_letter="B",
+                                        current_letter="B",
+                                        alignment_role="identity",
+                                        coverage="confirmed",
+                                    ),
+                                    ResolvedColumn(
+                                        column_id="ordinal_a",
+                                        baseline_letter="A",
+                                        current_letter="A",
+                                        alignment_role="ordinal",
+                                        coverage="confirmed",
+                                    ),
+                                ),
+                                coverage="confirmed",
+                            ),
+                        ),
+                        coverage="confirmed",
+                    ),
+                ),
+            ),
+        ),
+        warnings_acknowledged=("ranked_setup_confirmed",),
+    )
+    confirmed = _request(
+        manager,
+        profile_name=profile.name,
+        profile=profile.model_dump(mode="json"),
+        files=files,
+        display_files=display_files,
+        resolved_input_configuration=resolved.model_dump(mode="json"),
+        resolved_input_digest=resolved.canonical_sha256(),
+        **run_overrides,
+    )
+    manager.submit(confirmed)
+    completed = manager.wait(confirmed.request_id, timeout=300.0)
+
+    assert completed.status is RunStatus.SUCCEEDED, completed.error
+    assert completed.run_id is not None
+    history = RunHistory(manager.work_dir / "history.sqlite3")
+    assert len(history.list_runs()) == 1
+    stored = history.get_run(completed.run_id)
+    assert len(stored.findings) == 0
+    assert stored.file_hashes == file_hashes
+    assert stored.requested_output_mode is FindingOutputMode.DECISION
+    assert stored.allow_dependency_indexing is True
+    assert stored.acceptance_absolute == 2.5
+    assert stored.acceptance_relative == 0.001
+    assert stored.resolved_input_digest == resolved.canonical_sha256()
+    assert stored.resolved_input_configuration == resolved
+    assert stored.report_paths == {}  # browser reports are intentionally on demand
+
+
 # --- Step 5: shared resource coordinator (plan-20260913) --------------------
 
 

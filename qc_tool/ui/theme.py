@@ -239,6 +239,12 @@ body.body--dark { background: var(--paper) !important; color: var(--ink) !import
 .profile-icon-button { width: 2rem; height: 2rem; flex: 0 0 2rem; }
 .profile-yaml textarea { font-family: var(--font-mono); font-size: var(--fs-meta);
   line-height: 1.45; }
+.profile-editor-card { width: min(72rem, 96vw); height: min(52rem, 92vh);
+  max-width: 96vw; max-height: 92vh; display: flex; flex-direction: column;
+  overflow: hidden; }
+.profile-editor-panels { flex: 1 1 auto; min-height: 0;
+  overflow-y: auto !important; overscroll-behavior: contain; }
+.profile-editor-panels .q-tab-panel { overflow: visible; }
 .profile-editor-actions { position: sticky; bottom: -1px; z-index: 2;
   background: var(--panel); border-top: 1px solid var(--line);
   padding: 0.65rem 0 0.2rem; width: 100%; }

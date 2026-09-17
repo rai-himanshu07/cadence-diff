@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from nicegui import events, ui
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 from qc_tool.config.profile import (
     DeliverableProfile,
@@ -170,6 +170,9 @@ def build_session_choices(
     rerun_of: int | None,
     profile_snapshot: dict[str, object] | None = None,
     resolved_input_configuration: dict[str, object] | None = None,
+    selected_sheets: tuple[str, ...] = (),
+    selected_member_sheets: dict[str, tuple[str, ...]] | None = None,
+    selected_slides: tuple[int, ...] = (),
 ) -> dict[str, object]:
     """The primitive-only payload persisted into `ConfigSessionStore` when
     the main intake page hands off to this workspace.
@@ -187,6 +190,12 @@ def build_session_choices(
         "rerun_of": rerun_of,
         "profile_snapshot": profile_snapshot,
         "resolved_input_configuration": resolved_input_configuration,
+        "selected_sheets": list(selected_sheets),
+        "selected_member_sheets": {
+            member_id: list(sheet_names)
+            for member_id, sheet_names in (selected_member_sheets or {}).items()
+        },
+        "selected_slides": list(selected_slides),
     }
 
 
@@ -585,6 +594,7 @@ def _serialize_region(region) -> dict[str, object]:
         "ignore_columns_reason": region.ignore_columns_reason,
         "ignore_columns_expires_on": region.ignore_columns_expires_on,
         "confirmed": region.confirmed,
+        "ranked_candidate_pending": region.ranked_candidate_pending,
     }
 
 
@@ -646,6 +656,12 @@ def _apply_saved_region_choices(
                     ignore_columns_reason=saved_region.get("ignore_columns_reason", ""),
                     ignore_columns_expires_on=saved_region.get("ignore_columns_expires_on", ""),
                     confirmed=bool(saved_region.get("confirmed", False)),
+                    ranked_candidate_pending=bool(
+                        saved_region.get(
+                            "ranked_candidate_pending",
+                            region.ranked_candidate_pending,
+                        )
+                    ),
                 )
             )
         new_sheets.append(_replace(sheet, regions=tuple(new_regions)))
@@ -678,6 +694,15 @@ def _apply_pending_row_matching(
             if proposal is None:
                 new_regions.append(region)
                 continue
+            if region.mode != "automatic":
+                new_regions.append(
+                    _replace(
+                        region,
+                        ranked_candidate_pending=True,
+                        confirmed=False,
+                    )
+                )
+                continue
             header_row = _coerce_optional_int(proposal.get("header_row"))
             new_regions.append(
                 _replace(
@@ -700,8 +725,8 @@ def _apply_pending_row_matching(
                     duplicate_key_policy=str(
                         proposal.get("duplicate_policy", "skip")
                     ),
-                    ranked_candidate_pending=False,
-                    confirmed=True,
+                    ranked_candidate_pending=True,
+                    confirmed=False,
                 )
             )
         new_sheets.append(_replace(sheet, regions=tuple(new_regions)))
@@ -850,6 +875,26 @@ def render_config_workspace(
         return
 
     choices = record.choices
+    selected_sheets = set(_coerce_str_tuple(choices.get("selected_sheets", ())))
+    selected_member_sheets_raw = choices.get("selected_member_sheets", {})
+    selected_member_sheets = (
+        {
+            str(member_id): set(_coerce_str_tuple(sheet_names))
+            for member_id, sheet_names in selected_member_sheets_raw.items()
+        }
+        if isinstance(selected_member_sheets_raw, dict)
+        else {}
+    )
+    selected_slides_raw = choices.get("selected_slides", ())
+    selected_slides = (
+        {
+            item
+            for item in selected_slides_raw
+            if isinstance(item, int) and not isinstance(item, bool)
+        }
+        if isinstance(selected_slides_raw, (list, tuple))
+        else set()
+    )
     session_revision: dict[str, int] = {"value": record.revision}
     raw_profile_snapshot = choices.get("profile_snapshot")
 
@@ -869,6 +914,16 @@ def render_config_workspace(
         if credential_vault is not None
         else {}
     )
+
+    def _go_back_to_files() -> None:
+        if credential_vault is not None:
+            credential_vault.store_bundle(
+                record.session_id,
+                input_generation=record.input_generation,
+                source_hashes=file_hashes,
+                credentials=dict(credentials),
+            )
+        ui.navigate.to(f"/?config_session={record.session_id}")
     try:
         mode = QCRunMode(str(choices.get("mode", "cycle_comparison")))
     except ValueError:
@@ -890,9 +945,7 @@ def render_config_workspace(
         ui.button(
             "Back to files",
             icon="arrow_back",
-            on_click=lambda: ui.navigate.to(
-                f"/?config_session={record.session_id}"
-            ),
+            on_click=_go_back_to_files,
         ).classes("ghostbtn").props("flat no-caps")
         ui.label(f"Configure & run — {_MODE_LABELS[mode]}").classes("pagetitle")
         ui.label(
@@ -1077,42 +1130,55 @@ def render_config_workspace(
                         on_click=_clear_file,
                     ).props("flat round dense").tooltip(f"Clear {_role_label(role)}")
 
-            with ui.row().classes("items-end gap-2"):
-                new_member_id = ui.input("New Excel member ID").props(
-                    "outlined dense"
-                ).classes("w-56")
+            with ui.expansion(
+                "Additional workbooks (optional)", value=False
+            ).classes("w-full"):
+                ui.label(
+                    "Use this only when one deliverable contains several logical "
+                    "Excel workbooks. Give the same stable ID to the matching "
+                    "baseline and current workbook; the main pair above is "
+                    "already the primary workbook."
+                ).classes("note")
+                with ui.row().classes("items-end gap-2"):
+                    new_member_id = ui.input("Workbook member ID").props(
+                        "outlined dense"
+                    ).classes("w-56")
 
-                def _add_member_roles() -> None:
-                    import re
+                    def _add_member_roles() -> None:
+                        import re
 
-                    member_id = str(new_member_id.value or "").strip()
-                    if re.fullmatch(MEMBER_ID_PATTERN, member_id) is None:
-                        ui.notify(
-                            "Member ID must use letters, numbers, dots, dashes, "
-                            "or underscores.",
-                            type="warning",
+                        member_id = str(new_member_id.value or "").strip()
+                        if re.fullmatch(MEMBER_ID_PATTERN, member_id) is None:
+                            ui.notify(
+                                "Member ID must use letters, numbers, dots, dashes, "
+                                "or underscores.",
+                                type="warning",
+                            )
+                            return
+                        prefixes = (
+                            (_EXCEL_BASELINE_PREFIX, _EXCEL_CURRENT_PREFIX)
+                            if mode is QCRunMode.CYCLE_COMPARISON
+                            else (_EXCEL_CURRENT_PREFIX,)
                         )
-                        return
-                    prefixes = (
-                        (_EXCEL_BASELINE_PREFIX, _EXCEL_CURRENT_PREFIX)
-                        if mode is QCRunMode.CYCLE_COMPARISON
-                        else (_EXCEL_CURRENT_PREFIX,)
-                    )
-                    pending = {
-                        role
-                        for role in pending_roles_raw
-                        if isinstance(role, str)
-                    } if isinstance(pending_roles_raw, list) else set()
-                    pending.update(f"{prefix}:{member_id}" for prefix in prefixes)
-                    _persist_input_state(
-                        choice_updates={"pending_roles": sorted(pending)}
-                    )
+                        pending = {
+                            role
+                            for role in pending_roles_raw
+                            if isinstance(role, str)
+                        } if isinstance(pending_roles_raw, list) else set()
+                        pending.update(f"{prefix}:{member_id}" for prefix in prefixes)
+                        _persist_input_state(
+                            choice_updates={"pending_roles": sorted(pending)}
+                        )
 
-                ui.button(
-                    "Add workbook member",
-                    icon="add",
-                    on_click=_add_member_roles,
-                ).classes("ghostbtn").props("flat no-caps")
+                    ui.button(
+                        (
+                            "Add workbook pair"
+                            if mode is QCRunMode.CYCLE_COMPARISON
+                            else "Add workbook"
+                        ),
+                        icon="add",
+                        on_click=_add_member_roles,
+                    ).classes("ghostbtn").props("flat no-caps")
 
         members = _excel_members({role: str(path) for role, path in files.items()})
         # Preflight/final-package have no baseline side -- self-scan the
@@ -1218,6 +1284,9 @@ def render_config_workspace(
             "value": ConfigWorkspaceState(
                 mode=mode,
                 profile_name=str(choices.get("profile_name", "default")),
+                warnings_acknowledged=frozenset(
+                    _coerce_str_tuple(choices.get("warnings_acknowledged", ()))
+                ),
                 allow_large_workbooks=bool(choices.get("allow_large_workbooks", False)),
                 allow_dependency_indexing=bool(choices.get("allow_dependency_indexing", False)),
                 profile_opened_hash=_profile_hash_or_none(
@@ -1242,7 +1311,7 @@ def render_config_workspace(
             "outcome": None,
             "auto_request_key": None,
             "request_token": 0,
-            "editor_tab": "rows",
+            "editor_tab": "bounds",
             #: (member_id, sheet_name, region_id) currently armed to receive
             #: the next preview-grid cell click as its new anchor, or None.
             "anchor_target": None,
@@ -1253,6 +1322,10 @@ def render_config_workspace(
         #: never queried (mirrors ``preview_state``'s own "regenerates on
         #: demand" convention).
         key_overlap_state: dict[str, dict[str, float]] = {"ratios": {}}
+        #: Ephemeral display labels derived from the bounded current-side
+        #: preview after a data-start boundary is set. Stable letters remain
+        #: the stored values; labels never enter ConfigSessionStore or a run.
+        column_label_state: dict[str, dict[str, str]] = {}
         #: Strong references to in-flight fire-and-forget background tasks
         #: (Step 12 Fix 5's key-overlap recompute) so the event loop cannot
         #: garbage-collect one mid-flight; each removes itself on completion.
@@ -1343,6 +1416,9 @@ def render_config_workspace(
                         "sheet_renames": rename_choices,
                         "excluded_slides": excluded_slides,
                         "slide_renames": slide_renames,
+                        "warnings_acknowledged": sorted(
+                            state.warnings_acknowledged
+                        ),
                         "allow_large_workbooks": state.allow_large_workbooks,
                         "allow_dependency_indexing": state.allow_dependency_indexing,
                     },
@@ -1386,6 +1462,31 @@ def render_config_workspace(
             reviews = []
             for member_id, member_profile in result.members.items():
                 review = member_review_from_scan(member_id, member_profile)
+                member_scope = selected_member_sheets.get(member_id)
+                if member_scope is None and member_id == "primary":
+                    member_scope = selected_sheets
+                if member_scope:
+                    baseline_scope = set(member_scope)
+                    member_renames = saved_renames.get(member_id)
+                    if isinstance(member_renames, dict):
+                        baseline_scope.update(
+                            str(baseline_name)
+                            for current_name, baseline_name in member_renames.items()
+                            if str(current_name) in member_scope
+                        )
+                    review = dataclasses.replace(
+                        review,
+                        current_sheets=tuple(
+                            sheet
+                            for sheet in review.current_sheets
+                            if sheet.sheet_name in member_scope
+                        ),
+                        baseline_sheets=tuple(
+                            sheet
+                            for sheet in review.baseline_sheets
+                            if sheet.sheet_name in baseline_scope
+                        ),
+                    )
                 if saved_regions:
                     review = _apply_saved_region_choices(review, saved_regions)
                 member_selectors = saved_selectors.get(member_id)
@@ -1438,6 +1539,16 @@ def render_config_workspace(
             baseline_titles = peek_slide_titles(baseline_ppt) if baseline_ppt is not None else []
             current_titles = peek_slide_titles(current_ppt)
             deck = deck_review_from_titles(baseline_titles, current_titles)
+            if selected_slides:
+                deck = dataclasses.replace(
+                    deck,
+                    current_slides=tuple(
+                        dataclasses.replace(slide, included=False)
+                        if slide.slide_index not in selected_slides
+                        else slide
+                        for slide in deck.current_slides
+                    ),
+                )
             saved_excluded_raw = choices.get("excluded_slides", [])
             if isinstance(saved_excluded_raw, list):
                 excluded = {int(i) for i in saved_excluded_raw if str(i).lstrip("-").isdigit()}
@@ -1724,6 +1835,7 @@ def render_config_workspace(
             workspace_state["value"] = dataclasses.replace(
                 state, warnings_acknowledged=frozenset(acknowledged)
             )
+            _persist_choices()
             refresh()
 
         def render_scan_status() -> None:
@@ -1747,7 +1859,7 @@ def render_config_workspace(
 
             def _cancel_analysis() -> None:
                 coordinator.cancel(record.session_id, record.input_generation)
-                ui.navigate.to(f"/?config_session={record.session_id}")
+                _go_back_to_files()
 
             def _discard_setup() -> None:
                 nonlocal job
@@ -1859,9 +1971,7 @@ def render_config_workspace(
                     _render_password_inputs(missing_roles, resume_setup=True)
                     ui.button(
                         "Back to files",
-                        on_click=lambda: ui.navigate.to(
-                            f"/?config_session={record.session_id}"
-                        ),
+                        on_click=_go_back_to_files,
                     ).props("flat no-caps")
                 elif status in {
                     SetupStatus.WAITING_FOR_SLOT,
@@ -1921,9 +2031,7 @@ def render_config_workspace(
                     ).props("flat no-caps dense color=negative")
                     ui.button(
                         "Back to files",
-                        on_click=lambda: ui.navigate.to(
-                            f"/?config_session={record.session_id}"
-                        ),
+                        on_click=_go_back_to_files,
                     ).props("flat no-caps dense")
                 else:
                     disclosures = "; ".join(
@@ -1976,10 +2084,15 @@ def render_config_workspace(
                         with (
                             ui.dialog().props("persistent") as profile_dialog,
                             ui.card().classes(
-                                "w-[64rem] max-w-[96vw] max-h-[92vh] overflow-auto"
+                                "profile-editor-card"
                             ) as profile_card,
                         ):
                             ui.label("Edit profile policy").classes("runhead")
+                            ui.label(
+                                "Advanced reusable policy. Close this dialog and use "
+                                "Rows, Data bounds, Scenario checks, or Advanced for "
+                                "choices that should affect only this setup."
+                            ).classes("note")
                             with ui.row().classes("items-end gap-2 w-full no-wrap"):
                                 new_profile_name = ui.input(
                                     "New profile name"
@@ -2042,12 +2155,81 @@ def render_config_workspace(
                                     ),
                                 )
                                 _persist_choices()
+                                profile_editor_open["value"] = False
                                 profile_dialog.close()
                                 refresh()
 
                             def _close_profile_editor() -> None:
                                 profile_editor_open["value"] = False
                                 profile_dialog.close()
+                                refresh()
+
+                            def _profile_key_suggestions(
+                                path: tuple[str | int, ...],
+                            ) -> tuple[str, ...]:
+                                state = workspace_state["value"]
+                                if path == ("excel", "members"):
+                                    return tuple(
+                                        member.member_id
+                                        for member in state.member_reviews
+                                        if member.member_id != "primary"
+                                    )
+                                if path == ("excel", "sheets"):
+                                    primary = state.member_review("primary")
+                                    return (
+                                        tuple(
+                                            sheet.sheet_name
+                                            for sheet in primary.current_sheets
+                                        )
+                                        if primary is not None
+                                        else ()
+                                    )
+                                if path == ("excel", "ignore_sheets"):
+                                    primary = state.member_review("primary")
+                                    return (
+                                        tuple(
+                                            sheet.sheet_name
+                                            for sheet in primary.current_sheets
+                                        )
+                                        if primary is not None
+                                        else ()
+                                    )
+                                if (
+                                    len(path) == 4
+                                    and path[:2] == ("excel", "members")
+                                    and path[3] == "sheets"
+                                ):
+                                    member = state.member_review(str(path[2]))
+                                    return (
+                                        tuple(
+                                            sheet.sheet_name
+                                            for sheet in member.current_sheets
+                                        )
+                                        if member is not None
+                                        else ()
+                                    )
+                                if (
+                                    len(path) == 4
+                                    and path[:2] == ("excel", "members")
+                                    and path[3] == "ignore_sheets"
+                                ):
+                                    member = state.member_review(str(path[2]))
+                                    return (
+                                        tuple(
+                                            sheet.sheet_name
+                                            for sheet in member.current_sheets
+                                        )
+                                        if member is not None
+                                        else ()
+                                    )
+                                if path == ("ppt", "required_slides"):
+                                    deck = state.deck_review
+                                    return (
+                                        tuple(slide.title for slide in deck.current_slides)
+                                        if deck is not None
+                                        else ()
+                                    )
+                                return ()
 
                             editor_controller = open_profile_editor(
                                 profile_card,
@@ -2057,6 +2239,7 @@ def render_config_workspace(
                                 selected_files=lambda: dict(files),
                                 selected_passwords=lambda: dict(credentials),
                                 on_saved=_profile_saved,
+                                mapping_key_suggestions=_profile_key_suggestions,
                             )
                             ui.button(
                                 "Apply saved profile to this setup",
@@ -2134,7 +2317,7 @@ def render_config_workspace(
                     for region in sheet.regions
                     if (
                         region.ranked_candidate_pending
-                        and region.mode == "automatic"
+                        and not region.confirmed
                     )
                     or (region.mode != "automatic" and not region.is_valid)
                 ]
@@ -2433,11 +2616,53 @@ def render_config_workspace(
         def _render_region_row(member_id: str, sheet_name: str, region) -> None:
             """Render one task-first region editor with progressive disclosure."""
 
+            def _column_options() -> dict[str, str]:
+                options = {letter: letter for letter in region.available_columns}
+                options.update(column_label_state.get(region.region_id, {}))
+                if (
+                    region.header_intent != "first_data_row"
+                    or region.first_data_row is None
+                    or preview_state["member_id"] != member_id
+                    or preview_state["sheet_name"] != sheet_name
+                    or workspace_state["value"].preview_side != "current"
+                ):
+                    return options
+                outcome = preview_state["outcome"]
+                if outcome is None or outcome.disclosure or outcome.missing_credential:
+                    return options
+                header_row = region.first_data_row - 1
+                row_offset = header_row - outcome.resolved_min_row
+                if row_offset < 0 or row_offset >= len(outcome.rows):
+                    return options
+                values = outcome.rows[row_offset]
+                formulas = (
+                    outcome.formula_cells[row_offset]
+                    if row_offset < len(outcome.formula_cells)
+                    else []
+                )
+                for letter in region.available_columns:
+                    col_offset = (
+                        column_index_from_string(letter) - outcome.resolved_min_col
+                    )
+                    if col_offset < 0 or col_offset >= len(values):
+                        continue
+                    if col_offset < len(formulas) and formulas[col_offset]:
+                        continue
+                    label = " ".join(str(values[col_offset]).split())[:48]
+                    if label:
+                        options[letter] = f"{letter} · {label}"
+                column_label_state[region.region_id] = {
+                    letter: label
+                    for letter, label in options.items()
+                    if label != letter
+                }
+                return options
+
             def _status() -> tuple[str, str, str]:
                 if region.mode == "excluded":
                     return "limited", "Removed", "Excluded from this run"
-                if region.ranked_candidate_pending and region.mode == "automatic":
-                    return "attention", "Needs attention", "Choose how rows line up"
+                if region.ranked_candidate_pending and not region.confirmed:
+                    return "attention", "Needs attention", "Confirm how rows line up"
                 if not region.is_valid:
                     return "attention", "Needs details", "Complete the selected option"
                 if region.mode == "automatic":
@@ -2489,8 +2714,8 @@ def render_config_workspace(
                 with ui.tabs().classes("config-region-tabs").props(
                     "dense no-caps align=left"
                 ) as region_tabs:
-                    ui.tab("rows", label="Rows")
                     ui.tab("bounds", label="Data bounds")
+                    ui.tab("rows", label="Rows")
                     ui.tab("scenarios", label="Scenario checks")
                     ui.tab("advanced", label="Advanced")
                 region_tabs.value = preview_state["editor_tab"]
@@ -2547,6 +2772,9 @@ def render_config_workspace(
                                     region.region_id,
                                     mode=next_mode,
                                     confirmed=next_mode != "automatic",
+                                    ranked_candidate_pending=(
+                                        next_mode == "automatic"
+                                    ),
                                 )
 
                             ui.toggle(
@@ -2558,11 +2786,23 @@ def render_config_workspace(
                                 value=region.mode,
                                 on_change=_on_mode_change,
                             ).props("no-caps").mark("region-mode-toggle")
-                            if region.ranked_candidate_pending and region.mode == "automatic":
+                            if region.ranked_candidate_pending and not region.confirmed:
                                 ui.label(
-                                    "This table appears sorted or ranked. Choose matching "
-                                    "key columns or row position before running."
+                                    "QC needs this row setup confirmed. Any choices you "
+                                    "already made are preserved; review them here, then "
+                                    "confirm or choose a different row mode."
                                 ).classes("notecard")
+                                ui.button(
+                                    "Confirm row setup",
+                                    icon="check",
+                                    on_click=lambda: _update_region(
+                                        member_id,
+                                        sheet_name,
+                                        region.region_id,
+                                        ranked_candidate_pending=False,
+                                        confirmed=True,
+                                    ),
+                                ).classes("ghostbtn").props("flat no-caps dense")
                             if region.mode == "keyed":
 
                                 def _on_identity_change(
@@ -2589,7 +2829,7 @@ def render_config_workspace(
                                     )
 
                                 ui.select(
-                                    list(region.available_columns),
+                                    _column_options(),
                                     value=list(region.identity_columns),
                                     multiple=True,
                                     label="Key columns",
@@ -2654,12 +2894,33 @@ def render_config_workspace(
                                 data_start_input.error = str(exc)
                                 return
                             data_start_input.error = None
+                            column_label_state.pop(region.region_id, None)
                             _apply_region_transform(
                                 member_id,
                                 sheet_name,
                                 region.region_id,
                                 lambda _item: next_region,
                             )
+                            workspace_state["value"] = dataclasses.replace(
+                                workspace_state["value"], preview_side="current"
+                            )
+                            preview_state["member_id"] = member_id
+                            preview_state["sheet_name"] = sheet_name
+                            preview_state["min_row"] = max(
+                                1,
+                                (
+                                    next_region.first_data_row
+                                    if next_region.first_data_row is not None
+                                    else parse_a1_range(next_region.current_range)[0]
+                                )
+                                - 1,
+                            )
+                            preview_state["min_col"] = parse_a1_range(
+                                next_region.current_range
+                            )[1]
+                            preview_state["outcome"] = None
+                            render_preview_section()
+                            _schedule_preview_load()
 
                         data_start_input.on("blur", _commit_data_start)
                         data_start_input.on("keydown.enter", _commit_data_start)
@@ -2798,7 +3059,7 @@ def render_config_workspace(
 
                         if region.mode == "keyed":
                             ui.select(
-                                list(region.available_columns),
+                                _column_options(),
                                 value=list(region.ordinal_columns),
                                 multiple=True,
                                 label="Rank/order columns (skip value changes only)",
@@ -2858,7 +3119,7 @@ def render_config_workspace(
                             "Ignored and expected-refresh columns"
                         ).classes("w-full"):
                             ui.select(
-                                list(region.available_columns),
+                                _column_options(),
                                 value=list(region.ignore_columns),
                                 multiple=True,
                                 label="Ignore value changes in",
@@ -2897,7 +3158,7 @@ def render_config_workspace(
                                     ),
                                 ).props("outlined dense type=date").classes("w-44")
                             ui.select(
-                                list(region.available_columns),
+                                _column_options(),
                                 value=list(region.expected_refresh_columns),
                                 multiple=True,
                                 label="Expected-refresh value columns",
@@ -3377,6 +3638,8 @@ def render_config_workspace(
                     return
                 if request_token == preview_state["request_token"]:
                     preview_state["outcome"] = outcome
+                    if active_side == "current":
+                        render_regions_section()
             finally:
                 if request_token == preview_state["request_token"]:
                     preview_state["loading"] = False
@@ -3587,6 +3850,18 @@ def render_config_workspace(
                     if deck is not None
                     else set()
                 )
+                result = _job_result()
+                member_sheet_inventory = {
+                    member_id: [
+                        sheet.sheet_name for sheet in member.current_sheets
+                    ]
+                    for member_id, member in (result.members.items() if result else ())
+                }
+                primary_sheet_inventory = (
+                    member_sheet_inventory.get("primary", [])
+                    if set(member_sheet_inventory) == {"primary"}
+                    else []
+                )
                 run_state = SessionState(
                     files=files,
                     file_hashes=file_hashes,
@@ -3602,6 +3877,17 @@ def render_config_workspace(
                         choices.get("acceptance_percent"), 0.0
                     ),
                     rerun_of=_coerce_optional_int(choices.get("rerun_of")),
+                    selected_sheets=set(selected_sheets),
+                    available_sheets=primary_sheet_inventory,
+                    selected_member_sheets={
+                        member_id: set(sheet_names)
+                        for member_id, sheet_names in selected_member_sheets.items()
+                    },
+                    available_member_sheets=(
+                        member_sheet_inventory
+                        if set(member_sheet_inventory) != {"primary"}
+                        else {}
+                    ),
                     available_slides=available_slides,
                     selected_slides=selected_slides,
                 )
@@ -3636,6 +3922,7 @@ def render_config_workspace(
                 mode is QCRunMode.CYCLE_COMPARISON
                 and "baseline_excel" in files
                 and "current_excel" in files
+                and not selected_sheets
                 and not acknowledged_large_volume
             ):
                 projection = await asyncio.to_thread(
@@ -3664,16 +3951,17 @@ def render_config_workspace(
                         ui.card().classes("w-[36rem] max-w-full"),
                     ):
                         ui.label(
-                            "This looks like a very large comparison"
+                            "Confirm full comparison size"
                         ).classes("runhead")
                         ui.label(
                             f"Up to ~{projection.projected_max_findings:,} "
                             f"findings across {len(projection.changed_sheets)} "
                             "changed sheet"
                             f"{'s' if len(projection.changed_sheets) != 1 else ''}. "
-                            "Narrow the region/sheet choices above to reduce "
-                            "this, or continue -- a full run remains the "
-                            "sign-off artifact."
+                            "This is a volume confirmation, not another setup "
+                            "or row-matching review. Go back and choose a sheet "
+                            "scope to reduce it, or continue -- a full run remains "
+                            "the sign-off artifact."
                         ).classes("notecard")
                         with ui.row().classes("items-center gap-2"):
                             ui.button(
@@ -3746,7 +4034,8 @@ def render_config_workspace(
 
         def refresh() -> None:
             render_scan_status()
-            render_profile_section()
+            if not profile_editor_open["value"]:
+                render_profile_section()
             render_regions_section()
             render_deck_section()
             render_preview_section()

@@ -489,6 +489,22 @@ def _row_matching_choice_updates(
     }
 
 
+def _row_matching_choice_updates_from_action(
+    action: dict[str, object], source_profile: str
+) -> dict[str, object]:
+    """Convert a blocked run's bounded row evidence into workspace proposals.
+
+    The configuration workspace remains the only decision surface; this helper
+    carries suggestions there without creating or mutating a profile.
+    """
+    view_model = view_model_from_action(
+        action,
+        source_profile=source_profile,
+        source_profile_saved=False,
+    )
+    return _row_matching_choice_updates(view_model) if view_model is not None else {}
+
+
 def _set_desktop_focus_preference(
     work_dir: Path,
     service: FocusService,
@@ -906,7 +922,7 @@ def _terminal_request_summary(record: RunStateRecord) -> str:
         if action.get("reason") == "row_identity_confirmation_required":
             return (
                 f"{request} paused for row matching. No completed run was recorded; "
-                "review the row-matching dialog to continue."
+                "return to setup to confirm the affected table."
             )
         return f"{request} was blocked. No completed run was recorded."
     if record.status is RunStatus.FAILED:
@@ -6596,8 +6612,9 @@ def create_pages(
         add_member_buttons: dict[str, ui.button] = {}
         maybe_prompt_storage_cleanup(offer_history_nav=True)
 
+        config_store = ConfigSessionStore(work_dir / "history.sqlite3")
         resumed_config = (
-            ConfigSessionStore(work_dir / "history.sqlite3").get(config_session)
+            config_store.get(config_session)
             if config_session
             else None
         )
@@ -6665,8 +6682,32 @@ def create_pages(
                 if isinstance(raw_rerun, int) and not isinstance(raw_rerun, bool)
                 else None
             )
+            raw_selected_sheets = resumed_choices.get("selected_sheets", ())
+            if isinstance(raw_selected_sheets, (list, tuple)):
+                state.selected_sheets = {str(item) for item in raw_selected_sheets}
+            raw_member_sheets = resumed_choices.get("selected_member_sheets", {})
+            if isinstance(raw_member_sheets, dict):
+                state.selected_member_sheets = {
+                    str(member_id): {str(item) for item in sheet_names}
+                    for member_id, sheet_names in raw_member_sheets.items()
+                    if isinstance(sheet_names, (list, tuple))
+                }
+            raw_selected_slides = resumed_choices.get("selected_slides", ())
+            if isinstance(raw_selected_slides, (list, tuple)):
+                state.selected_slides = {
+                    item
+                    for item in raw_selected_slides
+                    if isinstance(item, int) and not isinstance(item, bool)
+                }
             state.config_session_id = resumed_config.session_id
             state.config_session_revision = resumed_config.revision
+            state.passwords.update(
+                credential_vault.claim_snapshot(
+                    resumed_config.session_id,
+                    resumed_config.input_generation,
+                    state.file_hashes,
+                )
+            )
             for role in state.files:
                 prefix, separator, member_id = role.partition(":")
                 if separator and prefix in {"baseline_excel", "current_excel"}:
@@ -7175,7 +7216,7 @@ def create_pages(
             def manage_profiles() -> None:
                 """Profile authoring lives here so routine setup stays a selector."""
                 with ui.dialog() as dialog, ui.card().classes(
-                    "w-[72rem] max-w-[96vw] max-h-[92vh] overflow-y-auto"
+                    "profile-editor-card"
                 ) as card:
                     ui.label("Manage profiles").classes("runhead")
                     ui.label(
@@ -7255,6 +7296,35 @@ def create_pages(
                     def close_profile_dialog() -> None:
                         dialog.close()
 
+                    def profile_key_suggestions(
+                        path: tuple[str | int, ...],
+                    ) -> tuple[str, ...]:
+                        if path == ("excel", "members"):
+                            return tuple(sorted(state.available_member_sheets))
+                        if path == ("excel", "sheets"):
+                            return tuple(state.available_sheets)
+                        if path == ("excel", "ignore_sheets"):
+                            return tuple(state.available_sheets)
+                        if (
+                            len(path) == 4
+                            and path[:2] == ("excel", "members")
+                            and path[3] == "sheets"
+                        ):
+                            return tuple(
+                                state.available_member_sheets.get(str(path[2]), ())
+                            )
+                        if (
+                            len(path) == 4
+                            and path[:2] == ("excel", "members")
+                            and path[3] == "ignore_sheets"
+                        ):
+                            return tuple(
+                                state.available_member_sheets.get(str(path[2]), ())
+                            )
+                        if path == ("ppt", "required_slides"):
+                            return tuple(title for _index, title in state.available_slides)
+                        return ()
+
                     editor_controller = open_profile_editor(
                         card,
                         profiles_dir,
@@ -7263,6 +7333,7 @@ def create_pages(
                         selected_files=lambda: dict(state.files),
                         selected_passwords=lambda: dict(state.passwords),
                         on_saved=profile_saved,
+                        mapping_key_suggestions=profile_key_suggestions,
                     )
                     dialog.on("hide", editor_controller.dispose)
                 dialog.open()
@@ -7665,6 +7736,16 @@ def create_pages(
                 queue_row.visible = False
                 initial_pending = queue_manager.store.pending()
                 latest_terminal = queue_manager.store.latest_terminal()
+                continued_request_id = (
+                    str(resumed_config.choices.get("continued_request_id", ""))
+                    if resumed_config is not None
+                    else ""
+                )
+                if (
+                    latest_terminal is not None
+                    and latest_terminal.request_id == continued_request_id
+                ):
+                    latest_terminal = None
                 terminal_message: dict[str, str] = {
                     "value": (
                         _terminal_request_summary(latest_terminal)
@@ -7683,6 +7764,73 @@ def create_pages(
                     terminal_actions = ui.row().classes(
                         "no-wrap items-center gap-2"
                     )
+                resumed_setup_banner: ui.element | None = None
+                if resumed_config is not None:
+                    with ui.element("div").classes(
+                        "notecard w-full"
+                    ).mark("resumed-setup-controls") as resumed_setup_banner:
+                        ui.label(
+                            "Your in-progress setup is restored. Selected files and "
+                            "scope remain editable above."
+                        )
+
+                        def discard_resumed_setup() -> None:
+                            current = config_store.get(resumed_config.session_id)
+                            if queue_manager.store.pending():
+                                ui.notify(
+                                    "Setup cannot be discarded while a QC request is active.",
+                                    type="warning",
+                                )
+                                return
+                            if (
+                                current is None
+                                or current.revision != state.config_session_revision
+                            ):
+                                ui.notify(
+                                    "This setup changed in another tab. Reload before "
+                                    "discarding it.",
+                                    type="warning",
+                                )
+                                return
+                            setup_coordinator.discard(
+                                current.session_id, current.input_generation
+                            )
+                            credential_vault.clear_session(current.session_id)
+                            config_store.delete(current.session_id)
+                            state.config_session_id = None
+                            state.config_session_revision = None
+                            resumed_setup_banner.visible = False
+                            ui.run_javascript(
+                                "window.history.replaceState({}, '', '/')"
+                            )
+                            ui.notify(
+                                "Setup discarded; selected files remain on this page."
+                            )
+
+                        with ui.row().classes("items-center gap-2"):
+                            ui.button(
+                                "Resume setup",
+                                icon="tune",
+                                on_click=lambda: ui.navigate.to(
+                                    f"/configure?session={resumed_config.session_id}"
+                                ),
+                            ).classes("ghostbtn").props("flat no-caps dense")
+                            ui.button(
+                                "Discard setup",
+                                icon="delete_outline",
+                                on_click=discard_resumed_setup,
+                            ).props("flat no-caps dense color=negative")
+                    resumed_setup_banner.visible = not (
+                        initial_pending or terminal_message["value"]
+                    )
+
+                def _refresh_recovery_visibility(
+                    pending: list[RunStateRecord],
+                ) -> None:
+                    if resumed_setup_banner is not None:
+                        resumed_setup_banner.visible = not (
+                            pending or terminal_message["value"]
+                        )
 
                 def refresh_readiness() -> None:
                     blockers = _run_blockers(
@@ -7733,7 +7881,9 @@ def create_pages(
                 own_requests: set[str] = set()
                 # Requests this page observed while active, including ones a
                 # different tab submitted, so a refresh still reports the outcome.
-                watched_requests: set[str] = set()
+                watched_requests: set[str] = {
+                    record.request_id for record in initial_pending
+                }
 
                 # Single-flight submission lock: idle -> projecting -> dialog ->
                 # submitted. Set synchronously (no `await` before the first
@@ -7744,6 +7894,7 @@ def create_pages(
                 # the volume-projection dialog.
                 run_lock: dict[str, str | None] = {"phase": "idle", "request_id": None}
                 prompted_complexity_requests: set[str] = set()
+                setup_attention_prompted: set[str] = set()
 
                 def _run_ui_busy() -> bool:
                     return run_lock["phase"] != "idle"
@@ -7753,11 +7904,116 @@ def create_pages(
                     run_lock["request_id"] = None
                     refresh_readiness()
 
+                def _current_terminal_record(
+                    record: RunStateRecord,
+                ) -> RunStateRecord | None:
+                    current = queue_manager.store.get(record.request_id)
+                    if queue_manager.store.pending() or current is None or current.is_active:
+                        ui.notify(
+                            "This action is no longer available while a run is active.",
+                            type="warning",
+                        )
+                        refresh_queue()
+                        return None
+                    return current
+
+                async def _continue_blocked_setup(record: RunStateRecord) -> bool:
+                    current = _current_terminal_record(record)
+                    if current is None or current.status is not RunStatus.BLOCKED:
+                        return False
+                    profile, error = await _restore_request_context(current)
+                    if error is not None or profile is None:
+                        ui.notify(
+                            error or "Retry context unavailable.",
+                            type="warning",
+                            multi_line=True,
+                        )
+                        return False
+                    action = current.action_required or {}
+                    proposal_updates = (
+                        {}
+                        if _ranked_action_needs_refresh(action)
+                        else _row_matching_choice_updates_from_action(
+                            action, current.profile
+                        )
+                    )
+                    choice_updates = {
+                        **proposal_updates,
+                        "continued_request_id": current.request_id,
+                    }
+                    resolved = (
+                        ResolvedInputConfigurationV1.model_validate(
+                            current.resolved_input_configuration
+                        )
+                        if current.resolved_input_configuration is not None
+                        else None
+                    )
+                    opened = open_configuration_workspace(
+                        profile_override=profile,
+                        resolved_override=resolved,
+                        choice_updates=choice_updates,
+                        reuse_source_session=True,
+                    )
+                    if not opened:
+                        return False
+                    queue_manager.store.delete_terminal_attempt(current.request_id)
+                    watched_requests.discard(current.request_id)
+                    own_requests.discard(current.request_id)
+                    terminal_message["value"] = ""
+                    terminal_outcome.set_text("")
+                    terminal_outcome.visible = False
+                    terminal_actions.clear()
+                    _refresh_recovery_visibility(queue_manager.store.pending())
+                    return True
+
+                def _open_setup_attention_prompt(record: RunStateRecord) -> None:
+                    if record.request_id in setup_attention_prompted:
+                        return
+                    current = queue_manager.store.get(record.request_id)
+                    action = (current.action_required if current is not None else None) or {}
+                    if (
+                        current is None
+                        or current.status is not RunStatus.BLOCKED
+                        or action.get("reason") != "row_identity_confirmation_required"
+                    ):
+                        return
+                    setup_attention_prompted.add(record.request_id)
+                    terminal_actions.visible = False
+                    with ui.dialog().props("persistent") as dialog, ui.card().classes(
+                        "w-[36rem] max-w-[94vw]"
+                    ):
+                        ui.label("QC needs more setup").classes("runhead")
+                        ui.label(
+                            "QC paused before recording a completed run because the "
+                            "authoritative load found row matching that still needs "
+                            "confirmation. Your files and previous setup choices are "
+                            "preserved. Return to the same setup to review the affected "
+                            "table; QC will not start automatically."
+                        ).classes("notecard")
+
+                        async def return_to_setup() -> None:
+                            if await _continue_blocked_setup(record):
+                                dialog.close()
+
+                        def defer_setup() -> None:
+                            dialog.close()
+                            terminal_actions.visible = True
+
+                        with ui.row().classes("items-center gap-2"):
+                            ui.button(
+                                "Return to setup", on_click=return_to_setup
+                            ).classes("runbtn").props("no-caps")
+                            ui.button("Not now", on_click=defer_setup).props(
+                                "flat no-caps"
+                            )
+                    dialog.open()
+
                 def announce(record: RunStateRecord) -> None:
                     terminal_message["value"] = _terminal_request_summary(record)
                     terminal_outcome.set_text(terminal_message["value"])
                     terminal_outcome.visible = bool(terminal_message["value"])
                     _refresh_terminal_actions(record)
+                    _refresh_recovery_visibility(queue_manager.store.pending())
                     if record.status is RunStatus.SUCCEEDED and record.run_id:
                         ui.notify(f"Run #{record.run_id} complete")
                         if record.request_id in own_requests:
@@ -7783,27 +8039,8 @@ def create_pages(
                         if (
                             action.get("reason")
                             == "row_identity_confirmation_required"
-                            and not _ranked_action_needs_refresh(action)
                         ):
-                            ui.notify(
-                                "QC paused for row matching. Open Configure setup "
-                                "to review the affected regions before running again.",
-                                type="warning",
-                                multi_line=True,
-                            )
-                            refresh_readiness()
-                            return
-                        if (
-                            action.get("reason")
-                            == "row_identity_confirmation_required"
-                            and _ranked_action_needs_refresh(action)
-                        ):
-                            ui.notify(
-                                "Stored row suggestions predate the current detector. "
-                                "Choose Refresh row suggestions to rebuild them.",
-                                type="warning",
-                                multi_line=True,
-                            )
+                            _open_setup_attention_prompt(record)
                             refresh_readiness()
                             return
                         raw_items = action.get("items")
@@ -7856,6 +8093,7 @@ def create_pages(
                         terminal_actions.clear()
                     else:
                         terminal_outcome.visible = bool(terminal_message["value"])
+                    _refresh_recovery_visibility(pending)
                     queue_row.visible = (
                         bool(lines)
                         or bool(completed_links.default_slot.children)
@@ -7890,7 +8128,8 @@ def create_pages(
                         if run_lock["request_id"] == request_id:
                             _unlock_run()
 
-                ui.timer(0.5, refresh_queue)
+                queue_refresh_timer = ui.timer(0.5, refresh_queue)
+                ui.context.client.on_disconnect(queue_refresh_timer.deactivate)
 
                 async def start_run(
                     profile_override: DeliverableProfile | None = None,
@@ -8123,7 +8362,7 @@ def create_pages(
                     resolved_override: ResolvedInputConfigurationV1 | None = None,
                     choice_updates: dict[str, object] | None = None,
                     reuse_source_session: bool = False,
-                ) -> None:
+                ) -> bool:
                     """Create a private configuration session for the
                     currently selected files/profile and hand off to the
                     full-page mode-aware setup review (plan-20260913, Step
@@ -8140,12 +8379,12 @@ def create_pages(
                     )
                     if blockers:
                         ui.notify("; ".join(blockers), type="warning")
-                        return
+                        return False
                     try:
                         files = _files_for_mode(state.mode, state.files)
                     except ValueError as exc:
                         ui.notify(str(exc), type="warning")
-                        return
+                        return False
                     file_hashes = {
                         role: state.file_hashes[role]
                         for role in files
@@ -8190,6 +8429,13 @@ def create_pages(
                             if resolved_override is not None
                             else None
                         ),
+                        selected_sheets=tuple(sorted(state.selected_sheets)),
+                        selected_member_sheets={
+                            member_id: tuple(sorted(sheet_names))
+                            for member_id, sheet_names in state.selected_member_sheets.items()
+                            if sheet_names
+                        },
+                        selected_slides=tuple(sorted(state.selected_slides)),
                     )
                     choice_updates = choice_updates or {}
                     choices = {
@@ -8230,7 +8476,7 @@ def create_pages(
                                 "Reload before continuing.",
                                 type="warning",
                             )
-                            return
+                            return False
                     else:
                         config_session = config_store.create_session(
                             file_hashes=file_hashes,
@@ -8252,6 +8498,7 @@ def create_pages(
                     ui.navigate.to(
                         f"/configure?session={config_session.session_id}"
                     )
+                    return True
 
                 def _open_complexity_override(record: RunStateRecord) -> None:
                     current_record = queue_manager.store.get(record.request_id)
@@ -8323,23 +8570,8 @@ def create_pages(
                     if record is None:
                         return
 
-                    def current_terminal_record() -> RunStateRecord | None:
-                        current = queue_manager.store.get(record.request_id)
-                        if (
-                            queue_manager.store.pending()
-                            or current is None
-                            or current.is_active
-                        ):
-                            ui.notify(
-                                "This action is no longer available while a run is active.",
-                                type="warning",
-                            )
-                            refresh_queue()
-                            return None
-                        return current
-
                     def discard_attempt() -> None:
-                        current = current_terminal_record()
+                        current = _current_terminal_record(record)
                         if current is None:
                             return
                         if not queue_manager.store.delete_terminal_attempt(
@@ -8357,6 +8589,7 @@ def create_pages(
                         terminal_outcome.set_text("")
                         terminal_outcome.visible = False
                         terminal_actions.clear()
+                        _refresh_recovery_visibility(queue_manager.store.pending())
                         queue_row.visible = bool(
                             queue_manager.store.pending()
                             or completed_links.default_slot.children
@@ -8370,31 +8603,6 @@ def create_pages(
                             on_click=discard_attempt,
                         ).props("flat no-caps dense color=negative")
 
-                    async def configure_blocked_attempt() -> None:
-                        current = current_terminal_record()
-                        if current is None or current.status is not RunStatus.BLOCKED:
-                            return
-                        profile, error = await _restore_request_context(current)
-                        if error is not None or profile is None:
-                            ui.notify(
-                                error or "Retry context unavailable.",
-                                type="warning",
-                                multi_line=True,
-                            )
-                            return
-                        resolved = (
-                            ResolvedInputConfigurationV1.model_validate(
-                                current.resolved_input_configuration
-                            )
-                            if current.resolved_input_configuration is not None
-                            else None
-                        )
-                        open_configuration_workspace(
-                            profile_override=profile,
-                            resolved_override=resolved,
-                            reuse_source_session=True,
-                        )
-
                     action = record.action_required or {}
                     if (
                         record.status is RunStatus.BLOCKED
@@ -8404,93 +8612,19 @@ def create_pages(
 
                         if _ranked_action_needs_refresh(action):
 
-                            async def refresh_row_suggestions() -> None:
-                                current = current_terminal_record()
-                                current_action = (
-                                    current.action_required if current is not None else None
-                                ) or {}
-                                if (
-                                    current is None
-                                    or current.status is not RunStatus.BLOCKED
-                                    or current_action.get("reason")
-                                    != "row_identity_confirmation_required"
-                                ):
-                                    return
-                                profile, error = await _restore_request_context(current)
-                                if error is not None or profile is None:
-                                    ui.notify(
-                                        error or "Retry context unavailable.",
-                                        type="warning",
-                                        multi_line=True,
-                                    )
-                                    return
-                                terminal_actions.clear()
-                                ui.notify(
-                                    "Review refreshed row-matching setup before running"
-                                )
-                                open_configuration_workspace(
-                                    profile_override=profile,
-                                    reuse_source_session=True,
-                                    resolved_override=(
-                                        ResolvedInputConfigurationV1.model_validate(
-                                            current.resolved_input_configuration
-                                        )
-                                        if current.resolved_input_configuration is not None
-                                        else None
-                                    ),
-                                )
-
                             with terminal_actions:
                                 ui.button(
-                                    "Refresh row suggestions",
-                                    on_click=refresh_row_suggestions,
+                                    "Refresh setup",
+                                    on_click=lambda: _continue_blocked_setup(record),
                                 ).classes("ghostbtn").props("flat no-caps dense")
                                 add_discard_button()
                             return
 
-                        def review_row_matching() -> None:
-                            current = current_terminal_record()
-                            current_action = (
-                                current.action_required if current is not None else None
-                            ) or {}
-                            if (
-                                current is None
-                                or current.status is not RunStatus.BLOCKED
-                                or current_action.get("reason")
-                                != "row_identity_confirmation_required"
-                            ):
-                                return
-                            try:
-                                snapshot = (
-                                    DeliverableProfile.model_validate(
-                                        current.profile_snapshot
-                                    )
-                                    if current.profile_snapshot is not None
-                                    else None
-                                )
-                            except ValueError:
-                                ui.notify(
-                                    "The stored profile for this attempt is no "
-                                    "longer valid; start the comparison again.",
-                                    type="warning",
-                                )
-                                return
-                            _open_row_identity_setup(
-                                current_action,
-                                current.profile,
-                                snapshot,
-                                source_record=current,
-                            )
-
                         with terminal_actions:
                             ui.button(
-                                "Configure setup",
-                                on_click=configure_blocked_attempt,
+                                "Return to setup",
+                                on_click=lambda: _continue_blocked_setup(record),
                             ).classes("runbtn").props("no-caps dense")
-                            ui.button(
-                                "Review row matching",
-                                on_click=review_row_matching,
-                            ).classes("ghostbtn").props("flat no-caps dense")
                             add_discard_button()
                         return
                     if (
@@ -8511,6 +8645,14 @@ def create_pages(
                 _refresh_terminal_actions(
                     latest_terminal if not initial_pending else None
                 )
+                if (
+                    latest_terminal is not None
+                    and not initial_pending
+                    and latest_terminal.status is RunStatus.BLOCKED
+                    and (latest_terminal.action_required or {}).get("reason")
+                    == "row_identity_confirmation_required"
+                ):
+                    _open_setup_attention_prompt(latest_terminal)
 
             if rerun_banner_actions is not None:
                 with rerun_banner_actions:

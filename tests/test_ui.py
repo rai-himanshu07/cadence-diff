@@ -1170,6 +1170,8 @@ def test_terminal_request_summary_explains_blocked_attempt_without_a_run() -> No
 
     assert "paused for row matching" in summary
     assert "No completed run was recorded" in summary
+    assert "return to setup" in summary
+    assert "row-matching dialog" not in summary
 
 
 def test_terminal_request_summary_explains_complexity_failure_without_details() -> None:
@@ -1246,6 +1248,46 @@ async def test_active_request_hides_terminal_actions_and_stale_discard_is_refuse
     store.finish(active.request_id, RunStatus.CANCELLED)
     await user.should_see("Discard attempt", retries=20)
     await user.should_see("Last attempt #new-acti was cancelled", retries=20)
+
+
+@pytest.mark.asyncio
+async def test_active_request_becoming_blocked_opens_setup_prompt(
+    user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_dir = tmp_path / "work"
+    store = RunStateStore(work_dir / "history.sqlite3")
+    active = store.enqueue(
+        "active-then-blocked",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="default",
+        files={},
+        queue_position=0,
+    )
+    manager = _RecordingQueueManager(store)
+    monkeypatch.setattr(app_module, "get_manager", lambda _work_dir: manager)
+    create_pages(work_dir)
+
+    await user.open("/")
+    await user.should_not_see("QC needs more setup")
+    store.finalize_blocked(
+        active.request_id,
+        {
+            "version": 2,
+            "reason": "row_identity_confirmation_required",
+            "message": "Review row matching.",
+            "items": [
+                {
+                    "member_id": "primary",
+                    "sheet": "Data",
+                    "cell": "A1",
+                    "ranked_table_evidence": ranked_table_evidence_payload_v2(),
+                }
+            ],
+        },
+    )
+
+    await user.should_see("QC needs more setup", retries=20)
+    await user.should_see("Return to setup", retries=20)
 
 
 def test_old_typed_ranked_action_requires_a_detector_refresh() -> None:
@@ -1500,8 +1542,8 @@ async def test_stale_row_suggestions_refresh_with_restored_request_context(
     create_pages(work_dir)
 
     await user.open("/")
-    await user.should_see("Refresh row suggestions")
-    user.find("Refresh row suggestions").click()
+    await user.should_see("QC needs more setup")
+    user.find(kind=ui.button, content="Return to setup").click()
     await user.should_see("Configure & run")
 
     assert manager.submitted == []
@@ -1570,11 +1612,11 @@ async def test_run_qc_button_creates_a_configuration_session(
     create_pages(work_dir)
 
     await user.open("/")
-    await user.should_see("Refresh row suggestions")
+    await user.should_see("QC needs more setup")
     # Populate state.files/state.file_hashes the same established way this
     # file's own row-suggestions-refresh test does, without depending on a
     # real browser upload widget (none exists in this test suite).
-    user.find("Refresh row suggestions").click()
+    user.find(kind=ui.button, content="Return to setup").click()
     await user.should_see("Configure & run")
 
     file_hashes = {role: sha256_file(path) for role, path in files.items()}
@@ -1587,9 +1629,61 @@ async def test_run_qc_button_creates_a_configuration_session(
     }
 
 
+@pytest.mark.asyncio
+async def test_back_to_files_can_discard_setup_and_keep_files_and_scope(
+    user: User, tmp_path: Path
+) -> None:
+    from qc_tool.ui.config_workspace import build_session_choices
+
+    work_dir = tmp_path / "work"
+    files = _write_valid_managed_retry_pair(work_dir)
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    choices = build_session_choices(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="default",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode=FindingOutputMode.DECISION.value,
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+        selected_sheets=("Data",),
+    )
+    config_store = ConfigSessionStore(work_dir / "history.sqlite3")
+    original = config_store.create_session(
+        file_hashes=file_hashes,
+        profile_name="default",
+        choices=choices,
+    )
+    create_pages(work_dir)
+
+    await user.open(f"/?config_session={original.session_id}")
+    await user.should_see("Your in-progress setup is restored")
+    await user.should_see("Resume setup")
+    await user.should_see("Discard setup")
+    source = inspect.getsource(app_module.create_pages)
+    assert source.index('classes("readybar")') < source.index(
+        'mark("resumed-setup-controls")'
+    )
+
+    user.find(kind=ui.button, content="Discard setup").click()
+
+    await user.should_see("Setup discarded; selected files remain on this page.")
+    assert config_store.get(original.session_id) is None
+    user.find(marker="run-qc-button").click()
+    await user.should_see("Configure & run")
+
+    replacement = config_store.latest_for_source_set(file_hashes)
+    assert replacement is not None
+    assert replacement.session_id != original.session_id
+    assert replacement.choices["selected_sheets"] == ["Data"]
+
+
 
 @pytest.mark.asyncio
-async def test_blocked_row_matching_reopens_with_compact_labeled_controls(
+async def test_blocked_row_matching_opens_persistent_setup_prompt(
     user: User, tmp_path: Path
 ) -> None:
     work_dir = tmp_path / "work"
@@ -1645,37 +1739,17 @@ async def test_blocked_row_matching_reopens_with_compact_labeled_controls(
     create_pages(work_dir)
 
     await user.open("/")
-    await user.should_see("Review row matching")
-    user.find("Review row matching").click()
-
-    await user.should_see("This run only")
-    await user.should_see("Save for future runs")
-    await user.should_see("1 of 3")
-    await user.should_see("Manual review required")
-    await user.should_see("Check filter and parameter selections first")
-    await user.should_see("No formula result is used as a column header")
-    assert len(user.find(kind=ui.tab).elements) == 3
-    identity_options = [
-        element.options
-        for element in user.find(kind=ui.select).elements
-        if element.props.get("label") == "Match rows by"
-    ]
-    assert len(identity_options) == 3
-    assert all(isinstance(options, dict) for options in identity_options)
-    labels = {
-        (options["A"], options["B"])
-        for options in identity_options
-        if isinstance(options, dict)
-    }
-    assert labels == {
-        ("A", "B · formulas present (header unavailable)"),
-        ("A · Order", "B · Code"),
-        ("A · Position", "B · Key"),
-    }
+    await user.should_see("QC needs more setup")
+    await user.should_see("Your files and previous setup choices are preserved")
+    await user.should_see("Return to setup")
+    assert all(
+        button.text != "Review row matching"
+        for button in user.find(kind=ui.button).elements
+    )
 
 
 @pytest.mark.asyncio
-async def test_temporary_row_matching_returns_to_setup_and_can_discard_attempt(
+async def test_blocked_row_matching_consumes_attempt_and_preserves_existing_setup(
     user: User, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from qc_tool.config.resolved_input import (
@@ -1749,8 +1823,15 @@ async def test_temporary_row_matching_returns_to_setup_and_can_discard_attempt(
             }
         ]
     }
+    choices["region_decisions"] = {
+        "data_a1_b4": {
+            "mode": "keyed",
+            "identity_columns": ["B"],
+            "confirmed": True,
+        }
+    }
     config_store = ConfigSessionStore(work_dir / "history.sqlite3")
-    config_store.create_session(
+    config_session = config_store.create_session(
         file_hashes=file_hashes,
         profile_name="default",
         choices=choices,
@@ -1797,23 +1878,30 @@ async def test_temporary_row_matching_returns_to_setup_and_can_discard_attempt(
     monkeypatch.setattr(app_module, "get_manager", lambda _work_dir: manager)
     create_pages(work_dir)
 
-    await user.open("/")
-    await user.should_see("Configure setup")
-    await user.should_see("Discard attempt")
-    user.find("Review row matching").click()
-    await user.should_see("Apply and review setup")
-    user.find(kind=ui.button, content="Apply and review setup").click()
+    await user.open(f"/?config_session={config_session.session_id}")
+    await user.should_see("QC needs more setup")
+    await user.should_not_see("Discard attempt")
+    await user.should_not_see("Resume setup")
+    await user.should_not_see("Discard setup")
+    assert all(
+        button.text != "Review row matching"
+        for button in user.find(kind=ui.button).elements
+    )
+    user.find(kind=ui.button, content="Return to setup").click()
 
     await user.should_see("Configure & run", retries=20)
     await user.should_see("Analysis complete", retries=50)
     await user.should_see("Scenario choice (B1)", retries=20)
+    await user.should_see("Confirm row setup", retries=20)
     assert manager.submitted == []
     recovered = config_store.latest_for_source_set(file_hashes)
     assert recovered is not None
-    assert recovered.choices["profile_name"] == "default - temporary"
+    assert run_store.get(record.request_id) is None
+    assert recovered.choices["continued_request_id"] == record.request_id
+    assert recovered.choices["profile_name"] == "default"
     profile_snapshot = recovered.choices["profile_snapshot"]
     assert isinstance(profile_snapshot, dict)
-    assert profile_snapshot["name"] == "default - temporary"
+    assert profile_snapshot["name"] == "default"
     assert recovered.choices["selectors"] == choices["selectors"]
     pending = recovered.choices["pending_row_matching"]
     assert isinstance(pending, list)
@@ -1824,23 +1912,30 @@ async def test_temporary_row_matching_returns_to_setup_and_can_discard_attempt(
     mode_toggle = next(iter(user.find(marker="region-mode-toggle").elements))
     assert isinstance(mode_toggle, ui.toggle)
     assert mode_toggle.value == "keyed"
-    mode_toggle.value = "positional"
+    identity_select = next(iter(user.find(marker="identity-columns").elements))
+    assert isinstance(identity_select, ui.select)
+    assert identity_select.value == ["B"]
+    user.find(kind=ui.button, content="Confirm row setup").click()
     revised = config_store.latest_for_source_set(file_hashes)
     assert revised is not None
     assert "pending_row_matching" not in revised.choices
     region_choices = revised.choices["region_decisions"]
     assert isinstance(region_choices, dict)
     assert any(
-        isinstance(choice, dict) and choice.get("mode") == "positional"
+        isinstance(choice, dict)
+        and choice.get("mode") == "keyed"
+        and choice.get("identity_columns") == ["B"]
+        and choice.get("confirmed") is True
         for choice in region_choices.values()
     )
 
-    await user.open("/")
-    await user.should_see("Discard attempt")
-    user.find(kind=ui.button, content="Discard attempt").click()
-    await user.should_see("Previous attempt discarded")
-    assert run_store.get(record.request_id) is None
-    assert config_store.latest_for_source_set(file_hashes) is not None
+    await user.open(f"/?config_session={recovered.session_id}")
+    await user.should_see("Resume setup")
+    await user.should_not_see("QC needs more setup")
+    assert all(
+        button.text != "Discard attempt"
+        for button in user.find(kind=ui.button).elements
+    )
 
 
 @pytest.mark.asyncio
@@ -1859,6 +1954,12 @@ async def test_guide_page_renders_packaged_operator_content(
     await user.should_see("Choose the right QC mode")
     await user.should_see("they do not block read-only QC")
     await user.should_see("Profiles, controls, and waivers")
+    await user.should_see("The Files page then offers")
+    await user.should_see("Discard setup")
+    await user.should_see("Rank/order columns")
+    await user.should_see("B · Account ID")
+    await user.should_see("The profile editor is intentionally advanced")
+    await user.should_see("This is not another row-matching review")
     await user.should_see("Pattern review-item counts are analyst decisions")
     await user.should_see("Grouping never makes an error safer")
     await user.should_see("Scope narrows only Excel and PowerPoint findings")
@@ -4054,46 +4155,21 @@ def test_column_letters_normalizes_and_deduplicates() -> None:
     assert _column_letters(" b, A;B ") == ["B", "A"]
 
 
-def test_ranked_block_opens_the_review_row_matching_dialog() -> None:
+def test_ranked_block_routes_back_to_the_single_configuration_workspace() -> None:
     source = inspect.getsource(app_module.create_pages)
-    flat = " ".join(source.split())
+    action_branch = source.split("def _refresh_terminal_actions(", 1)[1].split(
+        "if rerun_banner_actions is not None:", 1
+    )[0]
 
-    assert "def _open_row_identity_setup(" in source
-    assert '"Review row matching"' in flat
-    assert '"QC paused"' in flat
-    assert '"Save rule and review setup"' in flat
-    assert '"Apply and review setup"' in flat
-    assert '"Configure setup"' in flat
-    assert '"Discard attempt"' in flat
-    assert '"This run only"' in flat
-    assert '"Save for future runs"' in flat
-    assert '"Existing profile or new name"' in flat
-    assert 'label=f"{index + 1} of {region_count}"' in source
-    assert "ui.label(region.label)" in source
-    assert '"Manual review required:' in source
-    assert '"Check filter and parameter selections first.' in source
-    assert "region.formula_driven_identity" in source
-    assert '"No formula result is used as a column "' in source
-    assert "options=region.column_options" in source
-    assert "open_configuration_workspace(" in source
-    assert "profile_override: DeliverableProfile | None = None" in source
-    assert "choice_updates=_row_matching_choice_updates(vm)" in source
+    assert "def _open_setup_attention_prompt(" in source
+    assert '"QC needs more setup"' in source
+    assert '"Return to setup"' in action_branch
+    assert '"Review row matching"' not in action_branch
+    assert "await _restore_request_context(current)" in source
+    assert "_row_matching_choice_updates_from_action(" in source
+    assert "choice_updates=choice_updates" in source
     assert "reuse_source_session=True" in source
-    assert '"rankedtable-card"' in flat
-    assert '"rankedtable-body w-full gap-2"' in flat
-    assert "await start_run(" not in source
-    assert "view_model_from_action(" in source
-    blocked_branch = source.split("elif record.status is RunStatus.BLOCKED:", 1)[1]
-    assert '== "row_identity_confirmation_required"' in blocked_branch
-    assert "current.profile_snapshot" in blocked_branch
-    assert "DeliverableProfile.model_validate(" in blocked_branch
-    assert "source_record=current" in blocked_branch
-    assert "await _restore_request_context(source_record)" in source
-    temporary_branch = source.split(
-        '"Temporary row matching applied; review setup "', 1
-    )[0].rsplit("else:", 1)[1]
-    assert "state.profile_override = profile.model_copy(deep=True)" in temporary_branch
-    assert "profile_select.value = profile.name" in temporary_branch
+    assert "await start_run(" not in action_branch
 
 
 def test_complexity_failure_branch_prompts_and_retries_only_after_confirmation() -> None:
@@ -4121,9 +4197,8 @@ def test_stale_ranked_action_refreshes_through_managed_request_context() -> None
     )[0]
 
     assert "_ranked_action_needs_refresh(action)" in action_branch
-    assert '"Refresh row suggestions"' in action_branch
-    assert "await _restore_request_context(current)" in action_branch
-    assert "open_configuration_workspace(" in action_branch
+    assert '"Refresh setup"' in action_branch
+    assert "_continue_blocked_setup(record)" in action_branch
     assert "await start_run(" not in action_branch
 
 
@@ -4135,10 +4210,14 @@ def test_guide_describes_manual_prerequisites_and_ranked_setup() -> None:
     assert "These cells are manually pinned" in source
     assert "Scenario checks" in source
     assert "Ranked or sorted tables" in source
-    assert "Apply and review setup" in source
-    assert '"this attempt only and returns to Configure & Run; it never starts "' in flat
+    assert "QC needs more " in source
+    assert '"setup message. Return to setup' in source
+    assert "There is no second" in source
+    assert '"row-matching editor and QC never restarts automatically.' in flat
+    assert '"is consumed and cannot prompt again on a later reload.' in flat
     assert '"Configuration never starts QC automatically;' in flat
-    assert "Discard attempt" in source
+    assert "Discard " in source
+    assert "attempt removes only" in source
     assert "formula result is never presented as a header" in source
     assert "Different selections can change reference columns" in source
     assert "Rank/order columns" in source

@@ -429,7 +429,8 @@ cadence-diff --data-dir "/path/to/qc-data"
                     "column letters, including when a table has preamble rows. A "
                     "formula result is never presented as a header; calculated identity "
                     "columns without a proven literal header are labelled as such. QC "
-                    "then re-runs automatically. Before confirming, make sure baseline "
+                    "then lets you submit again from the same setup. Before confirming, "
+                    "make sure baseline "
                     "and current use the same dropdown, filter, scenario, and parameter "
                     "selections. Different selections can change reference columns and "
                     "row membership, so QC may intentionally withhold a row-matching "
@@ -442,15 +443,17 @@ cadence-diff --data-dir "/path/to/qc-data"
                 )
                 _callout(
                     "Recovering a paused attempt",
-                    "An attempt paused by an older or unexpected row-matching check "
-                    "does not create a completed run. Choose Configure setup to return "
-                    "to the full workspace, or Review row matching to prepare a "
-                    "proposed rule first. Apply and review setup keeps the rule for "
-                    "this attempt only and returns to Configure & Run; it never starts "
-                    "QC automatically. Save for future runs writes the rule only after "
-                    "you choose a valid named profile. Discard attempt removes that "
-                    "terminal attempt message without deleting selected files, the "
-                    "configuration session, or completed run history.",
+                    "An attempt paused by an unexpected row-matching check does not "
+                    "create a completed run. QC Tool opens a persistent QC needs more "
+                    "setup message. Return to setup carries the bounded suggestion into "
+                    "the same Configure & Run session, preserves your existing files, "
+                    "scope, profile, selectors, ranges, and chosen columns, and marks "
+                    "only the affected table for confirmation. There is no second "
+                    "row-matching editor and QC never restarts automatically. Discard "
+                    "attempt removes only that terminal attempt message; it does not "
+                    "delete selected files, the configuration session, or completed "
+                    "run history. After Return to setup succeeds, the paused attempt "
+                    "is consumed and cannot prompt again on a later reload.",
                 )
                 _paragraph(
                     "A defensible run has four parts: select the mode that answers the "
@@ -475,21 +478,62 @@ cadence-diff --data-dir "/path/to/qc-data"
             with _guide_section("configure", "Configure and run"):
                 _paragraph(
                     "Every browser-started run opens one Configure & Run workspace. "
-                    "Choose the mode, files, workbook members, passwords, profile, "
-                    "and structural matching there before submitting QC."
+                    "Treat it as a short checklist: choose files and scope, wait for "
+                    "the read-only setup scan, resolve only the tables marked Needs "
+                    "attention, review warnings, then choose a run action."
                 )
                 _list(
                     [
-                        "Use <strong>Choose</strong>, <strong>Replace</strong>, and <strong>Clear</strong> on each file role. Re-QC restores valid managed copies and marks only roles that need replacement.",
-                        "Setup lists sheets and members first. Completed sheets become editable while later sheets continue scanning; leaving for History or Guide does not discard the setup session.",
-                        "Use <strong>Back to files</strong> at any setup or review stage. <strong>Cancel and go back</strong> stops the current setup generation but preserves selected files and configuration choices.",
-                        "For the active table, use <strong>Rows</strong>, <strong>Data bounds</strong>, <strong>Scenario checks</strong>, and <strong>Advanced</strong>. The preview remains mounted below the tabs and reloads when its side, window, or formula-text setting changes.",
-                        "<strong>Data bounds</strong> uses one data-start row plus footer rows and shows the effective baseline/current ranges. <strong>Advanced</strong> keeps physical outer ranges, anchor picking, moved-column letters, and specialized value policies out of the routine path.",
-                        "Use <strong>Edit profile policy</strong> to create or edit a named profile without leaving the setup. Saving the profile and applying it to this setup are separate explicit actions.",
-                        "After cancellation, <strong>Resume analysis</strong> starts a fresh setup attempt. <strong>Discard setup</strong> removes the setup decisions and sidecar; it does not silently replace source files.",
+                        "Choose the mode, upload each required role, and optionally narrow the sheet/slide scope. Selecting no scope means compare everything.",
+                        "Setup scans the selected files once with bounded, Office-free readers. A selected sheet scope is carried into Configure & Run and into the submitted QC request.",
+                        "Use <strong>Next needs attention</strong> until no table is unresolved. Leave ordinary tables on Automatic.",
+                        "Use the preview to verify headers, ranges, and scenario cells. Preview content is temporary; only your choices are saved.",
+                        "Use <strong>Back to files</strong> without fear: files, scope, choices, and in-memory passwords are carried back. The Files page then offers <strong>Resume setup</strong> or <strong>Discard setup</strong>.",
+                        "<strong>Discard setup</strong> deletes the setup decisions and inspection sidecar but keeps selected files and scope on the Files page. The next Run QC click creates a fresh setup.",
                         "Passwords are held only in page memory. After a browser refresh or server restart, re-enter any required password inline; files and non-secret choices remain available.",
                         "Final run and save-and-run actions remain disabled until every required member, sheet, deck, acknowledgement, and source hash belongs to the current input generation.",
                     ]
+                )
+                _table(
+                    ["Where", "Option", "What it does", "Example"],
+                    [
+                        ["Files", "Comparison scope", "Runs only the checked sheets/slides; blank means all. It does not reduce file-loading memory.", "Check Dashboard and Output when only those tabs are in sign-off scope."],
+                        ["Files", "Additional workbooks", "Adds another logical Excel workbook to a package. The same stable member ID pairs its baseline and current files.", "Use member ID <code>operations</code> for the old and new Operations workbook. Do not add anything for a normal one-workbook comparison."],
+                        ["Rows", "Automatic", "Uses detected table structure. Best default when no warning is shown.", "A normal detail table whose records stayed in the same order."],
+                        ["Rows", "Matching key columns", "Pairs rows by business identity instead of physical row number.", "Use Account ID + Month when the same accounts were re-sorted."],
+                        ["Rows", "Row position", "Forces row 10 to compare with row 10 and suppresses ranked-table screening.", "A fixed KPI panel where each row has a permanent meaning."],
+                        ["Rows", "Remove from this run", "Excludes that table from region-scoped checks and records the reason/review date.", "Exclude a temporary scratch block until 2026-10-01; do not use it merely to silence findings."],
+                        ["Advanced rows", "Rank/order columns", "Skips cached-value changes in rank/order columns only. Formulas, formats, styles, and structure remain checked.", "Ignore Rank moving from 2 to 5 after keyed rows are matched by Product ID."],
+                        ["Advanced rows", "Duplicate key handling", "Skip ambiguous duplicate groups, pair duplicates by occurrence, or pair their remaining rows by position.", "Use occurrence only when repeated IDs have a stable first/second occurrence meaning."],
+                        ["Advanced rows", "Blank key handling", "Use the system default, tolerate blanks, or block the run when an identity key is blank.", "Block when every transaction is required to have an ID."],
+                        ["Advanced rows", "Trim key whitespace", "Treat outer spaces as insignificant for key matching; all other text remains exact.", "Match <code>ABC</code> with <code> ABC </code>, but not with <code>abc</code>."],
+                        ["Data bounds", "Data starts on row", "Declares the first data row; rows above it remain positionally compared as headers/preamble.", "Set 6 when rows 1-5 contain title and multi-row headers."],
+                        ["Data bounds", "Footer rows", "Keeps trailing totals/notes outside the keyed data body and compares them positionally.", "Set 2 for Grand Total and Source rows."],
+                        ["Scenario checks", "Cell + label", "Requires the saved baseline/current selector values to match before QC. Values are never persisted.", "Pin B3 as Forecast scenario so Actual is never compared with Budget by mistake."],
+                        ["Advanced", "Outer range and anchor", "Moves/resizes the physical table or anchors it from a preview cell when detection chose the wrong block.", "Change A1:H200 to A5:H200 when rows 1-4 belong to another panel."],
+                        ["Advanced", "Ignore value columns", "Suppresses value/number-format findings for named columns until a dated exclusion expires; formulas can still report.", "Ignore a volatile Load timestamp with a reason and review date."],
+                        ["Advanced", "Expected-refresh columns", "Keeps value changes visible but marks them Expected.", "Mark Current forecast as expected to refresh every cycle."],
+                        ["Advanced", "Column differs from baseline", "Maps a moved baseline column to the current logical column.", "Current F corresponds to baseline D after two columns were inserted."],
+                        ["Preview", "Header labels", "After Data starts is set, literal cells in the last header row appear beside stable letters in column dropdowns. Formula-backed headers remain letter-only.", "Choose <code>B · Account ID</code>; the saved contract still stores stable column B."],
+                        ["Preview", "Reveal formula text", "Shows bounded OOXML formula text for the active window. XLSB setup shows formula presence only.", "Confirm a suspected header is a formula before choosing it as a key."],
+                    ],
+                )
+                _table(
+                    ["Final action", "Use it when", "Result"],
+                    [
+                        ["Run once", "The setup is specific to this run.", "Starts QC without creating/updating profile YAML."],
+                        ["Save profile", "You want to reuse the setup later but are not ready to run.", "Writes the logical setup into a named profile."],
+                        ["Save profile and run", "This is a new reusable setup.", "Creates the named profile, then submits QC."],
+                        ["Update profile and run", "You intentionally changed an existing named setup.", "Updates that profile with conflict protection, then submits QC."],
+                        ["Export configuration", "You need a private diagnostic or review bundle.", "Downloads the profile plus exact resolved setup; it may contain workbook structure and must be handled as sensitive."],
+                    ],
+                )
+                _callout(
+                    "The dialog after Run can be a size confirmation",
+                    "For a very large, unscoped cycle comparison, QC Tool asks once before "
+                    "submitting the full changed-sheet volume. This is not another row-matching "
+                    "review. A sheet scope chosen on Files bypasses that confirmation and is "
+                    "sent directly to the run.",
                 )
                 _callout(
                     "Setup is lighter than QC",
@@ -647,6 +691,23 @@ cadence-diff --data-dir "/path/to/qc-data"
                     "Core and Advanced Excel/PPT views over the complete contract. Lists and "
                     "mappings can be added, edited, removed, and reordered without dropping "
                     "fields that are not currently expanded."
+                )
+                _callout(
+                    "The profile editor is intentionally advanced",
+                    "Use the Configure & Run tabs for one-off row matching, data bounds, "
+                    "scenario checks, exclusions, and moved columns. Open Edit profile policy "
+                    "only for reusable controls or organization-specific policy. The editor "
+                    "suggests scanned workbook member IDs and sheet names where possible, but "
+                    "still allows a name that will exist only in a future cycle.",
+                )
+                _table(
+                    ["Editor tab", "Purpose", "Example"],
+                    [
+                        ["Core contract", "Common reusable rules: description, tolerances, restatement windows, waivers, severities, controls, and Excel-to-PowerPoint mappings.", "Require Dashboard!B2:B8 and allow an approved waiver until quarter-end."],
+                        ["Advanced Excel/PPT", "Format-specific sheets, members, formulas, slide pins, review policy, and the saved logical input contract.", "Configure a rolling chart window on Dashboard or require the Executive Summary slide."],
+                        ["Advanced YAML", "Edits the exact same complete profile as text. Apply validates it into the form; Reset discards unapplied text.", "Use for a carefully reviewed bulk edit, not as the first way to learn profiles."],
+                        ["Validate", "Loads the selected current files locally and checks saved references before a run.", "Catch a profile that still names a sheet removed from the latest workbook."],
+                    ],
                 )
                 _table(
                     ["Profile feature", "Typical use"],

@@ -203,6 +203,26 @@ def worker_main(
         if raw_manifest:
             # Validate shape (primitive-only) and convert to model
             manifest_obj = PackageManifest.model_validate(raw_manifest)
+        from qc_tool.config.resolved_input import ResolvedInputConfigurationV1
+
+        raw_resolved = payload.get("resolved_input_configuration") or None
+        resolved_input_configuration = (
+            ResolvedInputConfigurationV1.model_validate(raw_resolved)
+            if raw_resolved is not None
+            else None
+        )
+        resolved_input_digest = str(payload.get("resolved_input_digest") or "")
+        if resolved_input_configuration is None:
+            if resolved_input_digest:
+                raise ValueError(
+                    "resolved input digest was provided without its configuration"
+                )
+        elif (
+            resolved_input_digest
+            and resolved_input_configuration.canonical_sha256()
+            != resolved_input_digest
+        ):
+            raise ValueError("resolved input configuration digest mismatch")
 
         artifacts = perform_run(
             Path(payload["work_dir"]),
@@ -224,6 +244,7 @@ def worker_main(
             compare_member_sheets={
                 k: tuple(v or ()) for k, v in (payload.get("compare_member_sheets") or {}).items()
             },
+            resolved_input_configuration=resolved_input_configuration,
         )
     except RunCancelled:
         message = cancelled_message(telemetry.as_payload())

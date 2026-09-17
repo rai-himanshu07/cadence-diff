@@ -55,6 +55,91 @@ EDITOR_SECTIONS: dict[str, tuple[tuple[str, ...], ...]] = {
     ),
 }
 
+_PROFILE_HELP: dict[DraftPath, str] = {
+    ("name",): "The reusable profile name shown in setup and run history.",
+    ("contract_id",): "A stable internal identifier. QC Tool manages this value.",
+    ("description",): "Plain-language purpose and ownership of this reusable policy.",
+    ("tolerance",): (
+        "Numeric differences inside these global bounds remain visible as Info; "
+        "they are not deleted. Use stricter per-sheet acceptance bands when only "
+        "one range needs a tolerance."
+    ),
+    ("restatement_windows",): (
+        "How many recent weekly, monthly, or quarterly periods may be treated as "
+        "recent restatements. Older material changes remain Critical."
+    ),
+    ("waivers",): (
+        "Time-limited approved exceptions. Findings stay in evidence as Expected; "
+        "use a narrow sheet/location and an expiry date."
+    ),
+    ("severity",): "Optional finding-class severity overrides for this deliverable.",
+    ("materiality_severity",): (
+        "Optional severity overrides by materiality tier. Prefer the defaults unless "
+        "the review policy has been agreed in advance."
+    ),
+    ("excel", "controls"): (
+        "Reusable workbook assertions: required cells, unique business keys, numeric "
+        "bounds, and arithmetic tie-outs."
+    ),
+    ("crosscheck",): (
+        "Confirmed links between PowerPoint figures and workbook source cells for "
+        "final-package reconciliation."
+    ),
+    ("excel", "ignore_sheets"): (
+        "Whole sheets omitted from Excel QC. Use only for genuine scratch/helper tabs, "
+        "not to silence a noisy deliverable sheet. Scanned sheet names are suggested."
+    ),
+    ("excel", "sheets"): (
+        "Per-sheet reusable overrides. Add a sheet only when it needs ignored or "
+        "expected-refresh ranges, cadence/availability rules, chart-window policy, "
+        "manual regions, or row identity. Most sheets need no entry."
+    ),
+    ("excel", "comparison_prerequisites"): (
+        "Scenario/filter/parameter cells that must be non-blank and exactly equal "
+        "between baseline and current before comparison starts."
+    ),
+    ("excel", "formula_engine"): (
+        "XLSB formula-text adapter. Auto is recommended; an unavailable explicit "
+        "engine degrades to formula-presence checks and is disclosed."
+    ),
+    ("excel", "members"): (
+        "Per-workbook rules for multi-workbook packages, keyed by the same stable "
+        "member ID used for baseline/current files. Leave empty for one workbook."
+    ),
+    ("ppt",): (
+        "Reusable slide pairing, required-slide, draft-token, chart-window, and "
+        "availability policy for PowerPoint."
+    ),
+    ("review_policy",): (
+        "How repeated findings are grouped for review. This changes presentation, "
+        "not the underlying evidence."
+    ),
+    ("input_contract",): (
+        "The logical workbook/sheet/region contract saved from Configure & Run. "
+        "Normally update it through setup rather than editing it by hand."
+    ),
+}
+
+_PROFILE_FIELD_HELP = {
+    "ignore": "Exclude this configured sheet from Excel QC.",
+    "ignore_ranges": "A1 ranges omitted from comparison; reserve for non-evidence cells.",
+    "refresh_ranges": "Value changes stay visible but are classified as Expected.",
+    "acceptance_bands": "Range-specific numeric differences that stay visible as Info.",
+    "regions": "Manual table boundaries when automatic region detection needs correction.",
+    "cadence_bands": "Explicit weekly/monthly/quarterly/date axes for adjacent period blocks.",
+    "availability_rules": "Where future-period blanks are allowed after a required-through point.",
+    "chart_windows": "Force a chart or series to rolling-window or full-history semantics.",
+    "row_identity_rules": "Saved business-key row matching for ranked or re-sorted tables.",
+    "required_ranges": "Cells or ranges that must be populated in the current workbook.",
+    "unique_ranges": "Ranges whose row tuples must be unique.",
+    "numeric_bounds": "Minimum/maximum checks for numeric cells or ranges.",
+    "tie_outs": "Targets that must reconcile to additive or signed source terms.",
+    "slide_pins": "Explicit baseline-title to current-title slide pairings.",
+    "match_threshold": "Minimum fuzzy title similarity accepted for automatic slide pairing.",
+    "required_slides": "Slide titles that must exist in the final deck.",
+    "draft_tokens": "Case-insensitive text tokens that flag unfinished deck content.",
+}
+
 
 def editor_leaf_paths() -> set[tuple[str, ...]]:
     """Return the exact schema leaves assigned to the typed editor sections."""
@@ -196,6 +281,7 @@ class ProfileEditorController:
         selected_files: Callable[[], Mapping[str, Path]],
         selected_passwords: Callable[[], Mapping[str, str]],
         on_saved: Callable[[str, str], None],
+        mapping_key_suggestions: Callable[[DraftPath], tuple[str, ...]] | None = None,
     ) -> None:
         self.container = container
         self.profiles_dir = profiles_dir
@@ -204,6 +290,7 @@ class ProfileEditorController:
         self.selected_files = selected_files
         self.selected_passwords = selected_passwords
         self.on_saved = on_saved
+        self.mapping_key_suggestions = mapping_key_suggestions or (lambda _path: ())
         self.session = ProfileEditorSession(
             profiles_dir, str(editing.value or "default")
         )
@@ -229,7 +316,10 @@ class ProfileEditorController:
     def _build(self) -> None:
         with self.container:
             ui.label(
-                "The form and canonical YAML edit one complete profile draft."
+                "This is the advanced editor for reusable policy. Most one-off "
+                "runs only need the setup tabs behind this dialog. Use these "
+                "fields when a tolerance, control, sheet rule, waiver, or mapping "
+                "should apply again; the form and YAML edit the same profile."
             ).classes("note")
             with ui.tabs().props("dense no-caps align=left") as tabs:
                 ui.tab("core", label="Core contract")
@@ -238,7 +328,7 @@ class ProfileEditorController:
                 ui.tab("validate", label="Validate")
             with ui.tab_panels(
                 tabs, value="core", animated=False, keep_alive=True
-            ).classes("w-full"):
+            ).classes("profile-editor-panels w-full"):
                 with ui.tab_panel("core"):
                     self.core_box = ui.column().classes("w-full gap-1")
                 with ui.tab_panel("advanced"):
@@ -396,6 +486,7 @@ class ProfileEditorController:
             with ui.expansion(_label(name), value=depth == 0).classes(
                 "w-full profile-section"
             ):
+                self._render_help(path, name)
                 self._render_object(resolved, path, depth + 1)
         elif kind == "object":
             self._render_mapping(resolved, path, name, depth)
@@ -403,6 +494,11 @@ class ProfileEditorController:
             self._render_array(resolved, path, name, depth)
         else:
             self._render_scalar(schema, path, name)
+
+    def _render_help(self, path: DraftPath, name: str) -> None:
+        help_text = _PROFILE_HELP.get(path) or _PROFILE_FIELD_HELP.get(name)
+        if help_text:
+            ui.label(help_text).classes("profile-help note")
 
     def _render_object(self, schema: Schema, path: DraftPath, depth: int) -> None:
         for name, child_schema in schema.get("properties", {}).items():
@@ -443,6 +539,7 @@ class ProfileEditorController:
                 ),
             ).classes(classes).props("outlined dense options-dense")
             self._lock(control)
+            self._render_help(path, name)
             return
         kind = resolved.get("type")
         if kind == "boolean":
@@ -479,6 +576,7 @@ class ProfileEditorController:
             if name == "contract_id":
                 control.props("readonly")
         self._lock(control)
+        self._render_help(path, name)
 
     def _icon_button(
         self,
@@ -539,6 +637,32 @@ class ProfileEditorController:
 
         return append
 
+    def _append_value_handler(
+        self,
+        path: DraftPath,
+        item_schema: Schema,
+        control: Any,
+    ) -> Callable[[], None]:
+        def append() -> None:
+            if not self._allow_form_change():
+                return
+            value = str(control.value or "").strip()
+            if not value:
+                ui.notify("Choose or enter a value first", type="warning")
+                return
+            current = self.session.draft.get(path)
+            if isinstance(current, list) and value in current:
+                ui.notify(f"{value!r} is already configured", type="warning")
+                return
+            index = len(current) if isinstance(current, list) else 0
+            self.session.draft.append(path, item_schema)
+            self.session.draft.set((*path, index), value)
+            self._sync_yaml()
+            self._update_state()
+            self._render_forms()
+
+        return append
+
     def _render_array(
         self,
         schema: Schema,
@@ -554,6 +678,7 @@ class ProfileEditorController:
         with ui.expansion(f"{_label(name)} ({len(values)})", value=depth == 0).classes(
             "w-full profile-section"
         ):
+            self._render_help(path, name)
             for index, value in enumerate(values):
                 if item_resolved.get("type") == "object":
                     with ui.expansion(_item_summary(value, index)).classes("w-full"):
@@ -601,11 +726,32 @@ class ProfileEditorController:
                             "Remove item",
                             self._remove_handler(path, index),
                         )
-            add_button = ui.button(
-                f"Add {_label(name)} item",
-                icon="add",
-                on_click=self._append_handler(path, item_schema),
-            ).classes("ghostbtn").props("flat no-caps dense")
+            suggestions = tuple(
+                item
+                for item in self.mapping_key_suggestions(path)
+                if item and item not in values
+            )
+            if item_resolved.get("type") == "string" and suggestions:
+                with ui.row().classes("items-end gap-2 w-full"):
+                    value_control = ui.select(
+                        list(dict.fromkeys(suggestions)),
+                        label=f"Add {_label(name)}",
+                        with_input=True,
+                        new_value_mode="add-unique",
+                    ).classes("flex-1").props("outlined dense")
+                    add_button = ui.button(
+                        "Add",
+                        icon="add",
+                        on_click=self._append_value_handler(
+                            path, item_schema, value_control
+                        ),
+                    ).classes("ghostbtn").props("flat no-caps dense")
+            else:
+                add_button = ui.button(
+                    f"Add {_label(name)} item",
+                    icon="add",
+                    on_click=self._append_handler(path, item_schema),
+                ).classes("ghostbtn").props("flat no-caps dense")
             self._lock(add_button)
 
     def _rename_mapping_handler(
@@ -686,6 +832,7 @@ class ProfileEditorController:
         with ui.expansion(f"{_label(name)} ({len(mapping)})", value=depth == 0).classes(
             "w-full profile-section"
         ):
+            self._render_help(path, name)
             for raw_key in list(mapping):
                 key = str(raw_key)
                 with ui.expansion(key.replace("_", " ")).classes("w-full"):
@@ -715,10 +862,26 @@ class ProfileEditorController:
             if enum_keys and not available_keys:
                 ui.label("All available keys are configured.").classes("note")
                 return
+            suggested_keys = tuple(
+                key
+                for key in self.mapping_key_suggestions(path)
+                if key and key not in mapping
+            )
+            key_label = {
+                "members": "New workbook member ID",
+                "sheets": "New sheet",
+            }.get(name, "New key")
             key_control = (
-                ui.select(available_keys, label="New key")
+                ui.select(available_keys, label=key_label)
                 if enum_keys
-                else ui.input("New key")
+                else ui.select(
+                    list(dict.fromkeys(suggested_keys)),
+                    label=key_label,
+                    with_input=True,
+                    new_value_mode="add-unique",
+                )
+                if suggested_keys
+                else ui.input(key_label)
             )
             key_control.classes("w-full").props("outlined dense")
             self._lock(key_control)
@@ -883,6 +1046,7 @@ def open_profile_editor(
     selected_files: Callable[[], Mapping[str, Path]],
     selected_passwords: Callable[[], Mapping[str, str]],
     on_saved: Callable[[str, str], None],
+    mapping_key_suggestions: Callable[[DraftPath], tuple[str, ...]] | None = None,
 ) -> ProfileEditorController:
     """Attach and return the complete typed profile editor controller."""
     return ProfileEditorController(
@@ -893,4 +1057,5 @@ def open_profile_editor(
         selected_files=selected_files,
         selected_passwords=selected_passwords,
         on_saved=on_saved,
+        mapping_key_suggestions=mapping_key_suggestions,
     )

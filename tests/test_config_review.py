@@ -204,7 +204,7 @@ def test_unresolved_blockers_requires_an_explicit_ranked_region_choice() -> None
         with_ranked_candidate=True
     )))
 
-    assert any("choose Match rows by key" in blocker for blocker in blockers)
+    assert any("confirm the row setup" in blocker for blocker in blockers)
 
     region_id = review.current_sheets[0].regions[0].region_id
     positional = update_region_decision(
@@ -216,7 +216,7 @@ def test_unresolved_blockers_requires_an_explicit_ranked_region_choice() -> None
     )
     resolved = replace(state, member_reviews=(positional,))
     assert not any(
-        "choose Match rows by key" in blocker
+        "confirm the row setup" in blocker
         for blocker in unresolved_blockers(
             resolved, compute_warnings(_scan_result(with_ranked_candidate=True))
         )
