@@ -31,7 +31,6 @@ from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
 from starlette.responses import RedirectResponse
 
-from qc_tool.config.editor import source_sha256
 from qc_tool.config.lint import lint_profile
 from qc_tool.config.profile import (
     CrosscheckMapping,
@@ -198,14 +197,7 @@ from qc_tool.ui.config_review import (
 from qc_tool.ui.credential_vault import CredentialVault
 from qc_tool.ui.guide import render_guide
 from qc_tool.ui.profile_editor import ProfileEditorController, open_profile_editor
-from qc_tool.ui.ranked_table_dialog import (
-    DUPLICATE_POLICIES,
-    DUPLICATE_POLICY_COPY,
-    DialogViewModel,
-    DuplicatePolicy,
-    apply_view_model,
-    view_model_from_action,
-)
+from qc_tool.ui.ranked_table_dialog import ranked_regions_from_action
 from qc_tool.ui.theme import (
     COL_RESIZE_JS,
     FINDINGS_BODY_SLOT,
@@ -432,14 +424,6 @@ _TEMPORARY_PROFILE_SUFFIX = " - temporary"
 _LEGACY_TEMPORARY_PROFILE_SUFFIX = " (temporary)"
 
 
-def _temporary_profile_name(name: str) -> str:
-    if name.endswith(_LEGACY_TEMPORARY_PROFILE_SUFFIX):
-        name = name.removesuffix(_LEGACY_TEMPORARY_PROFILE_SUFFIX)
-    return name if name.endswith(_TEMPORARY_PROFILE_SUFFIX) else (
-        name + _TEMPORARY_PROFILE_SUFFIX
-    )
-
-
 def _temporary_row_matching_base(
     profiles_dir: Path,
     source_profile: str,
@@ -468,10 +452,17 @@ def _temporary_row_matching_base(
     )
 
 
-def _row_matching_choice_updates(
-    view_model: DialogViewModel,
+def _row_matching_choice_updates_from_action(
+    action: dict[str, object],
 ) -> dict[str, object]:
-    """Primitive pending decisions for Configure & Run to review visibly."""
+    """Convert a blocked run's bounded row evidence into workspace proposals.
+
+    The configuration workspace remains the only decision surface; this helper
+    carries suggestions there without creating or mutating a profile.
+    """
+    regions = ranked_regions_from_action(action)
+    if not regions:
+        return {}
     return {
         "pending_row_matching": [
             {
@@ -484,25 +475,9 @@ def _row_matching_choice_updates(
                 "ordinal_columns": list(region.ordinal_columns),
                 "duplicate_policy": region.duplicate_policy,
             }
-            for region in view_model.regions
+            for region in regions
         ]
     }
-
-
-def _row_matching_choice_updates_from_action(
-    action: dict[str, object], source_profile: str
-) -> dict[str, object]:
-    """Convert a blocked run's bounded row evidence into workspace proposals.
-
-    The configuration workspace remains the only decision surface; this helper
-    carries suggestions there without creating or mutating a profile.
-    """
-    view_model = view_model_from_action(
-        action,
-        source_profile=source_profile,
-        source_profile_saved=False,
-    )
-    return _row_matching_choice_updates(view_model) if view_model is not None else {}
 
 
 def _set_desktop_focus_preference(
@@ -580,18 +555,6 @@ def _managed_request_paths(
 def _profile_path(profiles_dir: Path, name: str) -> Path:
     """Resolve a validated profile name inside the managed profile directory."""
     return profile_path(profiles_dir, name)
-
-
-def _column_letters(raw: str) -> list[str]:
-    """Normalized, de-duplicated Excel column letters from one UI field."""
-    result: list[str] = []
-    for token in re.split(r"[\s,;+]+", raw.upper().strip()):
-        if not token:
-            continue
-        column_index_from_string(token)
-        if token not in result:
-            result.append(token)
-    return result
 
 
 def _storage_secret(work_dir: Path) -> str:
@@ -2909,15 +2872,36 @@ def _render_result_view(
     profiles_dir: Path | None = None,
     focus_actions: Callable[[Finding], None] | None = None,
     export_root: Path | None = None,
+    review_timer_owners: dict[int, set[object]] | None = None,
 ) -> Callable[[], None]:
     """Results workbench: a compact run header, then Review queue (default),
     Stories, Coverage, Atomic evidence, and Mapping review. Only the active
     view is mounted, so a high-volume run does not pay for hidden tables."""
     review_timer: Any | None = None
+    review_owner_token = object()
+
+    def claim_review_timer() -> None:
+        if review_timer_owners is not None and run_id is not None:
+            review_timer_owners.setdefault(run_id, set()).add(review_owner_token)
 
     def cleanup() -> None:
         if review_timer is not None:
-            review_timer.cancel()
+            review_timer.cancel(with_current_invocation=True)
+        if history is None or run_id is None:
+            return
+        if review_timer_owners is None:
+            if history.active_review_run() == run_id:
+                history.pause_review_sessions(run_id=run_id)
+            return
+        owners = review_timer_owners.get(run_id)
+        if owners is None or review_owner_token not in owners:
+            return
+        owners.discard(review_owner_token)
+        if owners:
+            return
+        review_timer_owners.pop(run_id, None)
+        if history.active_review_run() == run_id:
+            history.pause_review_sessions(run_id=run_id)
 
     summary_view: (
         tuple[
@@ -3020,6 +3004,7 @@ def _render_result_view(
             timer_history = history
             timer_run = run_id
             timer_box = ui.element("div").classes("stat timerkpi")
+            claim_review_timer()
 
             def render_timer() -> None:
                 active = timer_history.active_review_run() == timer_run
@@ -3033,7 +3018,7 @@ def _render_result_view(
                     elif active:
 
                         def pause_review() -> None:
-                            timer_history.pause_review_sessions()
+                            timer_history.pause_review_sessions(run_id=timer_run)
                             render_timer()
 
                         ui.button("Pause", on_click=pause_review).classes(
@@ -3057,7 +3042,6 @@ def _render_result_view(
             render_timer()
             review_timer = ui.timer(1.0, tick_timer)
             client = ui.context.client
-            client.on_disconnect(cleanup)
             client.on_delete(cleanup)
 
         def render_stats() -> None:
@@ -6281,6 +6265,7 @@ def _render_completed_run(
     run_id: int,
     *,
     focus_service: "FocusService | None" = None,
+    review_timer_owners: dict[int, set[object]] | None = None,
 ) -> None:
     history = RunHistory(work_dir / "history.sqlite3")
     try:
@@ -6312,6 +6297,7 @@ def _render_completed_run(
             profiles_dir=work_dir / "profiles",
             focus_actions=_focus_actions(focus_service, record),
             export_root=work_dir / "runs",
+            review_timer_owners=review_timer_owners,
         )
     # Results render below the upload/config sections; bring them into view.
     ui.run_javascript(
@@ -6350,6 +6336,7 @@ def create_pages(
     focus_service = FocusService(
         work_dir, enabled=desktop_focus, network_mode=network_mode
     )
+    review_timer_owners: dict[int, set[object]] = {}
 
     def open_app_settings() -> None:
         with ui.dialog() as dialog, ui.card().classes("w-[36rem] max-w-[94vw]"):
@@ -6529,11 +6516,10 @@ def create_pages(
             ui.button("Close", on_click=dialog.close).props("flat no-caps")
         dialog.open()
 
-    def on_disconnect(client) -> None:
+    def on_delete(client) -> None:
         focus_service.forget_client(str(client.id))
-        RunHistory(work_dir / "history.sqlite3").pause_review_sessions()
 
-    app.on_disconnect(on_disconnect)
+    app.on_delete(on_delete)
     # One process-global FIFO manager: refreshes reconnect, tabs never duplicate
     # work, and requests left over from a previous server run are orphaned.
     queue_manager = get_manager(work_dir)
@@ -7947,9 +7933,7 @@ def create_pages(
                     proposal_updates = (
                         {}
                         if _ranked_action_needs_refresh(action)
-                        else _row_matching_choice_updates_from_action(
-                            action, current.profile
-                        )
+                        else _row_matching_choice_updates_from_action(action)
                     )
                     choice_updates = {
                         **proposal_updates,
@@ -8036,6 +8020,7 @@ def create_pages(
                                 work_dir,
                                 record.run_id,
                                 focus_service=focus_service,
+                                review_timer_owners=review_timer_owners,
                             )
                         else:
                             with completed_links:
@@ -8145,9 +8130,8 @@ def create_pages(
                 queue_refresh_timer = ui.timer(0.5, refresh_queue)
 
                 def cleanup_queue_timer() -> None:
-                    queue_refresh_timer.cancel()
+                    queue_refresh_timer.cancel(with_current_invocation=True)
 
-                ui.context.client.on_disconnect(cleanup_queue_timer)
                 ui.context.client.on_delete(cleanup_queue_timer)
 
                 async def start_run(
@@ -8687,480 +8671,6 @@ def create_pages(
             update_mode_surface()
             refresh_readiness()
 
-            def _open_row_identity_setup(
-                action: dict[str, object],
-                source_profile: str,
-                source_profile_snapshot: DeliverableProfile | None = None,
-                *,
-                source_record: RunStateRecord | None = None,
-            ) -> bool:
-                """Review Row Matching: one flat, task-focused dialog for every
-                unconfirmed ranked/sorted-table region a blocked run raised
-                (Criteria 12-15). Regions and destination validity gate the
-                primary action; column selection is chip-based from each
-                region's own bounded ``available_columns`` for a v2 item, with
-                a free-text fallback for a legacy v1 item (Criterion 11)."""
-                try:
-                    candidate_path = (
-                        None
-                        if source_profile == "default"
-                        else _profile_path(profiles_dir, source_profile)
-                    )
-                except ValueError:
-                    candidate_path = None
-                opened_path = (
-                    candidate_path
-                    if candidate_path is not None and candidate_path.exists()
-                    else None
-                )
-                opened_hash = (
-                    source_sha256(opened_path)
-                    if opened_path is not None and opened_path.exists()
-                    else None
-                )
-                opened_exists = opened_path is not None and opened_path.exists()
-                view_model = view_model_from_action(
-                    action,
-                    source_profile=source_profile,
-                    source_profile_saved=opened_path is not None,
-                    opened_hash=opened_hash,
-                    opened_source_existed=opened_exists,
-                )
-                if view_model is None:
-                    return False
-
-                dialog_state: dict[str, DialogViewModel] = {"view_model": view_model}
-                region_controls: list[dict[str, Any]] = []
-
-                def _refresh_validation() -> None:
-                    vm = dialog_state["view_model"]
-                    destination_errors = vm.destination_errors()
-                    profile_name_select.visible = vm.persist_profile
-                    profile_name_select.error = (
-                        destination_errors[0] if destination_errors else None
-                    )
-                    destination_note.set_text(
-                        "Used for this run only; no profile file will be created."
-                        if not vm.persist_profile
-                        else (
-                            ""
-                            if destination_errors
-                            else (
-                                "Creates a new profile"
-                                if vm.is_creating_profile
-                                else f"Updates {vm.profile_name.strip()!r}"
-                            )
-                        )
-                    )
-                    for index, controls in enumerate(region_controls):
-                        region = vm.regions[index]
-                        errors = region.errors()
-                        for widget in controls["column_widgets"]:
-                            widget.error = errors[0] if errors else None
-                        icon = "check_circle" if region.is_valid else "error"
-                        controls["tab"].props(f"icon={icon}")
-                    save_button.set_text(
-                        "Save rule and review setup"
-                        if vm.persist_profile
-                        else "Apply and review setup"
-                    )
-                    save_button.set_enabled(vm.is_valid)
-
-                def _on_persistence_change(
-                    event: events.ValueChangeEventArguments,
-                ) -> None:
-                    dialog_state["view_model"] = dialog_state[
-                        "view_model"
-                    ].with_persist_profile(event.value == "saved")
-                    _refresh_validation()
-
-                def _on_profile_name_change(event: events.ValueChangeEventArguments) -> None:
-                    name = str(event.value or "")
-                    try:
-                        path = _profile_path(profiles_dir, name)
-                    except ValueError:
-                        dialog_state["view_model"] = dialog_state[
-                            "view_model"
-                        ].with_profile_name(name)
-                    else:
-                        exists = path.exists()
-                        dialog_state["view_model"] = dialog_state[
-                            "view_model"
-                        ].with_profile_destination(
-                            name,
-                            opened_hash=source_sha256(path) if exists else None,
-                            opened_source_existed=exists,
-                        )
-                    _refresh_validation()
-
-                def _on_columns_change(
-                    index: int,
-                    *,
-                    identity: list[str] | None = None,
-                    ordinal: list[str] | None = None,
-                ) -> None:
-                    region = dialog_state["view_model"].regions[index]
-                    updated = region.with_columns(
-                        identity=(
-                            tuple(identity)
-                            if identity is not None
-                            else region.identity_columns
-                        ),
-                        ordinal=(
-                            tuple(ordinal)
-                            if ordinal is not None
-                            else region.ordinal_columns
-                        ),
-                    )
-                    dialog_state["view_model"] = dialog_state["view_model"].with_region(
-                        index, updated
-                    )
-                    _refresh_validation()
-
-                def _on_duplicate_policy_change(index: int, policy: DuplicatePolicy) -> None:
-                    region = dialog_state["view_model"].regions[index]
-                    dialog_state["view_model"] = dialog_state["view_model"].with_region(
-                        index, region.with_duplicate_policy(policy)
-                    )
-
-                with ui.dialog().props("persistent") as dialog, ui.card().classes(
-                    "rankedtable-card"
-                ):
-                    with ui.column().classes("rankedtable-head w-full gap-2"):
-                        with ui.row().classes("items-baseline justify-between w-full"):
-                            ui.label("Review row matching").classes("runhead")
-                            ui.label("QC paused").classes("hint")
-                        ui.label(
-                            "One or more sheets look like a ranked or sorted table "
-                            "compared by raw position. This is a suggestion, not "
-                            "proof -- review the evidence for each table below "
-                            "before confirming. Physical row order and any ordinal "
-                            "values you ignore are never compared again; formulas, "
-                            "styles, structure, and other business values stay "
-                            "fully checked."
-                        ).classes("note")
-                        ui.label(
-                            "Check filter and parameter selections first. Row matching "
-                            "assumes baseline and current contain the same underlying "
-                            "population. A different dropdown, filter, scenario, or "
-                            "parameter can change reference columns and row membership; "
-                            "QC intentionally will not guess across that change, so the "
-                            "region may not appear here. Align the selections before "
-                            "continuing. For recurring comparisons, pin each selector "
-                            "cell under Comparison prerequisites in a named profile."
-                        ).classes("notecard")
-
-                    with ui.column().classes("rankedtable-body w-full gap-2"):
-                        ui.label("Use this row-matching rule").classes("dk")
-                        ui.radio(
-                            {
-                                "temporary": "This run only",
-                                "saved": "Save for future runs",
-                            },
-                            value=(
-                                "saved" if view_model.persist_profile else "temporary"
-                            ),
-                            on_change=_on_persistence_change,
-                        ).props("inline dense")
-                        destination_note = ui.label().classes("hint")
-                        profile_name_select = (
-                            ui.select(
-                                options=[
-                                    name
-                                    for name in list_profiles(profiles_dir)
-                                    if name != "default"
-                                ],
-                                value=view_model.profile_name or None,
-                                label="Existing profile or new name",
-                                with_input=True,
-                                new_value_mode="add-unique",
-                                on_change=_on_profile_name_change,
-                            )
-                            .classes("w-full")
-                            .props(
-                                "outlined dense autofocus"
-                                if view_model.initial_focus_target == "profile_name"
-                                else "outlined dense"
-                            )
-                        )
-
-                        region_count = view_model.region_count
-                        with ui.tabs().props("dense").classes(
-                            "w-full rankedtable-tabs"
-                        ) as region_tabs:
-                            tabs = [
-                                ui.tab(
-                                    f"region-{index}",
-                                    label=f"{index + 1} of {region_count}",
-                                )
-                                for index, region in enumerate(view_model.regions)
-                            ]
-                        with ui.tab_panels(region_tabs, value="region-0").classes(
-                            "w-full"
-                        ):
-                            for index, region in enumerate(view_model.regions):
-                                with ui.tab_panel(f"region-{index}"):
-                                    column_widgets: list[Any] = []
-                                    ui.label(region.label).classes("dk preline")
-                                    if region.manual_review:
-                                        warning = (
-                                            "Manual review required: this table shows "
-                                            "strong row displacement, but its suggested "
-                                            "identity is sparse or formula-derived and "
-                                            "does not clear the automatic confidence gate."
-                                        )
-                                        if region.formula_driven_identity:
-                                            warning += (
-                                                " The suggested identity includes formulas. "
-                                                "No formula result is used as a column "
-                                                "header; verify matching selector values "
-                                                "before accepting it."
-                                            )
-                                        ui.label(warning).classes("notecard")
-                                    ui.label(region.noise_summary).classes("note")
-                                    if region.available_columns:
-                                        if region.header_row is not None:
-                                            ui.label(
-                                                f"Likely header row {region.header_row}; "
-                                                "column letters remain the saved rule."
-                                            ).classes("hint")
-                                        identity_select = ui.select(
-                                            options=region.column_options,
-                                            multiple=True,
-                                            value=list(region.identity_columns),
-                                            label="Match rows by",
-                                            on_change=lambda e, i=index: (
-                                                _on_columns_change(
-                                                    i, identity=list(e.value or [])
-                                                )
-                                            ),
-                                        ).props("use-chips outlined dense").classes(
-                                            "w-full"
-                                        )
-                                        ordinal_select = ui.select(
-                                            options=region.column_options,
-                                            multiple=True,
-                                            value=list(region.ordinal_columns),
-                                            label="Ignore order-only values in",
-                                            on_change=lambda e, i=index: (
-                                                _on_columns_change(
-                                                    i, ordinal=list(e.value or [])
-                                                )
-                                            ),
-                                        ).props("use-chips outlined dense").classes(
-                                            "w-full"
-                                        )
-                                        column_widgets = [identity_select, ordinal_select]
-                                    else:
-                                        identity_input = ui.input(
-                                            "Match rows by (column letters)",
-                                            value=", ".join(region.identity_columns),
-                                            on_change=lambda e, i=index: (
-                                                _on_columns_change(
-                                                    i,
-                                                    identity=_column_letters(
-                                                        str(e.value or "")
-                                                    ),
-                                                )
-                                            ),
-                                        ).props("outlined dense").classes("w-full")
-                                        ordinal_input = ui.input(
-                                            "Ignore order-only values in (column letters)",
-                                            value=", ".join(region.ordinal_columns),
-                                            on_change=lambda e, i=index: (
-                                                _on_columns_change(
-                                                    i,
-                                                    ordinal=_column_letters(
-                                                        str(e.value or "")
-                                                    ),
-                                                )
-                                            ),
-                                        ).props("outlined dense").classes("w-full")
-                                        column_widgets = [identity_input, ordinal_input]
-                                    ui.radio(
-                                        {
-                                            policy: DUPLICATE_POLICY_COPY[policy][0]
-                                            for policy in DUPLICATE_POLICIES
-                                        },
-                                        value=region.duplicate_policy,
-                                        on_change=lambda e, i=index: (
-                                            _on_duplicate_policy_change(
-                                                i, cast(DuplicatePolicy, e.value)
-                                            )
-                                        ),
-                                    ).props("dense").classes("w-full")
-                                    for policy in DUPLICATE_POLICIES:
-                                        label, consequence, risk = DUPLICATE_POLICY_COPY[
-                                            policy
-                                        ]
-                                        with ui.element("div").classes("note w-full"):
-                                            ui.label(f"{label} \u2014 {risk}").classes("dk")
-                                            ui.label(consequence).classes("hint")
-                                    with ui.expansion(
-                                        "Why QC paused", icon="help_outline"
-                                    ).classes("w-full"):
-                                        ui.label(region.why_paused_detail).classes("hint")
-                                    region_controls.append(
-                                        {
-                                            "tab": tabs[index],
-                                            "column_widgets": column_widgets,
-                                        }
-                                    )
-
-                    async def apply_rules() -> None:
-                        vm = dialog_state["view_model"]
-                        if not vm.is_valid:
-                            _refresh_validation()
-                            return
-                        if source_record is not None:
-                            _restored_profile, restore_error = (
-                                await _restore_request_context(source_record)
-                            )
-                            if restore_error is not None:
-                                ui.notify(
-                                    restore_error,
-                                    type="warning",
-                                    multi_line=True,
-                                )
-                                return
-                        workbook_count = max(
-                            1,
-                            sum(
-                                role == "current_excel"
-                                or role.startswith("current_excel:")
-                                for role in state.files
-                            ),
-                        )
-                        target_name = vm.profile_name.strip()
-                        target_path: Path | None = None
-                        try:
-                            if vm.persist_profile:
-                                target_path = _profile_path(profiles_dir, target_name)
-                                current_exists = target_path.exists()
-                                current_hash = (
-                                    source_sha256(target_path)
-                                    if current_exists
-                                    else None
-                                )
-                                if vm.has_profile_conflict(
-                                    current_hash=current_hash,
-                                    current_exists=current_exists,
-                                ):
-                                    ui.notify(
-                                        f"Profile {target_name!r} changed while this "
-                                        "dialog was open; reopen it and try again",
-                                        type="warning",
-                                        multi_line=True,
-                                    )
-                                    return
-                                base_profile = (
-                                    load_profile(target_path)
-                                    if current_exists
-                                    else new_profile(target_name)
-                                )
-                            else:
-                                base_profile = _temporary_row_matching_base(
-                                    profiles_dir,
-                                    source_profile,
-                                    source_profile_snapshot,
-                                )
-                            profile = apply_view_model(
-                                base_profile, vm, workbook_count=workbook_count
-                            )
-                            if vm.persist_profile:
-                                if target_path is None:
-                                    raise ValueError("profile destination is missing")
-                                save_profile(profile, target_path)
-                            else:
-                                profile = profile.model_copy(
-                                    update={
-                                        "name": _temporary_profile_name(
-                                            base_profile.name
-                                        )
-                                    },
-                                    deep=True,
-                                )
-                        except (OSError, ValueError) as exc:
-                            ui.notify(str(exc), type="warning", multi_line=True)
-                            return
-                        dialog.close()
-                        if vm.persist_profile:
-                            options = list_profiles(profiles_dir)
-                            profile_select.options = options
-                            profile_select.value = target_name
-                            profile_select.update()
-                            state.profile_name = target_name
-                            state.profile_override = None
-                            refresh_readiness()
-                            ui.notify(
-                                f"Saved row matching to profile {target_name!r}; "
-                                "review setup before running"
-                            )
-                            open_configuration_workspace(
-                                choice_updates=_row_matching_choice_updates(vm),
-                                reuse_source_session=True,
-                                resolved_override=(
-                                    ResolvedInputConfigurationV1.model_validate(
-                                        source_record.resolved_input_configuration
-                                    )
-                                    if source_record is not None
-                                    and source_record.resolved_input_configuration
-                                    is not None
-                                    else None
-                                )
-                            )
-                        else:
-                            state.profile_name = profile.name
-                            state.profile_override = profile.model_copy(deep=True)
-                            options = list_profiles(profiles_dir)
-                            if profile.name not in options:
-                                options.append(profile.name)
-                            profile_select.options = options
-                            profile_select.value = profile.name
-                            profile_select.update()
-                            refresh_readiness()
-                            ui.notify(
-                                "Temporary row matching applied; review setup "
-                                "before running"
-                            )
-                            open_configuration_workspace(
-                                profile_override=profile,
-                                choice_updates=_row_matching_choice_updates(vm),
-                                reuse_source_session=True,
-                                resolved_override=(
-                                    ResolvedInputConfigurationV1.model_validate(
-                                        source_record.resolved_input_configuration
-                                    )
-                                    if source_record is not None
-                                    and source_record.resolved_input_configuration
-                                    is not None
-                                    else None
-                                ),
-                            )
-
-                    with ui.row().classes("items-center gap-2 rankedtable-actions"):
-                        save_button = ui.button(
-                            "Save rule and review setup", on_click=apply_rules
-                        ).classes("runbtn").props("no-caps")
-
-                        def _cancel() -> None:
-                            dialog.close()
-                            # Criterion 14: Cancel returns focus to the Run
-                            # surface, not wherever the browser defaults to.
-                            ui.run_javascript(
-                                f'getHtmlElement("{run_button.html_id}").focus()'
-                            )
-
-                        ui.button("Cancel", on_click=_cancel).props("flat no-caps")
-                _refresh_validation()
-                if view_model.initial_focus_target == "region_identity" and region_controls:
-                    first_widget = region_controls[0]["column_widgets"][0]
-                    ui.run_javascript(
-                        f'getHtmlElement("{first_widget.html_id}").focus()'
-                    )
-                dialog.open()
-                return True
-
             results = ui.column().classes("w-full")
 
     @ui.page("/configure")
@@ -9595,6 +9105,7 @@ def create_pages(
                 profiles_dir=work_dir / "profiles",
                 focus_actions=_focus_actions(focus_service, record),
                 export_root=work_dir / "runs",
+                review_timer_owners=review_timer_owners,
             )
 
 

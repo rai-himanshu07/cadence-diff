@@ -594,6 +594,7 @@ def _serialize_region(region) -> dict[str, object]:
         "ignore_columns_reason": region.ignore_columns_reason,
         "ignore_columns_expires_on": region.ignore_columns_expires_on,
         "confirmed": region.confirmed,
+        "ranked_candidate_detected": region.ranked_candidate_detected,
         "ranked_candidate_pending": region.ranked_candidate_pending,
     }
 
@@ -616,10 +617,24 @@ def _apply_saved_region_choices(
             if saved_region is None:
                 new_regions.append(region)
                 continue
+            saved_mode = saved_region.get("mode", region.mode)
+            detected = region.ranked_candidate_detected or bool(
+                saved_region.get("ranked_candidate_detected", False)
+            )
+            saved_confirmed = bool(saved_region.get("confirmed", False))
+            saved_pending = bool(
+                saved_region.get(
+                    "ranked_candidate_pending",
+                    region.ranked_candidate_pending,
+                )
+            )
+            if saved_mode == "automatic":
+                saved_confirmed = False
+                saved_pending = detected
             new_regions.append(
                 _replace(
                     region,
-                    mode=saved_region.get("mode", region.mode),
+                    mode=saved_mode,
                     header_intent=saved_region.get("header_intent", region.header_intent),
                     first_data_row=(
                         _coerce_optional_int(saved_region["first_data_row"])
@@ -655,13 +670,9 @@ def _apply_saved_region_choices(
                     exclusion_expires_on=saved_region.get("exclusion_expires_on", ""),
                     ignore_columns_reason=saved_region.get("ignore_columns_reason", ""),
                     ignore_columns_expires_on=saved_region.get("ignore_columns_expires_on", ""),
-                    confirmed=bool(saved_region.get("confirmed", False)),
-                    ranked_candidate_pending=bool(
-                        saved_region.get(
-                            "ranked_candidate_pending",
-                            region.ranked_candidate_pending,
-                        )
-                    ),
+                    confirmed=saved_confirmed,
+                    ranked_candidate_detected=detected,
+                    ranked_candidate_pending=saved_pending,
                 )
             )
         new_sheets.append(_replace(sheet, regions=tuple(new_regions)))
@@ -698,6 +709,7 @@ def _apply_pending_row_matching(
                 new_regions.append(
                     _replace(
                         region,
+                        ranked_candidate_detected=True,
                         ranked_candidate_pending=True,
                         confirmed=False,
                     )
@@ -725,6 +737,7 @@ def _apply_pending_row_matching(
                     duplicate_key_policy=str(
                         proposal.get("duplicate_policy", "skip")
                     ),
+                    ranked_candidate_detected=True,
                     ranked_candidate_pending=True,
                     confirmed=False,
                 )
@@ -2315,10 +2328,7 @@ def render_config_workspace(
                     for member in state.member_reviews
                     for sheet in member.current_sheets
                     for region in sheet.regions
-                    if (
-                        region.ranked_candidate_pending
-                        and not region.confirmed
-                    )
+                    if region.needs_ranked_resolution
                     or (region.mode != "automatic" and not region.is_valid)
                 ]
 
@@ -2661,7 +2671,7 @@ def render_config_workspace(
             def _status() -> tuple[str, str, str]:
                 if region.mode == "excluded":
                     return "limited", "Removed", "Excluded from this run"
-                if region.ranked_candidate_pending and not region.confirmed:
+                if region.needs_ranked_resolution:
                     return "attention", "Needs attention", "Confirm how rows line up"
                 if not region.is_valid:
                     return "attention", "Needs details", "Complete the selected option"
@@ -2680,6 +2690,7 @@ def render_config_workspace(
                         region.region_id,
                         mode="automatic",
                         confirmed=False,
+                        ranked_candidate_pending=region.ranked_candidate_detected,
                     )
                 else:
                     _update_region(
@@ -2688,6 +2699,7 @@ def render_config_workspace(
                         region.region_id,
                         mode="excluded",
                         confirmed=True,
+                        ranked_candidate_pending=False,
                     )
 
             with ui.element("div").classes("config-region-editor w-full").mark(
@@ -2774,6 +2786,7 @@ def render_config_workspace(
                                     confirmed=next_mode != "automatic",
                                     ranked_candidate_pending=(
                                         next_mode == "automatic"
+                                        and region.ranked_candidate_detected
                                     ),
                                 )
 
@@ -2786,23 +2799,35 @@ def render_config_workspace(
                                 value=region.mode,
                                 on_change=_on_mode_change,
                             ).props("no-caps").mark("region-mode-toggle")
-                            if region.ranked_candidate_pending and not region.confirmed:
+                            if (
+                                region.ranked_candidate_detected
+                                and region.mode == "automatic"
+                            ):
+                                ui.label(
+                                    "This table appears sorted or ranked. Choose matching "
+                                    "key columns, row position, or remove it from this run "
+                                    "before continuing. Automatic cannot confirm a ranked "
+                                    "table because the authoritative QC load would screen it "
+                                    "again."
+                                ).classes("notecard")
+                            elif region.ranked_candidate_pending and not region.confirmed:
                                 ui.label(
                                     "QC needs this row setup confirmed. Any choices you "
                                     "already made are preserved; review them here, then "
                                     "confirm or choose a different row mode."
                                 ).classes("notecard")
-                                ui.button(
-                                    "Confirm row setup",
-                                    icon="check",
-                                    on_click=lambda: _update_region(
-                                        member_id,
-                                        sheet_name,
-                                        region.region_id,
-                                        ranked_candidate_pending=False,
-                                        confirmed=True,
-                                    ),
-                                ).classes("ghostbtn").props("flat no-caps dense")
+                                if region.mode != "automatic":
+                                    ui.button(
+                                        "Confirm row setup",
+                                        icon="check",
+                                        on_click=lambda: _update_region(
+                                            member_id,
+                                            sheet_name,
+                                            region.region_id,
+                                            ranked_candidate_pending=False,
+                                            confirmed=True,
+                                        ),
+                                    ).classes("ghostbtn").props("flat no-caps dense")
                             if region.mode == "keyed":
 
                                 def _on_identity_change(

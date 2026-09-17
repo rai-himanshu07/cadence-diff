@@ -14,7 +14,9 @@ from typing import Literal, cast
 import pytest
 import yaml
 from nicegui import app, events, ui
+from nicegui.elements.timer import Timer
 from nicegui.helpers import warnings as nicegui_warnings
+from nicegui.nicegui import _on_handshake
 from nicegui.testing import User
 from openpyxl.utils import get_column_letter
 
@@ -99,7 +101,6 @@ from qc_tool.ui.app import (
     _set_desktop_focus_preference,
     _storage_prompt_due,
     _storage_secret,
-    _temporary_profile_name,
     _temporary_row_matching_base,
     _terminal_request_summary,
     build_cluster_context,
@@ -122,6 +123,30 @@ from tests.fixtures.ranked_table_action_v2 import ranked_table_evidence_payload_
 from tests.test_review_series import series_oracle
 
 pytest_plugins = ["nicegui.testing.user_plugin"]
+
+
+async def _transiently_reconnect(user: User) -> None:
+    client = user._client
+    socket_id, document_id = next(iter(client._socket_to_document_id.items()))
+    client.handle_disconnect(socket_id)
+    reconnected = await _on_handshake(
+        f"test-reconnect-{client.id}",
+        {
+            "client_id": client.id,
+            "tab_id": user.tab_id,
+            "document_id": document_id,
+        },
+    )
+    assert reconnected
+
+
+def _client_timer(user: User, callback_name: str) -> Timer:
+    return next(
+        element
+        for element in user._client.elements.values()
+        if isinstance(element, Timer)
+        and getattr(element.callback, "__name__", "") == callback_name
+    )
 
 
 class _RecordingQueueManager:
@@ -1369,12 +1394,6 @@ def test_migrated_default_temporary_profile_recovers_without_yaml(
     )
 
     assert profile.name == "default"
-    assert _temporary_profile_name(profile.name) == "default - temporary"
-    assert _temporary_profile_name("default (temporary)") == "default - temporary"
-    assert _temporary_profile_name("default - temporary") == "default - temporary"
-    assert _profile_path(tmp_path, _temporary_profile_name(profile.name)).name == (
-        "default - temporary.yaml"
-    )
 
 
 def test_missing_non_default_temporary_profile_has_targeted_error(
@@ -1418,6 +1437,30 @@ async def test_run_page_reconnects_to_queue_state_from_another_tab(
 
     await user.should_see("#abcdef01")
     await user.should_see("Cancel #abcdef01")
+
+
+@pytest.mark.asyncio
+async def test_main_page_queue_timer_resumes_after_transient_reconnect(
+    user: User, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    create_pages(work_dir)
+    await user.open("/")
+    queue_timer = _client_timer(user, "refresh_queue")
+
+    await _transiently_reconnect(user)
+    assert not queue_timer._is_canceled
+
+    RunStateStore(work_dir / "history.sqlite3").enqueue(
+        "fedcba9876543210",
+        mode=QCRunMode.CYCLE_COMPARISON.value,
+        profile="fixture",
+        files={"current_excel": "current.xlsx"},
+        queue_position=1,
+    )
+
+    await user.should_see("#fedcba98", retries=10)
+    await user.should_see("Cancel #fedcba98")
 
 
 @pytest.mark.asyncio
@@ -2410,6 +2453,32 @@ async def test_manage_profiles_uses_complete_typed_editor_and_dirty_close(
 
 
 @pytest.mark.asyncio
+async def test_named_profile_adds_nested_optional_arrays_without_error(
+    user: User,
+    tmp_path: Path,
+) -> None:
+    create_pages(tmp_path / "work")
+    await user.open("/")
+    user.find("Manage profiles").click()
+
+    new_name = next(
+        element
+        for element in user.find(kind=ui.input).elements
+        if element.props.get("label") == "New profile name"
+    )
+    new_name.value = "nested-arrays"
+    user.find("Create").click()
+    user.find("Advanced Excel/PPT").click()
+
+    user.find("Add Classes item").click()
+    await user.should_see("Unsaved profile changes")
+    user.find("Add Members item").click()
+
+    await user.should_see("Member Id")
+    await user.should_see("Unsaved profile changes")
+
+
+@pytest.mark.asyncio
 async def test_shutdown_control_confirms_before_stopping(
     user: User, tmp_path: Path
 ) -> None:
@@ -2605,13 +2674,186 @@ async def test_run_detail_review_timer_stops_when_page_is_deleted(
     create_pages(work_dir)
     await user.open(f"/runs/{artifacts.run_id}")
     user.find(kind=ui.button, content="Start").click()
+    run_client = user._client
+    review_timer = _client_timer(user, "tick_timer")
+    await asyncio.sleep(0.1)
     caplog.clear()
 
-    await user.open("/")
+    run_client.delete()
     await asyncio.sleep(1.2)
 
     assert "parent slot of Timer" not in caplog.text
     assert "has been deleted" not in caplog.text
+    assert review_timer._is_canceled
+    assert RunHistory(work_dir / "history.sqlite3").active_review_run() is None
+
+
+@pytest.mark.asyncio
+async def test_dynamic_result_replacement_cancels_the_previous_timer(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+
+    @ui.page("/replace-result")
+    def replace_result_page() -> None:
+        container = ui.column()
+        app_module._render_completed_run(container, work_dir, artifacts.run_id)
+        ui.button(
+            "Replace result",
+            on_click=lambda: app_module._render_completed_run(
+                container, work_dir, artifacts.run_id
+            ),
+        )
+
+    await user.open("/replace-result")
+    previous_timer = _client_timer(user, "tick_timer")
+    await asyncio.sleep(0.1)
+    caplog.clear()
+
+    user.find(kind=ui.button, content="Replace result").click()
+    current_timer = _client_timer(user, "tick_timer")
+    await asyncio.sleep(1.2)
+
+    assert previous_timer._is_canceled
+    assert current_timer is not previous_timer
+    assert not current_timer._is_canceled
+    assert "parent slot of Timer" not in caplog.text
+    assert "has been deleted" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_detail_review_timer_resumes_after_transient_reconnect(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    user.find(kind=ui.button, content="Start").click()
+    review_timer = _client_timer(user, "tick_timer")
+    callback = review_timer.callback
+    assert callback is not None
+    tick_count = 0
+
+    def count_tick() -> object:
+        nonlocal tick_count
+        tick_count += 1
+        return callback()
+
+    review_timer.callback = count_tick
+    history = RunHistory(work_dir / "history.sqlite3")
+    before = history.review_seconds(artifacts.run_id)
+    assert before is not None
+    await _transiently_reconnect(user)
+    assert not review_timer._is_canceled
+    assert history.active_review_run() == artifacts.run_id
+
+    await asyncio.sleep(1.2)
+
+    assert tick_count >= 1
+    after = history.review_seconds(artifacts.run_id)
+    assert after is not None
+    assert after > before
+    assert not review_timer._is_canceled
+
+
+@pytest.mark.asyncio
+async def test_stale_run_page_deletion_does_not_pause_the_newer_view(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    user.find(kind=ui.button, content="Start").click()
+    stale_client = user._client
+
+    await user.open(f"/runs/{artifacts.run_id}")
+    await user.should_see("Pause")
+    current_timer = _client_timer(user, "tick_timer")
+    history = RunHistory(work_dir / "history.sqlite3")
+    before = history.review_seconds(artifacts.run_id)
+    assert before is not None
+
+    stale_client.delete()
+    await asyncio.sleep(1.2)
+
+    assert history.active_review_run() == artifacts.run_id
+    after = history.review_seconds(artifacts.run_id)
+    assert after is not None
+    assert after > before
+    assert not current_timer._is_canceled
+
+
+@pytest.mark.asyncio
+async def test_inactive_run_view_claims_timing_started_by_another_client(
+    user: User,
+    fixture_dir: Path,
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    artifacts = perform_run(
+        work_dir,
+        {
+            "baseline_excel": fixture_dir / "baseline.xlsx",
+            "current_excel": fixture_dir / "current.xlsx",
+        },
+        {},
+        fixture_profile(),
+    )
+    create_pages(work_dir)
+    await user.open(f"/runs/{artifacts.run_id}")
+    inactive_timer = _client_timer(user, "tick_timer")
+    await asyncio.sleep(0.1)
+
+    await user.open(f"/runs/{artifacts.run_id}")
+    user.find(kind=ui.button, content="Start").click()
+    starter_client = user._client
+    history = RunHistory(work_dir / "history.sqlite3")
+    await asyncio.sleep(0.1)
+    before = history.review_seconds(artifacts.run_id)
+    assert before is not None
+
+    starter_client.delete()
+    await asyncio.sleep(1.2)
+
+    assert history.active_review_run() == artifacts.run_id
+    after = history.review_seconds(artifacts.run_id)
+    assert after is not None
+    assert after > before
+    assert not inactive_timer._is_canceled
 
 
 @pytest.mark.asyncio
@@ -4194,12 +4436,6 @@ def test_run_qc_submission_is_single_flight() -> None:
         "run_lock", 1
     )[0]
     assert "_unlock_run()" in busy_error_branch
-
-
-def test_column_letters_normalizes_and_deduplicates() -> None:
-    from qc_tool.ui.app import _column_letters
-
-    assert _column_letters(" b, A;B ") == ["B", "A"]
 
 
 def test_ranked_block_routes_back_to_the_single_configuration_workspace() -> None:

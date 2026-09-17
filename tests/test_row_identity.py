@@ -35,6 +35,7 @@ from openpyxl.styles import Font
 import qc_tool.engine as engine_module
 from qc_tool.config.profile import (
     DeliverableProfile,
+    ExcelMemberProfile,
     ExcelProfile,
     RowIdentityRule,
     SheetProfile,
@@ -70,7 +71,7 @@ from qc_tool.run_action import (
     RunActionRequired,
     RunBlockedError,
 )
-from qc_tool.ui.ranked_table_dialog import apply_view_model, view_model_from_action
+from qc_tool.ui.ranked_table_dialog import ranked_regions_from_action
 
 #: Large enough that a fully displaced permutation clears the detector's
 #: MIN_PROJECTED_MISMATCHES (10,000) floor -- see tests/test_ranked_identity.py
@@ -689,17 +690,15 @@ def test_ranked_suggestions_emit_two_automatic_and_one_manual_region(
         ("Rank", "Record ID", "Value"),
         ("Rank", "", "Value"),
     ]
-    view_model = view_model_from_action(
+    proposals = ranked_regions_from_action(
         {
             "version": 2,
             "reason": "row_identity_confirmation_required",
             "items": [item.model_dump(mode="json") for item in items],
-        },
-        source_profile="default",
+        }
     )
-    assert view_model is not None
-    assert view_model.region_count == 3
-    assert sum(region.manual_review for region in view_model.regions) == 1
+    assert len(proposals) == 3
+    assert sum(region.manual_review for region in proposals) == 1
 
 
 def test_perform_run_writes_no_history_or_reports_when_blocked_by_detector(
@@ -803,18 +802,29 @@ def test_multi_package_reports_and_resolves_all_ranked_members_in_one_cycle(
         for item in action.items
         if item.ranked_table_evidence is not None
     } == {"ops", "primary"}
-    view_model = view_model_from_action(
-        action.model_dump(mode="json"),
-        source_profile="default",
+    regions = ranked_regions_from_action(action.model_dump(mode="json"))
+    member_sheets: dict[str, dict[str, SheetProfile]] = {}
+    for region in regions:
+        member_sheets.setdefault(region.member_id, {})[region.sheet] = SheetProfile(
+            row_identity_rules=[
+                RowIdentityRule(
+                    anchor_cell=region.anchor_cell,
+                    header_row=region.header_row,
+                    identity_columns=list(region.identity_columns),
+                    ordinal_columns=list(region.ordinal_columns),
+                    duplicate_policy=region.duplicate_policy,
+                )
+            ]
+        )
+    profile = DeliverableProfile(
+        name="ranked-package",
+        excel=ExcelProfile(
+            members={
+                member_id: ExcelMemberProfile(sheets=sheets)
+                for member_id, sheets in member_sheets.items()
+            }
+        ),
     )
-    assert view_model is not None
-    view_model = view_model.with_profile_name("ranked-package")
-    assert view_model.is_valid
-    profile = apply_view_model(
-        default_profile(),
-        view_model,
-        workbook_count=2,
-    ).model_copy(update={"name": "ranked-package"})
 
     result = run_qc(
         package_manifest=manifest,

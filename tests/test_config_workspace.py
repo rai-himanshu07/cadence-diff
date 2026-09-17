@@ -27,6 +27,7 @@ from qc_tool.config.resolved_input import (
     ResolvedSheet,
 )
 from qc_tool.coverage import QCRunMode
+from qc_tool.excel.ranked_identity import RankedTableCandidate
 from qc_tool.excel.regions import TableRegion
 from qc_tool.history.config_session import ConfigSessionStore, session_key_for
 from qc_tool.history.run_state import RunStateStore
@@ -46,6 +47,7 @@ from qc_tool.ui.app import create_pages
 from qc_tool.ui.config_review import member_review_from_scan
 from qc_tool.ui.config_workspace import (
     _apply_pending_row_matching,
+    _apply_saved_region_choices,
     _credentials_for_unchanged_sources,
     build_session_choices,
     configuration_export_bytes,
@@ -103,6 +105,29 @@ def _member_profile_for_pending() -> MemberSetupProfile:
         current_hash="b" * 64,
         baseline_sheets=(SheetSetupProfile(sheet_name="Data", regions=regions),),
         current_sheets=(SheetSetupProfile(sheet_name="Data", regions=regions),),
+    )
+
+
+def _member_profile_with_ranked_candidate() -> MemberSetupProfile:
+    region = DetectedRegion(
+        region=TableRegion("Data", 1, 1, 8, 2, "block", 1, 1, "none"),
+        ranked_candidate=RankedTableCandidate(
+            columns=(1,),
+            non_blank_coverage=0.99,
+            unique_ratio=0.99,
+            key_overlap=0.95,
+            formula_ratio=0.0,
+            displaced_ratio=0.5,
+            mismatch_reduction=0.9,
+            projected_positional_mismatches=100,
+        ),
+    )
+    return MemberSetupProfile(
+        member_id="primary",
+        baseline_hash="a" * 64,
+        current_hash="b" * 64,
+        baseline_sheets=(SheetSetupProfile(sheet_name="Data", regions=(region,)),),
+        current_sheets=(SheetSetupProfile(sheet_name="Data", regions=(region,)),),
     )
 
 
@@ -259,6 +284,45 @@ def test_pending_row_matching_preserves_an_existing_configured_region() -> None:
     assert not preserved.confirmed
 
 
+def test_legacy_saved_automatic_choice_inherits_fresh_ranked_detection() -> None:
+    member = member_review_from_scan(
+        "primary", _member_profile_with_ranked_candidate()
+    )
+    region_id = member.current_sheets[0].regions[0].region_id
+
+    restored = _apply_saved_region_choices(
+        member,
+        {
+            region_id: {
+                "mode": "automatic",
+                "confirmed": True,
+                "ranked_candidate_pending": False,
+            }
+        },
+    )
+    region = restored.current_sheets[0].regions[0]
+
+    assert region.ranked_candidate_detected
+    assert region.ranked_candidate_pending
+    assert not region.confirmed
+    assert region.needs_ranked_resolution
+
+
+def test_saved_automatic_choice_stays_clear_for_an_ordinary_region() -> None:
+    member = member_review_from_scan("primary", _member_profile_for_pending())
+    region_id = member.current_sheets[0].regions[0].region_id
+
+    restored = _apply_saved_region_choices(
+        member,
+        {region_id: {"mode": "automatic", "confirmed": False}},
+    )
+    region = restored.current_sheets[0].regions[0]
+
+    assert not region.ranked_candidate_detected
+    assert not region.ranked_candidate_pending
+    assert not region.needs_ranked_resolution
+
+
 def _stage_session(work_dir: Path) -> str:
     files = {
         "baseline_excel": work_dir / "uploads" / "baseline_excel" / "baseline.xlsx",
@@ -269,6 +333,44 @@ def _stage_session(work_dir: Path) -> str:
         _write_simple_workbook(
             path, final_value=31 if role == "current_excel" else 30
         )
+    file_hashes = {role: sha256_file(path) for role, path in files.items()}
+    choices = build_session_choices(
+        mode=QCRunMode.CYCLE_COMPARISON,
+        profile_name="default",
+        files={role: str(path) for role, path in files.items()},
+        file_hashes=file_hashes,
+        output_mode="decision",
+        allow_large_workbooks=False,
+        allow_dependency_indexing=False,
+        acceptance_absolute=0.0,
+        acceptance_percent=0.0,
+        rerun_of=None,
+    )
+    session_key = session_key_for(file_hashes)
+    ConfigSessionStore(work_dir / "history.sqlite3").save_choices(
+        session_key, profile_name="default", choices=choices
+    )
+    return session_key
+
+def _stage_ranked_session(work_dir: Path) -> str:
+    from tests.test_row_identity import (
+        _LARGE_N,
+        _detector_rows,
+        _shuffled,
+        _write_panel,
+    )
+
+    files = {
+        "baseline_excel": work_dir / "uploads" / "baseline_excel" / "baseline.xlsx",
+        "current_excel": work_dir / "uploads" / "current_excel" / "current.xlsx",
+    }
+    for path in files.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_rows = _detector_rows(_LARGE_N)
+    current_rows = _shuffled(baseline_rows, seed=99)
+    headers = ("Rank", "ID", "Value", "Value2", "Value3")
+    _write_panel(files["baseline_excel"], baseline_rows, headers=headers)
+    _write_panel(files["current_excel"], current_rows, headers=headers)
     file_hashes = {role: sha256_file(path) for role, path in files.items()}
     choices = build_session_choices(
         mode=QCRunMode.CYCLE_COMPARISON,
@@ -1131,6 +1233,69 @@ async def test_confirm_all_regions_persists_confirmed_true_for_a_valid_region(
     assert isinstance(region_decisions, dict)
     assert region_decisions
     assert all(decision["confirmed"] is True for decision in region_decisions.values())
+
+@pytest.mark.asyncio
+async def test_ranked_automatic_region_cannot_be_bulk_confirmed(
+    user: User, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    session_key = _stage_ranked_session(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=100)
+    await user.should_see("Automatic cannot confirm a ranked table")
+    await user.should_not_see("Confirm row setup")
+
+    run_once = user.find(kind=ui.button, content="Run once").elements.pop()
+    assert isinstance(run_once, ui.button)
+    assert not run_once.enabled
+
+    user.find("Confirm all detected regions").click()
+
+    stored = ConfigSessionStore(work_dir / "history.sqlite3").get(session_key)
+    assert stored is not None
+    region_decisions = stored.choices["region_decisions"]
+    assert isinstance(region_decisions, dict)
+    [decision] = region_decisions.values()
+    assert decision["mode"] == "automatic"
+    assert decision["ranked_candidate_detected"] is True
+    assert decision["ranked_candidate_pending"] is True
+    assert decision["confirmed"] is False
+    run_once = user.find(kind=ui.button, content="Run once").elements.pop()
+    assert isinstance(run_once, ui.button)
+    assert not run_once.enabled
+
+    mode_toggle = next(iter(user.find(marker="region-mode-toggle").elements))
+    assert isinstance(mode_toggle, ui.toggle)
+    mode_toggle.value = "positional"
+
+    await user.should_not_see("Automatic cannot confirm a ranked table")
+    run_once = user.find(kind=ui.button, content="Run once").elements.pop()
+    assert isinstance(run_once, ui.button)
+    assert run_once.enabled
+
+@pytest.mark.asyncio
+async def test_ordinary_region_can_return_to_automatic_without_ui_block(
+    user: User, tmp_path: Path
+) -> None:
+    work_dir = tmp_path / "work"
+    session_key = _stage_session(work_dir)
+    create_pages(work_dir)
+
+    await user.open(f"/configure?session={session_key}")
+    await user.should_see("Analysis complete", retries=_SUBPROCESS_RETRIES)
+    mode_toggle = next(iter(user.find(marker="region-mode-toggle").elements))
+    assert isinstance(mode_toggle, ui.toggle)
+    mode_toggle.value = "positional"
+    mode_toggle = next(iter(user.find(marker="region-mode-toggle").elements))
+    assert isinstance(mode_toggle, ui.toggle)
+    mode_toggle.value = "automatic"
+
+    await user.should_not_see("Confirm row setup")
+    run_once = user.find(kind=ui.button, content="Run once").elements.pop()
+    assert isinstance(run_once, ui.button)
+    assert run_once.enabled
 
 
 @pytest.mark.asyncio

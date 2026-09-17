@@ -239,6 +239,39 @@ def test_append_materializes_an_omitted_optional_array() -> None:
     assert prerequisite.cell == "B3"
 
 
+def test_append_materializes_omitted_review_policy_parents() -> None:
+    draft = ProfileDraft.from_profile(DeliverableProfile(name="nested-array"))
+    path = ("review_policy", "populations", "classes")
+    item_schema = _schema_at("review_policy", "populations", "classes", "[]")
+
+    assert "review_policy" not in draft.payload
+    draft.append(path, item_schema)
+    draft.set((*path, 0), "formula_logic_changed")
+    draft.set(("review_policy", "populations", "enabled"), True)
+
+    values = draft.get(path)
+    assert isinstance(values, list)
+    assert len(values) == 1
+    assert len(draft.profile().review_policy.populations.classes) == 1
+
+
+def test_append_materializes_omitted_input_contract_parents() -> None:
+    draft = ProfileDraft.from_profile(DeliverableProfile(name="nested-array"))
+    path = ("input_contract", "members")
+    item_schema = _schema_at("input_contract", "members", "[]")
+
+    assert "input_contract" not in draft.payload
+    draft.append(path, item_schema)
+    draft.set(("input_contract", "members", 0, "member_id"), "primary")
+
+    values = draft.get(path)
+    assert isinstance(values, list)
+    assert len(values) == 1
+    contract = draft.profile().input_contract
+    assert contract is not None
+    assert contract.members[0].member_id == "primary"
+
+
 def test_default_is_immutable_and_named_profile_can_be_renamed(tmp_path: Path) -> None:
     default = ProfileDraft.from_profile(DeliverableProfile(name="default"))
     with pytest.raises(ValueError, match="default profile is immutable"):

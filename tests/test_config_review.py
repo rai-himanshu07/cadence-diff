@@ -154,6 +154,17 @@ def test_member_review_from_scan_defaults_every_region_to_automatic() -> None:
     assert data_sheet.regions[0].available_columns == ("A", "B", "C")
 
 
+def test_member_review_preserves_ranked_candidate_detection_separately() -> None:
+    review = member_review_from_scan(
+        "primary", _member_profile(with_ranked_candidate=True)
+    )
+    region = review.current_sheets[0].regions[0]
+
+    assert region.ranked_candidate_detected
+    assert region.ranked_candidate_pending
+    assert region.needs_ranked_resolution
+
+
 def test_sheet_pairing_auto_pairs_same_name_and_flags_added_removed() -> None:
     review = member_review_from_scan("primary", _member_profile())
     pairs, added, removed = sheet_pairing(review)
@@ -204,7 +215,7 @@ def test_unresolved_blockers_requires_an_explicit_ranked_region_choice() -> None
         with_ranked_candidate=True
     )))
 
-    assert any("confirm the row setup" in blocker for blocker in blockers)
+    assert any("choose Match rows by key" in blocker for blocker in blockers)
 
     region_id = review.current_sheets[0].regions[0].region_id
     positional = update_region_decision(
@@ -216,7 +227,7 @@ def test_unresolved_blockers_requires_an_explicit_ranked_region_choice() -> None
     )
     resolved = replace(state, member_reviews=(positional,))
     assert not any(
-        "confirm the row setup" in blocker
+        "choose Match rows by key" in blocker
         for blocker in unresolved_blockers(
             resolved, compute_warnings(_scan_result(with_ranked_candidate=True))
         )
@@ -1069,6 +1080,99 @@ def test_confirm_all_regions_only_touches_valid_regions() -> None:
     )
     confirmed_valid = confirm_all_regions(valid_member)
     assert confirmed_valid.current_sheets[0].regions[0].confirmed is True
+
+
+def test_confirm_all_regions_cannot_confirm_an_automatic_ranked_candidate() -> None:
+    review = member_review_from_scan(
+        "primary", _member_profile(with_ranked_candidate=True)
+    )
+
+    confirmed = confirm_all_regions(review)
+    region = confirmed.current_sheets[0].regions[0]
+
+    assert region.mode == "automatic"
+    assert not region.confirmed
+    assert region.ranked_candidate_pending
+    assert region.needs_ranked_resolution
+
+
+def test_confirm_all_regions_confirms_an_explicit_ranked_choice() -> None:
+    review = member_review_from_scan(
+        "primary", _member_profile(with_ranked_candidate=True)
+    )
+    region_id = review.current_sheets[0].regions[0].region_id
+    positional = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="positional",
+        confirmed=False,
+        ranked_candidate_pending=True,
+    )
+
+    confirmed = confirm_all_regions(positional)
+    region = confirmed.current_sheets[0].regions[0]
+
+    assert region.confirmed
+    assert not region.ranked_candidate_pending
+    assert not region.needs_ranked_resolution
+
+
+@pytest.mark.parametrize("mode", ["keyed", "positional", "excluded"])
+def test_explicit_ranked_region_modes_resolve_the_candidate(mode: str) -> None:
+    review = member_review_from_scan(
+        "primary", _member_profile(with_ranked_candidate=True)
+    )
+    region_id = review.current_sheets[0].regions[0].region_id
+    updates: dict[str, object] = {
+        "mode": mode,
+        "confirmed": True,
+        "ranked_candidate_pending": False,
+    }
+    if mode == "keyed":
+        updates["identity_columns"] = ("A",)
+    elif mode == "excluded":
+        updates["exclusion_reason"] = "not part of this comparison"
+        updates["exclusion_expires_on"] = "2099-01-01"
+
+    updated = update_region_decision(review, "Data", region_id, **updates)
+    region = updated.current_sheets[0].regions[0]
+
+    assert region.is_valid
+    assert not region.needs_ranked_resolution
+
+
+def test_ordinary_region_can_return_to_automatic_without_becoming_pending() -> None:
+    review = member_review_from_scan("primary", _member_profile())
+    region_id = review.current_sheets[0].regions[0].region_id
+    keyed = update_region_decision(
+        review,
+        "Data",
+        region_id,
+        mode="keyed",
+        identity_columns=("A",),
+        confirmed=True,
+    )
+
+    automatic = update_region_decision(
+        keyed,
+        "Data",
+        region_id,
+        mode="automatic",
+        confirmed=False,
+        ranked_candidate_pending=False,
+    )
+    region = automatic.current_sheets[0].regions[0]
+
+    assert not region.ranked_candidate_detected
+    assert not region.needs_ranked_resolution
+    assert unresolved_blockers(
+        ConfigWorkspaceState(
+            mode=QCRunMode.CYCLE_COMPARISON,
+            member_reviews=(automatic,),
+        ),
+        (),
+    ) == ()
 
 
 def test_baseline_regions_are_detected_alongside_current_regions() -> None:

@@ -127,6 +127,31 @@ def schema_at_path(path: tuple[str, ...]) -> Schema:
     return schema
 
 
+def _materialized_list(
+    payload: dict[str, Any], path: DraftPath
+) -> tuple[dict[str, Any], list[object]]:
+    updated = copy.deepcopy(payload)
+    node: object = updated
+    for index, part in enumerate(path):
+        is_last = index == len(path) - 1
+        if isinstance(part, str):
+            if not isinstance(node, dict):
+                raise TypeError(f"invalid draft path component {part!r}")
+            mapping = cast(dict[str, object], node)
+            if part not in mapping:
+                mapping[part] = (
+                    [] if is_last or isinstance(path[index + 1], int) else {}
+                )
+            node = mapping[part]
+        else:
+            if not isinstance(node, list):
+                raise TypeError(f"invalid draft path component {part!r}")
+            node = cast(list[object], node)[part]
+    if not isinstance(node, list):
+        raise TypeError("draft path is not a list")
+    return updated, node
+
+
 @dataclass(slots=True)
 class ProfileDraft:
     """One complete profile draft shared by the form and YAML views."""
@@ -202,8 +227,8 @@ class ProfileDraft:
         try:
             values = self.get(path)
         except KeyError:
-            self.set(path, [])
-            values = self.get(path)
+            payload, values = _materialized_list(self.payload, path)
+            self.payload = payload
         if not isinstance(values, list):
             raise TypeError("draft path is not a list")
         values.append(default_for_schema(item_schema))

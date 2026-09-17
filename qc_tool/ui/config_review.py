@@ -159,12 +159,19 @@ class RegionDecision:
     #: A detected ranked-table candidate existed for this region but has not
     #: yet been reviewed -- surfaced as a warning until the analyst
     #: explicitly picks a mode (never auto-applied).
+    ranked_candidate_detected: bool = False
     ranked_candidate_pending: bool = False
     confirmed: bool = False
 
     @property
     def requires_exclusion_detail(self) -> bool:
         return self.mode == "excluded"
+
+    @property
+    def needs_ranked_resolution(self) -> bool:
+        return (
+            self.ranked_candidate_detected and self.mode == "automatic"
+        ) or (self.ranked_candidate_pending and not self.confirmed)
 
     def baseline_letter_for(self, letter: str) -> str:
         """The baseline-side letter for a current-side column ``letter`` --
@@ -260,6 +267,7 @@ def region_decisions_from_sheet(
                 current_range=region.cell_range,
                 anchor_cell=f"{get_column_letter(region.min_col)}{region.min_row}",
                 available_columns=_region_columns(region.min_col, region.max_col),
+                ranked_candidate_detected=detected.ranked_candidate is not None,
                 ranked_candidate_pending=detected.ranked_candidate is not None,
             )
         )
@@ -620,8 +628,7 @@ def compute_warnings(
                         ) if reviewed_sheet is not None else None
                         ranked_is_pending = bool(
                             reviewed_region is not None
-                            and reviewed_region.ranked_candidate_pending
-                            and not reviewed_region.confirmed
+                            and reviewed_region.needs_ranked_resolution
                         )
                     if detected.ranked_candidate is not None and ranked_is_pending:
                         warnings.append(
@@ -1617,6 +1624,10 @@ def confirm_all_regions(member: MemberReview) -> MemberReview:
                 ranked_candidate_pending=False,
             )
             if region.is_valid
+            and not (
+                region.ranked_candidate_detected
+                and region.mode == "automatic"
+            )
             else region
             for region in sheet.regions
         )
@@ -1635,7 +1646,16 @@ def unresolved_blockers(
     for member in state.member_reviews:
         for sheet in member.current_sheets:
             for region in sheet.regions:
-                if region.ranked_candidate_pending and not region.confirmed:
+                if (
+                    region.ranked_candidate_detected
+                    and region.mode == "automatic"
+                ):
+                    blockers.append(
+                        f"{sheet.sheet_name!r} {region.current_range}: choose "
+                        "Match rows by key, Compare by position, or Exclude "
+                        "before running"
+                    )
+                elif region.needs_ranked_resolution:
                     blockers.append(
                         f"{sheet.sheet_name!r} {region.current_range}: confirm "
                         "the row setup before running"

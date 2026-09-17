@@ -26,6 +26,7 @@ _ALLOWED_FILES = {
     "scripts/audit_native_distributions.py",
     "scripts/audit_public_tree.py",
     "scripts/formula_phase_diagnostic.py",
+    "scripts/setup_performance_acceptance.py",
     "scripts/windows_excel_acceptance.py",
     "scripts/windows_focus_acceptance.py",
     "scripts/windows_office_discovery.py",
