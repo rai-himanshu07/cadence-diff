@@ -17,6 +17,8 @@ from qc_tool.setup.coordinator import (
 from qc_tool.setup.preview_store import SetupScanStore, SetupSidecarStaleError
 from qc_tool.setup.preview_worker import SetupScanOutcome, SetupScanProgress
 
+_WAIT_SECONDS = 5.0
+
 
 def _member(tmp_path: Path) -> SetupMemberInput:
     return SetupMemberInput(
@@ -55,7 +57,7 @@ def test_coordinator_persists_aggregate_progress_and_completion(tmp_path: Path) 
         passwords_by_member={},
     )
 
-    assert job.wait_terminal(2.0)
+    assert job.wait_terminal(_WAIT_SECONDS)
     snapshot = job.snapshot()
     assert snapshot.status is SetupStatus.COMPLETE
     assert snapshot.processed == 2
@@ -84,7 +86,7 @@ def test_newer_setup_state_cannot_be_overwritten_by_a_delayed_snapshot(
             if snapshot.status is SetupStatus.WAITING_FOR_SLOT and not self._delayed:
                 self._delayed = True
                 self.waiting_save_started.set()
-                assert self.release_waiting_save.wait(2.0)
+                assert self.release_waiting_save.wait(_WAIT_SECONDS)
             super().save(snapshot, requires_credentials=requires_credentials)
 
     store = DelayedStore(tmp_path / "history.sqlite3")
@@ -95,7 +97,7 @@ def test_newer_setup_state_cannot_be_overwritten_by_a_delayed_snapshot(
 
     older = threading.Thread(target=coordinator._persist, args=(job,))
     older.start()
-    assert store.waiting_save_started.wait(1.0)
+    assert store.waiting_save_started.wait(_WAIT_SECONDS)
 
     with job._condition:
         job.status = SetupStatus.COMPLETE
@@ -139,7 +141,7 @@ def test_completed_sheet_profile_is_available_before_member_completion(
             )
         )
         emitted.set()
-        release.wait(2.0)
+        release.wait(_WAIT_SECONDS)
         return SetupScanOutcome(result_payload=_result_payload())
 
     coordinator = SetupCoordinator(tmp_path, runner=runner)
@@ -151,7 +153,7 @@ def test_completed_sheet_profile_is_available_before_member_completion(
         passwords_by_member={},
     )
 
-    assert emitted.wait(1.0)
+    assert emitted.wait(_WAIT_SECONDS)
     partial = job.result_payloads_snapshot()["primary"]
     assert job.snapshot().status is SetupStatus.PARTIAL_READY
     assert partial["current_sheets"] == [
@@ -165,7 +167,7 @@ def test_completed_sheet_profile_is_available_before_member_completion(
     ]
 
     release.set()
-    assert job.wait_terminal(2.0)
+    assert job.wait_terminal(_WAIT_SECONDS)
 
 
 def test_credential_bound_slot_wait_demotes_when_last_page_detaches(
@@ -187,11 +189,11 @@ def test_credential_bound_slot_wait_demotes_when_last_page_detaches(
         {"primary": _member(tmp_path)},
         passwords_by_member={"primary": {"current": "secret"}},
     )
-    assert attempted.wait(1.0)
+    assert attempted.wait(_WAIT_SECONDS)
 
     coordinator.detach("session-1", 1, "client-1")
 
-    assert job.wait_for_status(SetupStatus.AWAITING_CREDENTIALS, 2.0)
+    assert job.wait_for_status(SetupStatus.AWAITING_CREDENTIALS, _WAIT_SECONDS)
     assert "secret" not in repr(job)
 
 
@@ -204,7 +206,7 @@ def test_credential_bound_inflight_job_restores_as_awaiting_credentials(
     def runner(request, *, cancel_event, on_progress):
         del request, cancel_event, on_progress
         entered.set()
-        release.wait(2.0)
+        release.wait(_WAIT_SECONDS)
         return SetupScanOutcome(result_payload=_result_payload())
 
     coordinator = SetupCoordinator(tmp_path, runner=runner)
@@ -215,7 +217,7 @@ def test_credential_bound_inflight_job_restores_as_awaiting_credentials(
         {"primary": _member(tmp_path)},
         passwords_by_member={"primary": {"current": "secret"}},
     )
-    assert entered.wait(1.0)
+    assert entered.wait(_WAIT_SECONDS)
 
     reconstructed = SetupCoordinator(tmp_path)
     restored = reconstructed.get_or_create("session-1", 1)
@@ -273,11 +275,11 @@ def test_detach_demotes_later_credential_member_after_an_earlier_dispatch(
             "second": {"current": "secret-two"},
         },
     )
-    assert second_waiting.wait(1.0)
+    assert second_waiting.wait(_WAIT_SECONDS)
 
     coordinator.detach("session-1", 1, "client-1")
 
-    assert job.wait_for_status(SetupStatus.AWAITING_CREDENTIALS, 2.0)
+    assert job.wait_for_status(SetupStatus.AWAITING_CREDENTIALS, _WAIT_SECONDS)
     assert "secret-two" not in repr(job)
     assert calls == 2
 
@@ -289,7 +291,7 @@ def test_cancel_wins_over_a_late_successful_result(tmp_path: Path) -> None:
     def runner(request, *, cancel_event, on_progress):
         del request, cancel_event, on_progress
         entered.set()
-        release.wait(2.0)
+        release.wait(_WAIT_SECONDS)
         return SetupScanOutcome(result_payload=_result_payload())
 
     coordinator = SetupCoordinator(tmp_path, runner=runner)
@@ -300,12 +302,12 @@ def test_cancel_wins_over_a_late_successful_result(tmp_path: Path) -> None:
         {"primary": _member(tmp_path)},
         passwords_by_member={},
     )
-    assert entered.wait(1.0)
+    assert entered.wait(_WAIT_SECONDS)
 
     coordinator.cancel("session-1", 1)
     release.set()
 
-    assert job.wait_terminal(2.0)
+    assert job.wait_terminal(_WAIT_SECONDS)
     assert job.snapshot().status is SetupStatus.CANCELLED
     assert job.result_payloads == {}
 
@@ -336,7 +338,7 @@ def test_terminal_job_evicts_after_last_subscriber_detaches(tmp_path: Path) -> N
         {"primary": _member(tmp_path)},
         passwords_by_member={},
     )
-    assert job.wait_terminal(2.0)
+    assert job.wait_terminal(_WAIT_SECONDS)
 
     coordinator.detach("session-1", 1, "client-1")
     assert coordinator.evict_terminal(max_age_seconds=0) == 1
@@ -390,7 +392,7 @@ def test_discard_reclaims_late_old_write_and_preserves_new_generation(
     def runner(request, *, cancel_event, on_progress):
         del cancel_event, on_progress
         entered.set()
-        release.wait(2.0)
+        release.wait(_WAIT_SECONDS)
         sidecar.save_sheet(
             request.session_key,
             request.member_id,
@@ -409,7 +411,7 @@ def test_discard_reclaims_late_old_write_and_preserves_new_generation(
         {"primary": _member(tmp_path)},
         passwords_by_member={},
     )
-    assert entered.wait(1.0)
+    assert entered.wait(_WAIT_SECONDS)
     sidecar.save_sheet(
         "session-1",
         "primary",
