@@ -99,6 +99,13 @@ def test_native_wheel_workflow_builds_three_wheels_without_sdist() -> None:
         "smoke-windows",
         "smoke-fallback",
     }
+    linux_step = next(
+        step
+        for step in jobs["build-linux"]["steps"]
+        if "PyO3/maturin-action" in step.get("uses", "")
+    )
+    assert linux_step["with"]["manylinux"] == 2014
+    assert "--compatibility" not in linux_step["with"]["args"]
 
 
 def test_publish_workflow_orders_helper_main_and_github_release() -> None:
@@ -125,3 +132,10 @@ def test_publish_workflow_orders_helper_main_and_github_release() -> None:
     assert "sha256sum --check ../helper-release/SHA256SUMS" in text
     assert "gh release create" in text
     assert "skip-existing" not in text
+    linux_step = next(
+        step
+        for step in jobs["build-native-linux"]["steps"]
+        if "PyO3/maturin-action" in step.get("uses", "")
+    )
+    assert linux_step["with"]["manylinux"] == 2014
+    assert "--compatibility" not in linux_step["with"]["args"]
