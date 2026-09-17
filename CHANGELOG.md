@@ -6,6 +6,8 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-18
+
 ### Added
 
 - A unified **Configure & Run** workspace for every browser-started run,
