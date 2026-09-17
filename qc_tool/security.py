@@ -66,14 +66,30 @@ def private_file(path: Path) -> Path:
     return path
 
 
+def _windows_path_disappeared(error: Exception) -> bool:
+    return (
+        isinstance(error, FileNotFoundError)
+        or getattr(error, "winerror", None) == 2
+        or (bool(error.args) and error.args[0] == 2)
+    )
+
+
+def _secure_windows_tree(root: Path) -> None:
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            continue
+        try:
+            _restrict_windows_path(path, inherit=path.is_dir())
+        except Exception as error:
+            if not _windows_path_disappeared(error):
+                raise
+
+
 def secure_managed_tree(root: Path) -> Path:
     """Restrict an existing app-managed tree without following symlinks."""
     private_directory(root)
     if os.name == "nt":
-        for path in root.rglob("*"):
-            if path.is_symlink():
-                continue
-            _restrict_windows_path(path, inherit=path.is_dir())
+        _secure_windows_tree(root)
         return root
     if os.name != "posix":
         return root

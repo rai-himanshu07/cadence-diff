@@ -124,6 +124,8 @@ from tests.test_review_series import series_oracle
 
 pytest_plugins = ["nicegui.testing.user_plugin"]
 
+_SUBPROCESS_RETRIES = 50
+
 
 async def _transiently_reconnect(user: User) -> None:
     client = user._client
@@ -1533,7 +1535,7 @@ async def test_complexity_failure_offers_an_explicit_override_confirmation(
         if button.text == "Run with override" and "runbtn" in button.classes
     )
     _emit(confirm, "click", {})
-    await user.should_see("Configure & run")
+    await user.should_see("Configure & run", retries=_SUBPROCESS_RETRIES)
 
     assert manager.submitted == []
     file_hashes = {role: sha256_file(path) for role, path in files.items()}
@@ -1587,7 +1589,7 @@ async def test_stale_row_suggestions_refresh_with_restored_request_context(
     await user.open("/")
     await user.should_see("QC needs more setup")
     user.find(kind=ui.button, content="Return to setup").click()
-    await user.should_see("Configure & run")
+    await user.should_see("Configure & run", retries=_SUBPROCESS_RETRIES)
 
     assert manager.submitted == []
     file_hashes = {role: sha256_file(path) for role, path in files.items()}
@@ -1660,7 +1662,7 @@ async def test_run_qc_button_creates_a_configuration_session(
     # file's own row-suggestions-refresh test does, without depending on a
     # real browser upload widget (none exists in this test suite).
     user.find(kind=ui.button, content="Return to setup").click()
-    await user.should_see("Configure & run")
+    await user.should_see("Configure & run", retries=_SUBPROCESS_RETRIES)
 
     file_hashes = {role: sha256_file(path) for role, path in files.items()}
     config_store = ConfigSessionStore(work_dir / "history.sqlite3")

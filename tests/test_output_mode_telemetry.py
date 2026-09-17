@@ -12,9 +12,11 @@ filename, sheet name, coordinate, formula, value, or raw pair-key text.
 from __future__ import annotations
 
 import datetime as dt
+import sys
 import time
 from pathlib import Path
 
+import pytest
 from openpyxl import Workbook
 
 from qc_tool.config.profile import PopulationPolicy, default_profile
@@ -220,6 +222,13 @@ def _build_large_formula_pair(tmp_path: Path, *, rows: int) -> tuple[Path, Path]
     return base, curr
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Windows process_time advances in coarse scheduler ticks; Linux CI owns "
+        "the 2% microbenchmark while Windows runs the functional telemetry suite"
+    ),
+)
 def test_bounded_synthetic_telemetry_overhead_stays_within_two_percent(
     tmp_path: Path,
 ) -> None:
